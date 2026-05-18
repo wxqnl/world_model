@@ -41,6 +41,7 @@ class Shard:
     meta: dict
     n_frames: int
     episode_index: int
+    clip_id: str
 
 
 def discover_shards(cache_dir: str | Path) -> list[Shard]:
@@ -50,7 +51,8 @@ def discover_shards(cache_dir: str | Path) -> list[Shard]:
         meta = json.loads(p.with_suffix(".json").read_text())
         out.append(Shard(path=p, meta=meta,
                          n_frames=int(meta["n_frames"]),
-                         episode_index=int(meta["episode_index"])))
+                         episode_index=int(meta["episode_index"]),
+                         clip_id=str(meta.get("clip_id", p.stem))))
     return out
 
 
@@ -136,10 +138,14 @@ def compute_action_stats(shards: list[Shard]) -> tuple[np.ndarray, np.ndarray]:
 
 def split_shards(
     shards: list[Shard],
-    val_episode_ids: list[int],
+    val_ids: list,
 ) -> tuple[list[Shard], list[Shard]]:
+    # val_ids may be clip_id strings (paper-scale manifest convention) or
+    # legacy integer episode_index values (prototype convention). Match on
+    # whichever is present in the set; never silently drop everything.
+    vs = set(val_ids)
     train, val = [], []
-    vs = set(val_episode_ids)
     for sh in shards:
-        (val if sh.episode_index in vs else train).append(sh)
+        is_val = sh.clip_id in vs or sh.episode_index in vs
+        (val if is_val else train).append(sh)
     return train, val

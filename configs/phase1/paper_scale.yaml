@@ -63,6 +63,10 @@ eval:
 
 ddp:
   backend: nccl
+  # heads.py now only creates action_proj when use_actions=True, so there are
+  # no unused params and we can keep find_unused_parameters=False (required
+  # for compatibility with the Join context manager that handles uneven
+  # IterableDataset inputs across ranks).
   find_unused_parameters: false
 
 wandb:

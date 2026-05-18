@@ -1,5 +1,11 @@
 data/raw/
 data/cache/
+data/hf_home/
+data/libero/
+data/libero_assets/
+data/oxe_hf/
+data/manifests/paper_scale.json
+download_logs/
 weights/
 *.pt
 *.pth

@@ -115,6 +115,49 @@ class DroidActions:
         return ep["action"][fi].copy(), ep["state"][fi].copy()
 
 
+@dataclass
+class OxeActions:
+    """Per-clip actions/state loader for OXE-extracted episodes.
+
+    `scripts/extract_oxe_frames.py` writes `episode.npz` next to each clip's
+    frames, with float32 `actions (n,7)` and `states (n,7)` arrays. This
+    loader is keyed by (dataset, episode_index) and reads on demand.
+    """
+
+    extracted_root: str = "data/raw/oxe_extracted"
+
+    def __call__(self, dataset: str, episode_index: int, frame_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        npz_path = Path(self.extracted_root) / dataset / f"episode_{int(episode_index):05d}" / "episode.npz"
+        d = np.load(npz_path)
+        a = np.asarray(d["actions"])
+        s = np.asarray(d["states"])
+        n_avail = a.shape[0]
+        fi = np.clip(frame_ids, 0, n_avail - 1)
+        return a[fi].copy(), s[fi].copy()
+
+
+class UnifiedActions:
+    """Dispatch (clip, frame_ids) -> (action, state) by clip.meta.dataset.
+
+    For `droid_100` falls through to `DroidActions` (lazy parquet load); for
+    OXE sub-datasets reads the per-episode npz sidecar produced by
+    `scripts/extract_oxe_frames.py`.
+    """
+
+    def __init__(self, droid_parquet: str | None = None, oxe_extracted_root: str = "data/raw/oxe_extracted") -> None:
+        self._droid = DroidActions(droid_parquet) if droid_parquet else None
+        self._oxe = OxeActions(extracted_root=oxe_extracted_root)
+
+    def __call__(self, clip: dict[str, Any], frame_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        ds = (clip.get("meta") or {}).get("dataset", "droid_100")
+        ep_idx = int(clip["meta"]["episode_index"])
+        if ds == "droid_100":
+            if self._droid is None:
+                raise RuntimeError("droid_100 clip without droid_parquet configured")
+            return self._droid(ep_idx, frame_ids)
+        return self._oxe(ds, ep_idx, frame_ids)
+
+
 # ------------------------------------------------------------- main processor
 class VGGTCachier:
     def __init__(self, cfg: dict[str, Any], device: str = "cuda"):
@@ -133,7 +176,7 @@ class VGGTCachier:
     def process_clip(
         self,
         clip: dict[str, Any],
-        actions: DroidActions,
+        actions: "UnifiedActions | DroidActions",
         out_dir: Path,
     ) -> dict[str, Any]:
         from src.data_loader import Clip, load_frames
@@ -213,7 +256,10 @@ class VGGTCachier:
         # Actions / states for these frames.
         episode_index = int(clip["meta"]["episode_index"])
         frame_ids = np.arange(n, dtype=np.int32)
-        act, state = actions(episode_index, frame_ids)
+        if isinstance(actions, UnifiedActions):
+            act, state = actions(clip, frame_ids)
+        else:
+            act, state = actions(episode_index, frame_ids)
 
         out_path = out_dir / f"{clip['clip_id']}.npz"
         meta = {
@@ -248,10 +294,16 @@ class VGGTCachier:
         return {"skipped": False, "elapsed": dt, "n_frames": n, "path": str(out_path)}
 
 
-def run(cfg_path: str, limit: int | None = None, force: bool = False) -> None:
+def run(
+    cfg_path: str,
+    limit: int | None = None,
+    force: bool = False,
+    shard_index: int = 0,
+    num_shards: int = 1,
+) -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s  %(message)s",
+        format=f"%(asctime)s %(levelname)s %(name)s[s{shard_index}/{num_shards}]  %(message)s",
         datefmt="%H:%M:%S",
     )
     cfg = yaml.safe_load(open(cfg_path))
@@ -259,11 +311,17 @@ def run(cfg_path: str, limit: int | None = None, force: bool = False) -> None:
     out_dir = Path(cfg["cache"]["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    actions = DroidActions(cfg["cache"]["droid_parquet"])
+    actions = UnifiedActions(
+        droid_parquet=cfg["cache"].get("droid_parquet"),
+        oxe_extracted_root=cfg["cache"].get("oxe_extracted_root", "data/raw/oxe_extracted"),
+    )
 
     cacher = VGGTCachier(cfg)
-    clips = manifest if limit is None else manifest[:limit]
-    summary = {"n": len(clips), "clips": []}
+    if limit is not None:
+        manifest = manifest[:limit]
+    # Shard by clip index (stable across runs because the manifest order is stable).
+    clips = [c for i, c in enumerate(manifest) if i % num_shards == shard_index]
+    summary = {"n": len(clips), "shard_index": shard_index, "num_shards": num_shards, "clips": []}
     for i, clip in enumerate(clips):
         out_path = out_dir / f"{clip['clip_id']}.npz"
         if out_path.exists() and not force:
@@ -273,7 +331,8 @@ def run(cfg_path: str, limit: int | None = None, force: bool = False) -> None:
         log.info("[%d/%d] %s", i + 1, len(clips), clip["clip_id"])
         info = cacher.process_clip(clip, actions, out_dir)
         summary["clips"].append({"clip_id": clip["clip_id"], **info})
-    (out_dir / "_summary.json").write_text(json.dumps(summary, indent=2))
+    summary_path = out_dir / f"_summary_shard_{shard_index:02d}_of_{num_shards:02d}.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
@@ -281,5 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--cfg", default="configs/phase1/default.yaml")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--shard_index", type=int, default=0)
+    parser.add_argument("--num_shards", type=int, default=1)
     args = parser.parse_args()
-    run(args.cfg, args.limit, args.force)
+    run(args.cfg, args.limit, args.force, args.shard_index, args.num_shards)

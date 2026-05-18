@@ -7,6 +7,7 @@ opencv-python-headless
 imageio[ffmpeg]
 matplotlib
 pandas
+pyarrow
 scipy
 scikit-learn
 tqdm
@@ -14,3 +15,5 @@ huggingface_hub
 safetensors
 einops
 trimesh
+timm
+transformers<5

@@ -137,6 +137,21 @@ if [[ "$NUM_GPUS" -eq 1 ]]; then
     exec "${PASS_ARGS[@]}"
 fi
 
+# If PASS_ARGS looks like `python -m MODULE ...script_args`, hand the module
+# to torchrun's own -m flag and use `--` to stop argparse from prefix-matching
+# script flags (e.g. our trainer's --run, which collides with torchrun's
+# --run-path/--run_path) before they reach the script.
+if [[ ${#PASS_ARGS[@]} -ge 3 && "${PASS_ARGS[0]}" == "python" && "${PASS_ARGS[1]}" == "-m" ]]; then
+    MODULE="${PASS_ARGS[2]}"
+    SCRIPT_ARGS=("${PASS_ARGS[@]:3}")
+    exec torchrun \
+        --nproc_per_node "$NUM_GPUS" \
+        --nnodes 1 \
+        --master_port "$MASTER_PORT" \
+        $EXTRA_TORCHRUN_ARGS \
+        -m "$MODULE" -- "${SCRIPT_ARGS[@]}"
+fi
+
 exec torchrun \
     --nproc_per_node "$NUM_GPUS" \
     --nnodes 1 \

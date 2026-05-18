@@ -54,11 +54,18 @@ class PredictiveHead(nn.Module):
         self.query = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn.init.normal_(self.query, std=0.02)
 
-        self.action_proj = nn.Sequential(
-            nn.Linear(action_dim, action_embed_dim),
-            nn.GELU(),
-            nn.Linear(action_embed_dim, hidden_dim),
-        )
+        # Only instantiate action conditioning when actually used. Carrying
+        # unused params forces DDP into `find_unused_parameters=True`, which
+        # is incompatible with `Join` (the unused-params allreduce collides
+        # with Join's shadow collectives → NCCL timeout at epoch boundaries).
+        if use_actions:
+            self.action_proj = nn.Sequential(
+                nn.Linear(action_dim, action_embed_dim),
+                nn.GELU(),
+                nn.Linear(action_embed_dim, hidden_dim),
+            )
+        else:
+            self.action_proj = None
 
         self.pos = nn.Parameter(torch.zeros(1, context_len + 1, hidden_dim))
         nn.init.normal_(self.pos, std=0.02)

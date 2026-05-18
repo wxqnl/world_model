@@ -24,6 +24,7 @@ Use ``scripts/launch_ddp.sh`` to auto-pin to free GPUs on a shared host.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -35,6 +36,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
+from torch.distributed.algorithms.join import Join
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
@@ -77,7 +79,9 @@ def cosine_lr(step: int, total: int, warmup: int, base_lr: float) -> float:
     return base_lr * 0.5 * (1 + math.cos(math.pi * min(1.0, t)))
 
 
-def _load_val_ids(cfg: dict) -> list[int]:
+def _load_val_ids(cfg: dict) -> list:
+    # Returns either clip_id strings (paper-scale: data/manifests/val_ids.json)
+    # or integer episode_index values (prototype). split_shards handles both.
     split = cfg["dataset"]["split"]
     if "val_episode_ids" in split:
         return list(split["val_episode_ids"])
@@ -230,9 +234,42 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
     # ---- train
     amp_dtype = torch.bfloat16 if cfg["train"].get("amp_dtype", "bfloat16") == "bfloat16" else torch.float16
     epochs = cfg["train"]["epochs"]
-    # Estimate total steps for cosine. With IterableDataset len is approximate.
-    steps_per_epoch = max(1, len(train_ds) // (bs * max(1, world)))
-    total_steps = steps_per_epoch * epochs
+
+    # Deterministic per-epoch batch count across ranks. IterableDataset gives
+    # each rank a different shard slice with different pair counts; if we let
+    # each rank iterate its own dataloader to exhaustion, the early-finisher
+    # exits the loop, stops issuing gradient allreduces, and the others hang
+    # for NCCL_TIMEOUT (600s) before crashing. The PyTorch `Join` context
+    # manager fails here (torch 2.4.1) — its shadow collectives don't line up
+    # with rank-0's val forwards / barriers.
+    #
+    # Solution: each epoch, replay the StreamingNextTokenPairs shuffle for
+    # that epoch, compute the rank's actual pair count, MIN-allreduce across
+    # ranks, break each rank's loop at that count. Done inside the epoch
+    # loop below (the per-epoch reshuffle changes the per-rank distribution).
+    import random as _random
+
+    def _min_batches_for_epoch(ep: int) -> int:
+        rng_e = _random.Random(int(cfg["seed"]) + ep)
+        order_e = list(range(len(train_shards)))
+        rng_e.shuffle(order_e)
+        my_e = [train_shards[i] for i in order_e[rank::max(1, world)]]
+        my_pairs_e = sum(max(0, sh.n_frames - C) for sh in my_e)
+        my_bat_e = max(1, my_pairs_e // bs)
+        if world > 1:
+            mb_e = torch.tensor([my_bat_e], device=device)
+            dist.all_reduce(mb_e, op=dist.ReduceOp.MIN)
+            return max(1, int(mb_e.item()) - 16)   # safety margin
+        return my_bat_e
+
+    # Estimate total_steps for cosine LR using epoch 0's count. Slight per-
+    # epoch variation in the actual per-epoch length is absorbed by cosine's
+    # smoothness.
+    steps_per_epoch_est = _min_batches_for_epoch(0)
+    if _is_main(rank):
+        log.info("steps/epoch (epoch 0 reference): %d", steps_per_epoch_est)
+
+    total_steps = steps_per_epoch_est * epochs
     warmup = cfg["train"]["warmup_steps"]
     grad_accum = max(1, int(cfg["train"].get("grad_accum", 1)))
     ckpt_every = int(cfg["train"]["ckpt_every_steps"])
@@ -245,7 +282,14 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
         head.train()
         opt.zero_grad(set_to_none=True)
         ep_losses = []
+        # Re-evaluate the global min for THIS epoch (per-epoch reshuffle).
+        steps_per_epoch = _min_batches_for_epoch(epoch)
+        if _is_main(rank):
+            log.info("ep %d steps/epoch (global min): %d", epoch, steps_per_epoch)
         for bi, batch in enumerate(train_dl):
+            if bi >= steps_per_epoch:
+                # Truncate to the global min so all ranks exit together.
+                break
             for k in ("ctx_tokens", "ctx_actions", "tgt_action", "tgt_tokens"):
                 batch[k] = batch[k].to(device, non_blocking=True)
             lr = cosine_lr(global_step, total_steps, warmup, cfg["train"]["lr"])
@@ -280,16 +324,25 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
                         step=global_step, epoch=epoch, best_val=best_val, cfg=cfg,
                     )
 
-        # ---- per-epoch validation (rank 0 only — val_ds is world_size=1)
+        # All ranks have done exactly `steps_per_epoch` train steps; sync
+        # before the rank-0-only val so that val's forwards never overlap
+        # with another rank's grad allreduce.
+        if world > 1:
+            dist.barrier()
+
+        # ---- per-epoch validation (rank 0 only).
+        # Use head.module (the underlying PredictiveHead) instead of the DDP
+        # wrapper so val forwards don't fire DDP's bookkeeping collectives.
         if _is_main(rank):
-            head.eval()
+            eval_model = head.module if world > 1 else head
+            eval_model.eval()
             with torch.no_grad():
                 vs = []
                 for batch in val_dl:
                     for k in ("ctx_tokens", "ctx_actions", "tgt_action", "tgt_tokens"):
                         batch[k] = batch[k].to(device, non_blocking=True)
                     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
-                        pred = head(batch["ctx_tokens"], batch["ctx_actions"], batch["tgt_action"])
+                        pred = eval_model(batch["ctx_tokens"], batch["ctx_actions"], batch["tgt_action"])
                         vs.append((pred.float() - batch["tgt_tokens"].float()).pow(2).mean().item())
                 val_loss = float(np.mean(vs)) if vs else float("nan")
             train_loss = float(np.mean(ep_losses)) if ep_losses else float("nan")
@@ -299,7 +352,7 @@ def run_one(cfg: dict, run_name: str, args) -> dict:
                 wandb_run.log({"val/loss": val_loss, "epoch": epoch}, step=global_step)
             if val_loss < best_val:
                 best_val = val_loss
-                torch.save((head.module if world > 1 else head).state_dict(), run_dir / "best.pt")
+                torch.save(eval_model.state_dict(), run_dir / "best.pt")
         if world > 1:
             dist.barrier()
 
