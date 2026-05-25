@@ -45,6 +45,9 @@ def build_model(cfg: dict) -> JointWorldModel:
         pixel_n_res=cfg["model"]["pixel_n_res"],
         enable_pixel=cfg["model"].get("enable_pixel", True),
         enable_bridging=cfg["model"].get("enable_bridging", True),
+        enable_aux_idm=cfg["model"].get("enable_aux_idm", False),
+        aux_idm_hidden=cfg["model"].get("aux_idm_hidden", 1024),
+        aux_idm_layers=cfg["model"].get("aux_idm_layers", 3),
     )
     return JointWorldModel(jc)
 

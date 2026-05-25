@@ -152,3 +152,29 @@ def test_compute_losses_vla_no_aux_idm_path():
     losses = compute_losses_vla(out, tgt, VLALossWeights())
     assert losses["L_aux_pose"].item() == 0.0
     assert losses["L_total"].requires_grad
+
+
+def test_idm_stream_attends_over_input_and_future():
+    from wm3d_v3.models.idm_stream import IDMStream, IDMStreamConfig
+    cfg = IDMStreamConfig(T=4, k=2, P=8, D=32, hidden=32,
+                          n_layers=2, n_heads=4, z_dim=8, cond_dim=32)
+    m = IDMStream(cfg)
+    s_in = torch.randn(2, 4, 8, 32)
+    pred_tokens = torch.randn(2, 2, 8, 32)
+    c = torch.randn(2, 32)
+    out = m(s_in, pred_tokens, c)
+    assert out["z_a"].shape == (2, 2, 8)
+
+
+def test_idm_stream_gradient_flows_to_pred_tokens():
+    from wm3d_v3.models.idm_stream import IDMStream, IDMStreamConfig
+    cfg = IDMStreamConfig(T=4, k=2, P=8, D=32, hidden=32,
+                          n_layers=1, n_heads=4, z_dim=8, cond_dim=32)
+    m = IDMStream(cfg)
+    s_in = torch.randn(2, 4, 8, 32, requires_grad=True)
+    pred_tokens = torch.randn(2, 2, 8, 32, requires_grad=True)
+    c = torch.randn(2, 32)
+    out = m(s_in, pred_tokens, c)
+    out["z_a"].sum().backward()
+    assert pred_tokens.grad is not None and pred_tokens.grad.abs().sum() > 0
+    assert s_in.grad is not None and s_in.grad.abs().sum() > 0
