@@ -1,0 +1,72 @@
+# Phase 1 — paper-scale predictor (D_psi)
+# Per PHASE2_PAPER_PLAN.md §5: ~100 M params, hidden 1024, 12 layers, context=8.
+# Trained on the 30K-clip / ~3M-frame paper-scale token cache.
+# Used by scripts/phase1/train_ddp.py (NOT the prototype train.py).
+seed: 1337
+
+cache:
+  manifest: data/manifests/paper_scale.json
+  droid_parquet: data/raw/droid_100/data/chunk-000/file-000.parquet
+  out_dir: results/phase1_scale/cache_tokens          # 750 GB int16 / 375 GB int8
+  window: 8
+  stride: 4
+  max_frames_per_clip: 128
+  token_grid: 8
+  token_dim: 2048
+  save_depth_hw: 64
+  dtype: bfloat16
+
+dataset:
+  split:
+    # Episode IDs reserved for validation. The paper-scale manifest must
+    # include ~3K val episodes; ID list pulled from data/manifests/val_ids.json.
+    val_episode_ids_file: data/manifests/val_ids.json
+  normalize_actions: true
+  action_dim: 7
+  state_dim: 7
+  streaming: true                     # use src.phase1.dataset_streaming
+
+head:
+  hidden_dim: 1024                    # was 512
+  n_layers: 12                        # was 4
+  n_heads: 16                         # was 8
+  dropout: 0.1
+  action_embed_dim: 256               # bumped per Phase 1 action-conditioning triage
+  context_len: 8                      # was 4 — longer history for k=16/32 rollout
+  token_pool: mean
+  use_checkpoint: true                # gradient checkpointing on the backbone
+
+loss:
+  type: mse
+  flow_sigma_min: 1.0e-4
+
+train:
+  # Per-rank batch size. Effective batch = batch_windows * world_size * grad_accum.
+  batch_windows: 32
+  grad_accum: 1
+  epochs: 12                          # paper-scale: 12 epochs over ~3M frames
+  lr: 3.0e-4
+  weight_decay: 0.05
+  warmup_steps: 2000
+  grad_clip: 1.0
+  num_workers: 4
+  device: cuda
+  amp_dtype: bfloat16                 # H100 native bf16; no GradScaler needed
+  ckpt_every_steps: 1000              # step-level resume
+  log_every_steps: 50
+  val_every_steps: 2000               # how often to run held-out val during a run
+  ema_decay: 0.999                    # null to disable
+
+eval:
+  horizons: [1, 2, 4, 8, 16, 32]
+  bootstrap_iters: 1000
+
+ddp:
+  backend: nccl
+  find_unused_parameters: false
+
+wandb:
+  enabled: false                      # set true to log to W&B
+  project: geophys-wm
+  entity: null
+  run_name: phase1-paper-scale

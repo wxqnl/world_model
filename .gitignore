@@ -1,0 +1,45 @@
+# ===== Heavy training artifacts (NEVER push) =====
+results/
+**/ckpt/
+**/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# ===== Data caches =====
+**/cache/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===== Build / packaging =====
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# ===== Editors / test =====
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ===== Env =====
+.env
+.venv
+venv/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# ===== Large media at repo root (we'll keep small ones below) =====
+# (root .gif kept since it's only 1.2M)
+
+# ===== Old versions / out-of-scope dirs for this push =====
+wm3d/

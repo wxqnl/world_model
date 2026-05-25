@@ -1,0 +1,50 @@
+data:
+  manifest: /home/user01/Minko/newwm/wm3d_v3/manifests/oxe_train.jsonl
+  cache_root: /home/user01/Minko/datasets/cache/wm3d_v3
+  T: 16
+  k: 8
+  stride: 2
+  val_frac: 0.50
+  seed: 0
+model:
+  state:  { T: 16, P: 64, D: 2048, hidden: 1152, n_layers: 14, n_heads: 16, k: 8 }
+  action: { T: 16, P: 64, D: 2048, hidden:  896, n_layers: 10, n_heads: 14, k: 8, z_dim: 192 }
+  xattn_layers_state: [3, 6, 9, 11, 13]
+  xattn_n_heads: 16
+  action_proj_hidden: 768
+  action_proj_layers: 5
+  geom_hidden: 384
+  pixel_hidden: 768
+  pixel_n_res: 2
+  enable_pixel: true
+  enable_bridging: false
+train:
+  epochs: 30
+  batch_size_per_gpu: 2
+  num_workers: 2
+  lr: 2.0e-4
+  weight_decay: 0.02
+  warmup_steps: 50
+  grad_clip: 1.0
+  precision: bf16
+  log_every: 1
+  ckpt_every_epochs: 30
+loss:
+  cos: 0.1
+  grip: 0.5
+  geom_depth: 0.3
+  geom_point: 0.05
+  geom_pose: 0.02
+  action: 1.0
+  idm_reg: 0.01
+  rgb_l1: 1.0
+  rgb_lpips: 0.5
+out:
+  root: /tmp/wm3d_v3_smoke
+  tb_dir: tb
+  ckpt_dir: ckpt
+overfit_clip_ids:
+  - bridge/00035/sample_000000018454
+  - bridge/00018/sample_000000009668
+  - bridge/00037/sample_000000019391
+  - bridge/00024/sample_000000012553

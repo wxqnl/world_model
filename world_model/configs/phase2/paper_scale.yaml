@@ -1,0 +1,95 @@
+# Phase 2 — paper-scale generator (G_theta) with coupling.
+# Per PHASE2_PAPER_PLAN.md §5: ~300 M generator, hidden 1280, 20 layers; physics
+# ~20 M with phi_dim swept in {64, 128, 256}; predictor frozen at 100 M (loaded
+# from configs/phase1/paper_scale.yaml output).
+# Used by scripts/phase2/train_generative_ddp.py.
+seed: 1337
+
+data:
+  cache_dir: results/phase1_scale/cache_tokens         # paper-scale tokens
+  manifest: data/manifests/paper_scale.json
+  val_episode_ids_file: data/manifests/val_ids.json
+  seq_len: 8
+  stride: 4
+  empty_task_placeholder: "robot manipulation task"
+  streaming: true                                      # use streaming dataset
+
+text_encoder:
+  hf_id: openai/clip-vit-large-patch14                 # was ViT-B/32
+  max_length: 64
+  output_dim: 768
+
+generator:
+  token_dim: 2048
+  token_grid: 8
+  seq_len: 8
+  cond_text_dim: 768                                   # matches CLIP-L/14
+  hidden_dim: 1280                                     # was 512
+  n_layers: 20                                         # was 6
+  n_heads: 16                                          # was 8
+  dropout: 0.0
+  use_checkpoint: true                                 # required at this scale
+
+physics:
+  token_dim: 2048
+  token_grid: 8
+  context_len: 4
+  hidden_dim: 768                                      # was 384
+  n_layers: 6                                          # was 3
+  n_heads: 12                                          # was 6
+  phi_dim: 128                                         # default; sweep {64,128,256} via override
+
+coupling:
+  context_len: 8                                       # matches paper-scale predictor
+  w_selfconsistency: 1.0                               # post-warmup
+  w_physics: 0.1                                       # post-warmup
+  warmup_epochs: 6                                     # ~50% of 12 epochs (sched coupling)
+
+predictor_ckpt:
+  # Trained by scripts/phase1/train_ddp.py with configs/phase1/paper_scale.yaml.
+  path: results/phase1_scale/runs/vggt_noact/best.pt
+  token_dim: 2048
+  action_dim: 7
+  hidden_dim: 1024
+  n_layers: 12
+  n_heads: 16
+  action_embed_dim: 256
+  context_len: 8
+  dropout: 0.1
+  use_actions: false
+  use_checkpoint: false                                # frozen at inference; no ckpt needed
+
+train:
+  batch_size: 16                                       # per rank
+  grad_accum: 2                                        # effective = 16 * world_size * 2
+  epochs: 12
+  lr: 1.5e-4
+  weight_decay: 0.05
+  warmup_steps: 2000
+  grad_clip: 1.0
+  num_workers: 4
+  device: cuda
+  amp_dtype: bfloat16
+  ckpt_every_steps: 1000
+  log_every_steps: 50
+  val_every_steps: 2000
+  ema_decay: 0.999
+  train_sample_steps: 8                                # Euler steps for L_sc rollouts during train
+
+variants:
+  flow_only:    { w_selfconsistency: 0.0, w_physics: 0.0 }
+  flow_coupled: { w_selfconsistency: 1.0, w_physics: 0.1 }
+
+eval:
+  sample_steps: 24
+  n_eval_windows: 256
+
+ddp:
+  backend: nccl
+  find_unused_parameters: false
+
+wandb:
+  enabled: false
+  project: geophys-wm
+  entity: null
+  run_name: phase2-paper-scale

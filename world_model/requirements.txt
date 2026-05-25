@@ -1,0 +1,16 @@
+torch==2.4.1
+torchvision==0.19.1
+numpy<2
+pyyaml
+pillow
+opencv-python-headless
+imageio[ffmpeg]
+matplotlib
+pandas
+scipy
+scikit-learn
+tqdm
+huggingface_hub
+safetensors
+einops
+trimesh

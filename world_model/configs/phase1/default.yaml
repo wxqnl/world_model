@@ -1,0 +1,55 @@
+# Phase 1 Lite — predictive head on frozen VGGT tokens
+seed: 1337
+
+cache:
+  manifest: data/manifests/set_a.json
+  droid_parquet: data/raw/droid_100/data/chunk-000/file-000.parquet
+  out_dir: results/phase1/cache_tokens
+  window: 8
+  stride: 4                 # 50 % overlap → more (s_t,a_t,s_{t+1}) pairs
+  max_frames_per_clip: 128  # 16 windows per clip at W=8 S=4
+  token_grid: 8             # pool patch tokens to token_grid**2 per frame
+  token_dim: 2048           # VGGT-1B last-layer dim (fixed by model)
+  save_depth_hw: 64         # depth map downsampled to this square
+  dtype: bfloat16
+
+dinov2:
+  name: vit_base_patch14_dinov2.lvd142m    # timm id
+  image_size: 518                           # match VGGT so camera fov is identical
+  token_grid: 8
+  token_dim: 768
+
+dataset:
+  split:
+    val_episode_ids: [3, 9, 14, 19, 24, 29]   # 6/30 held out; rest train
+  normalize_actions: true
+  action_dim: 7             # DROID end-effector delta (x,y,z,rx,ry,rz,gripper)
+  state_dim: 7
+
+head:
+  # Shared hyperparameters for all three predictors.
+  hidden_dim: 512
+  n_layers: 4
+  n_heads: 8
+  dropout: 0.1
+  action_embed_dim: 64
+  context_len: 4            # see 4 past frames → predict next
+  token_pool: mean           # "mean" or "spatial"   (spatial keeps grid)
+
+loss:
+  type: mse                 # alternatives: flow_matching
+  flow_sigma_min: 1.0e-4
+
+train:
+  batch_windows: 16
+  epochs: 30
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 200
+  grad_clip: 1.0
+  num_workers: 4
+  device: cuda
+
+eval:
+  horizons: [1, 2, 4, 8]
+  bootstrap_iters: 1000

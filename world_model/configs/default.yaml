@@ -1,0 +1,52 @@
+# GeoPhys-WM Phase 0 Feasibility — default configuration
+model:
+  name: facebook/VGGT-1B
+  dtype: bfloat16
+  device: cuda
+
+inference:
+  window_size: 8
+  stride: 4
+  max_frames_per_clip: 120
+  image_size: 518          # VGGT default square side
+  batch_windows: 1
+
+datasets:
+  set_a:
+    name: robot_manipulation
+    manifest: data/manifests/set_a.json
+    target_clips: 30
+    min_frames: 60
+    max_frames: 150
+  set_b:
+    name: static_scenes
+    manifest: data/manifests/set_b.json
+    target_scenes: 20
+    frames_per_scene: 20
+  set_c:
+    name: autonomous_driving
+    manifest: data/manifests/set_c.json
+    target_clips: 15
+    frames_per_clip: 60
+
+exp1:
+  window_size: 8
+  stride: 4
+  depth_align: median_ratio
+  chamfer_samples: 8192
+
+exp2:
+  window_size: 8
+  motion_bins: [0.0, 2.0, 5.0, 10.0, 1.0e9]  # optical flow magnitude bins (pixels)
+  abs_rel_cap: 10.0
+
+exp3:
+  raft_weights: DEFAULT
+  raft_resize: 520
+  correlation: pearson
+
+exp4:
+  repeat_experiments: [1, 3]
+
+seed: 1337
+cache_dir: results/cache
