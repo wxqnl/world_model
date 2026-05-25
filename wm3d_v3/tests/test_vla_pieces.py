@@ -35,3 +35,32 @@ def test_huber_linear_far_from_target():
     b = torch.zeros(1, 1)
     # delta=1 => |err|>1 => linear: |err|-0.5*delta = 10-0.5 = 9.5
     assert huber(a, b, delta=1.0).item() == pytest.approx(9.5, abs=1e-4)
+
+
+def test_action_proj_head_shapes_and_denormalize():
+    from wm3d_v3.models.action_proj import ActionProjHead
+    mean = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    std = torch.tensor([0.01, 0.01, 0.01, 0.05, 0.05, 0.05])
+    head = ActionProjHead(z_dim=192, hidden=1024, n_layers=5,
+                          stats_mean=mean, stats_std=std)
+    z = torch.randn(2, 8, 192)
+    out = head(z)
+    assert out["pose_norm"].shape == (2, 8, 6)
+    assert out["pose"].shape == (2, 8, 6)
+    assert out["gripper_logit"].shape == (2, 8)
+    denorm = out["pose_norm"] * std + mean
+    assert torch.allclose(out["pose"], denorm, atol=1e-6)
+
+
+def test_action_proj_head_unbounded_output():
+    from wm3d_v3.models.action_proj import ActionProjHead
+    mean = torch.zeros(6); std = torch.ones(6)
+    head = ActionProjHead(z_dim=192, hidden=64, n_layers=2,
+                          stats_mean=mean, stats_std=std)
+    with torch.no_grad():
+        head.pose_norm.weight.fill_(0.0)
+        head.pose_norm.bias.copy_(torch.tensor([5.0] * 6))
+    z = torch.zeros(1, 1, 192)
+    out = head(z)
+    # Old tanh*0.1 head would have clipped to 0.1; new head must exceed 1.0
+    assert out["pose"].abs().max().item() > 1.0
