@@ -64,3 +64,54 @@ def test_action_proj_head_unbounded_output():
     out = head(z)
     # Old tanh*0.1 head would have clipped to 0.1; new head must exceed 1.0
     assert out["pose"].abs().max().item() > 1.0
+
+
+def test_aux_idm_forward_shapes():
+    from wm3d_v3.models.aux_idm import AuxIDM, AuxIDMConfig
+    cfg = AuxIDMConfig(token_dim=2048, n_tokens=64, hidden=256, n_layers=2, k=8)
+    m = AuxIDM(cfg)
+    s_last = torch.randn(2, 64, 2048)
+    s_fut_last = torch.randn(2, 64, 2048)
+    out = m(s_last, s_fut_last)
+    assert out["aux_pose_norm"].shape == (2, 8, 6)
+    assert out["aux_grip"].shape == (2, 8)
+
+
+def test_aux_idm_gradient_flows_to_both_inputs():
+    from wm3d_v3.models.aux_idm import AuxIDM, AuxIDMConfig
+    cfg = AuxIDMConfig(token_dim=32, n_tokens=8, hidden=32, n_layers=1, k=4)
+    m = AuxIDM(cfg)
+    s_last = torch.randn(1, 8, 32, requires_grad=True)
+    s_fut_last = torch.randn(1, 8, 32, requires_grad=True)
+    out = m(s_last, s_fut_last)
+    out["aux_pose_norm"].sum().backward()
+    assert s_last.grad is not None and s_last.grad.abs().sum() > 0
+    assert s_fut_last.grad is not None and s_fut_last.grad.abs().sum() > 0
+
+
+def test_joint_model_with_aux_idm_outputs_all_keys():
+    from wm3d_v3.models.action_stream import ActionConfig
+    from wm3d_v3.models.state_stream import StateConfig
+    from wm3d_v3.models.dual_stream import DualConfig
+    from wm3d_v3.models.joint_model import JointConfig, JointWorldModel
+    # P=64 so GeomDecoder's hardcoded 256->224 crop works (5 upsamples of grid=8)
+    sc = StateConfig(T=4, P=64, D=64, hidden=64, n_layers=2, n_heads=4, k=2,
+                     cond_dim=64)
+    ac = ActionConfig(T=4, P=64, D=64, hidden=64, n_layers=2, n_heads=4, k=2,
+                      z_dim=16, cond_dim=64)
+    jc = JointConfig(
+        dual=DualConfig(state=sc, action=ac,
+                        xattn_layers_state=(1,), xattn_n_heads=4),
+        action_proj_hidden=64, action_proj_layers=2,
+        geom_hidden=32, pixel_hidden=32, pixel_n_res=1,
+        enable_pixel=False, enable_bridging=False,
+        enable_aux_idm=True, aux_idm_hidden=64, aux_idm_layers=1,
+    )
+    model = JointWorldModel(jc)
+    s = torch.randn(1, 4, 64, 64)
+    c = torch.randn(1, 64)
+    out = model(s, c, pixel=False, bridging=False, aux_idm=True)
+    for key in ("pose_norm", "pose", "gripper_logit",
+                "aux_pose_norm", "aux_grip", "z_a", "pred_tokens"):
+        assert key in out, f"missing {key}"
+    assert out["aux_pose_norm"].shape == (1, 2, 6)
