@@ -183,9 +183,7 @@ def main():
                 return (s + 1) / warmup
             prog = (s - warmup) / max(1, total_steps - warmup)
             return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * prog))
-        sch = torch.optim.lr_scheduler.LambdaLR(op, lr_lambda)
-        for _ in range(stp):
-            sch.step()
+        sch = torch.optim.lr_scheduler.LambdaLR(op, lr_lambda, last_epoch=stp - 1)
         return op, sch
 
     opt, sched = make_opt_sched(step)
@@ -233,10 +231,10 @@ def main():
             opt.step(); sched.step()
             if rank == 0 and step % cfg["train"]["log_every"] == 0:
                 for kk, v in losses.items():
-                    tb.add_scalar(f"train/{kk}", float(v.detach().float()), step)
+                    tb.add_scalar(f"train/{kk}", float(v.detach()), step)
                 tb.add_scalar("lr", sched.get_last_lr()[0], step)
                 tb.add_scalar("grad_norm", float(grad_norm), step)
-                print(f"  ep{epoch} step{step} L_total={float(losses['L_total']):.4f} "
+                print(f"  ep{epoch} step{step} L_total={float(losses['L_total'].detach()):.4f} "
                       f"L_pose={float(losses['L_pose']):.4f} L_grip={float(losses['L_grip']):.4f} "
                       f"L_aux_pose={float(losses['L_aux_pose']):.4f} gn={float(grad_norm):.2f}")
             step += 1
