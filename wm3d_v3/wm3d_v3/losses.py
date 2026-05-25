@@ -6,6 +6,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def huber(pred: torch.Tensor, target: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+    """Mean Huber loss. delta=1 => quadratic when |err|<=1, linear (|err|-0.5*delta) when |err|>1."""
+    err = pred.float() - target.float()
+    abs_err = err.abs()
+    quad = 0.5 * err.pow(2)
+    lin = delta * (abs_err - 0.5 * delta)
+    return torch.where(abs_err <= delta, quad, lin).mean()
+
+
+def focal_bce(logits: torch.Tensor, targets: torch.Tensor,
+              alpha: float = 0.25, gamma: float = 2.0,
+              pos_weight: float | None = None) -> torch.Tensor:
+    """Focal binary cross-entropy with logits.
+
+    L = -alpha_t * (1-p_t)^gamma * log(p_t)
+    where p_t = sigmoid(logit) if y=1 else 1-sigmoid(logit),
+    and alpha_t = alpha if y=1 else (1-alpha).
+    pos_weight (if given) multiplicatively reweights positives on top.
+    """
+    bce = F.binary_cross_entropy_with_logits(
+        logits.float(), targets.float(), reduction="none")
+    p = torch.sigmoid(logits.float())
+    p_t = torch.where(targets > 0.5, p, 1.0 - p)
+    alpha_t = torch.where(targets > 0.5,
+                          torch.full_like(p, alpha),
+                          torch.full_like(p, 1.0 - alpha))
+    focal_weight = alpha_t * (1.0 - p_t).pow(gamma)
+    loss = focal_weight * bce
+    if pos_weight is not None:
+        loss = torch.where(targets > 0.5, loss * pos_weight, loss)
+    return loss.mean()
+
+
 @dataclass
 class LossWeights:
     cos: float = 0.1
