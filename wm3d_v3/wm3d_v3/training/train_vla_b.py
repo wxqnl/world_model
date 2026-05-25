@@ -114,7 +114,7 @@ def main():
         print(f"action_stats: pos_rate={pos_rate:.4f} -> grip_pos_weight={cfg['loss']['grip_pos_weight']:.3f}")
 
     if world > 1:
-        model = DDP(model, device_ids=[local])
+        model = DDP(model, device_ids=[local], find_unused_parameters=True)
 
     weights = VLALossWeights(**cfg["loss"])
     lr = cfg["train"]["lr"]
