@@ -23,6 +23,7 @@ class WindowConfig:
     k: int = 8
     stride: int = 4
     cache_root: Path = Path("/home/user01/Minko/datasets/cache/wm3d_v3")
+    action_stats: Path | None = None  # set to action_stats.npz to enable normalization
 
 
 def _safe(cid: str) -> str:
@@ -34,6 +35,12 @@ class OXEWindowDataset(Dataset):
 
     def __init__(self, records: list[OXEClipRecord], cfg: WindowConfig | None = None):
         self.cfg = cfg or WindowConfig()
+        self.act_mean: np.ndarray | None = None
+        self.act_std: np.ndarray | None = None
+        if self.cfg.action_stats is not None and Path(self.cfg.action_stats).exists():
+            d = np.load(self.cfg.action_stats)
+            self.act_mean = d["mean"][:6].astype(np.float32)
+            self.act_std = d["std"][:6].astype(np.float32)
         self.records = []
         for r in records:
             cid = _safe(r.clip_id)
@@ -77,16 +84,21 @@ class OXEWindowDataset(Dataset):
         rgb_w = np.array(rgb[start : start + T + k])
         depth_w = np.array(depth[start : start + T + k])
         act_w = actions[start + T : start + T + k]
+        if self.act_mean is not None:
+            action_tgt_norm = (act_w[:, :6] - self.act_mean) / self.act_std
+        else:
+            action_tgt_norm = np.zeros_like(act_w[:, :6])
         return {
-            "s_in":       torch.from_numpy(pooled_w[:T]).float(),
-            "s_tgt":      torch.from_numpy(pooled_w[T:]).float(),
-            "depth_in":   torch.from_numpy(depth_w[:T]).float(),
-            "depth_tgt":  torch.from_numpy(depth_w[T:]).float(),
-            "rgb_in":     torch.from_numpy(rgb_w[:T]).float() / 255.0,        # [T,H,W,3] in [0,1]
-            "rgb_tgt":    torch.from_numpy(rgb_w[T:]).float() / 255.0,
-            "action_tgt": torch.from_numpy(act_w).float(),
-            "c":          torch.from_numpy(np.asarray(qwen, dtype=np.float16)).float(),
-            "clip_id":    rec.clip_id,
-            "start":      start,
-            "dataset":    rec.dataset,
+            "s_in":            torch.from_numpy(pooled_w[:T]).float(),
+            "s_tgt":           torch.from_numpy(pooled_w[T:]).float(),
+            "depth_in":        torch.from_numpy(depth_w[:T]).float(),
+            "depth_tgt":       torch.from_numpy(depth_w[T:]).float(),
+            "rgb_in":          torch.from_numpy(rgb_w[:T]).float() / 255.0,
+            "rgb_tgt":         torch.from_numpy(rgb_w[T:]).float() / 255.0,
+            "action_tgt":      torch.from_numpy(act_w).float(),
+            "action_tgt_norm": torch.from_numpy(action_tgt_norm).float(),
+            "c":               torch.from_numpy(np.asarray(qwen, dtype=np.float16)).float(),
+            "clip_id":         rec.clip_id,
+            "start":           start,
+            "dataset":         rec.dataset,
         }
