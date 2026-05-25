@@ -109,3 +109,49 @@ def compute_losses(out: dict, tgt: dict, w: LossWeights,
         losses["L_rgb_l1"] = L_rgb_l1.detach()
         losses["L_rgb_lpips"] = L_rgb_lpips.detach()
     return losses
+
+
+@dataclass
+class VLALossWeights:
+    action_pose: float = 10.0
+    action_grip: float = 2.0
+    aux_idm: float = 5.0
+    grip_pos_weight: float = 1.0
+    grip_focal_alpha: float = 0.25
+    grip_focal_gamma: float = 2.0
+    huber_delta: float = 1.0
+
+
+def compute_losses_vla(out: dict, tgt: dict, w: VLALossWeights) -> dict[str, torch.Tensor]:
+    """Loss for stage-A VLA fine-tune.
+
+    Required out keys: pose_norm, gripper_logit (+ aux_pose_norm, aux_grip if aux_idm head present)
+    Required tgt keys: action_tgt_norm, action_tgt
+    """
+    pose_norm = out["pose_norm"].float()
+    a_norm = tgt["action_tgt_norm"].to(pose_norm.dtype)
+    L_pose = huber(pose_norm, a_norm, delta=w.huber_delta)
+
+    grip_logit = out["gripper_logit"].float()
+    grip_tgt = (tgt["action_tgt"][..., 6] > 0.5).to(grip_logit.dtype)
+    L_grip = focal_bce(grip_logit, grip_tgt,
+                       alpha=w.grip_focal_alpha, gamma=w.grip_focal_gamma,
+                       pos_weight=w.grip_pos_weight)
+
+    L_total = w.action_pose * L_pose + w.action_grip * L_grip
+    losses = {"L_pose": L_pose.detach(), "L_grip": L_grip.detach()}
+    if "aux_pose_norm" in out:
+        aux_pn = out["aux_pose_norm"].float()
+        L_aux_pose = huber(aux_pn, a_norm, delta=w.huber_delta)
+        aux_grip = out["aux_grip"].float()
+        L_aux_grip = focal_bce(aux_grip, grip_tgt,
+                               alpha=w.grip_focal_alpha, gamma=w.grip_focal_gamma,
+                               pos_weight=w.grip_pos_weight)
+        L_total = L_total + w.aux_idm * (L_aux_pose + 0.5 * L_aux_grip)
+        losses["L_aux_pose"] = L_aux_pose.detach()
+        losses["L_aux_grip"] = L_aux_grip.detach()
+    else:
+        losses["L_aux_pose"] = torch.zeros((), device=pose_norm.device)
+        losses["L_aux_grip"] = torch.zeros((), device=pose_norm.device)
+    losses["L_total"] = L_total
+    return losses

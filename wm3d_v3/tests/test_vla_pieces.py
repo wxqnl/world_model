@@ -115,3 +115,40 @@ def test_joint_model_with_aux_idm_outputs_all_keys():
                 "aux_pose_norm", "aux_grip", "z_a", "pred_tokens"):
         assert key in out, f"missing {key}"
     assert out["aux_pose_norm"].shape == (1, 2, 6)
+
+
+def test_compute_losses_vla_shape_and_keys():
+    from wm3d_v3.losses import compute_losses_vla, VLALossWeights
+    B, k = 2, 8
+    out = {
+        "pose_norm":     torch.randn(B, k, 6, requires_grad=True),
+        "gripper_logit": torch.randn(B, k, requires_grad=True),
+        "aux_pose_norm": torch.randn(B, k, 6, requires_grad=True),
+        "aux_grip":      torch.randn(B, k, requires_grad=True),
+    }
+    tgt = {
+        "action_tgt_norm": torch.randn(B, k, 6),
+        "action_tgt":      torch.rand(B, k, 7),
+    }
+    w = VLALossWeights(action_pose=10.0, action_grip=2.0, aux_idm=5.0,
+                       grip_pos_weight=1.5, grip_focal_gamma=2.0, grip_focal_alpha=0.25)
+    losses = compute_losses_vla(out, tgt, w)
+    for key in ("L_total", "L_pose", "L_grip", "L_aux_pose", "L_aux_grip"):
+        assert key in losses, f"missing {key}"
+    assert losses["L_total"].requires_grad
+
+
+def test_compute_losses_vla_no_aux_idm_path():
+    from wm3d_v3.losses import compute_losses_vla, VLALossWeights
+    B, k = 1, 4
+    out = {
+        "pose_norm":     torch.randn(B, k, 6, requires_grad=True),
+        "gripper_logit": torch.randn(B, k, requires_grad=True),
+    }
+    tgt = {
+        "action_tgt_norm": torch.randn(B, k, 6),
+        "action_tgt":      torch.rand(B, k, 7),
+    }
+    losses = compute_losses_vla(out, tgt, VLALossWeights())
+    assert losses["L_aux_pose"].item() == 0.0
+    assert losses["L_total"].requires_grad
