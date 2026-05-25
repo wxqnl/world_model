@@ -172,10 +172,14 @@ def main():
 
     def make_opt_sched(stp: int):
         target = model.module if world > 1 else model
+        lr = cfg["train"]["lr"]
         op = torch.optim.AdamW([p for p in target.parameters() if p.requires_grad],
-                                lr=cfg["train"]["lr"],
+                                lr=lr,
                                 weight_decay=cfg["train"]["weight_decay"],
                                 betas=(0.9, 0.95))
+        # LambdaLR with last_epoch>=0 requires initial_lr in each param group.
+        for pg in op.param_groups:
+            pg["initial_lr"] = lr
         warmup = int(cfg["train"]["warmup_steps"])
         total_steps = max(1, len(tr_loader) * cfg["train"]["epochs"])
         def lr_lambda(s):
