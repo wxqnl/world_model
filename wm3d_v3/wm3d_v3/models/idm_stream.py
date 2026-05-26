@@ -26,13 +26,14 @@ class IDMStreamConfig:
     mlp_mult: int = 4
     dropout: float = 0.0
     cond_dim: int = 2048
+    extra_token_dim: int = 0   # optional auxiliary per-patch features (e.g. depth tokens)
 
 
 class IDMStream(nn.Module):
     def __init__(self, cfg: IDMStreamConfig):
         super().__init__()
         self.cfg = cfg
-        self.in_proj = nn.Linear(cfg.D, cfg.hidden)
+        self.in_proj = nn.Linear(cfg.D + cfg.extra_token_dim, cfg.hidden)
         self.cond_proj = nn.Linear(cfg.cond_dim, cfg.hidden)
         self.frame_pos = nn.Parameter(torch.zeros(1, cfg.T + cfg.k, 1, cfg.hidden))
         self.patch_pos = nn.Parameter(torch.zeros(1, 1, cfg.P, cfg.hidden))
@@ -61,9 +62,16 @@ class IDMStream(nn.Module):
         self.z_head = nn.Linear(cfg.hidden, cfg.z_dim)
 
     def forward(self, s_in: torch.Tensor, pred_tokens: torch.Tensor,
-                c: torch.Tensor) -> dict:
+                c: torch.Tensor,
+                extra_in: torch.Tensor | None = None,
+                extra_pred: torch.Tensor | None = None) -> dict:
         B = s_in.size(0)
         T, k, P, H = self.cfg.T, self.cfg.k, self.cfg.P, self.cfg.hidden
+        if self.cfg.extra_token_dim > 0:
+            assert extra_in is not None and extra_pred is not None, \
+                "extra_token_dim>0 requires extra_in and extra_pred"
+            s_in = torch.cat([s_in, extra_in], dim=-1)
+            pred_tokens = torch.cat([pred_tokens, extra_pred], dim=-1)
         xi = self.in_proj(s_in)                          # [B, T, P, H]
         xp = self.in_proj(pred_tokens)                   # [B, k, P, H]
         xi = xi + self.role_emb[0].view(1, 1, 1, H)

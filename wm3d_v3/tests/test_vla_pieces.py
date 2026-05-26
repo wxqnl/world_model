@@ -178,3 +178,55 @@ def test_idm_stream_gradient_flows_to_pred_tokens():
     out["z_a"].sum().backward()
     assert pred_tokens.grad is not None and pred_tokens.grad.abs().sum() > 0
     assert s_in.grad is not None and s_in.grad.abs().sum() > 0
+
+
+def test_depth_encoder_shapes():
+    from wm3d_v3.models.depth_encoder import DepthEncoder, DepthEncoderConfig
+    cfg = DepthEncoderConfig(in_size=224, out_grid=8, hidden_d=128, base_ch=8)
+    m = DepthEncoder(cfg)
+    depth = torch.rand(2, 4, 224, 224) * 2 + 0.5  # [0.5, 2.5] meters
+    out = m(depth)
+    assert out.shape == (2, 4, 64, 128)
+
+
+def test_idm_stream_with_extra_tokens():
+    from wm3d_v3.models.idm_stream import IDMStream, IDMStreamConfig
+    cfg = IDMStreamConfig(T=4, k=2, P=8, D=32, hidden=32,
+                          n_layers=1, n_heads=4, z_dim=8, cond_dim=32,
+                          extra_token_dim=16)
+    m = IDMStream(cfg)
+    s_in = torch.randn(2, 4, 8, 32)
+    pred = torch.randn(2, 2, 8, 32)
+    c = torch.randn(2, 32)
+    e_in = torch.randn(2, 4, 8, 16)
+    e_pred = torch.randn(2, 2, 8, 16)
+    out = m(s_in, pred, c, extra_in=e_in, extra_pred=e_pred)
+    assert out["z_a"].shape == (2, 2, 8)
+
+
+def test_joint_model_c_forward_and_grad():
+    from wm3d_v3.models.depth_encoder import DepthEncoderConfig
+    from wm3d_v3.models.idm_stream import IDMStreamConfig
+    from wm3d_v3.models.joint_model_c import JointCConfig, JointWorldModelC
+    from wm3d_v3.models.state_stream import StateConfig
+    sc = StateConfig(T=4, P=64, D=64, hidden=64, n_layers=2, n_heads=4, k=2, cond_dim=64)
+    ic = IDMStreamConfig(T=4, k=2, P=64, D=64, hidden=64,
+                          n_layers=1, n_heads=4, z_dim=8, cond_dim=64,
+                          extra_token_dim=32)
+    dc = DepthEncoderConfig(in_size=224, out_grid=8, hidden_d=32, base_ch=4)
+    cfg = JointCConfig(state=sc, idm=ic, depth_enc=dc,
+                       action_proj_hidden=64, action_proj_layers=2,
+                       geom_hidden=32, pixel_hidden=32, pixel_n_res=1,
+                       enable_pixel=False)
+    m = JointWorldModelC(cfg)
+    s = torch.randn(1, 4, 64, 64, requires_grad=True)
+    c = torch.randn(1, 64)
+    depth_in = torch.rand(1, 4, 224, 224) + 0.5
+    out = m(s, c, depth_in=depth_in, pixel=False)
+    for k in ("pose_norm", "pose", "gripper_logit", "depth", "pred_tokens", "z_a"):
+        assert k in out, f"missing {k}"
+    assert out["pose_norm"].shape == (1, 2, 6)
+    # gradient flow check: pose depends on s (via state -> pred -> idm) AND on depth (via depth_enc -> idm)
+    loss = out["pose_norm"].sum() + out["depth"].sum() * 0.001
+    loss.backward()
+    assert s.grad is not None and s.grad.abs().sum() > 0
