@@ -29,7 +29,7 @@ train:
   warmup_steps: 1500
   grad_clip: 1.0
   log_every: 50
-  ckpt_every_epochs: 1
+  ckpt_every_epochs: 2
 
 loss:
   action_pose: 10.0

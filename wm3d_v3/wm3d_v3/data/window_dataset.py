@@ -23,6 +23,7 @@ class WindowConfig:
     k: int = 8
     stride: int = 4
     cache_root: Path = Path("/home/user01/Minko/datasets/cache/wm3d_v3")
+    tokens_subdir: str = "vggt_pooled"  # set to "vggt_p256" for 16×16 grid
     action_stats: Path | None = None  # set to action_stats.npz to enable normalization
 
 
@@ -44,7 +45,7 @@ class OXEWindowDataset(Dataset):
         self.records = []
         for r in records:
             cid = _safe(r.clip_id)
-            if not (self.cfg.cache_root / "vggt_pooled" / f"{cid}.npy").exists():
+            if not (self.cfg.cache_root / self.cfg.tokens_subdir / f"{cid}.npy").exists():
                 continue
             if not (self.cfg.cache_root / "rgb_256" / f"{cid}.npy").exists():
                 continue
@@ -67,7 +68,7 @@ class OXEWindowDataset(Dataset):
         rec = self.records[ri]
         cid = _safe(rec.clip_id)
         T, k = self.cfg.T, self.cfg.k
-        pooled = np.load(self.cfg.cache_root / "vggt_pooled" / f"{cid}.npy", mmap_mode="r")
+        pooled = np.load(self.cfg.cache_root / self.cfg.tokens_subdir / f"{cid}.npy", mmap_mode="r")
         geom = np.load(self.cfg.cache_root / "vggt_geom" / f"{cid}.npz")
         rgb = np.load(self.cfg.cache_root / "rgb_256" / f"{cid}.npy", mmap_mode="r")
         actions = np.load(self.cfg.cache_root / "actions" / f"{cid}.npy")

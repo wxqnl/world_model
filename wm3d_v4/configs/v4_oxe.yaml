@@ -1,0 +1,41 @@
+data:
+  manifest: /home/user01/Minko/newwm/wm3d_v3/manifests/oxe_train.jsonl
+  cache_root: /home/user01/Minko/datasets/cache/wm3d_v3
+  T: 16
+  k: 8
+  stride: 4
+  val_frac: 0.05
+  seed: 0
+model:
+  state:  { T: 16, P: 64, D: 2048, hidden: 1152, n_layers: 14, n_heads: 16, k: 8 }
+  action: { T: 16, P: 64, D: 2048, hidden:  896, n_layers: 10, n_heads: 14, k: 8, z_dim: 192 }
+  xattn_layers_state: [3, 6, 9, 11, 13]
+  xattn_n_heads: 16
+  action_proj_hidden: 768
+  action_proj_layers: 5
+  geom_hidden: 384
+  vae_pretrained: stabilityai/sd-vae-ft-mse
+diff:
+  hidden: 768
+  n_layers: 14
+  n_heads: 12
+  mlp_ratio: 4.0
+  patch_size: 2
+  num_train_timesteps: 1000
+  timestep_dim: 256
+  dropout: 0.0
+train:
+  freeze_v3: true
+  epochs: 30
+  batch_size_per_gpu: 8
+  num_workers: 4
+  lr: 6.0e-5
+  weight_decay: 0.02
+  warmup_steps: 500
+  grad_clip: 0.5
+  log_every: 50
+  ckpt_every_epochs: 2
+out:
+  root: /home/user01/Minko/newwm/results/wm3d_v4
+  tb_dir: tb
+  ckpt_dir: ckpt

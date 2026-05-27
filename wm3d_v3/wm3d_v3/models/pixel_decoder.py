@@ -32,14 +32,28 @@ class PixelDecoder(nn.Module):
         super().__init__()
         cfg = cfg or PixelDecoderConfig()
         self.cfg = cfg
+        # n_ups = log2(out_hw / token_grid). 8→256: 5, 16→256: 4.
+        n_ups = 0
+        g = cfg.token_grid
+        while g < cfg.out_hw:
+            g *= 2; n_ups += 1
+        assert g == cfg.out_hw, f"out_hw {cfg.out_hw} not power-of-2 multiple of token_grid {cfg.token_grid}"
         H = cfg.hidden
-        chans = [H, H, H // 2, H // 4, H // 4, H // 8]
+        # Channel schedule: stem=H, then halve every 2 ups, floor at H//8.
+        # n_ups=5: [H, H, H//2, H//4, H//4, H//8] (legacy)
+        # n_ups=4: [H, H, H//2, H//4, H//8]
+        if n_ups == 5:
+            chans = [H, H, H // 2, H // 4, H // 4, H // 8]
+        elif n_ups == 4:
+            chans = [H, H, H // 2, H // 4, H // 8]
+        else:
+            chans = [H] + [max(H >> i, H // 8) for i in range(n_ups)]
         self.stem = nn.Sequential(
             nn.Conv2d(cfg.token_dim, H, 1),
             nn.GroupNorm(min(8, H), H), nn.GELU(),
         )
         ups = []
-        for i in range(5):
+        for i in range(n_ups):
             in_c, out_c = chans[i], chans[i + 1]
             blk = [nn.ConvTranspose2d(in_c, out_c, 4, 2, 1),
                     nn.GroupNorm(min(8, out_c), out_c), nn.GELU()]

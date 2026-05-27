@@ -43,3 +43,6 @@ Thumbs.db
 
 # ===== Old versions / out-of-scope dirs for this push =====
 wm3d/
+
+# ===== Local-only meta-backup of old git dir =====
+.world_model_git_backup/

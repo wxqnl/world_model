@@ -36,6 +36,19 @@ def build_model(cfg):
     return JointWorldModel(jc)
 
 
+def window_config_from_cfg(cfg: dict) -> WindowConfig:
+    data = cfg["data"]
+    action_stats = data.get("action_stats")
+    return WindowConfig(
+        T=data["T"],
+        k=data["k"],
+        stride=data["stride"],
+        cache_root=Path(data["cache_root"]),
+        tokens_subdir=data.get("tokens_subdir", "vggt_pooled"),
+        action_stats=Path(action_stats) if action_stats else None,
+    )
+
+
 def depth_to_rgb(d: np.ndarray) -> np.ndarray:
     """d: [H, W] float -> uint8 [H, W, 3] viridis."""
     import matplotlib
@@ -59,9 +72,7 @@ def main():
     torch.cuda.set_device(0)
 
     records = read_manifest(cfg["data"]["manifest"])
-    wcfg = WindowConfig(T=cfg["data"]["T"], k=cfg["data"]["k"],
-                        stride=cfg["data"]["stride"],
-                        cache_root=Path(cfg["data"]["cache_root"]))
+    wcfg = window_config_from_cfg(cfg)
     ds = OXEWindowDataset(records, wcfg)
     g = torch.Generator().manual_seed(cfg["data"]["seed"])
     perm = torch.randperm(len(ds), generator=g).tolist()

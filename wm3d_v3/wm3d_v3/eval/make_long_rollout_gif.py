@@ -40,6 +40,10 @@ def build_model(cfg):
     return JointWorldModel(jc)
 
 
+def tokens_subdir_from_cfg(cfg: dict) -> str:
+    return cfg["data"].get("tokens_subdir", "vggt_pooled")
+
+
 def depth_to_rgb(d: np.ndarray) -> np.ndarray:
     import matplotlib
     cmap = matplotlib.colormaps["viridis"]
@@ -82,6 +86,7 @@ def main():
     T = cfg["data"]["T"]
     k = cfg["data"]["k"]
     cache_root = Path(cfg["data"]["cache_root"])
+    tokens_subdir = tokens_subdir_from_cfg(cfg)
 
     model = build_model(cfg).to(device).eval()
     sd = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -91,7 +96,7 @@ def main():
 
     for ix, cid in enumerate(args.clip_ids):
         safe = _safe(cid)
-        pooled = np.array(np.load(cache_root / "vggt_pooled" / f"{safe}.npy"))
+        pooled = np.array(np.load(cache_root / tokens_subdir / f"{safe}.npy"))
         rgb = np.array(np.load(cache_root / "rgb_256" / f"{safe}.npy"))
         depth = np.array(np.load(cache_root / "vggt_geom" / f"{safe}.npz")["depth"])
         qwen_p = cache_root / "qwen_taskemb" / f"{safe}.npy"

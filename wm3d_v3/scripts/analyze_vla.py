@@ -30,7 +30,39 @@ from wm3d_v3.models.joint_model import JointConfig, JointWorldModel
 from wm3d_v3.models.state_stream import StateConfig
 
 
-def build_model(cfg: dict) -> JointWorldModel:
+def build_model(cfg: dict, variant: str = "a"):
+    if variant == "c":
+        from wm3d_v3.models.idm_stream import IDMStreamConfig
+        from wm3d_v3.models.depth_encoder import DepthEncoderConfig
+        from wm3d_v3.models.joint_model_c import JointCConfig, JointWorldModelC
+        sc = StateConfig(**cfg["model"]["state"])
+        ic = IDMStreamConfig(**cfg["model"]["idm"])
+        dec = DepthEncoderConfig(**cfg["model"]["depth_enc"])
+        jc = JointCConfig(
+            state=sc, idm=ic, depth_enc=dec,
+            action_proj_hidden=cfg["model"]["action_proj_hidden"],
+            action_proj_layers=cfg["model"]["action_proj_layers"],
+            geom_hidden=cfg["model"]["geom_hidden"],
+            pixel_hidden=cfg["model"]["pixel_hidden"],
+            pixel_n_res=cfg["model"]["pixel_n_res"],
+            enable_pixel=cfg["model"].get("enable_pixel", False),
+        )
+        return JointWorldModelC(jc)
+    if variant == "b":
+        from wm3d_v3.models.idm_stream import IDMStreamConfig
+        from wm3d_v3.models.joint_model_b import JointBConfig, JointWorldModelB
+        sc = StateConfig(**cfg["model"]["state"])
+        ic = IDMStreamConfig(**cfg["model"]["idm"])
+        jc = JointBConfig(
+            state=sc, idm=ic,
+            action_proj_hidden=cfg["model"]["action_proj_hidden"],
+            action_proj_layers=cfg["model"]["action_proj_layers"],
+            geom_hidden=cfg["model"]["geom_hidden"],
+            pixel_hidden=cfg["model"]["pixel_hidden"],
+            pixel_n_res=cfg["model"]["pixel_n_res"],
+            enable_pixel=cfg["model"].get("enable_pixel", False),
+        )
+        return JointWorldModelB(jc)
     sc = StateConfig(**cfg["model"]["state"])
     ac = ActionConfig(**cfg["model"]["action"])
     dc = DualConfig(state=sc, action=ac,
@@ -70,10 +102,10 @@ def collect(args):
     val = Subset(ds, perm[:n_val])
     print(f"val windows: {len(val)}")
 
-    model = build_model(cfg).to(device).eval()
+    model = build_model(cfg, variant=args.variant).to(device).eval()
     sd = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(sd["model"])
-    print(f"loaded ckpt epoch={sd.get('epoch')} val_total={sd.get('val_total'):.4f}")
+    print(f"loaded ckpt epoch={sd.get('epoch')} val_total={sd.get('val_total'):.4f} variant={args.variant}")
 
     loader = DataLoader(val, batch_size=cfg["train"]["batch_size_per_gpu"],
                         shuffle=False, num_workers=cfg["train"]["num_workers"],
@@ -88,7 +120,13 @@ def collect(args):
         c = batch["c"].to(device, non_blocking=True)
         action_tgt = batch["action_tgt"]
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(s, c, pixel=False, bridging=False)
+            if args.variant == "c":
+                depth_in = batch["depth_in"].to(device, non_blocking=True)
+                out = model(s, c, depth_in=depth_in, pixel=False)
+            elif args.variant == "b":
+                out = model(s, c, pixel=False)
+            else:
+                out = model(s, c, pixel=False, bridging=False)
         pose = out["pose"].float().cpu()
         grip_logit = out["gripper_logit"].float().cpu()
         for i in range(s.shape[0]):
@@ -231,6 +269,8 @@ def main():
     ap.add_argument("--max_batches", type=int, default=0,
                     help="0 = full val set")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--variant", choices=["a", "b", "c"], default="a",
+                    help="a = JointWorldModel (Stage A), b = JointWorldModelB (Stage B), c = JointWorldModelC (Stage C)")
     ap.add_argument("--demo_dirs", nargs="*", default=[
         "/home/user01/Minko/newwm/results/wm3d_v3/eval/demo",
         "/home/user01/Minko/newwm/results/wm3d_v3/eval/demo_full",
