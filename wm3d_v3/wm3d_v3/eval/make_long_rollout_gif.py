@@ -14,6 +14,7 @@ import yaml
 from PIL import Image
 
 from wm3d_v3.data.manifest import read_manifest
+from wm3d_v3.data.action_condition import make_action_condition_np
 from wm3d_v3.data.window_dataset import OXEWindowDataset, WindowConfig, _safe
 from wm3d_v3.models.action_stream import ActionConfig
 from wm3d_v3.models.dual_stream import DualConfig
@@ -32,9 +33,39 @@ def build_model(cfg):
         action_proj_hidden=cfg["model"]["action_proj_hidden"],
         action_proj_layers=cfg["model"]["action_proj_layers"],
         geom_hidden=cfg["model"]["geom_hidden"],
+        enable_geom_extra=cfg["model"].get("enable_geom_extra", True),
         pixel_hidden=cfg["model"]["pixel_hidden"],
         pixel_n_res=cfg["model"]["pixel_n_res"],
         enable_pixel=cfg["model"].get("enable_pixel", True),
+        enable_context_pixel=cfg["model"].get("enable_context_pixel", False),
+        context_pixel_hidden=cfg["model"].get("context_pixel_hidden", 384),
+        context_pixel_action_dim=cfg["model"].get("context_pixel_action_dim", 7),
+        context_pixel_task_dim=cfg["model"].get("context_pixel_task_dim"),
+        context_pixel_residual_scale=cfg["model"].get("context_pixel_residual_scale", 0.75),
+        context_pixel_use_action=cfg["model"].get("context_pixel_use_action", True),
+        context_pixel_use_task=cfg["model"].get("context_pixel_use_task", True),
+        context_pixel_predict_motion=cfg["model"].get("context_pixel_predict_motion", False),
+        context_pixel_motion_blend_gain=cfg["model"].get("context_pixel_motion_blend_gain", 0.0),
+        enable_control_head=cfg["model"].get("enable_control_head", False),
+        control_hidden=cfg["model"].get("control_hidden", 128),
+        control_output_size=cfg["model"].get("control_output_size", 256),
+        control_fuse_size=cfg["model"].get("control_fuse_size", 64),
+        control_refine_channels=cfg["model"].get("control_refine_channels", 16),
+        control_use_refine=cfg["model"].get("control_use_refine", True),
+        control_action_dim=cfg["model"].get("control_action_dim", 7),
+        control_task_dim=cfg["model"].get("control_task_dim"),
+        control_use_context=cfg["model"].get("control_use_context", True),
+        control_use_action=cfg["model"].get("control_use_action", True),
+        control_use_task=cfg["model"].get("control_use_task", True),
+        enable_progress_head=cfg["model"].get("enable_progress_head", False),
+        progress_hidden=cfg["model"].get("progress_hidden", 256),
+        progress_layers=cfg["model"].get("progress_layers", 2),
+        progress_heads=cfg["model"].get("progress_heads", 4),
+        progress_action_dim=cfg["model"].get("progress_action_dim", 7),
+        progress_task_dim=cfg["model"].get("progress_task_dim"),
+        progress_max_horizon=cfg["model"].get("progress_max_horizon", 32),
+        progress_use_action=cfg["model"].get("progress_use_action", True),
+        progress_use_task=cfg["model"].get("progress_use_task", True),
         enable_bridging=cfg["model"].get("enable_bridging", True),
     )
     return JointWorldModel(jc)
@@ -87,11 +118,17 @@ def main():
     k = cfg["data"]["k"]
     cache_root = Path(cfg["data"]["cache_root"])
     tokens_subdir = tokens_subdir_from_cfg(cfg)
+    stats_path = cfg["data"].get("action_stats")
+    action_mean = action_std = None
+    if stats_path and Path(stats_path).exists():
+        stats = np.load(stats_path)
+        action_mean, action_std = stats["mean"], stats["std"]
 
     model = build_model(cfg).to(device).eval()
     sd = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(sd["model"])
     print(f"loaded ckpt epoch={sd.get('epoch')} val_total={sd.get('val_total'):.4f}")
+    print(f"action-conditioned rollout: stats={'yes' if action_mean is not None else 'no'}")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     for ix, cid in enumerate(args.clip_ids):
@@ -100,13 +137,17 @@ def main():
         rgb = np.array(np.load(cache_root / "rgb_256" / f"{safe}.npy"))
         depth = np.array(np.load(cache_root / "vggt_geom" / f"{safe}.npz")["depth"])
         qwen_p = cache_root / "qwen_taskemb" / f"{safe}.npy"
+        action_p = cache_root / "actions" / f"{safe}.npy"
+        if not action_p.exists():
+            raise FileNotFoundError(f"missing action cache for rollout: {action_p}")
+        actions = np.array(np.load(action_p), dtype=np.float32)
         qwen = np.load(qwen_p) if qwen_p.exists() else np.zeros(2048, dtype=np.float16)
         n = pooled.shape[0]
         s0 = args.start
         if args.full:
             n_steps = max(1, (n - s0 - T + k - 1) // k)
         else:
-            n_steps = n_steps
+            n_steps = args.n_steps
         need = T + k * n_steps
         if s0 + T > n:
             s0 = max(0, n - T)
@@ -114,6 +155,8 @@ def main():
 
         # Initialize token window with GT
         s_window = torch.from_numpy(pooled[s0:s0 + T]).float().unsqueeze(0).to(device)
+        context_rgb = torch.from_numpy(rgb[s0 + T - 1]).float().div(255.0)
+        context_rgb = context_rgb.permute(2, 0, 1).unsqueeze(0).to(device)
         c = torch.from_numpy(np.asarray(qwen, dtype=np.float16)).float().unsqueeze(0).to(device)
 
         rgb_pred_all: list[np.ndarray] = []
@@ -122,14 +165,25 @@ def main():
 
         for step in range(n_steps):
             print(f"  step {step+1}/{n_steps}", flush=True)
+            action_start = s0 + T + step * k
+            action_chunk = actions[action_start: action_start + k]
+            if action_chunk.shape[0] < k:
+                pad = np.zeros((k - action_chunk.shape[0], actions.shape[-1]), dtype=np.float32)
+                action_chunk = np.concatenate([action_chunk, pad], axis=0)
+            action_cond_np = make_action_condition_np(
+                action_chunk, mean=action_mean, std=action_std
+            )
+            action_cond = torch.from_numpy(action_cond_np).unsqueeze(0).to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = model(s_window, c, pixel=True, bridging=False)
+                out = model(s_window, c, action_cond=action_cond,
+                            context_rgb=context_rgb, pixel=True, bridging=False)
             rgb_pred_all.append(out["rgb"][0].float().clamp(0, 1).cpu().numpy())     # [k,3,256,256]
             depth_pred_all.append(out["depth"][0].float().cpu().numpy())              # [k,224,224]
             pose_pred_all.append(out["pose"][0].float().cpu().numpy())                # [k,6]
             # Slide window: [s_window[k:], pred_tokens]
             pred_tok = out["pred_tokens"].float()
             s_window = torch.cat([s_window[:, k:], pred_tok], dim=1)
+            context_rgb = out["rgb"][:, -1].float().clamp(0, 1)
             assert s_window.shape[1] == T
 
         rgb_pred_all_np = np.concatenate(rgb_pred_all, axis=0)      # [k*n, 3, 256, 256]

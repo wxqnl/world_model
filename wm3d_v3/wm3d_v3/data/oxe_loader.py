@@ -18,6 +18,7 @@ DATASET_ROBOT = {
     "fractal20220817_data": "google_robot",
     "taco_play": "franka",
     "jaco_play": "jaco",
+    "kuka": "kuka",
 }
 
 
@@ -43,7 +44,7 @@ def _decode_image(b) -> np.ndarray:
 
 def _pick_image_key(obs: dict) -> str | None:
     for k in ("image", "image_primary", "rgb", "front_image",
-              "image_static", "wrist_image"):
+              "image_static", "rgb_static", "wrist_image", "image_wrist", "rgb_gripper"):
         if k in obs:
             return k
     for k, v in obs.items():

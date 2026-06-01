@@ -88,7 +88,7 @@ class OXEWindowDataset(Dataset):
         if self.act_mean is not None:
             action_tgt_norm = (act_w[:, :6] - self.act_mean) / self.act_std
         else:
-            action_tgt_norm = np.zeros_like(act_w[:, :6])
+            action_tgt_norm = act_w[:, :6].astype(np.float32)
         return {
             "s_in":            torch.from_numpy(pooled_w[:T]).float(),
             "s_tgt":           torch.from_numpy(pooled_w[T:]).float(),

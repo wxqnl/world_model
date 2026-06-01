@@ -50,11 +50,35 @@ class LossWeights:
     idm_reg: float = 0.01
     rgb_l1: float = 1.0
     rgb_lpips: float = 0.5
+    rgb_motion_l1: float = 0.0
+    rgb_edge: float = 0.0
+    rgb_motion_bce: float = 0.0
+    rgb_motion_dice: float = 0.0
+    rgb_motion_pos_weight: float = 1.0
+    rgb_motion_threshold: float = 0.03
+    rgb_motion_gain: float = 4.0
 
 
 def _normalize_depth(d: torch.Tensor) -> torch.Tensor:
     med = d.flatten(-2).median(dim=-1).values.clamp_min(1e-6)
     return d / med[..., None, None]
+
+
+def _rgb_edge_l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    pred_dx = pred[..., :, 1:] - pred[..., :, :-1]
+    tgt_dx = target[..., :, 1:] - target[..., :, :-1]
+    pred_dy = pred[..., 1:, :] - pred[..., :-1, :]
+    tgt_dy = target[..., 1:, :] - target[..., :-1, :]
+    return F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
+
+
+def _dice_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    prob = torch.sigmoid(logits.float())
+    target = target.float()
+    reduce_dims = tuple(range(1, prob.ndim))
+    inter = (prob * target).sum(dim=reduce_dims)
+    denom = prob.sum(dim=reduce_dims) + target.sum(dim=reduce_dims)
+    return (1.0 - (2.0 * inter + eps) / (denom + eps)).mean()
 
 
 def compute_losses(out: dict, tgt: dict, w: LossWeights,
@@ -90,6 +114,19 @@ def compute_losses(out: dict, tgt: dict, w: LossWeights,
         "L_grip": L_grip.detach(), "L_idm": L_idm.detach(),
     }
 
+    motion_mask = None
+    if "rgb_tgt_p" in tgt and "rgb_ref_p" in tgt and (
+        w.rgb_motion_l1 > 0 or w.rgb_motion_bce > 0 or w.rgb_motion_dice > 0
+    ):
+        rgb_tgt_for_motion = tgt["rgb_tgt_p"]
+        rgb_ref = tgt["rgb_ref_p"][:, None].expand_as(rgb_tgt_for_motion)
+        motion = (rgb_tgt_for_motion.float() - rgb_ref.float()).abs().mean(dim=2, keepdim=True)
+        motion_mask = (motion > w.rgb_motion_threshold).float()
+
+    L_rgb_l1 = L_total.new_zeros(())
+    L_rgb_lpips = L_total.new_zeros(())
+    L_rgb_motion_l1 = L_total.new_zeros(())
+    L_rgb_edge = L_total.new_zeros(())
     if "rgb" in out and "rgb_tgt_p" in tgt:
         # rgb_tgt_p shape matches out["rgb"] = [B, k, 3, H, W]
         rgb_pred = out["rgb"]
@@ -102,12 +139,60 @@ def compute_losses(out: dict, tgt: dict, w: LossWeights,
                 L_rgb_lpips = lpips_fn(rp, rt).mean()
         else:
             L_rgb_lpips = torch.zeros_like(L_rgb_l1)
-        L_rgb = w.rgb_l1 * L_rgb_l1 + w.rgb_lpips * L_rgb_lpips
+        if motion_mask is not None and w.rgb_motion_l1 > 0:
+            motion_weight = 1.0 + w.rgb_motion_gain * motion_mask.to(dtype=rgb_pred.dtype)
+            L_rgb_motion_l1 = ((rgb_pred - rgb_tgt).abs() * motion_weight).mean()
+        else:
+            L_rgb_motion_l1 = torch.zeros_like(L_rgb_l1)
+        L_rgb_edge = _rgb_edge_l1(rgb_pred, rgb_tgt) if w.rgb_edge > 0 else torch.zeros_like(L_rgb_l1)
+
+    if "motion_logit" in out and motion_mask is not None and w.rgb_motion_bce > 0:
+        motion_logit = out["motion_logit"].float()
+        target = motion_mask.to(device=motion_logit.device, dtype=motion_logit.dtype)
+        if motion_logit.shape[-2:] != target.shape[-2:]:
+            target = F.interpolate(
+                target.flatten(0, 1),
+                size=motion_logit.shape[-2:],
+                mode="nearest",
+            ).reshape_as(motion_logit)
+        pos_weight = torch.as_tensor(w.rgb_motion_pos_weight, device=motion_logit.device)
+        L_rgb_motion_bce = F.binary_cross_entropy_with_logits(
+            motion_logit,
+            target,
+            pos_weight=pos_weight,
+        )
+    else:
+        L_rgb_motion_bce = L_total.new_zeros(())
+    if "motion_logit" in out and motion_mask is not None and w.rgb_motion_dice > 0:
+        motion_logit = out["motion_logit"].float()
+        target = motion_mask.to(device=motion_logit.device, dtype=motion_logit.dtype)
+        if motion_logit.shape[-2:] != target.shape[-2:]:
+            target = F.interpolate(
+                target.flatten(0, 1),
+                size=motion_logit.shape[-2:],
+                mode="nearest",
+            ).reshape_as(motion_logit)
+        L_rgb_motion_dice = _dice_loss_from_logits(motion_logit, target)
+    else:
+        L_rgb_motion_dice = L_total.new_zeros(())
+    if "rgb" in out or "motion_logit" in out:
+        L_rgb = (
+            w.rgb_l1 * L_rgb_l1
+            + w.rgb_lpips * L_rgb_lpips
+            + w.rgb_motion_l1 * L_rgb_motion_l1
+            + w.rgb_edge * L_rgb_edge
+            + w.rgb_motion_bce * L_rgb_motion_bce
+            + w.rgb_motion_dice * L_rgb_motion_dice
+        )
         L_total = L_total + L_rgb
         losses["L_total"] = L_total
         losses["L_rgb"] = L_rgb.detach()
         losses["L_rgb_l1"] = L_rgb_l1.detach()
         losses["L_rgb_lpips"] = L_rgb_lpips.detach()
+        losses["L_rgb_motion_l1"] = L_rgb_motion_l1.detach()
+        losses["L_rgb_edge"] = L_rgb_edge.detach()
+        losses["L_rgb_motion_bce"] = L_rgb_motion_bce.detach()
+        losses["L_rgb_motion_dice"] = L_rgb_motion_dice.detach()
     return losses
 
 

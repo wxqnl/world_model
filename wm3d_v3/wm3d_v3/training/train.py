@@ -4,7 +4,9 @@ import argparse
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -15,7 +17,9 @@ from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
+from wm3d_v3.data.action_condition import make_action_condition
 from wm3d_v3.data.manifest import read_manifest
+from wm3d_v3.data.splits import episode_split, load_clip_split_file, random_window_indices
 from wm3d_v3.data.window_dataset import OXEWindowDataset, WindowConfig
 from wm3d_v3.losses import LossWeights, compute_losses
 from wm3d_v3.models.action_stream import ActionConfig
@@ -46,12 +50,75 @@ def build_model(cfg: dict) -> JointWorldModel:
         action_proj_hidden=cfg["model"]["action_proj_hidden"],
         action_proj_layers=cfg["model"]["action_proj_layers"],
         geom_hidden=cfg["model"]["geom_hidden"],
+        enable_geom_extra=cfg["model"].get("enable_geom_extra", True),
         pixel_hidden=cfg["model"]["pixel_hidden"],
         pixel_n_res=cfg["model"]["pixel_n_res"],
         enable_pixel=cfg["model"].get("enable_pixel", True),
+        enable_context_pixel=cfg["model"].get("enable_context_pixel", False),
+        context_pixel_hidden=cfg["model"].get("context_pixel_hidden", 384),
+        context_pixel_action_dim=cfg["model"].get("context_pixel_action_dim", 7),
+        context_pixel_task_dim=cfg["model"].get("context_pixel_task_dim"),
+        context_pixel_residual_scale=cfg["model"].get("context_pixel_residual_scale", 0.75),
+        context_pixel_use_action=cfg["model"].get("context_pixel_use_action", True),
+        context_pixel_use_task=cfg["model"].get("context_pixel_use_task", True),
+        context_pixel_predict_motion=cfg["model"].get("context_pixel_predict_motion", False),
+        context_pixel_motion_blend_gain=cfg["model"].get("context_pixel_motion_blend_gain", 0.0),
+        enable_control_head=cfg["model"].get("enable_control_head", False),
+        control_hidden=cfg["model"].get("control_hidden", 128),
+        control_output_size=cfg["model"].get("control_output_size", 256),
+        control_fuse_size=cfg["model"].get("control_fuse_size", 64),
+        control_refine_channels=cfg["model"].get("control_refine_channels", 16),
+        control_use_refine=cfg["model"].get("control_use_refine", True),
+        control_action_dim=cfg["model"].get("control_action_dim", 7),
+        control_task_dim=cfg["model"].get("control_task_dim"),
+        control_use_context=cfg["model"].get("control_use_context", True),
+        control_use_action=cfg["model"].get("control_use_action", True),
+        control_use_task=cfg["model"].get("control_use_task", True),
+        enable_progress_head=cfg["model"].get("enable_progress_head", False),
+        progress_hidden=cfg["model"].get("progress_hidden", 256),
+        progress_layers=cfg["model"].get("progress_layers", 2),
+        progress_heads=cfg["model"].get("progress_heads", 4),
+        progress_action_dim=cfg["model"].get("progress_action_dim", 7),
+        progress_task_dim=cfg["model"].get("progress_task_dim"),
+        progress_max_horizon=cfg["model"].get("progress_max_horizon", 32),
+        progress_use_action=cfg["model"].get("progress_use_action", True),
+        progress_use_task=cfg["model"].get("progress_use_task", True),
         enable_bridging=cfg["model"].get("enable_bridging", True),
     )
     return JointWorldModel(jc)
+
+
+def _data_split_cfg(data_cfg: dict) -> dict:
+    split_cfg = data_cfg.get("split") or {}
+    if isinstance(split_cfg, (str, Path)):
+        return {"file": str(split_cfg)}
+    if not isinstance(split_cfg, dict):
+        raise ValueError("data.split must be a mapping or split-file path")
+    return dict(split_cfg)
+
+
+def _split_value(data_cfg: dict, split_cfg: dict, key: str, default=None):
+    return split_cfg.get(key, data_cfg.get(key, default))
+
+
+def _explicit_clip_ids(data_cfg: dict, split_cfg: dict) -> tuple[list[str] | None, list[str] | None]:
+    train_ids = split_cfg.get("train_clip_ids")
+    val_ids = split_cfg.get("val_clip_ids")
+    split_file = data_cfg.get("split_file") or split_cfg.get("file") or split_cfg.get("path")
+    if split_file:
+        file_split = load_clip_split_file(split_file)
+        train_ids = train_ids if train_ids is not None else file_split["train_clip_ids"]
+        val_ids = val_ids if val_ids is not None else file_split["val_clip_ids"]
+    return train_ids, val_ids
+
+
+def _window_config(data_cfg: dict) -> WindowConfig:
+    return WindowConfig(T=data_cfg["T"], k=data_cfg["k"],
+                        stride=data_cfg["stride"],
+                        cache_root=Path(data_cfg["cache_root"]),
+                        tokens_subdir=data_cfg.get("tokens_subdir", "vggt_pooled"),
+                        action_stats=Path(data_cfg["action_stats"])
+                        if data_cfg.get("action_stats") else None)
 
 
 def build_datasets(cfg: dict, overfit_ids=None):
@@ -60,33 +127,101 @@ def build_datasets(cfg: dict, overfit_ids=None):
         records = [r for r in records if r.clip_id in overfit_ids]
         if not records:
             raise RuntimeError(f"no records matched overfit ids: {overfit_ids}")
-    wcfg = WindowConfig(T=cfg["data"]["T"], k=cfg["data"]["k"],
-                        stride=cfg["data"]["stride"],
-                        cache_root=Path(cfg["data"]["cache_root"]),
-                        tokens_subdir=cfg["data"].get("tokens_subdir", "vggt_pooled"))
+    data_cfg = cfg["data"]
+    split_cfg = _data_split_cfg(data_cfg)
+    has_episode_split_keys = (
+        data_cfg.get("split_file")
+        or any(k in split_cfg for k in ("file", "path", "train_clip_ids", "val_clip_ids", "heldout_dataset"))
+    )
+    mode = split_cfg.get("mode", "episode" if has_episode_split_keys else "random_window")
+    val_frac = float(_split_value(data_cfg, split_cfg, "val_frac", 0.0))
+    seed = int(_split_value(data_cfg, split_cfg, "seed", 0))
+    wcfg = _window_config(data_cfg)
+
+    if mode == "episode":
+        train_ids, val_ids = _explicit_clip_ids(data_cfg, split_cfg)
+        clip_split = episode_split(
+            records,
+            val_frac=val_frac,
+            seed=seed,
+            train_clip_ids=train_ids,
+            val_clip_ids=val_ids,
+            heldout_dataset=_split_value(data_cfg, split_cfg, "heldout_dataset"),
+        )
+        train_records = [r for r in records if r.clip_id in clip_split.train_clip_ids]
+        val_records = [r for r in records if r.clip_id in clip_split.val_clip_ids]
+        tr_ds = OXEWindowDataset(train_records, wcfg)
+        val_ds = OXEWindowDataset(val_records, wcfg)
+        if len(tr_ds) == 0:
+            raise RuntimeError("episode train split empty — caches missing?")
+        if len(val_ds) == 0:
+            raise RuntimeError("episode val split empty — caches missing?")
+        return tr_ds, val_ds
+
+    if mode != "random_window":
+        raise ValueError(f"unsupported data.split.mode: {mode}")
+
     ds = OXEWindowDataset(records, wcfg)
     n = len(ds)
     if n == 0:
         raise RuntimeError("OXEWindowDataset empty — caches missing?")
-    g = torch.Generator().manual_seed(cfg["data"]["seed"])
-    perm = torch.randperm(n, generator=g).tolist()
-    n_val = max(1, int(n * cfg["data"]["val_frac"]))
-    return Subset(ds, perm[n_val:]), Subset(ds, perm[:n_val])
+    train_idx, val_idx = random_window_indices(n, val_frac=val_frac, seed=seed)
+    return Subset(ds, train_idx), Subset(ds, val_idx)
 
 
 def batch_to_device(batch: dict, device: torch.device, k: int) -> tuple:
     s = batch["s_in"].to(device, non_blocking=True)
     c = batch["c"].to(device, non_blocking=True)
+    context_rgb = batch["rgb_in"][:, -1].to(device, non_blocking=True).permute(0, 3, 1, 2).contiguous()
     rgb_tgt_p = batch["rgb_tgt"].to(device, non_blocking=True).permute(0, 1, 4, 2, 3)
     # rgb_tgt: [B, k, 256, 256, 3]; permute -> [B, k, 3, 256, 256]
     tgt = {
         "s_tgt": batch["s_tgt"].to(device, non_blocking=True),
         "depth_tgt": batch["depth_tgt"].to(device, non_blocking=True),
-        "action_tgt": batch["action_tgt"].to(device, non_blocking=True),
         "rgb_tgt_p": rgb_tgt_p,
+        "rgb_ref_p": context_rgb,
     }
-    return s, c, tgt
+    action_tgt = batch["action_tgt"].to(device, non_blocking=True)
+    action_tgt_norm = batch["action_tgt_norm"].to(device, non_blocking=True)
+    tgt["action_tgt"] = action_tgt
+    tgt["action_tgt_norm"] = action_tgt_norm
+    action_cond = make_action_condition(action_tgt, action_tgt_norm)
+    return s, c, action_cond, context_rgb, tgt
 
+
+def load_compatible_state_dict(model: torch.nn.Module, state: dict, strict: bool):
+    if strict:
+        return model.load_state_dict(state, strict=True)
+    current = model.state_dict()
+    compatible = {}
+    skipped = []
+    for key, value in state.items():
+        if key in current and current[key].shape == value.shape:
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    result = model.load_state_dict(compatible, strict=False)
+    return SimpleNamespace(
+        missing_keys=result.missing_keys,
+        unexpected_keys=result.unexpected_keys,
+        skipped_keys=skipped,
+    )
+
+
+def load_action_stats_if_available(model, cfg: dict, rank: int, device: torch.device) -> None:
+    stats_path = cfg["data"].get("action_stats")
+    if not stats_path:
+        return
+    path = Path(stats_path)
+    if not path.exists():
+        raise FileNotFoundError(f"action_stats not found: {path}")
+    stats = np.load(path)
+    target = model.module if isinstance(model, DDP) else model
+    mean = torch.as_tensor(stats["mean"][:6], device=device)
+    std = torch.as_tensor(stats["std"][:6], device=device)
+    target.load_action_stats(mean, std)
+    if rank == 0:
+        print(f"[rank0] loaded action_stats from {path}")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -123,7 +258,11 @@ def main():
         n_p = model.num_trainable_params()
         print(f"[rank0] JointWorldModel: {n_p/1e6:.1f}M; train_windows={len(tr_ds)} val_windows={len(val_ds)}")
     if world > 1:
-        model = DDP(model, device_ids=[local], find_unused_parameters=True)
+        model = DDP(
+            model,
+            device_ids=[local],
+            find_unused_parameters=cfg["train"].get("find_unused_parameters", False),
+        )
 
     lpips_fn = lpips.LPIPS(net="vgg").to(device).eval()
     for p in lpips_fn.parameters():
@@ -151,18 +290,20 @@ def main():
     if args.resume is not None and args.resume.exists():
         sd = torch.load(args.resume, map_location=device, weights_only=False)
         target = (model.module if world > 1 else model)
-        load_res = target.load_state_dict(sd["model"], strict=args.strict_resume)
+        load_res = load_compatible_state_dict(target, sd["model"], strict=args.strict_resume)
         if args.reset_optim:
             if rank == 0:
                 miss = len(getattr(load_res, "missing_keys", []) or [])
                 un = len(getattr(load_res, "unexpected_keys", []) or [])
+                skip = len(getattr(load_res, "skipped_keys", []) or [])
                 print(f"[rank0] resumed weights only from {args.resume} (optim RESET) — "
-                      f"missing={miss} unexpected={un}")
+                      f"missing={miss} unexpected={un} skipped={skip}")
         else:
             opt.load_state_dict(sd["opt"]); sched.load_state_dict(sd["sched"])
             start_epoch = sd["epoch"] + 1; step = sd["step"]; best_val = sd.get("best_val", best_val)
             if rank == 0:
                 print(f"[rank0] resumed from {args.resume} at epoch {start_epoch}")
+    load_action_stats_if_available(model, cfg, rank, device)
 
     k = cfg["data"]["k"]
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
@@ -171,10 +312,13 @@ def main():
         do_pixel = epoch >= args.disable_pixel_until
         model.train()
         for batch in tr_loader:
-            s, c, tgt = batch_to_device(batch, device, k)
+            s, c, action_cond, context_rgb, tgt = batch_to_device(batch, device, k)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = (model.module if world > 1 else model)(s, c, pixel=do_pixel, bridging=False) \
-                    if not isinstance(model, DDP) else model(s, c, pixel=do_pixel, bridging=False)
+                out = model(s, c, action_cond=action_cond, context_rgb=context_rgb,
+                            pixel=do_pixel, bridging=False) \
+                    if isinstance(model, DDP) else model(s, c, action_cond=action_cond,
+                                                         context_rgb=context_rgb,
+                                                         pixel=do_pixel, bridging=False)
                 losses = compute_losses(out, tgt, weights, lpips_fn if do_pixel else None)
             loss = losses["L_total"]
             if not torch.isfinite(loss):
@@ -207,9 +351,10 @@ def main():
         agg = {}; nb = 0
         with torch.no_grad():
             for batch in val_loader:
-                s, c, tgt = batch_to_device(batch, device, k)
+                s, c, action_cond, context_rgb, tgt = batch_to_device(batch, device, k)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    out = model(s, c, pixel=do_pixel, bridging=False)
+                    out = model(s, c, action_cond=action_cond, context_rgb=context_rgb,
+                                pixel=do_pixel, bridging=False)
                     losses = compute_losses(out, tgt, weights, lpips_fn if do_pixel else None)
                 for kk, v in losses.items():
                     agg[kk] = agg.get(kk, 0.0) + float(v.detach().float())

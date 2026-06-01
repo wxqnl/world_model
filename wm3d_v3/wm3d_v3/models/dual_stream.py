@@ -37,9 +37,9 @@ class DualStreamDynamics(nn.Module):
             if cfg.action.hidden != cfg.state.hidden else nn.Identity()
         )
 
-    def forward(self, s, c):
-        h_s = self.state.encode(s, c)
-        h_a = self.action.encode(s, c)
+    def forward(self, s, c, action_cond=None):
+        h_s = self.state.encode(s, c, action_cond=action_cond)
+        h_a = self.action.encode(s, c, action_cond=action_cond)
         xattn_set = set(self.cfg.xattn_layers_state)
         xattn_iter = iter(self.xattn_blocks)
         a_i = 0
@@ -61,8 +61,8 @@ class DualStreamDynamics(nn.Module):
         h_s = self.state.norm(h_s)
         h_a = self.action.norm(h_a)
         return {
-            "pred_tokens": self.state.decode(h_s),
-            "z_a": self.action.decode(h_a),
+            "pred_tokens": self.state.decode(h_s, action_cond=action_cond),
+            "z_a": self.action.decode(h_a, action_cond=action_cond),
             "h_s": h_s,
             "h_a": h_a,
         }

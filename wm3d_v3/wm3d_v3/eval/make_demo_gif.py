@@ -10,6 +10,7 @@ import yaml
 from torch.utils.data import Subset
 
 from wm3d_v3.data.manifest import read_manifest
+from wm3d_v3.data.action_condition import make_action_condition
 from wm3d_v3.data.window_dataset import OXEWindowDataset, WindowConfig
 from wm3d_v3.models.action_stream import ActionConfig
 from wm3d_v3.models.dual_stream import DualConfig
@@ -28,9 +29,39 @@ def build_model(cfg):
         action_proj_hidden=cfg["model"]["action_proj_hidden"],
         action_proj_layers=cfg["model"]["action_proj_layers"],
         geom_hidden=cfg["model"]["geom_hidden"],
+        enable_geom_extra=cfg["model"].get("enable_geom_extra", True),
         pixel_hidden=cfg["model"]["pixel_hidden"],
         pixel_n_res=cfg["model"]["pixel_n_res"],
         enable_pixel=cfg["model"].get("enable_pixel", True),
+        enable_context_pixel=cfg["model"].get("enable_context_pixel", False),
+        context_pixel_hidden=cfg["model"].get("context_pixel_hidden", 384),
+        context_pixel_action_dim=cfg["model"].get("context_pixel_action_dim", 7),
+        context_pixel_task_dim=cfg["model"].get("context_pixel_task_dim"),
+        context_pixel_residual_scale=cfg["model"].get("context_pixel_residual_scale", 0.75),
+        context_pixel_use_action=cfg["model"].get("context_pixel_use_action", True),
+        context_pixel_use_task=cfg["model"].get("context_pixel_use_task", True),
+        context_pixel_predict_motion=cfg["model"].get("context_pixel_predict_motion", False),
+        context_pixel_motion_blend_gain=cfg["model"].get("context_pixel_motion_blend_gain", 0.0),
+        enable_control_head=cfg["model"].get("enable_control_head", False),
+        control_hidden=cfg["model"].get("control_hidden", 128),
+        control_output_size=cfg["model"].get("control_output_size", 256),
+        control_fuse_size=cfg["model"].get("control_fuse_size", 64),
+        control_refine_channels=cfg["model"].get("control_refine_channels", 16),
+        control_use_refine=cfg["model"].get("control_use_refine", True),
+        control_action_dim=cfg["model"].get("control_action_dim", 7),
+        control_task_dim=cfg["model"].get("control_task_dim"),
+        control_use_context=cfg["model"].get("control_use_context", True),
+        control_use_action=cfg["model"].get("control_use_action", True),
+        control_use_task=cfg["model"].get("control_use_task", True),
+        enable_progress_head=cfg["model"].get("enable_progress_head", False),
+        progress_hidden=cfg["model"].get("progress_hidden", 256),
+        progress_layers=cfg["model"].get("progress_layers", 2),
+        progress_heads=cfg["model"].get("progress_heads", 4),
+        progress_action_dim=cfg["model"].get("progress_action_dim", 7),
+        progress_task_dim=cfg["model"].get("progress_task_dim"),
+        progress_max_horizon=cfg["model"].get("progress_max_horizon", 32),
+        progress_use_action=cfg["model"].get("progress_use_action", True),
+        progress_use_task=cfg["model"].get("progress_use_task", True),
         enable_bridging=cfg["model"].get("enable_bridging", True),
     )
     return JointWorldModel(jc)
@@ -103,8 +134,13 @@ def main():
         smp = ds[vi]
         s = smp["s_in"].unsqueeze(0).to(device)
         c = smp["c"].unsqueeze(0).to(device)
+        action_tgt = smp["action_tgt"].unsqueeze(0).to(device)
+        action_tgt_norm = smp["action_tgt_norm"].unsqueeze(0).to(device)
+        context_rgb = smp["rgb_in"][-1].permute(2, 0, 1).unsqueeze(0).to(device)
+        action_cond = make_action_condition(action_tgt, action_tgt_norm)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(s, c, pixel=True, bridging=False)
+            out = model(s, c, action_cond=action_cond, context_rgb=context_rgb,
+                        pixel=True, bridging=False)
         rgb_pred = out["rgb"][0].float().clamp(0, 1).cpu().numpy()              # [k, 3, 256, 256]
         depth_pred = out["depth"][0].float().cpu().numpy()                       # [k, 224, 224]
         rgb_gt = smp["rgb_tgt"].numpy()                                          # [k, 256, 256, 3]
@@ -128,6 +164,21 @@ def main():
         gif_path = args.out_dir / f"{ix:02d}_{smp['dataset']}_{clip_id}.gif"
         imageio.mimsave(gif_path, frames, duration=0.2, loop=0)
         print(f"  -> {gif_path}  pose0={out['pose'][0,0].float().cpu().tolist()}")
+        if "motion_hint" in out:
+            motion_pred = out["motion_hint"][0].float().clamp(0, 1).cpu().numpy()
+            ref = rgb_in[-1]
+            motion_gt = (np.abs(rgb_gt - ref[None]).mean(axis=-1, keepdims=True) > 0.03).astype(np.float32)
+            motion_frames = []
+            for j in range(k):
+                mp = (motion_pred[j, 0] * 255).astype(np.uint8)
+                mg = (motion_gt[j, :, :, 0] * 255).astype(np.uint8)
+                if mp.shape != mg.shape:
+                    mp = np.array(Image.fromarray(mp).resize((mg.shape[1], mg.shape[0])))
+                mp = np.repeat(mp[..., None], 3, axis=-1)
+                mg = np.repeat(mg[..., None], 3, axis=-1)
+                motion_frames.append(np.concatenate([mp, mg], axis=1))
+            motion_path = args.out_dir / f"{ix:02d}_{smp['dataset']}_{clip_id}_motion.gif"
+            imageio.mimsave(motion_path, motion_frames, duration=0.2, loop=0)
         # Also dump action prediction vs GT for the clip
         np.savez(
             args.out_dir / f"{ix:02d}_{smp['dataset']}_{clip_id}_action.npz",

@@ -1,4 +1,4 @@
-"""Geometry decoder: pooled VGGT tokens -> depth (224x224) + point + pose."""
+"""Geometry decoder: pooled VGGT tokens -> depth, optionally point + pose."""
 from __future__ import annotations
 import torch
 import torch.nn as nn
@@ -6,13 +6,22 @@ import torch.nn.functional as F
 
 
 class GeomDecoder(nn.Module):
-    """[B, T, 64, 2048] -> depth [B, T, 224, 224], point [B, T, 224, 224, 3], pose [B, T, 9]"""
+    """[B, T, 64, 2048] -> depth [B, T, 224, 224] and optional extra geometry."""
 
-    def __init__(self, token_dim=2048, token_grid=8, hidden=384, out_hw=256, crop_hw=224):
+    def __init__(
+        self,
+        token_dim=2048,
+        token_grid=8,
+        hidden=384,
+        out_hw=256,
+        crop_hw=224,
+        enable_extra=True,
+    ):
         super().__init__()
         self.token_grid = token_grid
         self.out_hw = out_hw
         self.crop_hw = crop_hw
+        self.enable_extra = enable_extra
         H = hidden
         # n_ups so token_grid * 2**n_ups == out_hw. 8→256: 5; 16→256: 4.
         n_ups = 0
@@ -39,12 +48,16 @@ class GeomDecoder(nn.Module):
         self._register_load_state_dict_pre_hook(self._remap_legacy_keys)
         c_last = chans[-1]
         self.depth_head = nn.Conv2d(c_last, 1, 1)
-        self.point_head = nn.Conv2d(c_last, 3, 1)
-        self.pose_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
-            nn.Linear(H, H), nn.GELU(),
-            nn.Linear(H, 9),
-        )
+        if enable_extra:
+            self.point_head = nn.Conv2d(c_last, 3, 1)
+            self.pose_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+                nn.Linear(H, H), nn.GELU(),
+                nn.Linear(H, 9),
+            )
+        else:
+            self.point_head = None
+            self.pose_head = None
 
     @staticmethod
     def _remap_legacy_keys(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -60,12 +73,17 @@ class GeomDecoder(nn.Module):
         G = self.token_grid
         x = tok.reshape(B * T, G * G, D).transpose(1, 2).reshape(B * T, D, G, G)
         x = self.stem(x)
-        pose = self.pose_head(x).view(B, T, 9)
+        pose = self.pose_head(x).view(B, T, 9) if self.pose_head is not None else None
         for u in self.ups:
             x = u(x)
         # crop out_hw → crop_hw centered
         off = (self.out_hw - self.crop_hw) // 2
         x = x[:, :, off:off + self.crop_hw, off:off + self.crop_hw]
         depth = F.softplus(self.depth_head(x)).squeeze(1).view(B, T, self.crop_hw, self.crop_hw)
-        point = self.point_head(x).permute(0, 2, 3, 1).contiguous().view(B, T, self.crop_hw, self.crop_hw, 3)
-        return {"depth": depth, "point": point, "pose": pose}
+        out = {"depth": depth}
+        if self.point_head is not None and pose is not None:
+            out["point"] = self.point_head(x).permute(0, 2, 3, 1).contiguous().view(
+                B, T, self.crop_hw, self.crop_hw, 3
+            )
+            out["pose"] = pose
+        return out

@@ -18,10 +18,8 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
-import sys
-sys.path.insert(0, "/home/user01/Minko/newwm/wm3d/wm3d")
-from encoders.vggt_encoder import VGGTEncoder  # noqa
-from encoders.qwen_vl_encoder import QwenVLEmbed  # noqa
+from wm3d_v3.encoders.vggt_encoder import VGGTEncoder
+from wm3d_v3.encoders.qwen_vl_encoder import QwenVLEmbed
 
 from wm3d_v3.data.manifest import read_manifest, OXEClipRecord
 from wm3d_v3.data.oxe_loader import decode_episode
@@ -40,6 +38,17 @@ def resize_image_batch(imgs: np.ndarray, size: int) -> torch.Tensor:
     return t
 
 
+def cache_complete(cache_root: Path, cid: str, need_qwen: bool) -> bool:
+    base_ok = (
+        (cache_root / "vggt_pooled" / f"{cid}.npy").exists()
+        and (cache_root / "vggt_geom" / f"{cid}.npz").exists()
+        and (cache_root / "rgb_256" / f"{cid}.npy").exists()
+        and (cache_root / "actions" / f"{cid}.npy").exists()
+    )
+    qwen_ok = (not need_qwen) or (cache_root / "qwen_taskemb" / f"{cid}.npy").exists()
+    return base_ok and qwen_ok
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", type=Path,
@@ -52,7 +61,11 @@ def main() -> None:
                     help="VGGT chunk size per episode")
     ap.add_argument("--skip_qwen", action="store_true",
                     help="skip Qwen task embedding (saves loading the 2B model)")
+    ap.add_argument("--only_qwen", action="store_true",
+                    help="only backfill missing Qwen task embeddings; do not run VGGT")
     args = ap.parse_args()
+    if args.skip_qwen and args.only_qwen:
+        raise SystemExit("--skip_qwen and --only_qwen are mutually exclusive")
 
     records = read_manifest(args.manifest)
     # Group by tar so we open each tar once.
@@ -71,8 +84,9 @@ def main() -> None:
     for d in (pool_dir, geom_dir, rgb_dir, act_dir, qwen_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    enc = VGGTEncoder(device="cuda")
+    enc = None if args.only_qwen else VGGTEncoder(device="cuda", return_depth=True)
     qwen = None if args.skip_qwen else QwenVLEmbed()
+    need_qwen = qwen is not None
 
     for tar_path in tar_keys:
         recs = by_tar[tar_path]
@@ -83,7 +97,10 @@ def main() -> None:
         done = 0
         for r in recs:
             cid = safe_id(r.clip_id)
-            if (pool_dir / f"{cid}.npy").exists() and (rgb_dir / f"{cid}.npy").exists():
+            if args.only_qwen:
+                if (qwen_dir / f"{cid}.npy").exists():
+                    done += 1
+            elif cache_complete(args.cache_root, cid, need_qwen):
                 done += 1
         if done == len(recs):
             tar.close()
@@ -101,7 +118,8 @@ def main() -> None:
             act_path = act_dir / f"{cid}.npy"
             qwen_path = qwen_dir / f"{cid}.npy"
 
-            if pool_path.exists() and rgb_path.exists() and act_path.exists():
+            base_done = pool_path.exists() and geom_path.exists() and rgb_path.exists() and act_path.exists()
+            if base_done and ((not need_qwen) or qwen_path.exists()):
                 pbar.update(1)
                 continue
 
@@ -119,31 +137,24 @@ def main() -> None:
                 pbar.update(1)
                 continue
 
-            # Save actions + RGB first (cheap)
-            np.save(act_path, ep.actions.astype(np.float32))
-            rgb256 = resize_image_batch(ep.images, 256)  # [T, 3, 256, 256] float
-            np.save(rgb_path, (rgb256.clamp(0, 1) * 255).byte().permute(0, 2, 3, 1).numpy())
+            if not args.only_qwen and not base_done:
+                # Save actions + RGB first (cheap)
+                np.save(act_path, ep.actions.astype(np.float32))
+                rgb256 = resize_image_batch(ep.images, 256)  # [T, 3, 256, 256] float
+                np.save(rgb_path, (rgb256.clamp(0, 1) * 255).byte().permute(0, 2, 3, 1).numpy())
 
-            # VGGT cache (pooled + depth)
-            T = ep.images.shape[0]
-            frames_224 = resize_image_batch(ep.images, 224)  # [T, 3, 224, 224]
-            pooled_chunks, depth_chunks = [], []
-            for s in range(0, T, args.batch_frames):
-                chunk = frames_224[s : s + args.batch_frames].unsqueeze(0).to("cuda")
-                out = enc(chunk)
-                pooled_chunks.append(out["pooled"][0].cpu().numpy().astype(np.float16))
-                # Use 64x64 depth from enc + ALSO save 224x224 from the wrapper
-                # The enc.forward already pools depth to 64x64; we want 224x224 for cosmos
-                # Re-run wrapper to get full-res depth
-                with torch.no_grad():
-                    inner = enc.wrapper.full_inference(chunk[0])
-                d224 = inner["depth"].squeeze(-1).reshape(-1, inner["depth"].shape[-3],
-                                                            inner["depth"].shape[-2])
-                # d224 shape might be [1, T_chunk, 224, 224] depending on wrapper
-                d224 = d224.reshape(-1, 224, 224)
-                depth_chunks.append(d224.cpu().numpy().astype(np.float16))
-            np.save(pool_path, np.concatenate(pooled_chunks, axis=0))
-            np.savez_compressed(geom_path, depth=np.concatenate(depth_chunks, axis=0))
+                # VGGT cache (pooled + depth)
+                T = ep.images.shape[0]
+                frames_224 = resize_image_batch(ep.images, 224)  # [T, 3, 224, 224]
+                pooled_chunks, depth_chunks = [], []
+                for s in range(0, T, args.batch_frames):
+                    chunk = frames_224[s : s + args.batch_frames].unsqueeze(0).to("cuda")
+                    assert enc is not None
+                    out = enc(chunk)
+                    pooled_chunks.append(out["pooled"][0].cpu().numpy().astype(np.float16))
+                    depth_chunks.append(out["depth"][0].cpu().numpy().astype(np.float16))
+                np.save(pool_path, np.concatenate(pooled_chunks, axis=0))
+                np.savez_compressed(geom_path, depth=np.concatenate(depth_chunks, axis=0))
 
             # Qwen task embedding (per episode, one vector)
             if qwen is not None and not qwen_path.exists():

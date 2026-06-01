@@ -12,6 +12,7 @@ Per dataset:
    fractal20220817: same as bridge (RT-1 schema)
    taco_play: action vector (7,)  [dx,dy,dz,drx,dry,drz,grip] where grip in [-1,1]
    jaco_play: action vector (7,) similar
+   kuka: RT-1-style world_vector + rotation_delta + gripper_closedness_action
 """
 from __future__ import annotations
 import numpy as np
@@ -24,6 +25,8 @@ def normalize_action(action, dataset: str) -> np.ndarray:
         return _normalize_taco(action)
     if dataset == "jaco_play":
         return _normalize_jaco(action)
+    if dataset == "kuka":
+        return _normalize_kuka(action)
     raise ValueError(f"unknown dataset {dataset}")
 
 
@@ -44,6 +47,17 @@ def _normalize_jaco(a) -> np.ndarray:
         grip = float(np.asarray(a["gripper_closedness_action"]).flat[0]) > 0
         return np.array([wv[0], wv[1], wv[2], 0., 0., 0., float(grip)], dtype=np.float32)
     raise TypeError(f"jaco action unsupported: {type(a)}")
+
+
+def _normalize_kuka(a) -> np.ndarray:
+    """Kuka has world delta, rotation delta, and gripper closedness."""
+    if isinstance(a, dict):
+        wv = np.asarray(a["world_vector"], dtype=np.float32).reshape(3)
+        rd = np.asarray(a["rotation_delta"], dtype=np.float32).reshape(3)
+        grip = float(np.asarray(a["gripper_closedness_action"]).flat[0]) > 0
+        return np.array(
+            [wv[0], wv[1], wv[2], rd[0], rd[1], rd[2], float(grip)], dtype=np.float32)
+    raise TypeError(f"kuka action unsupported: {type(a)}")
 
 
 def _normalize_bridge_rt1(a) -> np.ndarray:

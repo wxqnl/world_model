@@ -1,0 +1,70 @@
+data:
+  manifest: /data/Minko/world_model/wm3d_v3/manifests/oxe_stage1_cached_bridge_fractal.jsonl
+  cache_root: /data/Minko/datasets/cache/wm3d_v3
+  tokens_subdir: vggt_p256
+  action_stats: /data/Minko/datasets/cache/wm3d_v3/action_stats_stage1_bridge_fractal.npz
+  T: 16
+  k: 8
+  stride: 4
+  val_frac: 0.02
+  seed: 0
+model:
+  state:
+    T: 16
+    P: 256
+    D: 2048
+    hidden: 1152
+    n_layers: 14
+    n_heads: 16
+    k: 8
+    action_cond_dim: 7
+  action:
+    T: 16
+    P: 256
+    D: 2048
+    hidden: 896
+    n_layers: 10
+    n_heads: 14
+    k: 8
+    z_dim: 192
+    action_cond_dim: 7
+  xattn_layers_state:
+  - 3
+  - 6
+  - 9
+  - 11
+  - 13
+  xattn_n_heads: 16
+  action_proj_hidden: 768
+  action_proj_layers: 5
+  geom_hidden: 384
+  pixel_hidden: 4096
+  pixel_n_res: 2
+  enable_pixel: true
+  enable_bridging: true
+train:
+  epochs: 8
+  batch_size_per_gpu: 1
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.02
+  warmup_steps: 2000
+  grad_clip: 1.0
+  precision: bf16
+  log_every: 50
+  ckpt_every_epochs: 99
+loss:
+  cos: 0.1
+  grip: 0.5
+  geom_depth: 0.3
+  geom_point: 0.05
+  geom_pose: 0.02
+  action: 1.0
+  idm_reg: 0.01
+  rgb_l1: 1.0
+  rgb_lpips: 0.5
+out:
+  root: /data/Minko/world_model/wm3d_v3/results/wm3d_v3_p256_rgb1b_actioncond_stage1
+  tb_dir: tb
+  ckpt_dir: ckpt
+overfit_clip_ids: []

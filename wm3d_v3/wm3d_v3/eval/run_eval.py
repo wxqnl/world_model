@@ -12,7 +12,9 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader, Subset
 
+from wm3d_v3.data.action_condition import make_action_condition
 from wm3d_v3.data.manifest import read_manifest
+from wm3d_v3.data.splits import random_window_indices, split_mode_from_config, split_records
 from wm3d_v3.data.window_dataset import OXEWindowDataset, WindowConfig
 from wm3d_v3.losses import _normalize_depth
 from wm3d_v3.models.action_stream import ActionConfig
@@ -32,9 +34,39 @@ def build_model(cfg: dict) -> JointWorldModel:
         action_proj_hidden=cfg["model"]["action_proj_hidden"],
         action_proj_layers=cfg["model"]["action_proj_layers"],
         geom_hidden=cfg["model"]["geom_hidden"],
+        enable_geom_extra=cfg["model"].get("enable_geom_extra", True),
         pixel_hidden=cfg["model"]["pixel_hidden"],
         pixel_n_res=cfg["model"]["pixel_n_res"],
         enable_pixel=cfg["model"].get("enable_pixel", True),
+        enable_context_pixel=cfg["model"].get("enable_context_pixel", False),
+        context_pixel_hidden=cfg["model"].get("context_pixel_hidden", 384),
+        context_pixel_action_dim=cfg["model"].get("context_pixel_action_dim", 7),
+        context_pixel_task_dim=cfg["model"].get("context_pixel_task_dim"),
+        context_pixel_residual_scale=cfg["model"].get("context_pixel_residual_scale", 0.75),
+        context_pixel_use_action=cfg["model"].get("context_pixel_use_action", True),
+        context_pixel_use_task=cfg["model"].get("context_pixel_use_task", True),
+        context_pixel_predict_motion=cfg["model"].get("context_pixel_predict_motion", False),
+        context_pixel_motion_blend_gain=cfg["model"].get("context_pixel_motion_blend_gain", 0.0),
+        enable_control_head=cfg["model"].get("enable_control_head", False),
+        control_hidden=cfg["model"].get("control_hidden", 128),
+        control_output_size=cfg["model"].get("control_output_size", 256),
+        control_fuse_size=cfg["model"].get("control_fuse_size", 64),
+        control_refine_channels=cfg["model"].get("control_refine_channels", 16),
+        control_use_refine=cfg["model"].get("control_use_refine", True),
+        control_action_dim=cfg["model"].get("control_action_dim", 7),
+        control_task_dim=cfg["model"].get("control_task_dim"),
+        control_use_context=cfg["model"].get("control_use_context", True),
+        control_use_action=cfg["model"].get("control_use_action", True),
+        control_use_task=cfg["model"].get("control_use_task", True),
+        enable_progress_head=cfg["model"].get("enable_progress_head", False),
+        progress_hidden=cfg["model"].get("progress_hidden", 256),
+        progress_layers=cfg["model"].get("progress_layers", 2),
+        progress_heads=cfg["model"].get("progress_heads", 4),
+        progress_action_dim=cfg["model"].get("progress_action_dim", 7),
+        progress_task_dim=cfg["model"].get("progress_task_dim"),
+        progress_max_horizon=cfg["model"].get("progress_max_horizon", 32),
+        progress_use_action=cfg["model"].get("progress_use_action", True),
+        progress_use_task=cfg["model"].get("progress_use_task", True),
         enable_bridging=cfg["model"].get("enable_bridging", True),
     )
     return JointWorldModel(jc)
@@ -53,6 +85,35 @@ def window_config_from_cfg(cfg: dict) -> WindowConfig:
     )
 
 
+def build_dataset_for_split(records, cfg: dict, split: str = "val"):
+    """Build a window dataset/subset using config-defined split semantics."""
+    if split not in {"train", "val", "all"}:
+        raise ValueError(f"split must be train/val/all, got {split}")
+    wcfg = window_config_from_cfg(cfg)
+    if split == "all":
+        return OXEWindowDataset(records, wcfg)
+    data_cfg = cfg["data"]
+    mode = split_mode_from_config(data_cfg)
+    if mode == "episode":
+        train_records, val_records = split_records(records, data_cfg)
+        selected = train_records if split == "train" else val_records
+        ds = OXEWindowDataset(selected, wcfg)
+        if len(ds) == 0:
+            raise RuntimeError(f"episode {split} split empty — caches missing?")
+        return ds
+    if mode != "random_window":
+        raise ValueError(f"unsupported data.split.mode: {mode}")
+    ds = OXEWindowDataset(records, wcfg)
+    if len(ds) == 0:
+        raise RuntimeError("OXEWindowDataset empty — caches missing?")
+    train_idx, val_idx = random_window_indices(
+        len(ds),
+        val_frac=float(data_cfg.get("val_frac", 0.05)),
+        seed=int(data_cfg.get("seed", 0)),
+    )
+    return Subset(ds, train_idx if split == "train" else val_idx)
+
+
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
@@ -68,13 +129,7 @@ def main():
     torch.cuda.set_device(0)
 
     records = read_manifest(cfg["data"]["manifest"])
-    wcfg = window_config_from_cfg(cfg)
-    ds = OXEWindowDataset(records, wcfg)
-    n = len(ds)
-    g = torch.Generator().manual_seed(cfg["data"]["seed"])
-    perm = torch.randperm(n, generator=g).tolist()
-    n_val = max(1, int(n * cfg["data"]["val_frac"]))
-    val = Subset(ds, perm[:n_val])
+    val = build_dataset_for_split(records, cfg, split="val")
     print(f"val windows: {len(val)}")
 
     model = build_model(cfg).to(device).eval()
@@ -103,8 +158,14 @@ def main():
         depth_tgt = batch["depth_tgt"].to(device, non_blocking=True)
         action_tgt = batch["action_tgt"].to(device, non_blocking=True)
         rgb_tgt = batch["rgb_tgt"].to(device, non_blocking=True).permute(0, 1, 4, 2, 3)
+        action_tgt_norm = batch["action_tgt_norm"].to(device, non_blocking=True)
+        action_cond = make_action_condition(action_tgt, action_tgt_norm)
+        context_rgb = batch["rgb_in"][:, -1].to(device, non_blocking=True).permute(0, 3, 1, 2).contiguous()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(s, c, pixel=True, bridging=False)
+            kwargs = dict(action_cond=action_cond, pixel=True, bridging=False)
+            if cfg["model"].get("enable_context_pixel", False):
+                kwargs["context_rgb"] = context_rgb
+            out = model(s, c, **kwargs)
         pred_s = out["pred_tokens"]
         L_state_mse = F.mse_loss(pred_s.float(), s_tgt.float(), reduction="none").mean(dim=(1, 2, 3))
         cos = F.cosine_similarity(pred_s.float().flatten(-2),
@@ -117,6 +178,14 @@ def main():
         grip_acc = ((out["gripper_logit"].float().sigmoid() > 0.5).float() == grip_tgt).float().mean(dim=-1)
         rgb_pred = out["rgb"].float()
         L_rgb_l1 = (rgb_pred - rgb_tgt).abs().mean(dim=(1, 2, 3, 4))
+        rgb_ref = context_rgb.unsqueeze(1)
+        motion = (rgb_tgt - rgb_ref).abs().mean(dim=2, keepdim=True)
+        motion_mask = (motion > 0.03).float()
+        motion_denom = (motion_mask.sum(dim=(1, 2, 3, 4)) * rgb_tgt.shape[2]).clamp_min(1.0)
+        L_rgb_motion_l1 = (
+            (rgb_pred - rgb_tgt).abs() * motion_mask
+        ).sum(dim=(1, 2, 3, 4)) / motion_denom
+        motion_frac = motion_mask.mean(dim=(1, 2, 3, 4))
         with torch.autocast(device_type="cuda", enabled=False):
             rp = (rgb_pred.flatten(0, 1) * 2 - 1)
             rt = (rgb_tgt.flatten(0, 1) * 2 - 1)
@@ -130,6 +199,8 @@ def main():
             by_ds[d]["grip_acc"] += float(grip_acc[i])
             by_ds[d]["L_rgb_L1"] += float(L_rgb_l1[i])
             by_ds[d]["L_rgb_lpips"] += float(lpv[i])
+            by_ds[d]["L_rgb_motion_L1"] += float(L_rgb_motion_l1[i])
+            by_ds[d]["motion_frac"] += float(motion_frac[i])
             cnt[d] += 1
         by_ds["ALL"]["L_state_mse"] += float(L_state_mse.sum())
         by_ds["ALL"]["cos_sim"] += float(cos.sum())
@@ -138,6 +209,8 @@ def main():
         by_ds["ALL"]["grip_acc"] += float(grip_acc.sum())
         by_ds["ALL"]["L_rgb_L1"] += float(L_rgb_l1.sum())
         by_ds["ALL"]["L_rgb_lpips"] += float(lpv.sum())
+        by_ds["ALL"]["L_rgb_motion_L1"] += float(L_rgb_motion_l1.sum())
+        by_ds["ALL"]["motion_frac"] += float(motion_frac.sum())
         cnt["ALL"] += s.shape[0]
         if (bi + 1) % 25 == 0:
             print(f"[{bi+1}/{len(loader)}] L_state {by_ds['ALL']['L_state_mse']/cnt['ALL']:.4f} "
@@ -145,7 +218,8 @@ def main():
                   f"L_pose {by_ds['ALL']['L_pose_mse']/cnt['ALL']:.4f} "
                   f"grip {by_ds['ALL']['grip_acc']/cnt['ALL']:.4f} "
                   f"rgb_L1 {by_ds['ALL']['L_rgb_L1']/cnt['ALL']:.4f} "
-                  f"lpips {by_ds['ALL']['L_rgb_lpips']/cnt['ALL']:.4f}")
+                  f"lpips {by_ds['ALL']['L_rgb_lpips']/cnt['ALL']:.4f} "
+                  f"motion_L1 {by_ds['ALL']['L_rgb_motion_L1']/cnt['ALL']:.4f}")
 
     report = {"counts": dict(cnt), "metrics": {}}
     for d, mvals in by_ds.items():

@@ -20,9 +20,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-import sys
-sys.path.insert(0, "/home/user01/Minko/newwm/wm3d/wm3d")
-from encoders.vggt_encoder import VGGTEncoder  # noqa
+from wm3d_v3.encoders.vggt_encoder import VGGTEncoder
 
 from wm3d_v3.data.manifest import read_manifest, OXEClipRecord
 from wm3d_v3.data.oxe_loader import decode_episode
