@@ -310,3 +310,17 @@ Nothing is hard-deleted here; `.bak`/`__pycache__`/`egg-info` junk is handled se
 - `v5_p64_1b_stage0_native3d_windowgeom_mini_smoke_v1.yaml`
 - `v5_p64_1b_stage0_native3d_wsd_4node_v1.yaml`
 - `v5_p64_300m_stage0_native3d_oxe_droid20k_balanced_2node_v1.yaml`
+
+## Post-verification correction (2026-06-07)
+
+A reference-integrity scan after archiving found 6 files still referenced by ACTIVE
+code/docs/tests; they were restored from archive back to the active tree (over-archived):
+
+- `configs/v3_p64_300m_stage1_world_oxe_droid20k_fromscratch_2node_v1.yaml` (benchmark scripts + doc)
+- `configs/v3_p64_300m_stage2_oxe_droid20k_joint_visual_proposer_from_stage1_2node_v1.yaml` (canonical doc)
+- `scripts/run_300m_stage1_oxe_droid20k_fromscratch_2node_v1.sh` (watcher)
+- `scripts/run_300m_stage2_oxe_droid20k_joint_visual_proposer_from_stage1_2node_v1.sh` (watcher)
+- `scripts/run_v5_generation_stage_hunyuan_adapter_v1.sh` (test_v5_generation_optional)
+- `scripts/train_hunyuan_latent_adapter.py` (wm3d_v3/eval/make_hunyuan_latent_demo)
+
+Final tally: 57 active scripts / 49 active configs / 140 archived. 0 active->archive refs.
