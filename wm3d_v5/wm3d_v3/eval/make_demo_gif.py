@@ -17,6 +17,12 @@ from wm3d_v3.models.dual_stream import DualConfig
 from wm3d_v3.models.joint_model import JointConfig, JointWorldModel
 from wm3d_v3.models.state_stream import StateConfig
 
+# Re-export so demo modules (make_hunyuan_latent_demo, make_hunyuan_dit_control_demo)
+# and tests can `from wm3d_v3.eval.make_demo_gif import window_config_from_cfg`.
+# Canonical definition lives in run_eval; run_eval does not import this module, so
+# this module-level import is cycle-free.
+from wm3d_v3.eval.run_eval import window_config_from_cfg  # noqa: E402,F401
+
 
 def build_model(cfg):
     from wm3d_v3.eval.run_eval import build_model as build_full_model
