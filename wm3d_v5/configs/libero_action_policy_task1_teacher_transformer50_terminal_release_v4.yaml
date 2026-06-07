@@ -1,0 +1,36 @@
+base_cfg: configs/v3_p64_140m_actioncond_context_motion_p0_heads_direct_policy_lowdimhist_phase_object_plan17_localres_stage3waypoint_summary.yaml
+data:
+  manifest:
+    - results/wm3d_libero_teacher_cache_task1_transformer50_rich_future_v2/manifest.jsonl
+    - results/wm3d_libero_teacher_cache_task1_transformer50_terminal_release_v4/manifest.jsonl
+  plan_state_dim: 17
+  action_stats: /data/Minko/datasets/cache/wm3d_v3/action_stats.npz
+  preload: true
+  val_frac: 0.05
+  seed: 229
+train:
+  init_ckpt: results/wm3d_libero_action_policy_task1_teacher_transformer50_rich_future_v3_overfit/ckpt/best.pt
+  device: cuda:0
+  batch_size: 32
+  num_workers: 0
+  max_steps: 1000
+  eval_every: 200
+  keep_eval_ckpts: true
+  eval_ckpt_dir: ckpt/eval_steps
+  lr: 5.0e-6
+  weight_decay: 0.01
+  warmup_steps: 50
+  grad_clip: 1.0
+  trainable_prefixes:
+    - action_policy.
+loss:
+  pose_weight: 1.0
+  first_pose_weight: 8.0
+  delta_weight: 0.2
+  grip_weight: 5.0
+  grip_transition_weight: 32.0
+  first_grip_weight: 8.0
+  huber_delta: 0.5
+out:
+  root: results/wm3d_libero_action_policy_task1_teacher_transformer50_terminal_release_v4
+  ckpt_dir: ckpt

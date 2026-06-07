@@ -1,0 +1,35 @@
+base_cfg: configs/v3_p64_140m_actioncond_context_motion_p0_heads_direct_policy_lowdimhist_phase_summary.yaml
+data:
+  manifest:
+    - results/wm3d_libero_action_policy_lowdimhist_task1_start_stride4_from_partial4_v1_cache/manifest.jsonl
+    - results/wm3d_libero_action_policy_lowdimhist_task1_recovery_step800_timealign_v2_cache/manifest.jsonl
+  action_stats: results/wm3d_libero_action_policy_lowdimhist_partial4_start_stride4_sharded_v1_cache/action_stats.npz
+  preload: true
+  val_frac: 0.08
+  seed: 53
+train:
+  init_ckpt: results/wm3d_libero_action_policy_lowdimhist_task1_phasecond_v4_summary/ckpt/best.pt
+  device: cuda:0
+  batch_size: 256
+  num_workers: 0
+  max_steps: 400
+  eval_every: 100
+  keep_eval_ckpts: true
+  eval_ckpt_dir: ckpt/eval_steps
+  lr: 5.0e-5
+  weight_decay: 0.02
+  warmup_steps: 40
+  grad_clip: 1.0
+  trainable_prefixes:
+    - action_policy.
+loss:
+  pose_weight: 1.0
+  first_pose_weight: 4.0
+  delta_weight: 0.3
+  grip_weight: 1.5
+  grip_transition_weight: 20.0
+  first_grip_weight: 2.0
+  huber_delta: 1.0
+out:
+  root: results/wm3d_libero_action_policy_lowdimhist_task1_phasecond_v5_summary_griprefine
+  ckpt_dir: ckpt
