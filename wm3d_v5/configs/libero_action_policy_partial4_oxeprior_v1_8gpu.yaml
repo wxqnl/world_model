@@ -1,0 +1,36 @@
+base_cfg: configs/v3_p64_140m_p0_action_policy_oxe_prior_isolated_v1.yaml
+data:
+  manifest:
+    - results/wm3d_libero_action_policy_lowdimhist_partial4_start_stride4_v1_cache/manifest.jsonl
+  action_stats: results/wm3d_libero_action_policy_lowdimhist_partial4_start_stride4_v1_cache/action_stats.npz
+  preload: true
+  val_frac: 0.08
+  seed: 53
+  plan_state_dim: 17
+train:
+  init_ckpt: results/wm3d_v3_p64_140m_p0_action_policy_oxe_prior_bridge_fractal_v2_8gpu/ckpt/best.pt
+  device: cuda:0
+  batch_size: 64
+  num_workers: 0
+  max_steps: 1200
+  eval_every: 100
+  lr: 3.0e-5
+  weight_decay: 0.02
+  warmup_steps: 100
+  grad_clip: 1.0
+  trainable_prefixes:
+    - action_policy.pose_norm_head
+    - action_policy.gripper_head
+    - action_policy.local_residual_head
+    - action_policy.waypoint_head
+loss:
+  pose_weight: 1.2
+  first_pose_weight: 8.0
+  delta_weight: 0.2
+  grip_weight: 2.5
+  grip_transition_weight: 18.0
+  first_grip_weight: 4.0
+  huber_delta: 0.5
+out:
+  root: results/wm3d_libero_action_policy_partial4_oxeprior_v1_8gpu
+  ckpt_dir: ckpt

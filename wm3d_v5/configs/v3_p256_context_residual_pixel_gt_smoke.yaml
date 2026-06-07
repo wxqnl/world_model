@@ -1,0 +1,43 @@
+data:
+  manifest: /data/Minko/world_model/wm3d_v3/manifests/oxe_stage1_cached_bridge_fractal.jsonl
+  cache_root: /data/Minko/datasets/cache/wm3d_v3
+  tokens_subdir: vggt_p256
+  action_stats: /data/Minko/datasets/cache/wm3d_v3/action_stats_stage1_bridge_fractal.npz
+  T: 16
+  k: 8
+  stride: 4
+  val_frac: 0.02
+  seed: 42
+model:
+  token_dim: 2048
+  token_grid: 16
+  hidden: 384
+  action_dim: 7
+  task_dim: 2048
+  residual_scale: 0.75
+  use_action: true
+  use_task: true
+train:
+  epochs: 3
+  batch_size_per_gpu: 4
+  num_workers: 4
+  lr: 0.0002
+  weight_decay: 0.01
+  warmup_steps: 300
+  grad_clip: 1.0
+  precision: bf16
+  log_every: 20
+  ckpt_every_epochs: 1
+  max_train_windows: 50000
+  max_val_windows: 2048
+loss:
+  l1: 1.0
+  lpips: 0.4
+  motion_l1: 2.0
+  edge: 0.2
+  motion_threshold: 0.03
+  motion_gain: 4.0
+out:
+  root: /data/Minko/world_model/wm3d_v3/results/context_residual_pixel_gt_p256_smoke
+  tb_dir: tb
+  ckpt_dir: ckpt
