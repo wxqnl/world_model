@@ -28,3 +28,7 @@ manifests/
 *.pointbak
 *.orig
 .DS_Store
+
+# Generated t2v demo outputs
+t2v_best_results/
+t2v_gifs/
