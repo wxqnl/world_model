@@ -6,185 +6,190 @@
 <title>WM3D — A Native-3D Action-Conditioned World Model</title>
 <style>
   :root{
-    --bg:#0a0e1a;
-    --bg-soft:#0f1424;
-    --panel:#141a2e;
-    --panel-2:#1a2238;
-    --line:#283251;
-    --ink:#eaf0ff;
-    --muted:#9aa7c7;
-    --dim:#6b7796;
-    --accent:#6ad5ff;     /* 3D / geometry cyan */
-    --accent-2:#a98bff;   /* action / dynamics violet */
-    --good:#4be3a3;
-    --warn:#ffce6a;
-    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --bg:#ffffff;
+    --bg-alt:#f7f8fa;
+    --ink:#1b1f24;
+    --ink-soft:#3c434c;
+    --muted:#6b7480;
+    --faint:#98a1ad;
+    --line:#e7e9ee;
+    --line-strong:#d6dae1;
+    --blue:#2257d6;       /* geometry / primary */
+    --blue-bg:#eef3fd;
+    --plum:#6b3fa0;       /* action / secondary */
+    --plum-bg:#f4effb;
+    --teal:#0f7a6b;       /* positive metric */
+    --amber:#b5760a;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
     --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
   html{scroll-behavior:smooth}
-  body{
-    margin:0;background:
-      radial-gradient(1200px 700px at 80% -10%,rgba(106,213,255,.10),transparent 60%),
-      radial-gradient(1000px 600px at 0% 10%,rgba(169,139,255,.10),transparent 55%),
-      var(--bg);
-    color:var(--ink);font-family:var(--sans);line-height:1.65;
-    -webkit-font-smoothing:antialiased;
-  }
-  a{color:var(--accent);text-decoration:none}
-  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
-  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--accent)}
-  h1,h2,h3{line-height:1.2;margin:0}
-  .pill{display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border:1px solid var(--line);
-    border-radius:999px;font-size:12.5px;color:var(--muted);background:rgba(255,255,255,.02)}
-  .dot{width:7px;height:7px;border-radius:50%}
-  section{padding:74px 0;border-top:1px solid rgba(40,50,81,.5)}
+  body{margin:0;background:var(--bg);color:var(--ink-soft);font-family:var(--sans);
+    font-size:17px;line-height:1.72;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+  a{color:var(--blue);text-decoration:none}
+  a:hover{text-decoration:underline}
+  h1,h2,h3,h4{color:var(--ink);line-height:1.25;margin:0}
+  .wrap{max-width:960px;margin:0 auto;padding:0 28px}
+  .measure{max-width:720px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)}
 
-  /* ---------- HERO ---------- */
-  header{padding:90px 0 64px;position:relative;overflow:hidden}
-  .hero-grid{position:absolute;inset:0;background-image:
-      linear-gradient(rgba(106,213,255,.045) 1px,transparent 1px),
-      linear-gradient(90deg,rgba(106,213,255,.045) 1px,transparent 1px);
-    background-size:46px 46px;mask:radial-gradient(700px 380px at 70% 0%,#000,transparent 75%);pointer-events:none}
-  h1{font-size:clamp(34px,5.4vw,62px);font-weight:800;letter-spacing:-.02em;margin:18px 0 0}
-  h1 .grad{background:linear-gradient(100deg,var(--accent),var(--accent-2));-webkit-background-clip:text;background-clip:text;color:transparent}
-  .lede{font-size:clamp(16px,2.1vw,20px);color:var(--muted);max-width:760px;margin:20px 0 0}
-  .hero-tags{display:flex;flex-wrap:wrap;gap:10px;margin-top:28px}
-  .cta{display:flex;gap:12px;margin-top:34px;flex-wrap:wrap}
-  .btn{padding:12px 20px;border-radius:11px;font-weight:600;font-size:14.5px;border:1px solid var(--line)}
-  .btn.primary{background:linear-gradient(100deg,var(--accent),var(--accent-2));color:#06101e;border:none}
-  .btn.ghost{color:var(--ink);background:rgba(255,255,255,.03)}
+  /* back link */
+  .backlink{position:fixed;top:18px;left:22px;z-index:50;font-size:14px;color:var(--muted);
+    background:rgba(255,255,255,.85);backdrop-filter:blur(6px);padding:6px 12px;border-radius:8px}
+  .backlink:hover{color:var(--ink);text-decoration:none}
 
-  /* ---------- thesis strip ---------- */
-  .thesis{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:8px}
-  .card{background:linear-gradient(180deg,var(--panel),var(--bg-soft));border:1px solid var(--line);
-    border-radius:16px;padding:22px 22px}
-  .card h3{font-size:15px;letter-spacing:.01em;margin-bottom:8px;display:flex;align-items:center;gap:9px}
-  .card.old h3{color:var(--dim)} .card.new h3{color:var(--accent)}
-  .card p{margin:0;color:var(--muted);font-size:14.5px}
-  .tag{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid var(--line)}
-  .tag.old{color:var(--dim)} .tag.new{color:var(--accent);border-color:rgba(106,213,255,.4)}
+  /* ---------- hero ---------- */
+  header{padding:104px 0 46px;text-align:center;border-bottom:1px solid var(--line)}
+  header .eyebrow{margin-bottom:20px}
+  h1{font-family:var(--serif);font-weight:600;font-size:clamp(32px,5vw,52px);letter-spacing:-.015em;
+    max-width:14ch;margin:0 auto;color:#15181d}
+  h1 em{font-style:italic;color:var(--blue)}
+  .tagline{font-size:clamp(17px,2.2vw,20px);color:var(--ink-soft);max-width:640px;margin:24px auto 0;line-height:1.6}
+  .byline{margin-top:26px;font-size:15px;color:var(--muted)}
+  .byline b{color:var(--ink);font-weight:600}
+  .links{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:28px}
+  .lnk{display:inline-flex;align-items:center;gap:7px;padding:9px 18px;border:1px solid var(--line-strong);
+    border-radius:8px;font-size:14.5px;font-weight:500;color:var(--ink);background:#fff;transition:.15s}
+  .lnk:hover{border-color:var(--blue);color:var(--blue);text-decoration:none}
+  .lnk.solid{background:var(--ink);color:#fff;border-color:var(--ink)}
+  .lnk.solid:hover{background:#000;color:#fff;border-color:#000}
+  .demo-tag{display:inline-block;margin-top:22px;font-family:var(--mono);font-size:12px;letter-spacing:.04em;
+    color:var(--blue);background:var(--blue-bg);border:1px solid #d4e1f8;border-radius:999px;padding:4px 13px}
 
-  h2{font-size:clamp(24px,3.4vw,34px);font-weight:750;letter-spacing:-.01em}
-  .sub{color:var(--muted);max-width:760px;margin:14px 0 0;font-size:15.5px}
-  .kicker{margin-bottom:30px}
+  /* teaser */
+  .teaser{max-width:880px;margin:42px auto 0}
+  .teaser figure{margin:0}
+  .teaser img{width:100%;border:1px solid var(--line);border-radius:10px;display:block}
+  figcaption{font-size:13.5px;color:var(--muted);margin-top:10px;text-align:center;line-height:1.5}
 
-  /* ---------- architecture diagram ---------- */
-  .arch{background:
-      radial-gradient(600px 300px at 50% -10%,rgba(106,213,255,.07),transparent 70%),
-      var(--bg-soft);
-    border:1px solid var(--line);border-radius:20px;padding:30px 26px 26px;margin-top:8px}
-  .row{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
-  .node{background:var(--panel-2);border:1px solid var(--line);border-radius:13px;padding:13px 16px;min-width:150px;text-align:center}
-  .node .t{font-weight:650;font-size:14px}
-  .node .s{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:3px}
-  .node.frozen{border-style:dashed;border-color:#3a4a6e}
-  .node.io{background:transparent;border-color:#2b3656;color:var(--muted)}
-  .node.geo{border-color:rgba(106,213,255,.45);box-shadow:0 0 0 1px rgba(106,213,255,.12) inset}
-  .node.act{border-color:rgba(169,139,255,.45);box-shadow:0 0 0 1px rgba(169,139,255,.12) inset}
-  .node .frozen-badge{display:inline-block;font-family:var(--mono);font-size:9.5px;color:var(--dim);border:1px solid var(--line);border-radius:5px;padding:1px 5px;margin-top:6px}
-  .trunk{margin:16px auto;max-width:640px;background:linear-gradient(180deg,rgba(106,213,255,.08),rgba(169,139,255,.08));
-    border:1px solid var(--line);border-radius:15px;padding:18px}
-  .trunk .ttl{text-align:center;font-weight:700;font-size:15px;margin-bottom:14px}
-  .streams{display:flex;gap:14px;align-items:stretch}
-  .stream{flex:1;border-radius:11px;padding:14px;text-align:center}
-  .stream.state{background:rgba(106,213,255,.07);border:1px solid rgba(106,213,255,.32)}
-  .stream.action{background:rgba(169,139,255,.07);border:1px solid rgba(169,139,255,.32)}
-  .stream .st{font-weight:650;font-size:13.5px}
-  .stream .ss{font-size:12px;color:var(--muted);margin-top:5px}
-  .xattn{display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--dim);font-family:var(--mono);font-size:10px;padding:0 2px}
-  .xattn .ar{font-size:18px;color:var(--muted);line-height:1}
-  .arrow{display:flex;justify-content:center;color:var(--dim);font-size:20px;margin:6px 0}
-  .heads{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:6px}
-  .head{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:11px 13px;min-width:118px;text-align:center;font-size:12.5px}
-  .head.core{border-color:rgba(106,213,255,.5);background:linear-gradient(180deg,rgba(106,213,255,.10),var(--panel))}
-  .head .ht{font-weight:650}
-  .head .hs{color:var(--dim);font-size:11px;margin-top:3px}
-  .head.render{border-style:dashed}
-  .legend{display:flex;gap:18px;flex-wrap:wrap;justify-content:center;margin-top:20px;font-size:12px;color:var(--muted)}
-  .legend span{display:inline-flex;align-items:center;gap:7px}
-  .swatch{width:14px;height:14px;border-radius:4px;border:1px solid var(--line)}
-  .loop-note{text-align:center;margin-top:18px;font-family:var(--mono);font-size:12.5px;color:var(--muted)}
-  .loop-note b{color:var(--accent-2)}
+  /* ---------- sections ---------- */
+  section{padding:68px 0}
+  section + section{border-top:1px solid var(--line)}
+  .alt{background:var(--bg-alt)}
+  .head{text-align:center;max-width:680px;margin:0 auto 40px}
+  .head .eyebrow{margin-bottom:12px}
+  h2{font-family:var(--serif);font-weight:600;font-size:clamp(24px,3.2vw,32px);letter-spacing:-.01em}
+  .head p{color:var(--muted);margin:14px auto 0;font-size:16px}
+  p.lead{font-size:16.5px}
 
-  /* ---------- demos ---------- */
-  .gallery{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin-top:8px}
-  .demo{background:var(--panel);border:1px solid var(--line);border-radius:15px;overflow:hidden}
-  .demo img{display:block;width:100%;height:auto;background:#05080f}
-  .demo .cap{padding:12px 15px;display:flex;align-items:center;justify-content:space-between;gap:10px}
-  .demo .cap .name{font-weight:650;font-size:14px}
-  .demo .cap .emb{font-family:var(--mono);font-size:11px;color:var(--accent)}
-  .demo .lr{font-family:var(--mono);font-size:10.5px;color:var(--dim);padding:0 15px 12px}
-  .feature{grid-column:1/-1;background:linear-gradient(180deg,var(--panel),var(--bg-soft));
-    border:1px solid rgba(169,139,255,.35);border-radius:15px;overflow:hidden}
-  .feature .body{padding:16px 18px}
-  .feature h3{font-size:16px;display:flex;align-items:center;gap:9px}
-  .feature p{color:var(--muted);font-size:14px;margin:8px 0 0}
-  .feature img{width:100%;border-top:1px solid var(--line)}
+  /* positioning cards */
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:840px;margin:0 auto}
+  .card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:24px}
+  .card.alt-card{background:#fcfcfd}
+  .card .tag{font-family:var(--mono);font-size:11px;letter-spacing:.06em;padding:3px 9px;border-radius:5px;border:1px solid var(--line-strong);color:var(--muted)}
+  .card.is-new{border-color:#cfddf7}
+  .card.is-new .tag{color:var(--blue);border-color:#cfddf7;background:var(--blue-bg)}
+  .card h3{font-size:16px;margin:14px 0 8px}
+  .card p{margin:0;color:var(--muted);font-size:14.5px;line-height:1.6}
+  .keynote{max-width:760px;margin:28px auto 0;padding:18px 22px;border-left:3px solid var(--blue);
+    background:var(--blue-bg);border-radius:0 8px 8px 0;font-size:15px;color:var(--ink-soft)}
+  .keynote b{color:var(--ink)}
 
-  /* ---------- metrics ---------- */
-  .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:26px}
-  .metric{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:18px}
-  .metric .v{font-family:var(--mono);font-size:26px;font-weight:700;color:var(--ink)}
-  .metric.good .v{color:var(--good)}
-  .metric .k{font-size:12.5px;color:var(--muted);margin-top:4px}
-  .metric .d{font-size:11.5px;color:var(--dim);margin-top:6px}
-  .note{margin-top:18px;font-size:13px;color:var(--dim);border-left:2px solid var(--line);padding-left:14px}
+  /* ---------- architecture ---------- */
+  .arch{max-width:760px;margin:0 auto;border:1px solid var(--line);border-radius:14px;background:#fff;padding:28px 24px}
+  .arow{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+  .node{background:#fff;border:1px solid var(--line-strong);border-radius:10px;padding:11px 15px;min-width:138px;text-align:center}
+  .node .t{font-weight:600;font-size:14px;color:var(--ink)}
+  .node .s{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-top:3px}
+  .node.io{background:var(--bg-alt);border-style:none;border:1px solid var(--line)}
+  .node.geo{background:var(--blue-bg);border-color:#cfddf7}
+  .node.geo .t{color:var(--blue)}
+  .node.frozen .s::before{content:"❄ ";color:var(--faint)}
+  .chev{display:flex;justify-content:center;color:var(--faint);font-size:15px;margin:9px 0;font-family:var(--mono)}
+  .chev small{font-size:11px;color:var(--faint)}
+  .trunk{margin:12px auto;border:1px solid var(--line-strong);border-radius:12px;background:var(--bg-alt);padding:18px}
+  .trunk .tt{text-align:center;font-weight:600;font-size:14px;color:var(--ink);margin-bottom:14px}
+  .streams{display:flex;gap:12px;align-items:stretch}
+  .stream{flex:1;border-radius:9px;padding:13px;text-align:center;background:#fff;border:1px solid var(--line)}
+  .stream.s-state{border-color:#cfddf7;background:var(--blue-bg)}
+  .stream.s-act{border-color:#e0d4f1;background:var(--plum-bg)}
+  .stream .nm{font-weight:600;font-size:13px;color:var(--ink)}
+  .stream.s-state .nm{color:var(--blue)} .stream.s-act .nm{color:var(--plum)}
+  .stream .ds{font-size:12px;color:var(--muted);margin-top:5px;line-height:1.45}
+  .xa{display:flex;flex-direction:column;justify-content:center;align-items:center;color:var(--faint);font-family:var(--mono);font-size:10px;min-width:34px}
+  .xa b{font-size:17px;color:var(--muted);font-weight:400}
+  .heads{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:4px}
+  .hd{background:#fff;border:1px solid var(--line);border-radius:9px;padding:10px 12px;min-width:112px;text-align:center}
+  .hd.core{border-color:#cfddf7;background:var(--blue-bg)}
+  .hd .ht{font-weight:600;font-size:12.5px;color:var(--ink)}
+  .hd .hs{font-size:11px;color:var(--muted);margin-top:2px}
+  .hd.render{border-style:dashed}
+  .loop{text-align:center;margin-top:18px;font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+  .loop b{color:var(--plum)}
+  .legend{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin-top:18px;font-size:12.5px;color:var(--muted)}
+  .legend i{width:12px;height:12px;border-radius:3px;display:inline-block;vertical-align:-1px;margin-right:6px;border:1px solid var(--line-strong)}
 
   /* ---------- training & data ---------- */
-  .bigstats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:8px}
-  .bigstat{background:linear-gradient(180deg,var(--panel),var(--bg-soft));border:1px solid var(--line);border-radius:14px;padding:20px 18px;text-align:center}
-  .bigstat .v{font-family:var(--mono);font-size:30px;font-weight:750;color:var(--accent)}
-  .bigstat .k{font-size:12.5px;color:var(--muted);margin-top:6px}
-  .split2{display:grid;grid-template-columns:1.15fr 1fr;gap:18px;margin-top:22px}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px 22px}
-  .panel h3{font-size:15px;display:flex;align-items:center;gap:9px;margin-bottom:14px}
-  .panel h3 .ic{width:9px;height:9px;border-radius:3px}
-  .kv{display:grid;grid-template-columns:auto 1fr;gap:9px 16px;font-size:13.5px}
-  .kv dt{color:var(--muted)}
-  .kv dd{margin:0;font-family:var(--mono);font-size:12.5px;color:var(--ink);text-align:right}
-  .dtbl{width:100%;border-collapse:collapse;font-size:13px;margin-top:2px}
-  .dtbl th,.dtbl td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left}
-  .dtbl td.num,.dtbl th.num{text-align:right;font-family:var(--mono);font-size:12px}
-  .dtbl th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-  .dtbl tfoot td{font-family:var(--mono);font-weight:700;color:var(--accent);border-bottom:none}
-  .demo-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 13px;border-radius:999px;
-    background:linear-gradient(100deg,rgba(106,213,255,.16),rgba(169,139,255,.16));
-    border:1px solid rgba(106,213,255,.4);font-family:var(--mono);font-size:12px;color:var(--accent);margin-bottom:14px}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;max-width:840px;margin:0 auto 30px}
+  .stat{text-align:center;padding:20px 12px;border:1px solid var(--line);border-radius:12px;background:#fff}
+  .stat .v{font-family:var(--serif);font-size:30px;font-weight:600;color:var(--ink)}
+  .stat .k{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.4}
+  .split{display:grid;grid-template-columns:1.1fr .9fr;gap:22px;max-width:880px;margin:0 auto;align-items:start}
+  .panel{border:1px solid var(--line);border-radius:12px;background:#fff;padding:22px 24px}
+  .panel h3{font-size:15px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+  .panel h3 i{width:8px;height:8px;border-radius:2px;display:inline-block}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;font-size:14px}
+  .kv dt{color:var(--muted)} .kv dd{margin:0;text-align:right;font-family:var(--mono);font-size:13px;color:var(--ink)}
 
-  /* ---------- heads table ---------- */
-  table{width:100%;border-collapse:collapse;margin-top:6px;font-size:14px}
-  th,td{text-align:left;padding:12px 14px;border-bottom:1px solid var(--line)}
-  th{color:var(--muted);font-weight:600;font-size:12.5px;letter-spacing:.04em;text-transform:uppercase}
-  td .nm{font-weight:640}
-  td.role{color:var(--muted)}
-  tr td:first-child{white-space:nowrap}
-  .badge{font-family:var(--mono);font-size:10.5px;padding:2px 7px;border-radius:6px;border:1px solid var(--line);color:var(--dim)}
-  .badge.core{color:var(--accent);border-color:rgba(106,213,255,.4)}
-  .badge.render{color:var(--accent-2);border-color:rgba(169,139,255,.4)}
+  /* tables */
+  table{width:100%;border-collapse:collapse;font-size:14.5px}
+  caption{caption-side:top;text-align:left}
+  th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:13px}
+  tfoot td{font-weight:700;color:var(--ink);border-bottom:none;font-family:var(--mono)}
+  .tnote{font-size:13.5px;color:var(--muted);margin-top:14px;max-width:760px}
+  .data-table{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .data-table th,.data-table td{padding:10px 16px}
 
-  /* ---------- status ---------- */
-  .status{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:8px}
-  .st-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}
-  .st-card .h{display:flex;align-items:center;gap:9px;font-weight:680;font-size:15px}
-  .st-card p{color:var(--muted);font-size:13.5px;margin:10px 0 0}
-  .chk{font-family:var(--mono);font-size:12px}
-  .chk.done{color:var(--good)} .chk.prog{color:var(--warn)} .chk.todo{color:var(--dim)}
+  /* ---------- demos ---------- */
+  .gallery{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:880px;margin:0 auto}
+  .fig{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:#fff}
+  .fig img{display:block;width:100%}
+  .fig .cap{padding:12px 16px;display:flex;justify-content:space-between;align-items:baseline;gap:10px;border-top:1px solid var(--line)}
+  .fig .cap .n{font-weight:600;font-size:14px;color:var(--ink)}
+  .fig .cap .e{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .span2{grid-column:1/-1}
+  .cf{border:1px solid #e0d4f1;border-radius:12px;overflow:hidden;background:var(--plum-bg)}
+  .cf .body{padding:16px 20px}
+  .cf h4{font-size:15px;color:var(--plum)}
+  .cf p{margin:7px 0 0;font-size:14px;color:var(--ink-soft)}
+  .cf img{width:100%;display:block;border-top:1px solid #e0d4f1}
 
-  footer{padding:48px 0 70px;color:var(--dim);font-size:13px;text-align:center;border-top:1px solid rgba(40,50,81,.5)}
-  .honest{background:linear-gradient(180deg,rgba(255,206,106,.06),transparent);border:1px solid rgba(255,206,106,.25);
-    border-radius:14px;padding:18px 20px;margin-top:26px}
-  .honest b{color:var(--warn)}
-  .backlink{position:fixed;top:16px;left:18px;z-index:50;font-family:var(--mono);font-size:12.5px;
-    color:var(--muted);background:rgba(10,14,26,.6);backdrop-filter:blur(8px);
-    border:1px solid var(--line);border-radius:999px;padding:7px 14px}
-  .backlink:hover{color:var(--ink);border-color:var(--accent)}
-  @media(max-width:760px){
+  .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;max-width:840px;margin:34px auto 0}
+  .m{border:1px solid var(--line);border-radius:10px;padding:16px 18px;background:#fff}
+  .m .v{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--ink)}
+  .m.key .v{color:var(--teal)}
+  .m .k{font-size:13px;color:var(--ink);margin-top:4px}
+  .m .d{font-size:12px;color:var(--muted);margin-top:4px}
+
+  /* triptych */
+  .trip{max-width:820px;margin:0 auto}
+  .trip .legend3{display:flex;justify-content:space-around;font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:8px;gap:8px}
+  .trip .legend3 span{flex:1;text-align:center}
+  .trip .fig{margin-bottom:16px}
+
+  /* status */
+  .cards3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;max-width:880px;margin:0 auto 26px}
+  .sc{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px}
+  .sc .h{font-weight:600;font-size:15px;color:var(--ink);display:flex;align-items:center;gap:8px}
+  .sc p{font-size:13.5px;color:var(--muted);margin:9px 0 0}
+  .mk{font-family:var(--mono);font-size:13px}
+  .mk.done{color:var(--teal)} .mk.prog{color:var(--amber)} .mk.todo{color:var(--faint)}
+  .road{max-width:880px;margin:0 auto}
+
+  footer{padding:46px 0 64px;border-top:1px solid var(--line);text-align:center}
+  footer p{color:var(--muted);font-size:14px;max-width:680px;margin:0 auto 10px}
+  footer .fin{font-size:13px;color:var(--faint)}
+
+  @media(max-width:740px){
     .backlink{position:absolute}
-    .thesis,.gallery,.metrics,.status,.split2{grid-template-columns:1fr}
-    .bigstats{grid-template-columns:repeat(2,1fr)}
+    .two,.split,.gallery,.metrics,.cards3{grid-template-columns:1fr}
+    .stats{grid-template-columns:repeat(2,1fr)}
     .streams{flex-direction:column}
-    .node{min-width:120px}
+    .kv dd{text-align:left}
   }
 </style>
 </head>
@@ -192,319 +197,318 @@
 
 <a href="/" class="backlink">← Mingquan Liu</a>
 
+<!-- ===================== HERO ===================== -->
 <header>
-  <div class="hero-grid"></div>
   <div class="wrap">
-    <div class="eyebrow">World Model · Embodied AI · 2026</div>
-    <h1>WM3D — modeling the future in<br><span class="grad">native 3D</span>, not in 2D video.</h1>
-    <p class="lede">
-      Most world models predict the future in pixel or video-latent space. WM3D moves the
-      world state onto explicit 3D geometry — <b>world points + camera pose + depth</b>,
-      read out by a frozen feed-forward 3D foundation model (VGGT) — and predicts how a
-      <b>given action chunk</b> pushes that geometry forward in time. For embodied
-      manipulation, modeling the world in 3D is the more physically grounded, more
-      transferable route.
-    </p>
-    <div class="hero-tags">
-      <span class="pill"><span class="dot" style="background:var(--good)"></span> 1B trunk trained end-to-end</span>
-      <span class="pill"><span class="dot" style="background:var(--accent)"></span> 160k OXE real-robot windows</span>
-      <span class="pill"><span class="dot" style="background:var(--accent-2)"></span> VGGT pointmap + pose as world state</span>
-      <span class="pill"><span class="dot" style="background:var(--warn)"></span> Native-3D variant in training</span>
+    <div class="eyebrow">World Model · Embodied AI</div>
+    <h1>WM3D: A Native-3D <em>Action-Conditioned</em> World Model</h1>
+    <p class="tagline">Most world models predict the future in 2D video. WM3D predicts it in
+      explicit 3D geometry — world points, camera pose, and depth — and conditions that
+      prediction on the robot's action.</p>
+    <div class="byline"><b>Mingquan Liu</b> · 2026</div>
+    <div class="links">
+      <a class="lnk solid" href="#demos">View demos</a>
+      <a class="lnk" href="/posts/2026/06/wm3d-native-3d-world-model/">Blog post</a>
+      <a class="lnk" href="#method">Method</a>
     </div>
-    <div class="cta">
-      <a class="btn primary" href="#demos">See predictions ↓</a>
-      <a class="btn ghost" href="#arch">How it works</a>
+    <div class="demo-tag">Results shown are from the current 1B model</div>
+
+    <div class="teaser">
+      <figure>
+        <img src="assets/hero_architecture.png" alt="WM3D native-3D action-conditioned world model architecture" />
+        <figcaption>Frozen VGGT / Qwen encoders turn observations into native-3D tokens; a
+          dual-stream JointWorldModel predicts the future under a given action; pluggable heads
+          land it as geometry, pixels, scores, proposals, and Hunyuan video — closing the
+          propose → imagine → rank → execute loop.</figcaption>
+      </figure>
     </div>
   </div>
 </header>
 
-<!-- POSITIONING -->
+<!-- ===================== WHY ===================== -->
 <section id="why">
   <div class="wrap">
-    <div class="kicker">
+    <div class="head">
       <div class="eyebrow">Positioning</div>
       <h2>Why native 3D?</h2>
-      <p class="sub">A single video frame is consistent with many different 3D structures and
-        camera motions. In 2D, the coupling between <i>action</i> and <i>geometry</i> stays
-        implicit — the model is good at "looks like", not at "is physically right, and can I
-        act on it." WM3D makes the 3D structure the thing being predicted.</p>
+      <p>A single video frame is consistent with many different 3D structures and camera
+        motions. In 2D, the link between action and geometry stays implicit. WM3D makes the
+        3D structure itself the thing being predicted.</p>
     </div>
-    <div class="thesis">
-      <div class="card old">
-        <h3><span class="tag old">2D / VIDEO LATENT</span> The mainstream</h3>
-        <p>Dreamer, GAIA, Genie, DIAMOND/IRIS, Sora-as-world-model. State = video latent or
-           RGB frame; at most depth-augmented 2.5D. Action→geometry causality is a byproduct
-           of texture prediction.</p>
+    <div class="two">
+      <div class="card alt-card">
+        <span class="tag">2D / video latent</span>
+        <h3>The mainstream</h3>
+        <p>Dreamer, GAIA, Genie, DIAMOND/IRIS, Sora-as-world-model. The state is a video
+          latent or RGB frame — at most depth-augmented 2.5D. Action→geometry causality is a
+          byproduct of predicting texture.</p>
       </div>
-      <div class="card new">
-        <h3><span class="tag new">NATIVE 3D</span> WM3D</h3>
-        <p>State = explicit 3D — world points (pointmap) + camera pose + depth. The model
-           predicts <b>where the action moves the scene's 3D structure</b>, making
-           action→geometry an explicit training target, not a side effect of pixels.</p>
+      <div class="card is-new">
+        <span class="tag">native 3D</span>
+        <h3>WM3D</h3>
+        <p>The state is explicit 3D — world points (pointmap) + camera pose + depth. The model
+          predicts <b>where the action moves the scene's 3D structure</b>, so action→geometry
+          is a direct training target, not a side effect of pixels.</p>
       </div>
     </div>
-    <div class="honest">
-      <b>Honest boundary.</b> 3D-aware generation is a heating-up area — we make no
-      "world-first" claim. What is uncommon and defensible is using VGGT-style feed-forward
-      3D (pointmap + pose) <i>as the world model's state and supervision target</i>, and
-      wiring it as the world engine of a VLA closed loop.
+    <div class="keynote">
+      <b>The differentiator:</b> using VGGT-style feed-forward 3D (pointmap + pose) as the
+      world model's <i>state and supervision target</i>, and wiring it as the world engine of a
+      vision-language-action closed loop.
     </div>
   </div>
 </section>
 
-<!-- ARCHITECTURE -->
-<section id="arch">
+<!-- ===================== METHOD ===================== -->
+<section id="method" class="alt">
   <div class="wrap">
-    <div class="kicker">
+    <div class="head">
       <div class="eyebrow">Method</div>
-      <h2>One dual-stream trunk, many pluggable heads</h2>
-      <p class="sub">A frozen VGGT turns observations into native-3D tokens. A dual-stream
-        trunk predicts the <i>future</i> 3D tokens conditioned on an action chunk. Pluggable
-        heads land that prediction as geometry, pixels, scores, proposals, or video.</p>
+      <h2>One dual-stream trunk, many heads</h2>
+      <p>A frozen VGGT turns each observation into native-3D tokens. A dual-stream trunk
+        predicts the <i>future</i> 3D tokens, conditioned on an action chunk. Pluggable heads
+        land that prediction as geometry, pixels, scores, proposals, or video.</p>
     </div>
 
     <div class="arch">
-      <!-- inputs -->
-      <div class="row">
+      <div class="arow">
         <div class="node io"><div class="t">Past RGB</div><div class="s">16 frames</div></div>
-        <div class="node io"><div class="t">Task text</div><div class="s">natural language</div></div>
-        <div class="node io"><div class="t">Future actions</div><div class="s">k=8 · 7-DoF + gripper</div></div>
+        <div class="node io"><div class="t">Task text</div><div class="s">language</div></div>
+        <div class="node io"><div class="t">Future actions</div><div class="s">k=8 · 7-DoF + grip</div></div>
       </div>
-      <div class="arrow">↓</div>
-      <!-- encoders -->
-      <div class="row">
-        <div class="node geo frozen"><div class="t">VGGT</div><div class="s">3D geometry tokenizer</div><div class="frozen-badge">FROZEN</div></div>
-        <div class="node frozen"><div class="t">Qwen3-VL</div><div class="s">text encoder</div><div class="frozen-badge">FROZEN</div></div>
+      <div class="chev">▼</div>
+      <div class="arow">
+        <div class="node geo frozen"><div class="t">VGGT</div><div class="s">frozen · 3D tokenizer</div></div>
+        <div class="node frozen"><div class="t">Qwen3-VL</div><div class="s">frozen · text</div></div>
       </div>
-      <div class="arrow">↓ &nbsp; geometry tokens [16, 64, 2048] &nbsp; + &nbsp; text · action embeddings</div>
+      <div class="chev"><small>geometry tokens [16, 64, 2048] + text · action embeddings</small></div>
 
-      <!-- trunk -->
       <div class="trunk">
-        <div class="ttl">JointWorldModel — single end-to-end forward</div>
+        <div class="tt">JointWorldModel — single end-to-end forward</div>
         <div class="streams">
-          <div class="stream state">
-            <div class="st">State Stream <span style="color:var(--accent)">(main)</span></div>
-            <div class="ss">3D-token dynamics → predicts <b>future VGGT state tokens</b> [k=8, 64, 2048]</div>
+          <div class="stream s-state">
+            <div class="nm">State Stream (main)</div>
+            <div class="ds">3D-token dynamics → predicts future VGGT state tokens [k=8, 64, 2048]</div>
           </div>
-          <div class="xattn"><div class="ar">⇄</div>bi-dir<br>cross-attn</div>
-          <div class="stream action">
-            <div class="st">Action Stream / IDM</div>
-            <div class="ss">infers latent action <span style="font-family:var(--mono)">z<sub>a</sub></span> via inverse dynamics</div>
+          <div class="xa"><b>⇄</b>cross-<br>attn</div>
+          <div class="stream s-act">
+            <div class="nm">Action Stream / IDM</div>
+            <div class="ds">infers latent action z<sub>a</sub> by inverse dynamics</div>
           </div>
         </div>
       </div>
-      <div class="arrow">↓ &nbsp; future world tokens</div>
+      <div class="chev">▼ <small>&nbsp;future world tokens</small></div>
 
-      <!-- heads -->
       <div class="heads">
-        <div class="head core"><div class="ht">Native-3D head</div><div class="hs">world points + camera pose + depth</div></div>
-        <div class="head"><div class="ht">Pixel / context</div><div class="hs">coarse RGB + motion</div></div>
-        <div class="head"><div class="ht">Evaluator</div><div class="hs">progress · feasibility</div></div>
-        <div class="head"><div class="ht">Proposer</div><div class="hs">candidate actions</div></div>
-        <div class="head render"><div class="ht">Hunyuan bridge</div><div class="hs">renderer, not state</div></div>
+        <div class="hd core"><div class="ht">Native-3D</div><div class="hs">points · pose · depth</div></div>
+        <div class="hd"><div class="ht">Pixel</div><div class="hs">coarse RGB + motion</div></div>
+        <div class="hd"><div class="ht">Evaluator</div><div class="hs">progress · feasibility</div></div>
+        <div class="hd"><div class="ht">Proposer</div><div class="hs">candidate actions</div></div>
+        <div class="hd render"><div class="ht">Hunyuan</div><div class="hs">video renderer</div></div>
       </div>
 
-      <div class="loop-note">
-        Closed loop: <b>propose</b> → <b>imagine</b> → <b>rank</b> → <b>execute</b>
-      </div>
-
+      <div class="loop">Closed loop &nbsp;·&nbsp; <b>propose → imagine → rank → execute</b></div>
       <div class="legend">
-        <span><span class="swatch" style="border-color:rgba(106,213,255,.6);background:rgba(106,213,255,.12)"></span> 3D / geometry path</span>
-        <span><span class="swatch" style="border-color:rgba(169,139,255,.6);background:rgba(169,139,255,.12)"></span> action / dynamics path</span>
-        <span><span class="swatch" style="border-style:dashed"></span> frozen / renderer</span>
+        <span><i style="background:var(--blue-bg);border-color:#cfddf7"></i>geometry path</span>
+        <span><i style="background:var(--plum-bg);border-color:#e0d4f1"></i>action path</span>
+        <span><i style="background:#fff;border-style:dashed"></i>frozen / renderer</span>
       </div>
     </div>
-    <p class="note">In one line: frozen VGGT makes observations native-3D → the dual-stream
-      trunk predicts the future in 3D under a given action → heads land it as geometry / pixels
-      / scores / proposals / video. The world state is always 3D; Hunyuan is only a renderer,
-      never the source of state.</p>
+    <p class="tnote" style="margin:18px auto 0;text-align:center">The world state is always 3D;
+      Hunyuan is only a renderer, never the source of state.</p>
   </div>
 </section>
 
-<!-- TRAINING & DATA -->
+<!-- ===================== TRAINING & DATA ===================== -->
 <section id="data">
   <div class="wrap">
-    <div class="kicker">
+    <div class="head">
       <div class="eyebrow">Scale · Data · Recipe</div>
-      <h2>Trained from scratch on ~500 hours of real robot video</h2>
-      <p class="sub">The current <b>1B trunk</b> is pretrained from scratch on 160k action-labeled
-        windows mined from <b>Open X-Embodiment</b> — roughly 500 hours of real-robot footage
-        spanning five embodiments. The full per-dataset and training recipe is below.</p>
+      <h2>Trained from scratch on ~500 hours of robot video</h2>
+      <p>The current 1B trunk is pretrained from scratch on 160k action-labeled windows mined
+        from Open X-Embodiment — roughly 500 hours of real-robot footage across five embodiments.</p>
     </div>
 
-    <div class="bigstats">
-      <div class="bigstat"><div class="v">~497 h</div><div class="k">raw robot video<br>(160k windows · 5 fps)</div></div>
-      <div class="bigstat"><div class="v">8.9 M</div><div class="k">frames sampled<br>into training windows</div></div>
-      <div class="bigstat"><div class="v">5</div><div class="k">robot embodiments<br>across 6 OXE sources</div></div>
-      <div class="bigstat"><div class="v">~1 B</div><div class="k">params · trained<br>from scratch</div></div>
+    <div class="stats">
+      <div class="stat"><div class="v">~497 h</div><div class="k">robot video<br>(160k windows · 5 fps)</div></div>
+      <div class="stat"><div class="v">8.9 M</div><div class="k">frames sampled<br>into windows</div></div>
+      <div class="stat"><div class="v">5</div><div class="k">embodiments<br>· 6 OXE sources</div></div>
+      <div class="stat"><div class="v">~1 B</div><div class="k">parameters<br>from scratch</div></div>
     </div>
 
-    <div class="split2">
-      <!-- DATA panel -->
-      <div class="panel">
-        <h3><span class="ic" style="background:var(--accent)"></span> Data — Open X-Embodiment mix</h3>
-        <table class="dtbl">
-          <thead><tr><th>Dataset</th><th>Embodiment</th><th class="num">Windows</th><th class="num">Hours</th></tr></thead>
-          <tbody>
-            <tr><td>Droid</td><td>Franka</td><td class="num">64,000</td><td class="num">234</td></tr>
-            <tr><td>Bridge</td><td>WidowX</td><td class="num">32,000</td><td class="num">64</td></tr>
-            <tr><td>Taco Play</td><td>Franka</td><td class="num">26,266</td><td class="num">96</td></tr>
-            <tr><td>Fractal (RT-1)</td><td>Google robot</td><td class="num">24,000</td><td class="num">62</td></tr>
-            <tr><td>Jaco Play</td><td>Kinova Jaco</td><td class="num">7,867</td><td class="num">32</td></tr>
-            <tr><td>Kuka</td><td>Kuka iiwa</td><td class="num">5,867</td><td class="num">8</td></tr>
-          </tbody>
-          <tfoot><tr><td>Total</td><td></td><td class="num">160,000</td><td class="num">~497</td></tr></tfoot>
-        </table>
-        <p class="note" style="margin-top:14px">Each window = <b>16 past frames → predict 8 future</b>
-          (stride 4) at 5 fps. Balanced sampling across embodiments; episode-level train/val split (3% val).</p>
+    <div class="split">
+      <div class="panel" style="padding:0;overflow:hidden">
+        <div class="data-table">
+          <table>
+            <thead><tr><th>Dataset</th><th>Embodiment</th><th class="num">Windows</th><th class="num">Hours</th></tr></thead>
+            <tbody>
+              <tr><td>Droid</td><td>Franka</td><td class="num">64,000</td><td class="num">234</td></tr>
+              <tr><td>Bridge</td><td>WidowX</td><td class="num">32,000</td><td class="num">64</td></tr>
+              <tr><td>Taco Play</td><td>Franka</td><td class="num">26,266</td><td class="num">96</td></tr>
+              <tr><td>Fractal (RT-1)</td><td>Google robot</td><td class="num">24,000</td><td class="num">62</td></tr>
+              <tr><td>Jaco Play</td><td>Kinova Jaco</td><td class="num">7,867</td><td class="num">32</td></tr>
+              <tr><td>Kuka</td><td>Kuka iiwa</td><td class="num">5,867</td><td class="num">8</td></tr>
+            </tbody>
+            <tfoot><tr><td>Total</td><td></td><td class="num">160,000</td><td class="num">~497</td></tr></tfoot>
+          </table>
+        </div>
       </div>
-
-      <!-- TRAINING panel -->
       <div class="panel">
-        <h3><span class="ic" style="background:var(--accent-2)"></span> Training recipe</h3>
+        <h3><i style="background:var(--plum)"></i> Training recipe</h3>
         <dl class="kv">
           <dt>Model</dt><dd>~1B · dual-stream</dd>
-          <dt>State Stream</dt><dd>1408 d · 16 L · 16 H</dd>
-          <dt>Action Stream (IDM)</dt><dd>1024 d · 12 L</dd>
-          <dt>Token grid</dt><dd>P=64 · D=2048</dd>
-          <dt>Cross-attn layers</dt><dd>3 · 6 · 9 · 12 · 15</dd>
+          <dt>State Stream</dt><dd>1408d · 16L · 16H</dd>
+          <dt>Action (IDM)</dt><dd>1024d · 12L</dd>
+          <dt>Tokens</dt><dd>P=64 · D=2048</dd>
           <dt>Optimizer</dt><dd>AdamW (0.9, 0.95)</dd>
-          <dt>LR schedule</dt><dd>WSD · 1.2e-5 → 1.2e-6</dd>
-          <dt>Warmup / decay</dt><dd>4k steps · 85/15</dd>
-          <dt>Schedule</dt><dd>4 epochs · 55,952 steps</dd>
-          <dt>Global batch</dt><dd>96 (3/GPU × 32)</dd>
-          <dt>Precision</dt><dd>bf16 · grad-clip 1.0</dd>
-          <dt>Hardware</dt><dd>4 × 8 H100 = 32 GPUs</dd>
+          <dt>LR (WSD)</dt><dd>1.2e-5 → 1.2e-6</dd>
+          <dt>Schedule</dt><dd>4 ep · 55,952 steps</dd>
+          <dt>Global batch</dt><dd>96 (3×32)</dd>
+          <dt>Precision</dt><dd>bf16</dd>
+          <dt>Hardware</dt><dd>32 × H100</dd>
         </dl>
       </div>
     </div>
-    <p class="note">Staged pipeline: Stage0 visual/geometry → Stage1 action-conditioned dynamics
-      → Stage1.5 Hunyuan bridge → Stage2 progress + proposer → Stage3 generation → Run3 closed loop.
-      The numbers above are the Stage0 1B configuration.</p>
+    <p class="tnote" style="margin-left:auto;margin-right:auto;text-align:center">Each window:
+      16 past frames → predict 8 future (stride 4), 5 fps · episode-level 3% val split. Staged
+      pipeline: visual/geometry → dynamics → Hunyuan bridge → progress + proposer → generation → closed loop.</p>
   </div>
 </section>
 
-<!-- DEMOS -->
-<section id="demos">
+<!-- ===================== DEMOS ===================== -->
+<section id="demos" class="alt">
   <div class="wrap">
-    <div class="kicker">
-      <div class="eyebrow">Results · 1B trunk</div>
-      <div class="demo-badge">● 1B-scale demo</div>
+    <div class="head">
+      <div class="eyebrow">Results · prediction</div>
       <h2>Prediction vs. ground truth, across embodiments</h2>
-      <p class="sub">Given past observations and the real action sequence, the model imagines
-        the next frames. <b>Left = model's imagined future, right = real future.</b> Everything
-        shown here is from the current <b>1B world-model trunk</b>, which generalizes across four
-        very different OXE robot embodiments.</p>
+      <p>Left: the model's imagined future. Right: the real future. The same 1B trunk
+        generalizes across four very different OXE robot embodiments.</p>
     </div>
 
     <div class="gallery">
-      <div class="demo">
+      <figure class="fig">
         <img loading="lazy" src="assets/demo_droid.gif" alt="Droid prediction vs ground truth" />
-        <div class="cap"><span class="name">Droid</span><span class="emb">Franka · 7-DoF</span></div>
-        <div class="lr">left: imagined &nbsp;·&nbsp; right: ground truth</div>
-      </div>
-      <div class="demo">
+        <figcaption class="cap"><span class="n">Droid</span><span class="e">Franka · 7-DoF</span></figcaption>
+      </figure>
+      <figure class="fig">
         <img loading="lazy" src="assets/demo_bridge.gif" alt="Bridge prediction vs ground truth" />
-        <div class="cap"><span class="name">Bridge</span><span class="emb">WidowX · tabletop</span></div>
-        <div class="lr">left: imagined &nbsp;·&nbsp; right: ground truth</div>
-      </div>
-      <div class="demo">
-        <img loading="lazy" src="assets/demo_fractal.gif" alt="Fractal / RT-1 prediction vs ground truth" />
-        <div class="cap"><span class="name">Fractal (RT-1)</span><span class="emb">Everyday Robot</span></div>
-        <div class="lr">left: imagined &nbsp;·&nbsp; right: ground truth</div>
-      </div>
-      <div class="demo">
+        <figcaption class="cap"><span class="n">Bridge</span><span class="e">WidowX · tabletop</span></figcaption>
+      </figure>
+      <figure class="fig">
+        <img loading="lazy" src="assets/demo_fractal.gif" alt="Fractal prediction vs ground truth" />
+        <figcaption class="cap"><span class="n">Fractal (RT-1)</span><span class="e">Google robot</span></figcaption>
+      </figure>
+      <figure class="fig">
         <img loading="lazy" src="assets/demo_jaco.gif" alt="Jaco Play prediction vs ground truth" />
-        <div class="cap"><span class="name">Jaco Play</span><span class="emb">Kinova Jaco</span></div>
-        <div class="lr">left: imagined &nbsp;·&nbsp; right: ground truth</div>
-      </div>
+        <figcaption class="cap"><span class="n">Jaco Play</span><span class="e">Kinova Jaco</span></figcaption>
+      </figure>
 
-      <div class="feature">
+      <div class="cf span2">
         <div class="body">
-          <h3><span class="dot" style="width:8px;height:8px;background:var(--accent-2)"></span> Action-conditioned counterfactual</h3>
-          <p>Same starting observation, different action chunks fed to the model — the imagined
-             future diverges with the action. This is the signal that the model is conditioning
-             on actions, not just replaying texture.</p>
+          <h4>Action-conditioned counterfactual</h4>
+          <p>Same starting observation, different action chunks — the imagined future diverges
+            with the action. Evidence the model conditions on actions, not just replays texture.</p>
         </div>
-        <img loading="lazy" src="assets/counterfactual_droid.gif" alt="Counterfactual: different actions, different imagined futures" />
+        <img loading="lazy" src="assets/counterfactual_droid.gif" alt="Counterfactual: different actions, different futures" />
       </div>
     </div>
 
-    <!-- metrics -->
     <div class="metrics">
-      <div class="metric good"><div class="v">0.9946</div><div class="k">State-token cosine</div><div class="d">predicted future world tokens vs. truth</div></div>
-      <div class="metric"><div class="v">0.0446</div><div class="k">State MSE</div><div class="d">state regression error</div></div>
-      <div class="metric good"><div class="v">0.0411</div><div class="k">Depth relative-L1</div><div class="d">≈ 4% relative depth error</div></div>
-      <div class="metric good"><div class="v">6.7e-6</div><div class="k">Camera-pose MSE</div><div class="d">extrinsics near-exact</div></div>
-      <div class="metric good"><div class="v">1.00</div><div class="k">Gripper open/close acc.</div><div class="d">discrete gripper state</div></div>
-      <div class="metric"><div class="v">0.021 / 0.087</div><div class="k">RGB L1 / LPIPS</div><div class="d">coarse RGB read-out</div></div>
+      <div class="m key"><div class="v">0.9946</div><div class="k">State-token cosine</div><div class="d">predicted future vs. truth</div></div>
+      <div class="m"><div class="v">0.0446</div><div class="k">State MSE</div><div class="d">state regression error</div></div>
+      <div class="m key"><div class="v">0.0411</div><div class="k">Depth rel-L1</div><div class="d">≈ 4% relative error</div></div>
+      <div class="m key"><div class="v">6.7e-6</div><div class="k">Camera-pose MSE</div><div class="d">extrinsics near-exact</div></div>
+      <div class="m key"><div class="v">1.00</div><div class="k">Gripper accuracy</div><div class="d">open/close state</div></div>
+      <div class="m"><div class="v">0.021 / 0.087</div><div class="k">RGB L1 / LPIPS</div><div class="d">coarse RGB read-out</div></div>
     </div>
-    <p class="note">Quantitative metrics over 64 held-out windows. Demos show the best-matching
-      segment per embodiment. All numbers come from the 1B world-model trunk.</p>
+    <p class="tnote" style="margin:16px auto 0;text-align:center">Metrics over 64 held-out windows · 1B trunk.</p>
   </div>
 </section>
 
-<!-- HEADS TABLE -->
-<section id="heads">
+<!-- ===================== HUNYUAN BRIDGE ===================== -->
+<section id="bridge">
   <div class="wrap">
-    <div class="kicker">
+    <div class="head">
+      <div class="eyebrow">Results · Hunyuan video bridge</div>
+      <h2>From rough prediction to rendered video</h2>
+      <p>The model predicts a coarse RGB future; a frozen HunyuanVideo model, steered by a
+        trained control adapter, renders it into detailed video via SDEdit — keeping the
+        predicted structure while supplying texture.</p>
+    </div>
+    <div class="trip">
+      <div class="legend3"><span>① rough WM prediction</span><span>② Hunyuan render</span><span>③ ground truth</span></div>
+      <figure class="fig">
+        <img loading="lazy" src="assets/bridge_hunyuan_droid.gif" alt="Droid — rough vs Hunyuan render vs GT" />
+        <figcaption class="cap"><span class="n">Droid</span><span class="e">SDEdit · strength 0.35 · color-matched</span></figcaption>
+      </figure>
+      <figure class="fig">
+        <img loading="lazy" src="assets/bridge_hunyuan_taco.gif" alt="Taco Play — rough vs Hunyuan render vs GT" />
+        <figcaption class="cap"><span class="n">Taco Play</span><span class="e">SDEdit · strength 0.35 · color-matched</span></figcaption>
+      </figure>
+    </div>
+    <p class="tnote" style="margin:6px auto 0;text-align:center">Three panels per clip: rough WM
+      RGB · Hunyuan render (control-adapter steered) · ground truth. 512×320, 9 frames.</p>
+  </div>
+</section>
+
+<!-- ===================== HEADS ===================== -->
+<section id="system" class="alt">
+  <div class="wrap">
+    <div class="head">
       <div class="eyebrow">System</div>
       <h2>From "see the world" to "evaluate &amp; act"</h2>
-      <p class="sub">One shared trunk grows several pluggable heads spanning the full chain:
+      <p>One shared trunk grows several pluggable heads spanning the full chain:
         perceive → imagine → evaluate → execute.</p>
     </div>
-    <table>
-      <thead><tr><th>Component</th><th>Input → output</th><th>Role</th></tr></thead>
-      <tbody>
-        <tr><td><span class="nm">VGGT tokenizer</span> <span class="badge">frozen</span></td><td>RGB → geometry tokens + points / pose / depth</td><td class="role">The only source of world state — native 3D</td></tr>
-        <tr><td><span class="nm">State Stream</span> <span class="badge core">trunk</span></td><td>past tokens + task + actions → future state tokens</td><td class="role">Action-conditioned dynamics in 3D-token space</td></tr>
-        <tr><td><span class="nm">Native-3D head</span> <span class="badge core">core</span></td><td>state tokens → world points + camera pose + depth</td><td class="role">Lands the prediction as explicit 3D (core output)</td></tr>
-        <tr><td><span class="nm">Pixel / context head</span></td><td>state tokens → coarse RGB + motion</td><td class="role">Lightweight pixel read-out for visualization</td></tr>
-        <tr><td><span class="nm">Action Stream / IDM</span></td><td>adjacent states → latent action z<sub>a</sub></td><td class="role">Inverse dynamics: infer the action from the change</td></tr>
-        <tr><td><span class="nm">Evaluator</span></td><td>imagined rollout → progress / feasibility</td><td class="role">Scores candidate futures for ranking</td></tr>
-        <tr><td><span class="nm">Proposer</span></td><td>state + task → candidate action chunks</td><td class="role">Generates options for the model to imagine</td></tr>
-        <tr><td><span class="nm">BC policy</span></td><td>state + task → action</td><td class="role">Behavior-cloning fallback policy</td></tr>
-        <tr><td><span class="nm">world_prior</span></td><td>task text → world tokens (rectified flow)</td><td class="role">Generate an initial world state from language</td></tr>
-        <tr><td><span class="nm">Hunyuan bridge</span> <span class="badge render">renderer</span></td><td>world tokens → future video</td><td class="role">Renders 3D state to watchable video — not state</td></tr>
-      </tbody>
-    </table>
+    <div style="max-width:840px;margin:0 auto" class="panel">
+      <table>
+        <thead><tr><th>Component</th><th>Input → output</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><b>VGGT tokenizer</b></td><td>RGB → geometry tokens + points / pose / depth</td><td>Only source of world state — native 3D</td></tr>
+          <tr><td><b>State Stream</b></td><td>past tokens + task + actions → future state tokens</td><td>Action-conditioned dynamics in 3D</td></tr>
+          <tr><td><b>Native-3D head</b></td><td>state tokens → world points + pose + depth</td><td>Lands the prediction as explicit 3D</td></tr>
+          <tr><td><b>Pixel head</b></td><td>state tokens → coarse RGB + motion</td><td>Lightweight pixel read-out</td></tr>
+          <tr><td><b>Action Stream / IDM</b></td><td>adjacent states → latent action z<sub>a</sub></td><td>Inverse dynamics</td></tr>
+          <tr><td><b>Evaluator</b></td><td>imagined rollout → progress / feasibility</td><td>Scores candidate futures</td></tr>
+          <tr><td><b>Proposer</b></td><td>state + task → candidate actions</td><td>Generates options to imagine</td></tr>
+          <tr><td><b>Hunyuan bridge</b></td><td>world tokens → future video</td><td>Renders 3D state to video</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </section>
 
-<!-- STATUS / ROADMAP -->
+<!-- ===================== STATUS ===================== -->
 <section id="status">
   <div class="wrap">
-    <div class="kicker">
+    <div class="head">
       <div class="eyebrow">Where we are</div>
-      <h2>Honest status &amp; roadmap</h2>
+      <h2>Status &amp; roadmap</h2>
     </div>
-    <div class="status">
-      <div class="st-card">
-        <div class="h"><span class="chk done">✓</span> Scale feasibility (1B)</div>
-        <p>World-model trunk trained from scratch to ~1B params through the full staged
-           pipeline on 160k OXE windows — high-quality future prediction (above).</p>
+    <div class="cards3">
+      <div class="sc">
+        <div class="h"><span class="mk done">✓</span> Scale (1B)</div>
+        <p>Trunk trained from scratch to ~1B params through the full staged pipeline on 160k
+          OXE windows, with high-quality future prediction.</p>
       </div>
-      <div class="st-card">
-        <div class="h"><span class="chk prog">◐</span> Native-3D variant</div>
-        <p>The counterfactual claim-gate eval protocol is ready; the world-points + pose
-           variant is training now. Full action→geometry causality results land on
-           convergence — not reported yet.</p>
+      <div class="sc">
+        <div class="h"><span class="mk prog">◐</span> Native-3D variant</div>
+        <p>The counterfactual claim-gate protocol is ready and the world-points + pose variant
+          is training now; full action→geometry results follow on convergence.</p>
       </div>
-      <div class="st-card">
-        <div class="h"><span class="chk prog">◐</span> Closed loop (LIBERO)</div>
-        <p>Runner, online tokenizer and action protocol verified by expert replay
-           (success 1.0). Learned closed-loop success rate is still an open item —
-           not reported, to avoid overstating.</p>
+      <div class="sc">
+        <div class="h"><span class="mk prog">◐</span> Closed loop</div>
+        <p>Runner, online tokenizer and action protocol verified by expert replay (success 1.0).
+          Learned closed-loop success rate is the next milestone.</p>
       </div>
     </div>
-
-    <div style="margin-top:26px">
+    <div class="road panel">
       <table>
         <thead><tr><th>#</th><th>Next milestone</th><th>Status</th></tr></thead>
         <tbody>
-          <tr><td>1</td><td>Native-3D × trunk — train world-points + pose variant, run the action-counterfactual gate, report win-rate / geometry metrics</td><td><span class="chk prog">in progress</span></td></tr>
-          <tr><td>2</td><td>Closed-loop success — solve LIBERO contact / placement + evaluator ranking; then extend to CALVIN / SimplerEnv</td><td><span class="chk todo">queued</span></td></tr>
-          <tr><td>3</td><td>3D consistency metrics — standardize world_point_l1, camera_pose_enc_mse, counterfactual win-rate as comparable public numbers</td><td><span class="chk todo">queued</span></td></tr>
+          <tr><td>1</td><td>Train the native-3D variant; run the action-counterfactual gate; report win-rate / geometry metrics</td><td><span class="mk prog">in progress</span></td></tr>
+          <tr><td>2</td><td>Closed-loop success on LIBERO (contact / placement + evaluator ranking); then CALVIN / SimplerEnv</td><td><span class="mk todo">queued</span></td></tr>
+          <tr><td>3</td><td>Standardize world_point_l1, camera_pose_enc_mse, counterfactual win-rate as comparable numbers</td><td><span class="mk todo">queued</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -513,13 +517,10 @@
 
 <footer>
   <div class="wrap">
-    <p style="max-width:720px;margin:0 auto 14px;color:var(--muted)">
-      <b style="color:var(--ink)">WM3D</b> moves the world model's state from 2D video to native 3D
-      (VGGT world points + camera pose), letting actions act directly on geometry — a more
-      grounded route toward embodied execution. The pipeline runs at 1B scale with high-quality
-      prediction; the native-3D variant is the core experiment currently in training.
-    </p>
-    <p>WM3D project page · 2026-06-08 · by <a href="/">Mingquan Liu</a></p>
+    <p>WM3D moves the world model's state from 2D video to native 3D (VGGT world points +
+      camera pose), letting actions act directly on geometry. The pipeline runs at 1B scale with
+      high-quality prediction; the native-3D variant is the core experiment in training.</p>
+    <p class="fin">WM3D project page · 2026 · by <a href="/">Mingquan Liu</a></p>
   </div>
 </footer>
 
