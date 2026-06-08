@@ -133,6 +133,8 @@ WM3D 是「单主干、多功能头」的设计 —— 一个共享的双流主�
 
 ### 4.1 预测质量(1B 主干)
 
+> **能力 · 动作条件下的原生三维未来预测** — 输入:过去视频(16 帧)+ 任务文本 + 动作块 → 输出:未来三维状态(world points · 相机位姿 · 深度)+ 世界模型自带的粗 RGB 视频。
+
 给定过去观测 + 真实动作,模型对未来若干帧做想象,与真值并排对比 —— 选取效果最佳的一段:
 
 ![1B 预测 vs 真值(Droid)](./assets/1b_demo_droid_pred_vs_gt.gif)
@@ -156,6 +158,8 @@ WM3D 是「单主干、多功能头」的设计 —— 一个共享的双流主�
 
 ### 4.3 视频桥渲染(Hunyuan)
 
+> **能力 · 把预测渲染成逼真视频** — 输入:世界模型的粗 RGB 预测 → 输出:细节视频(冻结 HunyuanVideo + 控制适配器,SDEdit;保留世界模型预测的结构,补足纹理)。
+
 世界模型只预测**粗 RGB 未来**;一个**冻结的 HunyuanVideo** 扩散模型,在我们训练的控制适配器(control adapter)引导下,通过 **SDEdit** 把粗预测渲染为**细节视频** —— 把粗预测编码进 latent、加部分噪声(strength = 0.35)再去噪,从而**保留世界模型预测的结构**,由 Hunyuan 补足纹理与细节。世界状态始终是三维的,Hunyuan 只是渲染器。
 
 ![Droid 三联:粗预测 → Hunyuan 渲染 → 真值](./assets/bridge_hunyuan_droid.gif)
@@ -164,11 +168,41 @@ WM3D 是「单主干、多功能头」的设计 —— 一个共享的双流主�
 
 *每段为三联面板 —— 左:世界模型的粗 RGB;中:控制适配器引导的 Hunyuan 渲染;右:真值。渲染 512×320 / 9 帧,SDEdit strength = 0.35 + 颜色匹配(color-match),把渲染锚定到预测结构。*
 
+### 4.4 文本→视频生成(从噪声,最后一块拼图)
+
+> **能力 · 文本→视频生成** — 输入:任务文本(+可选的世界模型预测)→ 输出:从纯噪声生成的机器人操作视频(30/40 步去噪)。
+
+与 §4.3 的 SDEdit(从粗预测出发精修)不同,这里 HunyuanVideo **从纯噪声**出发完整生成,其 DiT 由我们训练的**控制适配器(control adapter)**引导。控制强度 `control_scale` 是一个旋钮,在「忠于世界模型预测的几何结构」与「自由的文本生成」之间连续权衡。
+
+**(a) 世界模型条件下的从噪声生成(`control_scale = 1.0`)**
+
+DiT 由控制适配器引导,条件为任务文本 + 世界模型预测的未来(30 步去噪)。推理时**不喂入任何粗像素** —— 世界模型的预测只通过控制适配器注入。
+
+![Droid 三联:粗预测 → 从噪声生成 → 真值](./assets/t2v_droid.gif)
+
+![Fractal 三联:粗预测 → 从噪声生成 → 真值](./assets/t2v_fractal.gif)
+
+*每段三联面板 —— 左:世界模型粗 RGB;中:从噪声生成的视频(text→video,控制适配器引导);右:真值。512×320 / 9 帧。提示词:"robot manipulation scene … visible object and gripper motion"。*
+
+**(b) 纯文本→视频(`control_scale = 0`)**
+
+把世界模型的条件**完全关掉**(`control_scale = 0`),同一条推理路径就退化成一个**纯文本→视频生成器**:此时**任务指令是唯一输入**。下面四段各对应一条不同的 LIBERO 指令,从纯噪声生成(40 步去噪),指令标注在每段上方。
+
+![put the yellow and white mug in the microwave and close it](./assets/t2v_libero_00.gif)
+
+![put the white mug on the left plate and put the yellow and white mug on the right plate](./assets/t2v_libero_01.gif)
+
+![put both the alphabet soup and the tomato sauce in the basket](./assets/t2v_libero_02.gif)
+
+![put the black bowl in the bottom drawer of the cabinet and close it](./assets/t2v_libero_03.gif)
+
+*纯文本驱动:自然语言指令进,逼真机器人操作视频出 —— 指令里点名的物体与动作如实出现在画面中。512×320 / 13 帧,`control_scale = 0`。把世界模型条件调回去,则用文本自由度换取对具体场景与几何的锚定(§4.4a / §4.3)。*
+
 ---
 
 ## 5. 初步证据小结
 
-- **规模可行性(1B):** 世界模型主干已从零训练至 **~1B 参数**(State Stream hidden 1408 / 16 层,Action Stream hidden 1024 / 12 层),在 **16 万段 OXE 真实操作窗口**(约 **497 小时**真实机器人视频,Droid / Bridge / Taco / Fractal / Jaco / Kuka,均衡采样)上走通完整阶梯式流水线,并给出高质量的未来预测(见 4.1)与可渲染的视频桥(见 4.3),说明该架构与训练配方在 1B 规模稳定可扩展。
+- **规模可行性(1B):** 世界模型主干已从零训练至 **~1B 参数**(State Stream hidden 1408 / 16 层,Action Stream hidden 1024 / 12 层),在 **16 万段 OXE 真实操作窗口**(约 **497 小时**真实机器人视频,Droid / Bridge / Taco / Fractal / Jaco / Kuka,均衡采样)上走通完整阶梯式流水线,并给出高质量的未来预测(见 4.1)、可渲染的视频桥(见 4.3)与文本→视频生成(见 4.4),说明该架构与训练配方在 1B 规模稳定可扩展。
 - **原生三维表征(进行中):** 动作反事实判据门 `world3d_claim_eval` 的评测协议已就绪,原生三维变体正在训练;待其收敛后,我们将给出动作—三维几何因果有效性的完整指标(这是当前的核心实验,见 §6)。
 - **闭环评测就绪(LIBERO):** 框架与协议经专家回放验证(成功率 1.0);闭环策略成功率为待解项,暂不报告。
 
