@@ -24,6 +24,10 @@ class ActionChunkPolicyConfig:
     max_context: int = 16
     dropout: float = 0.1
     use_task: bool = True
+    patch_pool: str = "mean"
+    max_spatial_tokens: int = 64
+    use_context_rgb: bool = False
+    rgb_spatial_tokens: int = 64
     lowdim_dim: int = 0
     object_state_dim: int = 0
     plan_state_dim: int = 0
@@ -55,6 +59,7 @@ class ActionChunkPolicyConfig:
     waypoint_use_action_history: bool = True
     enable_prior_policy: bool = False
     prior_chunk_layers: int = 1
+    zero_init_output: bool = False
 
 
 class ActionChunkPolicy(nn.Module):
@@ -67,6 +72,8 @@ class ActionChunkPolicy(nn.Module):
             raise ValueError(f"progress_mode must be 'token' or 'summary', got {self.cfg.progress_mode!r}")
         if self.cfg.waypoint_mode not in ("residual", "direct", "aux"):
             raise ValueError(f"waypoint_mode must be residual/direct/aux, got {self.cfg.waypoint_mode!r}")
+        if self.cfg.patch_pool not in ("mean", "task_attn", "last_patches"):
+            raise ValueError(f"patch_pool must be mean/task_attn/last_patches, got {self.cfg.patch_pool!r}")
         self.context_proj = nn.Sequential(
             nn.LayerNorm(self.cfg.token_dim),
             nn.Linear(self.cfg.token_dim, self.cfg.hidden),
@@ -74,6 +81,15 @@ class ActionChunkPolicy(nn.Module):
             nn.Dropout(self.cfg.dropout),
             nn.Linear(self.cfg.hidden, self.cfg.hidden),
         )
+        if self.cfg.patch_pool == "task_attn":
+            self.patch_query = nn.Parameter(torch.zeros(1, 1, self.cfg.hidden))
+            self.patch_task_proj = nn.Sequential(
+                nn.LayerNorm(self.cfg.task_dim),
+                nn.Linear(self.cfg.task_dim, self.cfg.hidden),
+            )
+        else:
+            self.patch_query = None
+            self.patch_task_proj = None
         self.task_proj = nn.Sequential(
             nn.LayerNorm(self.cfg.task_dim),
             nn.Linear(self.cfg.task_dim, self.cfg.hidden),
@@ -139,6 +155,34 @@ class ActionChunkPolicy(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, self.cfg.hidden))
         pos_extra = 5 if self.cfg.use_progress and self.cfg.progress_mode == "token" else 4
         self.pos_embed = nn.Parameter(torch.zeros(1, self.cfg.max_context + pos_extra, self.cfg.hidden))
+        if self.cfg.patch_pool == "last_patches":
+            self.spatial_pos_embed = nn.Parameter(torch.zeros(1, int(self.cfg.max_spatial_tokens), self.cfg.hidden))
+        else:
+            self.spatial_pos_embed = None
+        if self.cfg.use_context_rgb:
+            self.rgb_encoder = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=5, stride=2, padding=2),
+                nn.GroupNorm(8, 64),
+                nn.GELU(),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(16, 128),
+                nn.GELU(),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.GroupNorm(16, 256),
+                nn.GELU(),
+                nn.Conv2d(256, self.cfg.hidden, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+            )
+            self.rgb_grid = int(round(float(self.cfg.rgb_spatial_tokens) ** 0.5))
+            if self.rgb_grid * self.rgb_grid != int(self.cfg.rgb_spatial_tokens):
+                raise ValueError("rgb_spatial_tokens must be a square number")
+            self.rgb_pool = nn.AdaptiveAvgPool2d((self.rgb_grid, self.rgb_grid))
+            self.rgb_pos_embed = nn.Parameter(torch.zeros(1, int(self.cfg.rgb_spatial_tokens), self.cfg.hidden))
+        else:
+            self.rgb_encoder = None
+            self.rgb_grid = 0
+            self.rgb_pool = None
+            self.rgb_pos_embed = None
         enc_layer = nn.TransformerEncoderLayer(
             d_model=self.cfg.hidden,
             nhead=self.cfg.n_heads,
@@ -270,7 +314,13 @@ class ActionChunkPolicy(nn.Module):
     def _reset_parameters(self) -> None:
         nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.pos_embed, std=0.02)
+        if self.spatial_pos_embed is not None:
+            nn.init.normal_(self.spatial_pos_embed, std=0.02)
+        if self.rgb_pos_embed is not None:
+            nn.init.normal_(self.rgb_pos_embed, std=0.02)
         nn.init.normal_(self.horizon_embed, std=0.02)
+        if self.patch_query is not None:
+            nn.init.normal_(self.patch_query, std=0.02)
         if self.prior_horizon_embed is not None:
             nn.init.normal_(self.prior_horizon_embed, std=0.02)
         if self.progress_proj is not None and self.cfg.progress_mode == "summary":
@@ -441,6 +491,7 @@ class ActionChunkPolicy(nn.Module):
         progress_state: torch.Tensor | None = None,
         object_state: torch.Tensor | None = None,
         plan_state: torch.Tensor | None = None,
+        context_rgb: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if context_tokens.ndim != 4:
             raise ValueError(f"context_tokens must be [B,T,P,D], got {tuple(context_tokens.shape)}")
@@ -450,15 +501,64 @@ class ActionChunkPolicy(nn.Module):
         if time > self.cfg.max_context:
             raise ValueError(f"context T={time} exceeds max_context={self.cfg.max_context}")
 
-        frame_tokens = context_tokens.mean(dim=2)
-        frame_h = self.context_proj(frame_tokens)
-        cls = self.cls_token.expand(bsz, -1, -1).to(dtype=frame_h.dtype)
         if self.cfg.use_task:
             if task_emb is None:
                 task_emb = torch.zeros(bsz, self.cfg.task_dim, device=context_tokens.device, dtype=context_tokens.dtype)
             if task_emb.shape != (bsz, self.cfg.task_dim):
                 raise ValueError(f"task_emb must be {(bsz, self.cfg.task_dim)}, got {tuple(task_emb.shape)}")
-            task_h = self.task_proj(task_emb.to(device=context_tokens.device, dtype=frame_h.dtype))[:, None]
+            task_emb_in = task_emb.to(device=context_tokens.device, dtype=context_tokens.dtype)
+        else:
+            task_emb_in = torch.zeros(bsz, self.cfg.task_dim, device=context_tokens.device, dtype=context_tokens.dtype)
+
+        patch_h = self.context_proj(context_tokens.reshape(bsz * time, _patches, dim)).view(
+            bsz,
+            time,
+            _patches,
+            self.cfg.hidden,
+        )
+        extra_spatial_tokens: list[torch.Tensor] = []
+        if self.cfg.patch_pool == "task_attn":
+            if self.patch_query is None or self.patch_task_proj is None:
+                raise RuntimeError("task_attn patch pool is not initialized")
+            query = self.patch_query.to(device=context_tokens.device, dtype=patch_h.dtype)
+            if self.cfg.use_task:
+                query = query + self.patch_task_proj(task_emb_in.to(dtype=patch_h.dtype))[:, None]
+            logits = (patch_h * query[:, None]).sum(dim=-1) * (self.cfg.hidden ** -0.5)
+            attn = logits.softmax(dim=2)
+            frame_h = (patch_h * attn[..., None]).sum(dim=2)
+        elif self.cfg.patch_pool == "last_patches":
+            frame_h = patch_h.mean(dim=2)
+            max_spatial = int(self.cfg.max_spatial_tokens)
+            if _patches > max_spatial:
+                raise ValueError(f"context patches={_patches} exceeds max_spatial_tokens={max_spatial}")
+            spatial_tokens = patch_h[:, -1]
+            if self.spatial_pos_embed is None:
+                raise RuntimeError("last_patches patch pool is missing spatial_pos_embed")
+            spatial_tokens = spatial_tokens + self.spatial_pos_embed[:, :_patches].to(
+                device=context_tokens.device,
+                dtype=spatial_tokens.dtype,
+            )
+            extra_spatial_tokens.append(spatial_tokens)
+        else:
+            frame_h = patch_h.mean(dim=2)
+        if self.rgb_encoder is not None:
+            if self.rgb_pool is None or self.rgb_pos_embed is None:
+                raise RuntimeError("context RGB branch is not initialized")
+            if context_rgb is None:
+                context_rgb = torch.zeros(bsz, 3, 256, 256, device=context_tokens.device, dtype=context_tokens.dtype)
+            context_rgb = context_rgb.to(device=context_tokens.device, dtype=frame_h.dtype)
+            if context_rgb.ndim != 4 or context_rgb.shape[:2] != (bsz, 3):
+                raise ValueError(f"context_rgb must be [B,3,H,W], got {tuple(context_rgb.shape)}")
+            rgb_feat = self.rgb_pool(self.rgb_encoder(context_rgb))
+            rgb_tokens = rgb_feat.flatten(2).transpose(1, 2)
+            rgb_tokens = rgb_tokens + self.rgb_pos_embed[:, : rgb_tokens.shape[1]].to(
+                device=rgb_tokens.device,
+                dtype=rgb_tokens.dtype,
+            )
+            extra_spatial_tokens.append(rgb_tokens)
+        cls = self.cls_token.expand(bsz, -1, -1).to(dtype=frame_h.dtype)
+        if self.cfg.use_task:
+            task_h = self.task_proj(task_emb_in.to(dtype=frame_h.dtype))[:, None]
         else:
             task_h = torch.zeros_like(cls)
         aux_tokens = [cls, task_h]
@@ -528,10 +628,22 @@ class ActionChunkPolicy(nn.Module):
             progress_h = self.progress_proj(progress_state.to(device=context_tokens.device, dtype=frame_h.dtype))
             if self.cfg.progress_mode == "token":
                 aux_tokens.append(progress_h[:, None])
+        n_aux = sum(token.shape[1] for token in aux_tokens)
         x = torch.cat([*aux_tokens, frame_h], dim=1)
-        x = x + self.pos_embed[:, : x.shape[1]].to(dtype=x.dtype)
+        x = x + self.pos_embed[:, : x.shape[1]].to(device=x.device, dtype=x.dtype)
+        n_spatial = 0
+        if extra_spatial_tokens:
+            spatial_cat = torch.cat(extra_spatial_tokens, dim=1)
+            n_spatial = int(spatial_cat.shape[1])
+            x = torch.cat([x, spatial_cat], dim=1)
         ctx = self.context_norm(self.context_encoder(x))
-        summary = ctx[:, 0] + 0.5 * ctx[:, 1:-time].mean(dim=1) + 0.5 * ctx[:, -1]
+        frame_ctx = ctx[:, n_aux: n_aux + time]
+        aux_ctx = ctx[:, 1:n_aux]
+        aux_summary = aux_ctx.mean(dim=1) if aux_ctx.shape[1] > 0 else torch.zeros_like(ctx[:, 0])
+        summary = ctx[:, 0] + 0.5 * aux_summary + 0.5 * frame_ctx[:, -1]
+        if n_spatial > 0:
+            spatial_ctx = ctx[:, n_aux + time: n_aux + time + n_spatial]
+            summary = summary + 0.75 * spatial_ctx.mean(dim=1)
         if progress_h is not None and self.cfg.progress_mode == "summary":
             summary = summary + progress_h
         if object_h is not None:

@@ -159,6 +159,21 @@ def _resize_context_depth_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tens
     )[:, 0]
 
 
+def _resize_motion_mask_to_rgb(motion: torch.Tensor, rgb_ref: torch.Tensor) -> torch.Tensor:
+    if motion.ndim != 5 or rgb_ref.ndim != 5:
+        raise ValueError(f"expected motion [B,T,1,H,W] and rgb [B,T,3,H,W], got {tuple(motion.shape)} and {tuple(rgb_ref.shape)}")
+    if motion.shape[0] != rgb_ref.shape[0] or motion.shape[1] != rgb_ref.shape[1]:
+        raise ValueError(f"cannot align motion/rgb leading dims: {tuple(motion.shape)} vs {tuple(rgb_ref.shape)}")
+    if motion.shape[-2:] != rgb_ref.shape[-2:]:
+        b, t = motion.shape[:2]
+        motion = F.interpolate(
+            motion.float().flatten(0, 1),
+            size=rgb_ref.shape[-2:],
+            mode="nearest",
+        ).reshape(b, t, motion.shape[2], rgb_ref.shape[-2], rgb_ref.shape[-1])
+    return motion.float().expand_as(rgb_ref)
+
+
 def _sample_cos(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return F.cosine_similarity(a.float().reshape(a.shape[0], -1), b.float().reshape(b.shape[0], -1), dim=1)
 
@@ -198,10 +213,9 @@ def compute_counterfactual_metrics(
     metrics["pred_tokens_gt_cos_gap"] = real_token_cos - variant_token_cos
     metrics["pred_tokens_gt_cos_acc"] = (real_token_cos > variant_token_cos).float()
 
-    depth_tgt_raw = targets["depth_tgt"].float()
-    real_depth = _normalize_depth(_resize_depth_sequence_like(real_out["depth"].float(), depth_tgt_raw))
-    variant_depth = _normalize_depth(_resize_depth_sequence_like(variant_out["depth"].float(), depth_tgt_raw))
-    depth_tgt = _normalize_depth(depth_tgt_raw)
+    real_depth = _normalize_depth(real_out["depth"].float())
+    variant_depth = _normalize_depth(_resize_depth_sequence_like(variant_out["depth"].float(), real_depth))
+    depth_tgt = _normalize_depth(_resize_depth_sequence_like(targets["depth_tgt"].float(), real_depth))
     metrics["depth_l1_gap"] = _sample_l1(real_depth, variant_depth)
 
     real_depth_l1 = _sample_l1(real_depth, depth_tgt)
@@ -212,7 +226,7 @@ def compute_counterfactual_metrics(
     metrics["depth_gt_l1_acc"] = (real_depth_l1 < variant_depth_l1).float()
 
     if "context_depth" in targets:
-        context_depth = _normalize_depth(_resize_context_depth_like(targets["context_depth"].float(), depth_tgt_raw)).unsqueeze(1)
+        context_depth = _normalize_depth(_resize_context_depth_like(targets["context_depth"].float(), real_depth)).unsqueeze(1)
         real_depth_change = real_depth - context_depth
         variant_depth_change = variant_depth - context_depth
         target_depth_change = depth_tgt - context_depth
@@ -252,6 +266,36 @@ def compute_counterfactual_metrics(
             metrics["motion_hint_variant_gt_l1"] = variant_motion_l1
             metrics["motion_hint_gt_l1_gap"] = variant_motion_l1 - real_motion_l1
             metrics["motion_hint_gt_l1_acc"] = (real_motion_l1 < variant_motion_l1).float()
+
+    if "rgb" in real_out and "rgb" in variant_out and "rgb_tgt" in targets:
+        real_rgb = real_out["rgb"].float().clamp(0.0, 1.0)
+        variant_rgb = variant_out["rgb"].float().clamp(0.0, 1.0)
+        rgb_tgt = targets["rgb_tgt"].float()
+        metrics["rgb_l1_gap"] = _sample_l1(real_rgb, variant_rgb)
+
+        real_rgb_l1 = _sample_l1(real_rgb, rgb_tgt)
+        variant_rgb_l1 = _sample_l1(variant_rgb, rgb_tgt)
+        metrics["rgb_real_gt_l1"] = real_rgb_l1
+        metrics["rgb_variant_gt_l1"] = variant_rgb_l1
+        metrics["rgb_gt_l1_gap"] = variant_rgb_l1 - real_rgb_l1
+        metrics["rgb_gt_l1_acc"] = (real_rgb_l1 < variant_rgb_l1).float()
+
+        if "motion_tgt" in targets:
+            motion_mask = _resize_motion_mask_to_rgb(targets["motion_tgt"].float(), real_rgb)
+            real_motion_rgb_l1 = _masked_sample_l1(real_rgb, rgb_tgt, motion_mask)
+            variant_motion_rgb_l1 = _masked_sample_l1(variant_rgb, rgb_tgt, motion_mask)
+            metrics["motion_region_rgb_real_gt_l1"] = real_motion_rgb_l1
+            metrics["motion_region_rgb_variant_gt_l1"] = variant_motion_rgb_l1
+            metrics["motion_region_rgb_gt_l1_gap"] = variant_motion_rgb_l1 - real_motion_rgb_l1
+            metrics["motion_region_rgb_gt_l1_acc"] = (real_motion_rgb_l1 < variant_motion_rgb_l1).float()
+
+            static_mask = 1.0 - motion_mask
+            real_static_rgb_l1 = _masked_sample_l1(real_rgb, rgb_tgt, static_mask)
+            variant_static_rgb_l1 = _masked_sample_l1(variant_rgb, rgb_tgt, static_mask)
+            metrics["static_region_rgb_real_gt_l1"] = real_static_rgb_l1
+            metrics["static_region_rgb_variant_gt_l1"] = variant_static_rgb_l1
+            metrics["static_region_rgb_gt_l1_gap"] = variant_static_rgb_l1 - real_static_rgb_l1
+            metrics["static_region_rgb_gt_l1_acc"] = (real_static_rgb_l1 < variant_static_rgb_l1).float()
 
     if "progress" in real_out and "progress" in variant_out:
         real_progress = torch.sigmoid(real_out["progress"].float())
@@ -371,6 +415,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         targets = {
             "s_tgt": s_tgt,
             "depth_tgt": depth_tgt,
+            "rgb_tgt": rgb_tgt,
             "motion_tgt": motion_target_from_rgb(rgb_tgt, context_rgb),
         }
         if "progress_tgt" in batch:

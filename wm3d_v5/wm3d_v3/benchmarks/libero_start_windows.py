@@ -42,6 +42,8 @@ def main() -> None:
     ap.add_argument("--T", type=int, default=16)
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--stride", type=int, default=1)
+    ap.add_argument("--min_target_start", type=int, default=0)
+    ap.add_argument("--max_target_start", type=int, default=-1, help="inclusive; <0 disables")
     ap.add_argument("--camera_key", default="agentview_rgb")
     args = ap.parse_args()
 
@@ -67,6 +69,10 @@ def main() -> None:
                 obs_keys = sorted(h5["data"][demo_id]["obs"].keys())
             episode_len = int(actions.shape[0])
             for target_start in range(0, max(1, episode_len - args.k + 1), args.stride):
+                if target_start < int(args.min_target_start):
+                    continue
+                if int(args.max_target_start) >= 0 and target_start > int(args.max_target_start):
+                    continue
                 action_chunk = actions[target_start: target_start + args.k]
                 if action_chunk.shape[0] < args.k:
                     pad = np.repeat(action_chunk[-1:], args.k - action_chunk.shape[0], axis=0)
@@ -78,7 +84,7 @@ def main() -> None:
                     "task_name": demo_row.get("task_name"),
                     "instruction": demo_row.get("instruction"),
                     "demo_id": demo_id,
-                    "context_start": int(target_start - args.T),
+                    "context_start": int(target_start - args.T + 1),
                     "target_start": int(target_start),
                     "episode_len": episode_len,
                     "T": int(args.T),
@@ -103,6 +109,8 @@ def main() -> None:
         "T": args.T,
         "k": args.k,
         "stride": args.stride,
+        "min_target_start": args.min_target_start,
+        "max_target_start": args.max_target_start,
     }, sort_keys=True))
 
 

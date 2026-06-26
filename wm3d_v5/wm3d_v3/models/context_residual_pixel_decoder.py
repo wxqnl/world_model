@@ -140,6 +140,8 @@ class ContextResidualPixelDecoder(nn.Module):
         action_cond: torch.Tensor | None = None,
         task_emb: torch.Tensor | None = None,
         return_aux: bool = False,
+        return_features: bool = False,
+        feature_hw: int = 32,
     ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Return RGB predictions in [0, 1], optionally with motion-control maps.
 
@@ -206,9 +208,23 @@ class ContextResidualPixelDecoder(nn.Module):
         residual_rgb = torch.clamp(base + residual, 0.0, 1.0)
         rgb = blend * direct + (1.0 - blend) * residual_rgb
         rgb = rgb.reshape(bsz, horizon, 3, context_rgb.shape[-2], context_rgb.shape[-1])
-        if not return_aux:
+        if not return_aux and not return_features:
             return rgb
         out = {"rgb": rgb}
+        if return_features:
+            feat = F.interpolate(
+                x,
+                size=(int(feature_hw), int(feature_hw)),
+                mode="bilinear",
+                align_corners=False,
+            )
+            out["rgb_motion_features"] = feat.reshape(
+                bsz,
+                horizon,
+                feat.shape[1],
+                feat.shape[-2],
+                feat.shape[-1],
+            )
         if motion_logit is not None and motion_hint is not None:
             out["motion_logit"] = motion_logit.reshape(
                 bsz, horizon, 1, context_rgb.shape[-2], context_rgb.shape[-1]

@@ -48,10 +48,27 @@ def _frame_to_b64(frame: np.ndarray) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _frame_payload(
+    frames: list[np.ndarray] | list[dict[str, np.ndarray]],
+) -> dict[str, Any]:
+    if not frames:
+        raise ValueError("empty frame window")
+    first = frames[0]
+    if isinstance(first, dict):
+        cameras = sorted(first.keys())
+        return {
+            "frames_by_camera": {
+                camera: [_frame_to_b64(step_frames[camera]) for step_frames in frames]
+                for camera in cameras
+            }
+        }
+    return {"frames": [_frame_to_b64(frame) for frame in frames]}  # type: ignore[arg-type]
+
+
 def _policy_act(
     server_url: str,
     task_text: str,
-    frames: list[np.ndarray],
+    frames: list[np.ndarray] | list[dict[str, np.ndarray]],
     timeout: float,
     *,
     lowdim_state: np.ndarray | None = None,
@@ -60,10 +77,7 @@ def _policy_act(
     action_history: np.ndarray | None = None,
     progress_state: float | None = None,
 ) -> dict[str, Any]:
-    payload_obj: dict[str, Any] = {
-        "task_text": task_text,
-        "frames": [_frame_to_b64(frame) for frame in frames],
-    }
+    payload_obj: dict[str, Any] = {"task_text": task_text, **_frame_payload(frames)}
     if lowdim_state is not None:
         payload_obj["lowdim_state"] = np.asarray(lowdim_state, dtype=np.float32).reshape(-1).tolist()
     if object_state is not None:
@@ -88,13 +102,80 @@ def _policy_act(
     return result
 
 
-def _extract_frame(obs: dict[str, Any], camera_key: str) -> np.ndarray:
+def _post_json(server_url: str, endpoint: str, payload_obj: dict[str, Any], timeout: float) -> dict[str, Any]:
+    request = urllib.request.Request(
+        server_url.rstrip("/") + endpoint,
+        data=json.dumps(payload_obj).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    return result
+
+
+def _teacher_server_reset(server_url: str, timeout: float) -> None:
+    _post_json(server_url, "/reset", {}, timeout)
+
+
+def _teacher_server_action(
+    server_url: str,
+    obs: dict[str, Any],
+    task_name: str,
+    timeout: float,
+) -> np.ndarray:
+    result = _post_json(
+        server_url,
+        "/act",
+        {
+            "task_name": task_name,
+            "agentview_image": _frame_to_b64(_extract_frame(obs, "agentview_image")),
+            "eye_in_hand_image": _frame_to_b64(
+                _extract_frame(obs, "robot0_eye_in_hand_image")
+            ),
+            "gripper_qpos": np.asarray(
+                obs["robot0_gripper_qpos"], dtype=np.float32
+            ).reshape(-1).tolist(),
+            "joint_pos": np.asarray(
+                obs["robot0_joint_pos"], dtype=np.float32
+            ).reshape(-1).tolist(),
+        },
+        timeout,
+    )
+    return np.asarray(result["action"], dtype=np.float32).reshape(7)
+
+
+def _extract_frame(obs: dict[str, Any], camera_key: str, *, rotate_180: bool = False) -> np.ndarray:
     if camera_key not in obs:
         raise KeyError(f"missing camera key {camera_key!r}; available={sorted(obs.keys())}")
     frame = np.asarray(obs[camera_key])
     if frame.ndim != 3 or frame.shape[-1] != 3:
         raise ValueError(f"camera frame must be HWC RGB, got {frame.shape}")
+    if rotate_180:
+        frame = frame[::-1, ::-1, :]
     return frame
+
+
+def _extract_frame_window_item(
+    obs: dict[str, Any],
+    camera_keys: list[str],
+    *,
+    rotate_180: bool = False,
+) -> np.ndarray | dict[str, np.ndarray]:
+    if len(camera_keys) == 1:
+        return _extract_frame(obs, camera_keys[0], rotate_180=rotate_180)
+    return {
+        camera_key: _extract_frame(obs, camera_key, rotate_180=rotate_180)
+        for camera_key in camera_keys
+    }
+
+
+def _debug_frame(frame_item: np.ndarray | dict[str, np.ndarray]) -> np.ndarray:
+    if isinstance(frame_item, dict):
+        return np.concatenate([frame_item[key] for key in sorted(frame_item)], axis=1)
+    return frame_item
 
 
 def _extract_lowdim(obs: dict[str, Any]) -> np.ndarray:
@@ -283,12 +364,12 @@ def _as_float_list(value: Any) -> list[float] | None:
     return out
 
 
-def _adapt_gripper(action: np.ndarray, mode: str) -> np.ndarray:
+def _adapt_gripper(action: np.ndarray, mode: str, closed_threshold: float = 0.5) -> np.ndarray:
     out = np.asarray(action, dtype=np.float32).copy()
     if mode == "identity":
         return out
     if mode == "closed01_to_libero":
-        out[..., 6] = np.where(out[..., 6] > 0.5, 1.0, -1.0)
+        out[..., 6] = np.where(out[..., 6] > float(closed_threshold), 1.0, -1.0)
         return out
     raise ValueError(f"unknown gripper_mode={mode!r}")
 
@@ -339,6 +420,11 @@ def main() -> None:
         default=None,
         help="Optional official LIBERO BC checkpoint used to label policy-visited states for DAgger caches.",
     )
+    ap.add_argument(
+        "--teacher_server_url",
+        default=None,
+        help="Optional remote BC teacher server; keeps GPU inference outside the simulator environment.",
+    )
     ap.add_argument("--teacher_device", default="cuda:0")
     ap.add_argument("--teacher_low_eval_noise", action="store_true")
     ap.add_argument("--teacher_deterministic_action", action="store_true")
@@ -373,12 +459,38 @@ def main() -> None:
     ap.add_argument("--max_steps", type=int, default=300)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--camera_key", default="agentview_image")
+    ap.add_argument(
+        "--camera_keys",
+        default=None,
+        help="Comma-separated camera keys. Overrides --camera_key and sends frames_by_camera to the policy server.",
+    )
     ap.add_argument("--camera_size", type=int, default=224)
+    ap.add_argument("--rotate_180", action="store_true", help="Rotate camera frames 180 degrees before tokenization.")
     ap.add_argument("--context_T", type=int, default=16)
     ap.add_argument("--warmup_steps", type=int, default=5)
+    ap.add_argument(
+        "--exec_horizon",
+        type=int,
+        default=1,
+        help="Number of actions to execute from one policy chunk before querying again.",
+    )
     ap.add_argument("--gripper_mode", default="closed01_to_libero", choices=("identity", "closed01_to_libero"))
+    ap.add_argument("--gripper_closed_threshold", type=float, default=0.5)
+    ap.add_argument(
+        "--use_policy_gripper_prob",
+        action="store_true",
+        help="Use continuous policy gripper probability from the server instead of the binarized raw action.",
+    )
     ap.add_argument("--pose_scale", type=float, default=1.0)
     ap.add_argument("--max_pose_norm", type=float, default=0.0)
+    ap.add_argument(
+        "--gripper_min_close_z",
+        type=float,
+        default=0.0,
+        help="Serve-side grasp gate: block gripper close until eef z <= this value; 0 disables. "
+        "Once a low-enough close happens the gate releases and the policy controls the gripper "
+        "(so place/release still works).",
+    )
     ap.add_argument("--send_lowdim", action="store_true")
     ap.add_argument("--send_object_state", action="store_true")
     ap.add_argument("--send_plan_state", action="store_true")
@@ -402,6 +514,13 @@ def main() -> None:
     ap.add_argument("--save_frame_every", type=int, default=0)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+    camera_keys = (
+        [item.strip() for item in str(args.camera_keys).split(",") if item.strip()]
+        if args.camera_keys
+        else [str(args.camera_key)]
+    )
+    if not camera_keys:
+        raise ValueError("at least one camera key is required")
 
     _bootstrap_libero(args.libero_root)
     from libero.libero.benchmark import get_benchmark
@@ -429,6 +548,8 @@ def main() -> None:
     teacher_algo = None
     teacher_raw_obs_to_tensor_obs = None
     teacher_action_fn = None
+    if args.teacher_bc_ckpt is not None and args.teacher_server_url is not None:
+        raise ValueError("use only one of --teacher_bc_ckpt or --teacher_server_url")
     if args.teacher_bc_ckpt is not None:
         from libero.lifelong.metric import raw_obs_to_tensor_obs
         import robomimic.utils.obs_utils as ObsUtils
@@ -472,7 +593,7 @@ def main() -> None:
                 obs = env.set_init_state(hdf5_init_state)
             for _ in range(args.warmup_steps):
                 obs, _reward, _done, _info = env.step(np.zeros(7, dtype=np.float32))
-            first_frame = _extract_frame(obs, args.camera_key)
+            first_frame = _extract_frame_window_item(obs, camera_keys, rotate_180=bool(args.rotate_180))
             frames = deque([first_frame] * args.context_T, maxlen=args.context_T)
             action_history = deque(
                 [np.zeros(7, dtype=np.float32) for _ in range(max(0, args.action_history_len))],
@@ -483,8 +604,14 @@ def main() -> None:
             step_trace: list[dict[str, Any]] = []
             steps = 0
             plan_stage = 0
+            chunk_buf = None
+            chunk_cursor = 0
+            last_policy_result: dict[str, Any] | None = None
+            grasp_gate_released = False
             if teacher_algo is not None:
                 teacher_algo.reset()
+            if args.teacher_server_url is not None:
+                _teacher_server_reset(args.teacher_server_url, args.request_timeout)
             try:
                 for steps in range(1, args.max_steps + 1):
                     frame_path = None
@@ -492,7 +619,7 @@ def main() -> None:
                         args.save_frame_every <= 1 or (steps - 1) % args.save_frame_every == 0
                     ):
                         frame_path = _save_frame(
-                            frames[-1],
+                            _debug_frame(frames[-1]),
                             args.save_frames_dir
                             / f"task{task_id:03d}_init{init_state_id:03d}_step{steps:04d}.png",
                     )
@@ -519,7 +646,14 @@ def main() -> None:
                         else None
                     )
                     teacher_action = None
-                    if teacher_algo is not None:
+                    if args.teacher_server_url is not None:
+                        teacher_action = _teacher_server_action(
+                            args.teacher_server_url,
+                            obs,
+                            task.name,
+                            args.request_timeout,
+                        )
+                    elif teacher_algo is not None:
                         if teacher_raw_obs_to_tensor_obs is None or teacher_action_fn is None or teacher_task_emb is None:
                             raise RuntimeError("teacher BC components are not initialized")
                         teacher_data = teacher_raw_obs_to_tensor_obs([obs], teacher_task_emb, teacher_cfg)
@@ -587,25 +721,62 @@ def main() -> None:
                         policy_action = teacher_action.astype(np.float32)
                         action_source = "teacher_bc"
                     else:
-                        policy_result = _policy_act(
-                            args.server_url,
-                            task.language,
-                            list(frames),
-                            args.request_timeout,
-                            lowdim_state=lowdim_state,
-                            object_state=object_state if args.send_object_state else None,
-                            plan_state=plan_state,
-                            action_history=hist_arr,
-                            progress_state=progress_state,
-                        )
-                        policy_action = np.asarray(policy_result["first_action_raw"], dtype=np.float32)
-                        action_source = "policy"
+                        if chunk_buf is not None and chunk_cursor < len(chunk_buf):
+                            policy_result = dict(last_policy_result or {})
+                            policy_action = np.asarray(chunk_buf[chunk_cursor], dtype=np.float32)
+                            chunk_cursor += 1
+                            action_source = "policy_chunk"
+                        else:
+                            policy_result = _policy_act(
+                                args.server_url,
+                                task.language,
+                                list(frames),
+                                args.request_timeout,
+                                lowdim_state=lowdim_state,
+                                object_state=object_state if args.send_object_state else None,
+                                plan_state=plan_state,
+                                action_history=hist_arr,
+                                progress_state=progress_state,
+                            )
+                            action_chunk = np.asarray(
+                                (
+                                    policy_result.get("action_chunk_continuous_raw")
+                                    if args.use_policy_gripper_prob
+                                    else policy_result.get("action_chunk_raw")
+                                )
+                                or [policy_result["first_action_raw"]],
+                                dtype=np.float32,
+                            ).reshape(-1, 7)
+                            horizon = max(1, int(args.exec_horizon))
+                            chunk_buf = action_chunk[:horizon]
+                            if len(chunk_buf) == 0:
+                                chunk_buf = np.asarray(policy_result["first_action_raw"], dtype=np.float32).reshape(1, 7)
+                            policy_action = np.asarray(chunk_buf[0], dtype=np.float32)
+                            chunk_cursor = 1
+                            last_policy_result = dict(policy_result)
+                            action_source = "policy"
                     forced_plan_grip = False
                     if args.force_plan_stage3_grip_closed and plan_state is not None and int(plan_stage) >= 3:
                         policy_action = np.asarray(policy_action, dtype=np.float32).copy()
                         policy_action[6] = 1.0
                         forced_plan_grip = True
-                    action = _adapt_gripper(policy_action, args.gripper_mode)
+                    grasp_gate_active = False
+                    if float(args.gripper_min_close_z) > 0.0 and not grasp_gate_released:
+                        eef_z = float(np.asarray(obs["robot0_eef_pos"], dtype=np.float32).reshape(-1)[2])
+                        wants_close = float(policy_action[6]) > float(args.gripper_closed_threshold)
+                        if eef_z <= float(args.gripper_min_close_z):
+                            # arm has descended to grasp height: release gate, policy now owns gripper
+                            grasp_gate_released = True
+                        elif wants_close:
+                            # premature close above grasp height: hold gripper open
+                            policy_action = np.asarray(policy_action, dtype=np.float32).copy()
+                            policy_action[6] = 0.0
+                            grasp_gate_active = True
+                    action = _adapt_gripper(
+                        policy_action,
+                        args.gripper_mode,
+                        closed_threshold=float(args.gripper_closed_threshold),
+                    )
                     if float(args.pose_scale) != 1.0:
                         action[:6] *= float(args.pose_scale)
                     if float(args.max_pose_norm) > 0:
@@ -615,7 +786,7 @@ def main() -> None:
                     obs, reward, done, info = env.step(action)
                     if args.action_history_len > 0:
                         action_history.append(action.astype(np.float32))
-                    frames.append(_extract_frame(obs, args.camera_key))
+                    frames.append(_extract_frame_window_item(obs, camera_keys, rotate_180=bool(args.rotate_180)))
                     success = bool(done) or bool(reward >= 1.0) or bool(env.check_success())
                     last_info = dict(info or {})
                     last_info.update({"reward": float(reward), "done": float(done)})
@@ -629,9 +800,13 @@ def main() -> None:
                         "pose_scale": float(args.pose_scale),
                         "max_pose_norm": float(args.max_pose_norm),
                         "gripper_mode": args.gripper_mode,
+                        "gripper_closed_threshold": float(args.gripper_closed_threshold),
+                        "use_policy_gripper_prob": bool(args.use_policy_gripper_prob),
                         "policy_gripper": float(policy_action[6]),
                         "env_gripper": float(action[6]),
                         "forced_plan_grip": bool(forced_plan_grip),
+                        "grasp_gate_active": bool(grasp_gate_active),
+                        "grasp_gate_released": bool(grasp_gate_released),
                         "reward": float(reward),
                         "done": bool(done),
                         "success": bool(success),
@@ -664,7 +839,20 @@ def main() -> None:
                     if isinstance(policy_result.get("action_chunk_raw"), list):
                         policy_chunk = np.asarray(policy_result["action_chunk_raw"], dtype=np.float32)
                         trace_item["policy_action_chunk_raw"] = policy_chunk.astype(float).tolist()
-                        env_chunk = _adapt_gripper(policy_chunk, args.gripper_mode)
+                        if isinstance(policy_result.get("action_chunk_continuous_raw"), list):
+                            trace_item["policy_action_chunk_continuous_raw"] = np.asarray(
+                                policy_result["action_chunk_continuous_raw"],
+                                dtype=np.float32,
+                            ).astype(float).tolist()
+                        if isinstance(policy_result.get("selected_gripper_prob"), list):
+                            trace_item["selected_gripper_prob"] = [
+                                float(x) for x in policy_result["selected_gripper_prob"]
+                            ]
+                        env_chunk = _adapt_gripper(
+                            policy_chunk,
+                            args.gripper_mode,
+                            closed_threshold=float(args.gripper_closed_threshold),
+                        )
                         if float(args.pose_scale) != 1.0:
                             env_chunk[..., :6] *= float(args.pose_scale)
                         if float(args.max_pose_norm) > 0:
@@ -677,7 +865,8 @@ def main() -> None:
                     if success or done:
                         break
             finally:
-                env.close()
+                if os.environ.get("LIBERO_SKIP_ENV_CLOSE", "0") != "1":
+                    env.close()
             results.append({
                 "suite": args.suite,
                 "task_id": task_id,
@@ -705,12 +894,15 @@ def main() -> None:
         "init_state_demo_id": args.init_state_demo_id if args.init_state_hdf5 is not None else None,
         "max_steps": args.max_steps,
         "camera_key": args.camera_key,
+        "camera_keys": camera_keys,
         "camera_size": args.camera_size,
+        "rotate_180": bool(args.rotate_180),
         "context_T": args.context_T,
         "warmup_steps": args.warmup_steps,
         "gripper_mode": args.gripper_mode,
         "pose_scale": float(args.pose_scale),
         "max_pose_norm": float(args.max_pose_norm),
+        "gripper_min_close_z": float(args.gripper_min_close_z),
         "send_lowdim": bool(args.send_lowdim),
         "send_object_state": bool(args.send_object_state),
         "send_plan_state": bool(args.send_plan_state),
@@ -725,6 +917,7 @@ def main() -> None:
         "expert_action_override_from_step": int(args.expert_action_override_from_step),
         "expert_action_full_replay": bool(args.expert_action_full_replay),
         "teacher_bc_ckpt": str(args.teacher_bc_ckpt) if args.teacher_bc_ckpt is not None else None,
+        "teacher_server_url": args.teacher_server_url,
         "teacher_action_override_from_step": int(args.teacher_action_override_from_step),
         "teacher_action_full_replay": bool(args.teacher_action_full_replay),
         "progress_denominator": float(args.progress_denominator),

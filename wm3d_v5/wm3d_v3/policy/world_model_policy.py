@@ -330,14 +330,17 @@ def select_action_chunk(
         action_policy = getattr(target, "action_policy", None)
         if action_policy is None:
             raise RuntimeError("selection_mode=direct requires enable_action_policy")
-        policy_out = action_policy(
+        # A2: route the closed-loop action policy through the dual trunk
+        # (JointWorldModel.act_policy) — identical to the training forward.
+        policy_out = target.act_policy(
             s,
-            task_emb=task_emb,
+            task_emb,
             lowdim_state=lowdim_state,
             object_state=object_state,
             plan_state=plan_state,
             action_history=action_history,
             progress_state=progress_state,
+            context_rgb=context_rgb,
         )
         action_key = "prior_policy_action_cond" if selection_mode in ("direct_prior", "prior_policy") else "policy_action_cond"
         if action_key not in policy_out:

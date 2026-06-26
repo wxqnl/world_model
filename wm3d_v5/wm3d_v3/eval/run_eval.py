@@ -85,6 +85,10 @@ def build_model(cfg: dict) -> JointWorldModel:
         policy_max_context=cfg["model"].get("policy_max_context"),
         policy_dropout=cfg["model"].get("policy_dropout", 0.1),
         policy_use_task=cfg["model"].get("policy_use_task", True),
+        policy_patch_pool=cfg["model"].get("policy_patch_pool", "mean"),
+        policy_max_spatial_tokens=cfg["model"].get("policy_max_spatial_tokens", 64),
+        policy_use_context_rgb=cfg["model"].get("policy_use_context_rgb", False),
+        policy_rgb_spatial_tokens=cfg["model"].get("policy_rgb_spatial_tokens", 64),
         policy_lowdim_dim=cfg["model"].get("policy_lowdim_dim", 0),
         policy_object_state_dim=cfg["model"].get("policy_object_state_dim", 0),
         policy_plan_state_dim=cfg["model"].get("policy_plan_state_dim", 0),
@@ -117,32 +121,13 @@ def build_model(cfg: dict) -> JointWorldModel:
         policy_enable_prior=cfg["model"].get("policy_enable_prior", False),
         policy_prior_chunk_layers=cfg["model"].get("policy_prior_chunk_layers", 1),
         enable_bridging=cfg["model"].get("enable_bridging", True),
-        enable_aux_idm=cfg["model"].get("enable_aux_idm", False),
-        aux_idm_hidden=cfg["model"].get("aux_idm_hidden", 1024),
-        aux_idm_layers=cfg["model"].get("aux_idm_layers", 3),
-        enable_world_prior=cfg["model"].get("enable_world_prior", False),
-        world_prior_hidden=cfg["model"].get("world_prior_hidden", 768),
-        world_prior_layers=cfg["model"].get("world_prior_layers", 4),
-        world_prior_heads=cfg["model"].get("world_prior_heads", 8),
-        world_prior_mlp_mult=cfg["model"].get("world_prior_mlp_mult", 4),
-        world_prior_dropout=cfg["model"].get("world_prior_dropout", 0.0),
-        world_prior_task_dim=cfg["model"].get("world_prior_task_dim"),
-        world_prior_action_dim=cfg["model"].get("world_prior_action_dim", 7),
-        world_prior_use_context=cfg["model"].get("world_prior_use_context", True),
-        world_prior_use_action=cfg["model"].get("world_prior_use_action", True),
-        world_prior_predict_initial=cfg["model"].get("world_prior_predict_initial", True),
     )
     return JointWorldModel(jc)
 
 
 def window_config_from_cfg(cfg: dict) -> WindowConfig:
     data = cfg["data"]
-    model = cfg.get("model", {})
     action_stats = data.get("action_stats")
-    policy_state_default = any(
-        int(model.get(k, 0) or 0) > 0
-        for k in ("policy_lowdim_dim", "policy_object_state_dim", "policy_plan_state_dim", "policy_action_history_len")
-    ) or bool(model.get("policy_use_progress", False))
     return WindowConfig(
         T=data["T"],
         k=data["k"],
@@ -151,44 +136,30 @@ def window_config_from_cfg(cfg: dict) -> WindowConfig:
         tokens_subdir=data.get("tokens_subdir", "vggt_pooled"),
         action_stats=Path(action_stats) if action_stats else None,
         require_task_emb=bool(data.get("require_task_emb", False)),
+        load_task_text=bool(data.get("load_task_text", False)),
         load_rgb=bool(data.get("load_rgb", True)),
         load_geom=bool(data.get("load_geom", True)),
-        load_geom_extra=bool(data.get("load_geom_extra", False)),
         load_state_tgt=bool(data.get("load_state_tgt", True)),
+        load_geom_extra=bool(data.get("load_geom_extra", False)),
         require_geom_extra=bool(data.get("require_geom_extra", False)),
         window_geom_subdir=data.get("window_geom_subdir", "vggt_window_geom_p64"),
+        window_geom_shard_index=Path(data["window_geom_shard_index"])
+        if data.get("window_geom_shard_index") else None,
+        window_geom_shard_root=Path(data["window_geom_shard_root"])
+        if data.get("window_geom_shard_root") else None,
         use_window_tokens=bool(data.get("use_window_tokens", False)),
         max_windows_per_episode=int(data.get("max_windows_per_episode", 0) or 0),
         trust_window_geom_cache=bool(data.get("trust_window_geom_cache", False)),
         allow_pseudo_progress_targets=bool(data.get("allow_pseudo_progress_targets", False)),
-        require_progress=bool(data.get("require_progress", bool(model.get("policy_use_progress", False)))),
-        load_policy_state=bool(data.get("load_policy_state", policy_state_default)),
+        require_progress=bool(data.get("require_progress", False)),
+        load_policy_state=bool(data.get("load_policy_state", False)),
         require_policy_state=bool(data.get("require_policy_state", False)),
-        policy_lowdim_dim=int(data.get("policy_lowdim_dim", model.get("policy_lowdim_dim", 0)) or 0),
-        policy_object_state_dim=int(data.get("policy_object_state_dim", model.get("policy_object_state_dim", 0)) or 0),
-        policy_plan_state_dim=int(data.get("policy_plan_state_dim", model.get("policy_plan_state_dim", 0)) or 0),
-        policy_action_history_len=int(data.get("policy_action_history_len", model.get("policy_action_history_len", 0)) or 0),
-        policy_action_history_dim=int(data.get("policy_action_history_dim", model.get("policy_action_history_dim", 7)) or 7),
+        policy_lowdim_dim=int(data.get("policy_lowdim_dim", 0) or 0),
+        policy_object_state_dim=int(data.get("policy_object_state_dim", 0) or 0),
+        policy_plan_state_dim=int(data.get("policy_plan_state_dim", 0) or 0),
+        policy_action_history_len=int(data.get("policy_action_history_len", 0) or 0),
+        policy_action_history_dim=int(data.get("policy_action_history_dim", 7) or 7),
     )
-
-
-def validate_eval_data_flags(cfg: dict, *, rgb_metrics: bool) -> None:
-    data = cfg.get("data", {})
-    model = cfg.get("model", {})
-    missing: list[str] = []
-    if not bool(data.get("load_state_tgt", True)):
-        missing.append("data.load_state_tgt")
-    if not bool(data.get("load_geom", True)):
-        missing.append("data.load_geom")
-    needs_rgb = bool(rgb_metrics) or bool(model.get("enable_context_pixel", False))
-    if needs_rgb and not bool(data.get("load_rgb", True)):
-        missing.append("data.load_rgb")
-    if missing:
-        raise ValueError(
-            "run_eval requires "
-            + ", ".join(missing)
-            + " because it computes latent, depth, and optional RGB/context metrics from those targets."
-        )
 
 
 def build_dataset_for_split(records, cfg: dict, split: str = "val"):
@@ -220,21 +191,6 @@ def build_dataset_for_split(records, cfg: dict, split: str = "val"):
     return Subset(ds, train_idx if split == "train" else val_idx)
 
 
-def policy_kwargs_from_batch(batch: dict, device: torch.device) -> dict:
-    kwargs = {}
-    for key in ("lowdim_state", "object_state", "plan_state", "action_history"):
-        if key in batch:
-            kwargs[key] = batch[key].to(device, non_blocking=True)
-    if "progress_state" in batch:
-        kwargs["progress_state"] = batch["progress_state"].to(device, non_blocking=True)
-    elif "progress_tgt" in batch:
-        progress = batch["progress_tgt"].to(device, non_blocking=True)
-        if progress.ndim > 1:
-            progress = progress[:, :1]
-        kwargs["progress_state"] = progress
-    return kwargs
-
-
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
@@ -256,7 +212,6 @@ def main():
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
     rgb_metrics = bool(cfg["model"].get("enable_pixel", True)) and not args.skip_rgb_metrics
-    validate_eval_data_flags(cfg, rgb_metrics=rgb_metrics)
 
     records = read_manifest(cfg["data"]["manifest"])
     val = build_dataset_for_split(records, cfg, split="val")
@@ -299,13 +254,9 @@ def main():
             rgb_tgt = batch["rgb_tgt"].to(device, non_blocking=True).permute(0, 1, 4, 2, 3)
         action_tgt_norm = batch["action_tgt_norm"].to(device, non_blocking=True)
         action_cond = make_action_condition(action_tgt, action_tgt_norm)
-        needs_context_rgb = rgb_metrics or bool(cfg["model"].get("enable_context_pixel", False))
-        context_rgb = None
-        if needs_context_rgb:
-            context_rgb = batch["rgb_in"][:, -1].to(device, non_blocking=True).permute(0, 3, 1, 2).contiguous()
+        context_rgb = batch["rgb_in"][:, -1].to(device, non_blocking=True).permute(0, 3, 1, 2).contiguous()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             kwargs = dict(action_cond=action_cond, pixel=rgb_metrics, bridging=False)
-            kwargs.update(policy_kwargs_from_batch(batch, device))
             if cfg["model"].get("enable_context_pixel", False):
                 kwargs["context_rgb"] = context_rgb
             out = model(s, c, **kwargs)
@@ -313,16 +264,7 @@ def main():
         L_state_mse = F.mse_loss(pred_s.float(), s_tgt.float(), reduction="none").mean(dim=(1, 2, 3))
         cos = F.cosine_similarity(pred_s.float().flatten(-2),
                                   s_tgt.float().flatten(-2), dim=-1).mean(dim=-1)
-        depth_pred = out["depth"].float()
-        if depth_pred.shape[-2:] != depth_tgt.shape[-2:]:
-            bsz, horizon = depth_pred.shape[:2]
-            depth_pred = F.interpolate(
-                depth_pred.flatten(0, 1)[:, None],
-                size=depth_tgt.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            ).reshape(bsz, horizon, depth_tgt.shape[-2], depth_tgt.shape[-1])
-        depth_n = _normalize_depth(depth_pred)
+        depth_n = _normalize_depth(out["depth"].float())
         depth_tn = _normalize_depth(depth_tgt.float())
         L_depth = (depth_n - depth_tn).abs().mean(dim=(1, 2, 3))
         L_pose = (out["pose"].float() - action_tgt[..., :6]).pow(2).mean(dim=(1, 2))
@@ -417,9 +359,7 @@ def main():
     report = {
         "mode": {
             "rgb_metrics": rgb_metrics,
-            "rgb_metrics_active": rgb_metrics,
-            "video_generation_active": False,
-            "hunyuan_generation_active": False,
+            "video_generation_active": rgb_metrics,
         },
         "counts": dict(cnt),
         "metrics": {},

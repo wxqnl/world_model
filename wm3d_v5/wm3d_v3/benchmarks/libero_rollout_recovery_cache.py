@@ -293,7 +293,7 @@ def main() -> None:
             lowdim = trace.get("lowdim_state")
             object_state = trace.get("object_state")
             action_history = trace.get("action_history")
-            if frames is None or lowdim is None or action_history is None:
+            if frames is None or lowdim is None:
                 skipped += 1
                 continue
             lowdim_arr = np.asarray(lowdim, dtype=np.float32).reshape(-1)
@@ -303,6 +303,10 @@ def main() -> None:
             object_state_arr = None
             if object_state is not None:
                 object_state_arr = np.asarray(object_state, dtype=np.float32).reshape(-1)
+            if action_history is None:
+                action_history_arr = np.zeros((0, 7), dtype=np.float32)
+            else:
+                action_history_arr = np.asarray(action_history, dtype=np.float32).reshape(-1, 7)
             rollout_step = int(trace.get("step", trace_idx + 1)) - 1
             if args.align_mode == "time":
                 phase = float(rollout_step) / max(1.0, float(len(traces) - 1))
@@ -357,7 +361,7 @@ def main() -> None:
                 terminal_success_tgt=np.asarray(1.0, dtype=np.float32),
                 plausibility_tgt=np.asarray(1.0, dtype=np.float32),
                 lowdim_state=lowdim_arr.astype(np.float32),
-                action_history=np.asarray(action_history, dtype=np.float32),
+                action_history=action_history_arr.astype(np.float32),
                 object_state=object_state_arr.astype(np.float32) if object_state_arr is not None else np.zeros(0, dtype=np.float32),
                 plan_state=plan_state.astype(np.float32),
                 proposer_weight=np.asarray(float(args.sample_weight), dtype=np.float32),
@@ -384,7 +388,7 @@ def main() -> None:
                 "T": int(args.T),
                 "k": int(args.k),
                 "lowdim_state": True,
-                "action_history_len": int(np.asarray(action_history).shape[0]),
+                "action_history_len": int(action_history_arr.shape[0]),
                 "terminal_success_tgt": 1.0,
                 "benchmark_success": True,
             }

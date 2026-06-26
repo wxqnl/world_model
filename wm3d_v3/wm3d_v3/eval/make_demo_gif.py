@@ -19,53 +19,8 @@ from wm3d_v3.models.state_stream import StateConfig
 
 
 def build_model(cfg):
-    sc = StateConfig(**cfg["model"]["state"])
-    ac = ActionConfig(**cfg["model"]["action"])
-    dc = DualConfig(state=sc, action=ac,
-                    xattn_layers_state=tuple(cfg["model"]["xattn_layers_state"]),
-                    xattn_n_heads=cfg["model"]["xattn_n_heads"])
-    jc = JointConfig(
-        dual=dc,
-        action_proj_hidden=cfg["model"]["action_proj_hidden"],
-        action_proj_layers=cfg["model"]["action_proj_layers"],
-        geom_hidden=cfg["model"]["geom_hidden"],
-        enable_geom_extra=cfg["model"].get("enable_geom_extra", True),
-        pixel_hidden=cfg["model"]["pixel_hidden"],
-        pixel_n_res=cfg["model"]["pixel_n_res"],
-        enable_pixel=cfg["model"].get("enable_pixel", True),
-        enable_context_pixel=cfg["model"].get("enable_context_pixel", False),
-        context_pixel_hidden=cfg["model"].get("context_pixel_hidden", 384),
-        context_pixel_action_dim=cfg["model"].get("context_pixel_action_dim", 7),
-        context_pixel_task_dim=cfg["model"].get("context_pixel_task_dim"),
-        context_pixel_residual_scale=cfg["model"].get("context_pixel_residual_scale", 0.75),
-        context_pixel_use_action=cfg["model"].get("context_pixel_use_action", True),
-        context_pixel_use_task=cfg["model"].get("context_pixel_use_task", True),
-        context_pixel_predict_motion=cfg["model"].get("context_pixel_predict_motion", False),
-        context_pixel_motion_blend_gain=cfg["model"].get("context_pixel_motion_blend_gain", 0.0),
-        enable_control_head=cfg["model"].get("enable_control_head", False),
-        control_hidden=cfg["model"].get("control_hidden", 128),
-        control_output_size=cfg["model"].get("control_output_size", 256),
-        control_fuse_size=cfg["model"].get("control_fuse_size", 64),
-        control_refine_channels=cfg["model"].get("control_refine_channels", 16),
-        control_use_refine=cfg["model"].get("control_use_refine", True),
-        control_action_dim=cfg["model"].get("control_action_dim", 7),
-        control_task_dim=cfg["model"].get("control_task_dim"),
-        control_use_context=cfg["model"].get("control_use_context", True),
-        control_use_action=cfg["model"].get("control_use_action", True),
-        control_use_task=cfg["model"].get("control_use_task", True),
-        enable_progress_head=cfg["model"].get("enable_progress_head", False),
-        progress_hidden=cfg["model"].get("progress_hidden", 256),
-        progress_layers=cfg["model"].get("progress_layers", 2),
-        progress_heads=cfg["model"].get("progress_heads", 4),
-        progress_action_dim=cfg["model"].get("progress_action_dim", 7),
-        progress_task_dim=cfg["model"].get("progress_task_dim"),
-        progress_max_horizon=cfg["model"].get("progress_max_horizon", 32),
-        progress_use_action=cfg["model"].get("progress_use_action", True),
-        progress_use_task=cfg["model"].get("progress_use_task", True),
-        enable_bridging=cfg["model"].get("enable_bridging", True),
-    )
-    return JointWorldModel(jc)
-
+    from wm3d_v3.eval.run_eval import build_model as build_full_model
+    return build_full_model(cfg)
 
 def window_config_from_cfg(cfg: dict) -> WindowConfig:
     data = cfg["data"]
@@ -77,6 +32,7 @@ def window_config_from_cfg(cfg: dict) -> WindowConfig:
         cache_root=Path(data["cache_root"]),
         tokens_subdir=data.get("tokens_subdir", "vggt_pooled"),
         action_stats=Path(action_stats) if action_stats else None,
+        require_task_emb=bool(data.get("require_task_emb", False)),
     )
 
 
@@ -124,10 +80,13 @@ def main():
             break
     print(f"picked {len(picks)} unique clips")
 
-    model = build_model(cfg).to(device).eval()
+    from wm3d_v3.eval.run_eval import build_model as build_full_model
+    model = build_full_model(cfg).to(device).eval()
     sd = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(sd["model"])
-    print(f"loaded ckpt epoch={sd.get('epoch')} val_total={sd.get('val_total'):.4f}")
+    val_total = sd.get("val_total")
+    val_total_text = f"{val_total:.4f}" if isinstance(val_total, (float, int)) else str(val_total)
+    print(f"loaded ckpt epoch={sd.get('epoch')} val_total={val_total_text}")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     for ix, vi in enumerate(picks):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -105,10 +106,44 @@ class WM3DTokenPolicy:
         selection_mode: str = "ranked",
         terminal_reference_path: str | Path | None = None,
     ) -> "WM3DTokenPolicy":
-        cfg = yaml.safe_load(Path(cfg_path).read_text())
-        model = build_model(cfg)
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        model.load_state_dict(sd["model"])
+        file_cfg = yaml.safe_load(Path(cfg_path).read_text())
+        ckpt_cfg = sd.get("base_cfg")
+        model_keys = sd["model"].keys()
+        inferred_geom_mode = None
+        if any(key.startswith("geom.ups.0.block.") for key in model_keys):
+            inferred_geom_mode = "resize_conv"
+        elif any(key.startswith("geom.ups.0.0.") for key in model_keys):
+            inferred_geom_mode = "transpose"
+
+        def with_geom_mode(cfg: dict[str, Any], mode: str) -> dict[str, Any]:
+            out = copy.deepcopy(cfg)
+            out.setdefault("model", {})["geom_upsample_mode"] = mode
+            return out
+
+        cfg_candidates = []
+        if ckpt_cfg is not None and inferred_geom_mode is not None:
+            cfg_candidates.append(with_geom_mode(ckpt_cfg, inferred_geom_mode))
+        if inferred_geom_mode is not None:
+            cfg_candidates.append(with_geom_mode(file_cfg, inferred_geom_mode))
+        if ckpt_cfg is not None:
+            cfg_candidates.append(ckpt_cfg)
+        if not cfg_candidates or ckpt_cfg != file_cfg:
+            cfg_candidates.append(file_cfg)
+        last_error: RuntimeError | None = None
+        model = None
+        for cfg in cfg_candidates:
+            try:
+                candidate = build_model(cfg)
+                candidate.load_state_dict(sd["model"])
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            model = candidate
+            break
+        if model is None:
+            assert last_error is not None
+            raise last_error
         terminal_reference = load_terminal_reference(terminal_reference_path) if terminal_reference_path else None
         return cls(
             model,

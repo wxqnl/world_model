@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tarfile
+
 import numpy as np
 import pytest
 import torch
@@ -52,6 +54,23 @@ def _write_window_cache(root, rec: OXEClipRecord, *, complete: bool = True) -> N
     np.savez_compressed(out_dir / f"{cid}__start_000000.npz", **payload)
 
 
+def _pack_window_cache_as_tar_shard(root, rec: OXEClipRecord) -> tuple[object, object]:
+    cid = _safe(rec.clip_id)
+    name = f"{cid}__start_000000.npz"
+    src = root / "vggt_window_geom_p64_test" / name
+    shard_root = root / "window_shards"
+    shard_root.mkdir(parents=True, exist_ok=True)
+    shard = shard_root / "shard_000.tar"
+    with tarfile.open(shard, "w") as tf:
+        tf.add(src, arcname=name)
+    index = shard_root / "index.tsv"
+    with tarfile.open(shard, "r") as tf:
+        member = tf.getmember(name)
+        index.write_text(f"{name}\t{shard.name}\t{member.offset_data}\t{member.size}\n")
+    src.unlink()
+    return index, shard_root
+
+
 def test_window_tokens_and_geometry_are_loaded_from_same_window_cache(tmp_path):
     rec = _record()
     _write_base_cache(tmp_path, rec)
@@ -84,6 +103,38 @@ def test_window_tokens_and_geometry_are_loaded_from_same_window_cache(tmp_path):
     assert sample["pose_geom_conf_tgt"].shape == (2,)
     assert sample["depth_tgt"].shape == (2, 4, 4)
     assert sample["depth_tgt"].mean().item() == pytest.approx(2.0)
+
+
+def test_window_tokens_and_geometry_load_from_tar_shard(tmp_path):
+    rec = _record()
+    _write_base_cache(tmp_path, rec)
+    _write_window_cache(tmp_path, rec)
+    index, shard_root = _pack_window_cache_as_tar_shard(tmp_path, rec)
+
+    ds = OXEWindowDataset(
+        [rec],
+        WindowConfig(
+            T=2,
+            k=2,
+            stride=1,
+            cache_root=tmp_path,
+            load_rgb=False,
+            load_geom=True,
+            load_geom_extra=True,
+            require_geom_extra=True,
+            use_window_tokens=True,
+            window_geom_subdir="vggt_window_geom_p64_test",
+            window_geom_shard_index=index,
+            window_geom_shard_root=shard_root,
+        ),
+    )
+    sample = ds[0]
+
+    assert len(ds) == 1
+    assert sample["s_in"][0, 0, 0].item() == 0
+    assert sample["s_tgt"][0, 0, 0].item() == 12
+    assert sample["point_tgt"].shape == (2, 4, 4, 3)
+    assert sample["pose_geom_tgt"].shape == (2, 9)
 
 
 def test_require_window_geometry_rejects_incomplete_npz(tmp_path):

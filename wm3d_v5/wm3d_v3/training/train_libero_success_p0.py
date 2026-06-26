@@ -76,10 +76,17 @@ def _infer_plan_state(row: dict[str, Any], data: np.lib.npyio.NpzFile, progress:
 
 
 class LiberoExpertCacheDataset(Dataset):
-    def __init__(self, manifest: Path | list[Path], *, plan_state_dim: int = DEFAULT_PLAN_STATE_DIM) -> None:
+    def __init__(
+        self,
+        manifest: Path | list[Path],
+        *,
+        plan_state_dim: int = DEFAULT_PLAN_STATE_DIM,
+        include_action_history: bool = True,
+    ) -> None:
         self.rows: list[dict[str, Any]] = []
         self._episode_len_cache: dict[tuple[str, str], int] = {}
         self.plan_state_dim = int(plan_state_dim)
+        self.include_action_history = bool(include_action_history)
         manifests = manifest if isinstance(manifest, list) else [manifest]
         for item in manifests:
             with Path(item).open() as fh:
@@ -109,6 +116,11 @@ class LiberoExpertCacheDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         row = self.rows[idx]
         data = np.load(row["cache_path"])
+        proposer_weight = float(data["proposer_weight"]) if "proposer_weight" in data else float(row.get("proposer_weight", 1.0))
+        if "proposer_weight_override" in row:
+            proposer_weight = float(row["proposer_weight_override"])
+        if "proposer_weight_mult" in row:
+            proposer_weight *= float(row["proposer_weight_mult"])
         sample = {
             "s_in": torch.from_numpy(data["s_in"].astype(np.float32)),
             "c": torch.from_numpy(data["c"].astype(np.float32)),
@@ -117,7 +129,7 @@ class LiberoExpertCacheDataset(Dataset):
             "action_tgt_norm": torch.from_numpy(data["action_tgt_norm"].astype(np.float32)),
             "terminal_success_tgt": torch.tensor(float(data["terminal_success_tgt"]), dtype=torch.float32),
             "plausibility_tgt": torch.tensor(float(data["plausibility_tgt"]), dtype=torch.float32),
-            "proposer_weight": torch.tensor(float(data["proposer_weight"]) if "proposer_weight" in data else float(row.get("proposer_weight", 1.0)), dtype=torch.float32),
+            "proposer_weight": torch.tensor(proposer_weight, dtype=torch.float32),
             "progress_tgt": torch.tensor(float(data["progress_tgt"]) if "progress_tgt" in data else 0.0, dtype=torch.float32),
             "task_name": row.get("task_name", ""),
         }
@@ -134,7 +146,7 @@ class LiberoExpertCacheDataset(Dataset):
             sample["object_state"] = torch.from_numpy(data["object_state"].astype(np.float32))
         else:
             sample["object_state"] = torch.zeros(112, dtype=torch.float32)
-        if "action_history" in data:
+        if self.include_action_history and "action_history" in data:
             sample["action_history"] = torch.from_numpy(data["action_history"].astype(np.float32))
         return sample
 

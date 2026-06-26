@@ -5,6 +5,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _ResizeConvUp(nn.Module):
+    def __init__(self, c_in: int, c_out: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(c_in, c_out, 3, padding=1), nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
+            nn.Conv2d(c_out, c_out, 3, padding=1), nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        return self.block(x)
+
+
 class GeomDecoder(nn.Module):
     """[B, T, 64, 2048] -> depth [B, T, 224, 224] and optional extra geometry."""
 
@@ -16,12 +29,16 @@ class GeomDecoder(nn.Module):
         out_hw=256,
         crop_hw=224,
         enable_extra=True,
+        upsample_mode="transpose",
     ):
         super().__init__()
+        if upsample_mode not in {"transpose", "resize_conv"}:
+            raise ValueError(f"unsupported geom upsample_mode: {upsample_mode}")
         self.token_grid = token_grid
         self.out_hw = out_hw
         self.crop_hw = crop_hw
         self.enable_extra = enable_extra
+        self.upsample_mode = upsample_mode
         H = hidden
         # n_ups so token_grid * 2**n_ups == out_hw. 8→256: 5; 16→256: 4.
         n_ups = 0
@@ -35,6 +52,8 @@ class GeomDecoder(nn.Module):
                 nn.ConvTranspose2d(c_in, c_out, 4, 2, 1), nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
                 nn.Conv2d(c_out, c_out, 3, padding=1), nn.GroupNorm(min(8, c_out), c_out), nn.GELU(),
             )
+        def resize_conv_up(c_in, c_out):
+            return _ResizeConvUp(c_in, c_out)
         # Channel schedule (legacy n_ups=5 unchanged; n_ups=4 drops the last H//8→H//8 stage).
         if n_ups == 5:
             chans = [H, H, H // 2, H // 4, H // 8, H // 8]
@@ -42,7 +61,8 @@ class GeomDecoder(nn.Module):
             chans = [H, H, H // 2, H // 4, H // 8]
         else:
             chans = [H] + [max(H >> i, H // 8) for i in range(n_ups)]
-        ups = [up(chans[i], chans[i + 1]) for i in range(n_ups)]
+        up_builder = resize_conv_up if upsample_mode == "resize_conv" else up
+        ups = [up_builder(chans[i], chans[i + 1]) for i in range(n_ups)]
         self.ups = nn.ModuleList(ups)
         # Remap legacy v3 ckpt keys (up1..up5) -> ups.0..ups.4 on load.
         self._register_load_state_dict_pre_hook(self._remap_legacy_keys)

@@ -365,7 +365,7 @@ def _numeric_file_order(path: Path, prefix: str, suffix: str) -> list[Path]:
     return sorted(files, key=key)
 
 
-def _video_name(run_id: str, episode: int, success: str, task: str) -> str:
+def _video_name(run_id: str, episode: str | int, success: str, task: str) -> str:
     task_clean = task.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
     return f"{run_id}--episode={episode}--success={success}--task={task_clean}.mp4"
 
@@ -532,7 +532,7 @@ def export_worldvla_videos(args: argparse.Namespace) -> dict[str, Any]:
                     if args.log_every and (step + 1) % int(args.log_every) == 0:
                         print(f"{suite} episode={spec.episode_index} camera={camera_name} step={step + 1}/{n_steps}", flush=True)
 
-                base_episode = spec.episode_index
+                base_episode = f"{suite}_{spec.episode_index:03d}"
                 gt_path = out_dir / _video_name(run_id, base_episode, "gt", camera_name)
                 recon_path = out_dir / _video_name(run_id, base_episode, "gt_recons", camera_name)
                 inf_path = out_dir / _video_name(run_id, base_episode, "inf", camera_name)

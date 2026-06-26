@@ -63,12 +63,22 @@ class PixelDecoder(nn.Module):
         self.ups = nn.ModuleList(ups)
         self.head = nn.Conv2d(chans[-1], 3, 1)
 
-    def forward(self, tok):
+    def forward(self, tok, *, return_features: bool = False, feature_hw: int = 32):
         B, T, P, D = tok.shape
         G = self.cfg.token_grid
         x = tok.reshape(B * T, G * G, D).transpose(1, 2).reshape(B * T, D, G, G)
         x = self.stem(x)
+        feature = None
         for up in self.ups:
             x = up(x)
-        x = torch.sigmoid(self.head(x))
-        return x.view(B, T, 3, self.cfg.out_hw, self.cfg.out_hw)
+            if return_features and x.shape[-1] == int(feature_hw) and x.shape[-2] == int(feature_hw):
+                feature = x
+        rgb = torch.sigmoid(self.head(x)).view(B, T, 3, self.cfg.out_hw, self.cfg.out_hw)
+        if not return_features:
+            return rgb
+        if feature is None:
+            feature = F.interpolate(x, size=(int(feature_hw), int(feature_hw)), mode="bilinear", align_corners=False)
+        return {
+            "rgb": rgb,
+            "rgb_motion_features": feature.view(B, T, feature.shape[1], feature.shape[-2], feature.shape[-1]),
+        }

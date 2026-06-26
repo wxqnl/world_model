@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import numpy as np
 import torch
@@ -32,6 +32,24 @@ def resize_frames(frames: Iterable[np.ndarray], size: int) -> torch.Tensor:
     return x.contiguous()
 
 
+def _pad_trim(frames: list[np.ndarray], T: int) -> list[np.ndarray]:
+    if not frames:
+        raise ValueError("at least one frame is required")
+    if len(frames) < T:
+        return [frames[0]] * (T - len(frames)) + frames
+    if len(frames) > T:
+        return frames[-T:]
+    return frames
+
+
+def _concat_camera_frames(frames_by_camera: Mapping[str, list[np.ndarray]], camera_names: list[str], T: int) -> list[np.ndarray]:
+    streams = [_pad_trim(list(frames_by_camera[name]), T) for name in camera_names]
+    out: list[np.ndarray] = []
+    for t in range(T):
+        out.append(np.concatenate([_as_rgb_uint8(stream[t]) for stream in streams], axis=1))
+    return out
+
+
 class OnlineObservationTokenizer:
     """Turn a rolling RGB observation window into WM3D policy inputs.
 
@@ -52,10 +70,14 @@ class OnlineObservationTokenizer:
         context_rgb_size: int = 256,
         qwen_device: str | None = None,
         allow_zero_task_fallback: bool = False,
+        camera_fusion: str = "mean",
     ) -> None:
         self.T = int(T)
         self.image_size = int(image_size)
         self.context_rgb_size = int(context_rgb_size)
+        if camera_fusion not in {"mean", "concat"}:
+            raise ValueError(f"camera_fusion must be 'mean' or 'concat', got {camera_fusion!r}")
+        self.camera_fusion = str(camera_fusion)
         self.vggt = VGGTEncoder(device=device, token_grid=token_grid, return_depth=False)
         self.task_provider = TaskConditionProvider(
             cache_dir=task_cache_dir,
@@ -64,24 +86,54 @@ class OnlineObservationTokenizer:
         )
 
     @torch.inference_mode()
-    def tokenize(self, frames: list[np.ndarray], task_text: str) -> TokenizedObservation:
-        if not frames:
-            raise ValueError("at least one frame is required")
-        if len(frames) < self.T:
-            pad = [frames[0]] * (self.T - len(frames))
-            frames = pad + frames
-        elif len(frames) > self.T:
-            frames = frames[-self.T :]
-
-        vggt_in = resize_frames(frames, self.image_size)
-        out = self.vggt(vggt_in.unsqueeze(0))
-        context_rgb = resize_frames([frames[-1]], self.context_rgb_size)[0].unsqueeze(0)
+    def tokenize(
+        self,
+        frames: list[np.ndarray] | Mapping[str, list[np.ndarray]],
+        task_text: str,
+    ) -> TokenizedObservation:
+        if isinstance(frames, Mapping):
+            if not frames:
+                raise ValueError("frames mapping must contain at least one camera")
+            camera_names = sorted(str(key) for key in frames.keys())
+            if self.camera_fusion == "concat":
+                context_frames = _concat_camera_frames(frames, camera_names, self.T)
+                vggt_in = resize_frames(context_frames, self.image_size)
+                out = self.vggt(vggt_in.unsqueeze(0))
+                context_tokens = out["pooled"].float()
+                context_rgb = resize_frames([context_frames[-1]], self.context_rgb_size)[0].unsqueeze(0)
+            else:
+                pooled = []
+                context_frames = None
+                for camera_name in camera_names:
+                    camera_frames = _pad_trim(list(frames[camera_name]), self.T)
+                    vggt_in = resize_frames(camera_frames, self.image_size)
+                    out = self.vggt(vggt_in.unsqueeze(0))
+                    pooled.append(out["pooled"].float())
+                    if context_frames is None:
+                        context_frames = camera_frames
+                context_tokens = torch.stack(pooled, dim=0).mean(dim=0)
+                if context_frames is None:
+                    raise ValueError("no context frames after camera fusion")
+                context_rgb = resize_frames([context_frames[-1]], self.context_rgb_size)[0].unsqueeze(0)
+            metadata = {
+                "task_text": task_text,
+                "num_frames": self.T,
+                "cameras": camera_names,
+                "camera_fusion": self.camera_fusion,
+            }
+        else:
+            frames = _pad_trim(list(frames), self.T)
+            vggt_in = resize_frames(frames, self.image_size)
+            out = self.vggt(vggt_in.unsqueeze(0))
+            context_tokens = out["pooled"].float()
+            context_rgb = resize_frames([frames[-1]], self.context_rgb_size)[0].unsqueeze(0)
+            metadata = {"task_text": task_text, "num_frames": len(frames), "cameras": ["default"]}
         task_emb = self.task_provider.embed(task_text).reshape(1, -1)
         return TokenizedObservation(
-            context_tokens=out["pooled"].float().cpu(),
+            context_tokens=context_tokens.cpu(),
             task_emb=task_emb.float().cpu(),
             context_rgb=context_rgb.float().cpu(),
-            metadata={"task_text": task_text, "num_frames": len(frames)},
+            metadata=metadata,
         )
 
 

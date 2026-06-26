@@ -1,0 +1,78 @@
+base_cfg: configs/v5_p64_1b_libero_action_policy_fastwam_spatial_dualcam_concat_padded_earlyw_rgb_lastobs_k32_base_v1.yaml
+data:
+  manifest:
+  - /data/Minko/world_model/wm3d_v5/manifests/libero_action_policy_all_dualcam_concat_T16_k32_s4_rot_spstat_v1.jsonl
+  - /data/Minko/world_model/wm3d_v5/cache/libero_spatial_expert_evalmatch_dense_s1_T16_k32_w0_v1/manifest_hardmix_sample_v1.jsonl
+  action_stats: /data/Minko/world_model/wm3d_v5/cache/libero_action_policy_all_dualcam_concat_T16_k32_s4_rot_spstat_v1/action_stats.npz
+  preload: false
+  val_frac: 0.05
+  val_split: episode
+  seed: 260617
+  plan_state_dim: 8
+train:
+  init_ckpt: /data/Minko/world_model/wm3d_v5/results/wm3d_v5_p64_1b_libero_all_plus_spatial_dense_taskboost_k32_actpolicy_sft_v1/ckpt/best.pt
+  device: cuda:0
+  batch_size: 2
+  num_workers: 4
+  max_steps: 12000
+  eval_every: 500
+  lr: 3.0e-06
+  lr_multipliers:
+    dual: 0.02
+    action_proj: 0.12
+    action_policy: 1.0
+  weight_decay: 0.02
+  warmup_steps: 400
+  grad_clip: 1.0
+  find_unused_parameters: true
+  keep_eval_ckpts: false
+  save_optimizer: false
+  action_history_dropout: 1.0
+  progress_dropout: 1.0
+  trainable_prefixes:
+  - dual.
+  - action_proj.
+  - action_policy.
+  eval_max_batches: 256
+  policy_forward_mode: act_policy
+  val_select_metric: L_serve_spatial
+  val_select_mode: min
+loss:
+  pose_weight: 3.0
+  first_pose_weight: 30.0
+  delta_weight: 1.0
+  raw_pose_weight: 12.0
+  raw_first_pose_weight: 72.0
+  raw_delta_weight: 2.0
+  grip_weight: 3.0
+  grip_transition_weight: 12.0
+  first_grip_weight: 4.0
+  huber_delta: 0.5
+  raw_huber_delta: 0.03
+  pose_axis_weights:
+  - 2.0
+  - 6.0
+  - 6.0
+  - 1.0
+  - 1.0
+  - 1.0
+  raw_pose_axis_weights:
+  - 4.0
+  - 12.0
+  - 12.0
+  - 1.0
+  - 1.0
+  - 1.0
+out:
+  root: /data/Minko/world_model/wm3d_v5/results/wm3d_v5_p64_1b_libero_all_plus_spatial_hardmix_k32_actpolicy_sft_v1
+  ckpt_dir: ckpt
+notes:
+  scope: continue from taskboost best; all-suite data plus spatial dense hard-task
+    sampling repeats
+  hardmix: 'base dense spatial repeats: task5/task7=4x, task4/task9=3x, task0/task1/task6/task8=2x,
+    task2/task3=1x'
+  reason: gate=0 full spatial after taskboost reached 76.8%; residual low tasks task5=28/50
+    task7=32/50 task4=33/50 task9=37/50 task0=39/50 task1=40/50
+  eval_protocol: spatial only; use gripper_min_close_z=0 for high-pose tasks/full
+    spatial until a better dynamic gate is implemented
+  trainable: dual/action_proj/action_policy on act_policy deploy path

@@ -34,7 +34,6 @@ from .action_proposer import ActionProposer, ActionProposerConfig
 from .action_policy import ActionChunkPolicy, ActionChunkPolicyConfig
 from .bridging_adapter import BridgingAdapter
 from .aux_idm import AuxIDM, AuxIDMConfig
-from .world_token_prior import WorldTokenPrior, WorldTokenPriorConfig
 
 
 @dataclass
@@ -95,6 +94,10 @@ class JointConfig:
     policy_max_context: int | None = None
     policy_dropout: float = 0.1
     policy_use_task: bool = True
+    policy_patch_pool: str = "mean"
+    policy_max_spatial_tokens: int = 64
+    policy_use_context_rgb: bool = False
+    policy_rgb_spatial_tokens: int = 64
     policy_lowdim_dim: int = 0
     policy_object_state_dim: int = 0
     policy_plan_state_dim: int = 0
@@ -235,6 +238,10 @@ class JointWorldModel(nn.Module):
                 max_context=cfg.policy_max_context or cfg.dual.state.T,
                 dropout=cfg.policy_dropout,
                 use_task=cfg.policy_use_task,
+                patch_pool=cfg.policy_patch_pool,
+                max_spatial_tokens=cfg.policy_max_spatial_tokens,
+                use_context_rgb=cfg.policy_use_context_rgb,
+                rgb_spatial_tokens=cfg.policy_rgb_spatial_tokens,
                 lowdim_dim=cfg.policy_lowdim_dim,
                 object_state_dim=cfg.policy_object_state_dim,
                 plan_state_dim=cfg.policy_plan_state_dim,
@@ -279,96 +286,11 @@ class JointWorldModel(nn.Module):
             ))
         else:
             self.aux_idm = None
-        self.world_prior = WorldTokenPrior(
-            WorldTokenPriorConfig(
-                token_dim=cfg.dual.state.D,
-                n_tokens=cfg.dual.state.P,
-                horizon=cfg.dual.state.k,
-                context_frames=cfg.dual.state.T,
-                hidden=cfg.world_prior_hidden,
-                n_layers=cfg.world_prior_layers,
-                n_heads=cfg.world_prior_heads,
-                mlp_mult=cfg.world_prior_mlp_mult,
-                dropout=cfg.world_prior_dropout,
-                task_dim=cfg.world_prior_task_dim or cfg.dual.state.cond_dim,
-                action_dim=cfg.world_prior_action_dim,
-                use_context=cfg.world_prior_use_context,
-                use_action=cfg.world_prior_use_action,
-                predict_initial=cfg.world_prior_predict_initial,
-            )
-        ) if cfg.enable_world_prior else None
 
     def load_action_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         """Copy pre-computed per-axis mean[6]/std[6] into ActionProjHead buffers."""
         self.action_proj.mean.copy_(mean.float().view(1, 1, 6))
         self.action_proj.std.copy_(std.float().view(1, 1, 6))
-
-    def _decode_prior_tokens(
-        self,
-        out: dict,
-        prior_tokens: torch.Tensor,
-        context_rgb: torch.Tensor | None,
-        action_cond: torch.Tensor | None,
-        task_emb: torch.Tensor,
-        *,
-        pixel: bool,
-    ) -> None:
-        prior_geom = self.geom(prior_tokens)
-        out["prior_depth"] = prior_geom["depth"]
-        out["prior_hunyuan_tokens"] = prior_tokens
-        out["prior_hunyuan_depth"] = prior_geom["depth"]
-        if "point" in prior_geom:
-            out["prior_point"] = prior_geom["point"]
-        if "pose" in prior_geom:
-            out["prior_pose_geom"] = prior_geom["pose"]
-        if not pixel:
-            return
-        if self.context_pixel is not None:
-            if context_rgb is None:
-                context_rgb = prior_tokens.new_zeros(prior_tokens.shape[0], 3, 256, 256)
-            if action_cond is None and self.cfg.context_pixel_use_action:
-                action_cond = prior_tokens.new_zeros(
-                    prior_tokens.shape[0], prior_tokens.shape[1], self.cfg.context_pixel_action_dim
-                )
-            render = self.context_pixel(
-                prior_tokens,
-                context_rgb,
-                action_cond=action_cond,
-                task_emb=task_emb,
-                return_aux=False,
-            )
-            out["prior_rgb"] = render["rgb"] if isinstance(render, dict) else render
-        elif self.pixel is not None:
-            out["prior_rgb"] = self.pixel(prior_tokens)
-
-    @torch.no_grad()
-    def generate_world_prior(
-        self,
-        c: torch.Tensor,
-        context_tokens: torch.Tensor | None = None,
-        action_cond: torch.Tensor | None = None,
-        context_rgb: torch.Tensor | None = None,
-        *,
-        steps: int = 8,
-        pixel: bool = False,
-    ) -> dict:
-        if self.world_prior is None:
-            raise RuntimeError("generate_world_prior requires enable_world_prior=True")
-        out = self.world_prior.sample_flow(
-            c,
-            context_tokens=context_tokens,
-            action_cond=action_cond,
-            steps=steps,
-        )
-        self._decode_prior_tokens(
-            out,
-            out["prior_future_tokens"],
-            context_rgb,
-            action_cond,
-            c,
-            pixel=pixel,
-        )
-        return out
 
     def forward(self, s: torch.Tensor, c: torch.Tensor,
                 action_cond: torch.Tensor | None = None,
@@ -380,7 +302,8 @@ class JointWorldModel(nn.Module):
                 progress_state: torch.Tensor | None = None,
                 prior_clean_tokens: torch.Tensor | None = None,
                 pixel: bool = True, bridging: bool = False,
-                aux_idm: bool = False) -> dict:
+                aux_idm: bool = False,
+                return_rgb_features: bool = False) -> dict:
         dual_out = self.dual(s, c, action_cond=action_cond)
         pred = dual_out["pred_tokens"]
         proj = self.action_proj(dual_out["z_a"])
@@ -406,29 +329,18 @@ class JointWorldModel(nn.Module):
                 action_cond=action_cond,
                 task_emb=c,
                 return_aux=self.cfg.context_pixel_predict_motion,
+                return_features=return_rgb_features,
             )
             if isinstance(render, dict):
                 out.update(render)
             else:
                 out["rgb"] = render
         elif pixel and self.pixel is not None:
-            out["rgb"] = self.pixel(pred)
-        if self.world_prior is not None:
-            prior_out = self.world_prior(
-                c,
-                context_tokens=s,
-                action_cond=action_cond,
-                clean_tokens=prior_clean_tokens,
-            )
-            out.update(prior_out)
-            self._decode_prior_tokens(
-                out,
-                prior_out["prior_future_tokens"],
-                context_rgb,
-                action_cond,
-                c,
-                pixel=pixel,
-            )
+            render = self.pixel(pred, return_features=return_rgb_features)
+            if isinstance(render, dict):
+                out.update(render)
+            else:
+                out["rgb"] = render
         if self.control_head is not None:
             out.update(self.control_head(
                 pred,
@@ -454,6 +366,7 @@ class JointWorldModel(nn.Module):
                 plan_state=plan_state,
                 action_history=action_history,
                 progress_state=progress_state,
+                context_rgb=context_rgb,
             ))
         if bridging and self.bridging is not None:
             out["cosmos_depth_input"] = self.bridging(geom["depth"])
@@ -463,6 +376,61 @@ class JointWorldModel(nn.Module):
             aux = self.aux_idm(s_last, pred_last)
             out["aux_pose_norm"] = aux["aux_pose_norm"]
             out["aux_grip"] = aux["aux_grip"]
+        return out
+
+    def act_policy(
+        self,
+        s: torch.Tensor,
+        c: torch.Tensor,
+        *,
+        lowdim_state: torch.Tensor | None = None,
+        object_state: torch.Tensor | None = None,
+        plan_state: torch.Tensor | None = None,
+        action_history: torch.Tensor | None = None,
+        progress_state: torch.Tensor | None = None,
+        context_rgb: torch.Tensor | None = None,
+        action_cond: torch.Tensor | None = None,
+    ) -> dict:
+        """Run the closed-loop action policy path used by LIBERO serving."""
+        if self.action_policy is None:
+            raise RuntimeError("act_policy requires enable_action_policy=True")
+        dual_out = self.dual(s, c, action_cond=action_cond)
+        proj = self.action_proj(dual_out["z_a"])
+        pol = self.action_policy(
+            dual_out["pred_tokens"],
+            task_emb=c,
+            lowdim_state=lowdim_state,
+            object_state=object_state,
+            plan_state=plan_state,
+            action_history=action_history,
+            progress_state=progress_state,
+            context_rgb=context_rgb,
+        )
+
+        def match_horizon(value: torch.Tensor, horizon: int) -> torch.Tensor:
+            if value.shape[1] == horizon:
+                return value
+            if value.shape[1] > horizon:
+                return value[:, :horizon]
+            pad = value[:, -1:].expand(-1, horizon - value.shape[1], *value.shape[2:])
+            return torch.cat([value, pad], dim=1)
+
+        policy_horizon = int(pol["policy_pose_norm"].shape[1])
+        trunk_pose_norm = match_horizon(proj["pose_norm"], policy_horizon)
+        trunk_gripper_logit = match_horizon(proj["gripper_logit"], policy_horizon)
+        pose_norm = trunk_pose_norm + pol["policy_pose_norm"]
+        gripper_logit = trunk_gripper_logit + pol["policy_gripper_logit"]
+        action_cond_out = torch.cat(
+            [pose_norm, torch.sigmoid(gripper_logit)[..., None]],
+            dim=-1,
+        )
+        out = dict(pol)
+        out["policy_pose_norm"] = pose_norm
+        out["policy_gripper_logit"] = gripper_logit
+        out["policy_action_cond"] = action_cond_out
+        out["trunk_pose_norm"] = trunk_pose_norm
+        out["trunk_gripper_logit"] = trunk_gripper_logit
+        out["trunk_pose"] = proj["pose"]
         return out
 
     def num_trainable_params(self) -> int:

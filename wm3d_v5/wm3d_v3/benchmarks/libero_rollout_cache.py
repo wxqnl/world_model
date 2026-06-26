@@ -63,6 +63,7 @@ def main() -> None:
     ap.add_argument("--out_dir", type=Path, required=True)
     ap.add_argument("--action_stats", type=Path, required=True)
     ap.add_argument("--max_windows", type=int, default=64)
+    ap.add_argument("--stride", type=int, default=1, help="Keep every Nth trace step when building windows.")
     ap.add_argument("--T", type=int, default=16)
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--token_grid", type=int, default=8)
@@ -116,14 +117,16 @@ def main() -> None:
             trace = ep.get("step_trace") or []
             for trace_idx, item in enumerate(trace):
                 step_id = int(item.get("step", trace_idx + 1))
-                if args.min_step > 0 and step_id < int(args.min_step):
-                    continue
-                if args.max_step > 0 and step_id > int(args.max_step):
-                    continue
                 frame_path = item.get("frame_path")
                 if not frame_path:
                     continue
                 frame_history.append(_load_frame(frame_path))
+                if args.stride > 1 and (trace_idx % int(args.stride)) != 0:
+                    continue
+                if args.min_step > 0 and step_id < int(args.min_step):
+                    continue
+                if args.max_step > 0 and step_id > int(args.max_step):
+                    continue
                 if args.target_chunk_source == "future_trace":
                     action_tgt = _future_action_chunk(trace, trace_idx, args.k)
                 elif args.target_chunk_source == "teacher_future_trace":
@@ -220,6 +223,7 @@ def main() -> None:
         "cached_windows": written,
         "T": args.T,
         "k": args.k,
+        "stride": int(args.stride),
         "token_grid": args.token_grid,
         "action_stats": str(args.action_stats),
         "training_signal": {

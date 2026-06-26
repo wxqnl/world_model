@@ -6,7 +6,6 @@ import math
 from collections import defaultdict
 from pathlib import Path
 
-import lpips
 import torch
 import torch.nn.functional as F
 import yaml
@@ -34,6 +33,7 @@ def build_model(cfg: dict) -> JointWorldModel:
         action_proj_hidden=cfg["model"]["action_proj_hidden"],
         action_proj_layers=cfg["model"]["action_proj_layers"],
         geom_hidden=cfg["model"]["geom_hidden"],
+        geom_upsample_mode=cfg["model"].get("geom_upsample_mode", "transpose"),
         enable_geom_extra=cfg["model"].get("enable_geom_extra", True),
         pixel_hidden=cfg["model"]["pixel_hidden"],
         pixel_n_res=cfg["model"]["pixel_n_res"],
@@ -67,7 +67,70 @@ def build_model(cfg: dict) -> JointWorldModel:
         progress_max_horizon=cfg["model"].get("progress_max_horizon", 32),
         progress_use_action=cfg["model"].get("progress_use_action", True),
         progress_use_task=cfg["model"].get("progress_use_task", True),
+        enable_action_proposer=cfg["model"].get("enable_action_proposer", False),
+        proposer_hidden=cfg["model"].get("proposer_hidden", 512),
+        proposer_layers=cfg["model"].get("proposer_layers", 3),
+        proposer_candidates=cfg["model"].get("proposer_candidates", 4),
+        proposer_horizon=cfg["model"].get("proposer_horizon"),
+        proposer_task_dim=cfg["model"].get("proposer_task_dim"),
+        proposer_dropout=cfg["model"].get("proposer_dropout", 0.0),
+        proposer_use_task=cfg["model"].get("proposer_use_task", True),
+        enable_action_policy=cfg["model"].get("enable_action_policy", False),
+        policy_hidden=cfg["model"].get("policy_hidden", 768),
+        policy_layers=cfg["model"].get("policy_layers", 6),
+        policy_heads=cfg["model"].get("policy_heads", 8),
+        policy_chunk_layers=cfg["model"].get("policy_chunk_layers", 2),
+        policy_horizon=cfg["model"].get("policy_horizon"),
+        policy_task_dim=cfg["model"].get("policy_task_dim"),
+        policy_max_context=cfg["model"].get("policy_max_context"),
+        policy_dropout=cfg["model"].get("policy_dropout", 0.1),
+        policy_use_task=cfg["model"].get("policy_use_task", True),
+        policy_lowdim_dim=cfg["model"].get("policy_lowdim_dim", 0),
+        policy_object_state_dim=cfg["model"].get("policy_object_state_dim", 0),
+        policy_plan_state_dim=cfg["model"].get("policy_plan_state_dim", 0),
+        policy_action_history_len=cfg["model"].get("policy_action_history_len", 0),
+        policy_action_history_dim=cfg["model"].get("policy_action_history_dim", 7),
+        policy_use_progress=cfg["model"].get("policy_use_progress", False),
+        policy_progress_dim=cfg["model"].get("policy_progress_dim", 1),
+        policy_progress_mode=cfg["model"].get("policy_progress_mode", "token"),
+        policy_enable_local_residual=cfg["model"].get("policy_enable_local_residual", False),
+        policy_local_hidden=cfg["model"].get("policy_local_hidden", 256),
+        policy_local_layers=cfg["model"].get("policy_local_layers", 2),
+        policy_local_residual_scale=cfg["model"].get("policy_local_residual_scale", 1.0),
+        policy_local_use_lowdim=cfg["model"].get("policy_local_use_lowdim", True),
+        policy_local_use_plan_state=cfg["model"].get("policy_local_use_plan_state", True),
+        policy_local_use_progress=cfg["model"].get("policy_local_use_progress", True),
+        policy_local_use_action_history=cfg["model"].get("policy_local_use_action_history", True),
+        policy_enable_waypoint_head=cfg["model"].get("policy_enable_waypoint_head", False),
+        policy_waypoint_hidden=cfg["model"].get("policy_waypoint_hidden", 256),
+        policy_waypoint_layers=cfg["model"].get("policy_waypoint_layers", 2),
+        policy_waypoint_num_stages=cfg["model"].get("policy_waypoint_num_stages", 4),
+        policy_waypoint_stage_dim=cfg["model"].get("policy_waypoint_stage_dim", 4),
+        policy_waypoint_active_stages=tuple(cfg["model"].get("policy_waypoint_active_stages", ())),
+        policy_waypoint_residual_scale=cfg["model"].get("policy_waypoint_residual_scale", 1.0),
+        policy_waypoint_mode=cfg["model"].get("policy_waypoint_mode", "residual"),
+        policy_waypoint_use_summary=cfg["model"].get("policy_waypoint_use_summary", True),
+        policy_waypoint_use_lowdim=cfg["model"].get("policy_waypoint_use_lowdim", True),
+        policy_waypoint_use_plan_state=cfg["model"].get("policy_waypoint_use_plan_state", True),
+        policy_waypoint_use_progress=cfg["model"].get("policy_waypoint_use_progress", True),
+        policy_waypoint_use_action_history=cfg["model"].get("policy_waypoint_use_action_history", True),
+        policy_enable_prior=cfg["model"].get("policy_enable_prior", False),
+        policy_prior_chunk_layers=cfg["model"].get("policy_prior_chunk_layers", 1),
         enable_bridging=cfg["model"].get("enable_bridging", True),
+        enable_aux_idm=cfg["model"].get("enable_aux_idm", False),
+        aux_idm_hidden=cfg["model"].get("aux_idm_hidden", 1024),
+        aux_idm_layers=cfg["model"].get("aux_idm_layers", 3),
+        enable_world_prior=cfg["model"].get("enable_world_prior", False),
+        world_prior_hidden=cfg["model"].get("world_prior_hidden", 768),
+        world_prior_layers=cfg["model"].get("world_prior_layers", 4),
+        world_prior_heads=cfg["model"].get("world_prior_heads", 8),
+        world_prior_mlp_mult=cfg["model"].get("world_prior_mlp_mult", 4),
+        world_prior_dropout=cfg["model"].get("world_prior_dropout", 0.0),
+        world_prior_task_dim=cfg["model"].get("world_prior_task_dim"),
+        world_prior_action_dim=cfg["model"].get("world_prior_action_dim", 7),
+        world_prior_use_context=cfg["model"].get("world_prior_use_context", True),
+        world_prior_use_action=cfg["model"].get("world_prior_use_action", True),
+        world_prior_predict_initial=cfg["model"].get("world_prior_predict_initial", True),
     )
     return JointWorldModel(jc)
 
@@ -82,6 +145,7 @@ def window_config_from_cfg(cfg: dict) -> WindowConfig:
         cache_root=Path(data["cache_root"]),
         tokens_subdir=data.get("tokens_subdir", "vggt_pooled"),
         action_stats=Path(action_stats) if action_stats else None,
+        require_task_emb=bool(data.get("require_task_emb", False)),
     )
 
 
@@ -122,11 +186,19 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--max_batches", type=int, default=0,
                     help="cap batches per dataset for quicker eval (0=all)")
+    ap.add_argument("--batch_size", type=int, default=0,
+                    help="override eval batch size (0=use train.batch_size_per_gpu)")
+    ap.add_argument(
+        "--skip_rgb_metrics",
+        action="store_true",
+        help="evaluate latent/action/progress prediction only; do not activate RGB/video renderer or LPIPS",
+    )
     args = ap.parse_args()
 
     cfg = yaml.safe_load(args.cfg.read_text())
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
+    rgb_metrics = bool(cfg["model"].get("enable_pixel", True)) and not args.skip_rgb_metrics
 
     records = read_manifest(cfg["data"]["manifest"])
     val = build_dataset_for_split(records, cfg, split="val")
@@ -135,13 +207,20 @@ def main():
     model = build_model(cfg).to(device).eval()
     sd = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(sd["model"])
-    print(f"loaded ckpt epoch={sd.get('epoch')} val_total={sd.get('val_total'):.4f}")
+    val_total = sd.get("val_total")
+    val_total_text = f"{val_total:.4f}" if isinstance(val_total, (float, int)) else str(val_total)
+    print(f"loaded ckpt epoch={sd.get('epoch')} val_total={val_total_text}")
 
-    lp = lpips.LPIPS(net="vgg").to(device).eval()
-    for p in lp.parameters():
-        p.requires_grad = False
+    lp = None
+    if rgb_metrics:
+        import lpips
 
-    loader = DataLoader(val, batch_size=cfg["train"]["batch_size_per_gpu"],
+        lp = lpips.LPIPS(net="vgg").to(device).eval()
+        for p in lp.parameters():
+            p.requires_grad = False
+
+    batch_size = int(args.batch_size) if int(args.batch_size) > 0 else int(cfg["train"]["batch_size_per_gpu"])
+    loader = DataLoader(val, batch_size=batch_size,
                         shuffle=False, num_workers=cfg["train"]["num_workers"],
                         pin_memory=True)
 
@@ -157,12 +236,14 @@ def main():
         s_tgt = batch["s_tgt"].to(device, non_blocking=True)
         depth_tgt = batch["depth_tgt"].to(device, non_blocking=True)
         action_tgt = batch["action_tgt"].to(device, non_blocking=True)
-        rgb_tgt = batch["rgb_tgt"].to(device, non_blocking=True).permute(0, 1, 4, 2, 3)
+        rgb_tgt = None
+        if rgb_metrics:
+            rgb_tgt = batch["rgb_tgt"].to(device, non_blocking=True).permute(0, 1, 4, 2, 3)
         action_tgt_norm = batch["action_tgt_norm"].to(device, non_blocking=True)
         action_cond = make_action_condition(action_tgt, action_tgt_norm)
         context_rgb = batch["rgb_in"][:, -1].to(device, non_blocking=True).permute(0, 3, 1, 2).contiguous()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            kwargs = dict(action_cond=action_cond, pixel=True, bridging=False)
+            kwargs = dict(action_cond=action_cond, pixel=rgb_metrics, bridging=False)
             if cfg["model"].get("enable_context_pixel", False):
                 kwargs["context_rgb"] = context_rgb
             out = model(s, c, **kwargs)
@@ -176,20 +257,45 @@ def main():
         L_pose = (out["pose"].float() - action_tgt[..., :6]).pow(2).mean(dim=(1, 2))
         grip_tgt = (action_tgt[..., 6] > 0.5).float()
         grip_acc = ((out["gripper_logit"].float().sigmoid() > 0.5).float() == grip_tgt).float().mean(dim=-1)
-        rgb_pred = out["rgb"].float()
-        L_rgb_l1 = (rgb_pred - rgb_tgt).abs().mean(dim=(1, 2, 3, 4))
-        rgb_ref = context_rgb.unsqueeze(1)
-        motion = (rgb_tgt - rgb_ref).abs().mean(dim=2, keepdim=True)
-        motion_mask = (motion > 0.03).float()
-        motion_denom = (motion_mask.sum(dim=(1, 2, 3, 4)) * rgb_tgt.shape[2]).clamp_min(1.0)
-        L_rgb_motion_l1 = (
-            (rgb_pred - rgb_tgt).abs() * motion_mask
-        ).sum(dim=(1, 2, 3, 4)) / motion_denom
-        motion_frac = motion_mask.mean(dim=(1, 2, 3, 4))
-        with torch.autocast(device_type="cuda", enabled=False):
-            rp = (rgb_pred.flatten(0, 1) * 2 - 1)
-            rt = (rgb_tgt.flatten(0, 1) * 2 - 1)
-            lpv = lp(rp, rt).view(rgb_pred.shape[0], rgb_pred.shape[1]).mean(dim=-1)
+        if "progress" in out and "progress_tgt" in batch:
+            progress_tgt = batch["progress_tgt"].to(device, non_blocking=True)
+            L_progress = (out["progress"].float().sigmoid() - progress_tgt.float()).abs().mean(dim=1)
+        else:
+            L_progress = None
+        if "proposer_pose_norm" in out:
+            prop_pose = out["proposer_pose_norm"].float()
+            prop_pose_tgt = action_tgt_norm.float()
+            prop_pose_err = (prop_pose - prop_pose_tgt[:, None]).abs().mean(dim=(2, 3))
+            prop_best = prop_pose_err.min(dim=1).values
+            prop_anchor = prop_pose_err[:, 0]
+            prop_grip_logits = out["proposer_gripper_logit"].float()
+            prop_grip_tgt = grip_tgt[:, None].expand_as(prop_grip_logits)
+            prop_grip_err = F.binary_cross_entropy_with_logits(
+                prop_grip_logits,
+                prop_grip_tgt,
+                reduction="none",
+            ).mean(dim=2).min(dim=1).values
+        else:
+            prop_best = prop_anchor = prop_grip_err = None
+        if rgb_metrics:
+            if "rgb" not in out:
+                raise RuntimeError("RGB metrics requested, but model output has no 'rgb'. Use --skip_rgb_metrics for action/prediction-only eval.")
+            if lp is None or rgb_tgt is None:
+                raise RuntimeError("internal RGB metric setup failed")
+            rgb_pred = out["rgb"].float()
+            L_rgb_l1 = (rgb_pred - rgb_tgt).abs().mean(dim=(1, 2, 3, 4))
+            rgb_ref = context_rgb.unsqueeze(1)
+            motion = (rgb_tgt - rgb_ref).abs().mean(dim=2, keepdim=True)
+            motion_mask = (motion > 0.03).float()
+            motion_denom = (motion_mask.sum(dim=(1, 2, 3, 4)) * rgb_tgt.shape[2]).clamp_min(1.0)
+            L_rgb_motion_l1 = (
+                (rgb_pred - rgb_tgt).abs() * motion_mask
+            ).sum(dim=(1, 2, 3, 4)) / motion_denom
+            motion_frac = motion_mask.mean(dim=(1, 2, 3, 4))
+            with torch.autocast(device_type="cuda", enabled=False):
+                rp = (rgb_pred.flatten(0, 1) * 2 - 1)
+                rt = (rgb_tgt.flatten(0, 1) * 2 - 1)
+                lpv = lp(rp, rt).view(rgb_pred.shape[0], rgb_pred.shape[1]).mean(dim=-1)
         for i in range(s.shape[0]):
             d = batch["dataset"][i]
             by_ds[d]["L_state_mse"] += float(L_state_mse[i])
@@ -197,31 +303,54 @@ def main():
             by_ds[d]["L_depth_rel_L1"] += float(L_depth[i])
             by_ds[d]["L_pose_mse"] += float(L_pose[i])
             by_ds[d]["grip_acc"] += float(grip_acc[i])
-            by_ds[d]["L_rgb_L1"] += float(L_rgb_l1[i])
-            by_ds[d]["L_rgb_lpips"] += float(lpv[i])
-            by_ds[d]["L_rgb_motion_L1"] += float(L_rgb_motion_l1[i])
-            by_ds[d]["motion_frac"] += float(motion_frac[i])
+            if L_progress is not None:
+                by_ds[d]["progress_abs_err"] += float(L_progress[i])
+            if prop_best is not None:
+                by_ds[d]["proposer_best_pose_L1"] += float(prop_best[i])
+                by_ds[d]["proposer_anchor_pose_L1"] += float(prop_anchor[i])
+                by_ds[d]["proposer_best_grip_bce"] += float(prop_grip_err[i])
+            if rgb_metrics:
+                by_ds[d]["L_rgb_L1"] += float(L_rgb_l1[i])
+                by_ds[d]["L_rgb_lpips"] += float(lpv[i])
+                by_ds[d]["L_rgb_motion_L1"] += float(L_rgb_motion_l1[i])
+                by_ds[d]["motion_frac"] += float(motion_frac[i])
             cnt[d] += 1
         by_ds["ALL"]["L_state_mse"] += float(L_state_mse.sum())
         by_ds["ALL"]["cos_sim"] += float(cos.sum())
         by_ds["ALL"]["L_depth_rel_L1"] += float(L_depth.sum())
         by_ds["ALL"]["L_pose_mse"] += float(L_pose.sum())
         by_ds["ALL"]["grip_acc"] += float(grip_acc.sum())
-        by_ds["ALL"]["L_rgb_L1"] += float(L_rgb_l1.sum())
-        by_ds["ALL"]["L_rgb_lpips"] += float(lpv.sum())
-        by_ds["ALL"]["L_rgb_motion_L1"] += float(L_rgb_motion_l1.sum())
-        by_ds["ALL"]["motion_frac"] += float(motion_frac.sum())
+        if L_progress is not None:
+            by_ds["ALL"]["progress_abs_err"] += float(L_progress.sum())
+        if prop_best is not None:
+            by_ds["ALL"]["proposer_best_pose_L1"] += float(prop_best.sum())
+            by_ds["ALL"]["proposer_anchor_pose_L1"] += float(prop_anchor.sum())
+            by_ds["ALL"]["proposer_best_grip_bce"] += float(prop_grip_err.sum())
+        if rgb_metrics:
+            by_ds["ALL"]["L_rgb_L1"] += float(L_rgb_l1.sum())
+            by_ds["ALL"]["L_rgb_lpips"] += float(lpv.sum())
+            by_ds["ALL"]["L_rgb_motion_L1"] += float(L_rgb_motion_l1.sum())
+            by_ds["ALL"]["motion_frac"] += float(motion_frac.sum())
         cnt["ALL"] += s.shape[0]
         if (bi + 1) % 25 == 0:
-            print(f"[{bi+1}/{len(loader)}] L_state {by_ds['ALL']['L_state_mse']/cnt['ALL']:.4f} "
-                  f"L_depth {by_ds['ALL']['L_depth_rel_L1']/cnt['ALL']:.4f} "
-                  f"L_pose {by_ds['ALL']['L_pose_mse']/cnt['ALL']:.4f} "
-                  f"grip {by_ds['ALL']['grip_acc']/cnt['ALL']:.4f} "
-                  f"rgb_L1 {by_ds['ALL']['L_rgb_L1']/cnt['ALL']:.4f} "
-                  f"lpips {by_ds['ALL']['L_rgb_lpips']/cnt['ALL']:.4f} "
-                  f"motion_L1 {by_ds['ALL']['L_rgb_motion_L1']/cnt['ALL']:.4f}")
+            msg = (f"[{bi+1}/{len(loader)}] L_state {by_ds['ALL']['L_state_mse']/cnt['ALL']:.4f} "
+                   f"L_depth {by_ds['ALL']['L_depth_rel_L1']/cnt['ALL']:.4f} "
+                   f"L_pose {by_ds['ALL']['L_pose_mse']/cnt['ALL']:.4f} "
+                   f"grip {by_ds['ALL']['grip_acc']/cnt['ALL']:.4f}")
+            if rgb_metrics:
+                msg += (f" rgb_L1 {by_ds['ALL']['L_rgb_L1']/cnt['ALL']:.4f} "
+                        f"lpips {by_ds['ALL']['L_rgb_lpips']/cnt['ALL']:.4f} "
+                        f"motion_L1 {by_ds['ALL']['L_rgb_motion_L1']/cnt['ALL']:.4f}")
+            print(msg)
 
-    report = {"counts": dict(cnt), "metrics": {}}
+    report = {
+        "mode": {
+            "rgb_metrics": rgb_metrics,
+            "video_generation_active": rgb_metrics,
+        },
+        "counts": dict(cnt),
+        "metrics": {},
+    }
     for d, mvals in by_ds.items():
         n = max(1, cnt[d])
         report["metrics"][d] = {k: v / n for k, v in mvals.items()}

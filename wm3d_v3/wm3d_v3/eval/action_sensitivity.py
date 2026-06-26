@@ -92,6 +92,12 @@ def _sample_l1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return _sample_mean((a.float() - b.float()).abs())
 
 
+def _masked_sample_l1(a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    values = (a.float() - b.float()).abs()
+    denom = mask.reshape(mask.shape[0], -1).sum(dim=1).clamp_min(1.0)
+    return (values * mask.float()).reshape(values.shape[0], -1).sum(dim=1) / denom
+
+
 def _resize_motion_like(motion: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     if motion.shape == ref.shape:
         return motion
@@ -105,6 +111,21 @@ def _resize_motion_like(motion: torch.Tensor, ref: torch.Tensor) -> torch.Tensor
         size=ref.shape[-2:],
         mode="nearest",
     ).reshape(b, t, c, ref.shape[-2], ref.shape[-1])
+
+
+def _resize_motion_mask_to_depth(motion: torch.Tensor, depth_ref: torch.Tensor) -> torch.Tensor:
+    if motion.ndim != 5 or depth_ref.ndim != 4:
+        raise ValueError(f"expected motion [B,T,1,H,W] and depth [B,T,H,W], got {tuple(motion.shape)} and {tuple(depth_ref.shape)}")
+    if motion.shape[0] != depth_ref.shape[0] or motion.shape[1] != depth_ref.shape[1]:
+        raise ValueError(f"cannot align motion/depth leading dims: {tuple(motion.shape)} vs {tuple(depth_ref.shape)}")
+    if motion.shape[-2:] != depth_ref.shape[-2:]:
+        b, t = motion.shape[:2]
+        motion = F.interpolate(
+            motion.float().flatten(0, 1),
+            size=depth_ref.shape[-2:],
+            mode="nearest",
+        ).reshape(b, t, motion.shape[2], depth_ref.shape[-2], depth_ref.shape[-1])
+    return motion[:, :, 0].float()
 
 
 def _sample_cos(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -158,6 +179,35 @@ def compute_counterfactual_metrics(
     metrics["depth_gt_l1_gap"] = variant_depth_l1 - real_depth_l1
     metrics["depth_gt_l1_acc"] = (real_depth_l1 < variant_depth_l1).float()
 
+    if "context_depth" in targets:
+        context_depth = _normalize_depth(targets["context_depth"].float()).unsqueeze(1)
+        real_depth_change = real_depth - context_depth
+        variant_depth_change = variant_depth - context_depth
+        target_depth_change = depth_tgt - context_depth
+        real_change_vector_l1 = _sample_l1(real_depth_change, target_depth_change)
+        variant_change_vector_l1 = _sample_l1(variant_depth_change, target_depth_change)
+        real_change_l1 = _sample_l1(real_depth_change.abs(), target_depth_change.abs())
+        variant_change_l1 = _sample_l1(variant_depth_change.abs(), target_depth_change.abs())
+        metrics["depth_change_vector_real_gt_l1"] = real_change_vector_l1
+        metrics["depth_change_vector_variant_gt_l1"] = variant_change_vector_l1
+        metrics["depth_change_vector_gt_l1_gap"] = variant_change_vector_l1 - real_change_vector_l1
+        metrics["depth_change_vector_gt_l1_acc"] = (real_change_vector_l1 < variant_change_vector_l1).float()
+        metrics["depth_change_real_gt_l1"] = real_change_l1
+        metrics["depth_change_variant_gt_l1"] = variant_change_l1
+        metrics["depth_change_gt_l1_gap"] = variant_change_l1 - real_change_l1
+        metrics["depth_change_gt_l1_acc"] = (real_change_l1 < variant_change_l1).float()
+        metrics["depth_change_l1_gap"] = _sample_l1(real_depth_change.abs(), variant_depth_change.abs())
+        metrics["depth_change_vector_l1_gap"] = _sample_l1(real_depth_change, variant_depth_change)
+
+    if "motion_tgt" in targets:
+        motion_mask = _resize_motion_mask_to_depth(targets["motion_tgt"].float(), real_depth)
+        real_motion_depth_l1 = _masked_sample_l1(real_depth, depth_tgt, motion_mask)
+        variant_motion_depth_l1 = _masked_sample_l1(variant_depth, depth_tgt, motion_mask)
+        metrics["motion_region_depth_real_gt_l1"] = real_motion_depth_l1
+        metrics["motion_region_depth_variant_gt_l1"] = variant_motion_depth_l1
+        metrics["motion_region_depth_gt_l1_gap"] = variant_motion_depth_l1 - real_motion_depth_l1
+        metrics["motion_region_depth_gt_l1_acc"] = (real_motion_depth_l1 < variant_motion_depth_l1).float()
+
     if "motion_hint" in real_out and "motion_hint" in variant_out:
         real_motion = real_out["motion_hint"].float()
         variant_motion = variant_out["motion_hint"].float()
@@ -170,6 +220,19 @@ def compute_counterfactual_metrics(
             metrics["motion_hint_variant_gt_l1"] = variant_motion_l1
             metrics["motion_hint_gt_l1_gap"] = variant_motion_l1 - real_motion_l1
             metrics["motion_hint_gt_l1_acc"] = (real_motion_l1 < variant_motion_l1).float()
+
+    if "progress" in real_out and "progress" in variant_out:
+        real_progress = torch.sigmoid(real_out["progress"].float())
+        variant_progress = torch.sigmoid(variant_out["progress"].float())
+        metrics["progress_l1_gap"] = _sample_l1(real_progress, variant_progress)
+        if "progress_tgt" in targets:
+            progress_tgt = targets["progress_tgt"].float()
+            real_progress_l1 = _sample_l1(real_progress, progress_tgt)
+            variant_progress_l1 = _sample_l1(variant_progress, progress_tgt)
+            metrics["progress_real_gt_l1"] = real_progress_l1
+            metrics["progress_variant_gt_l1"] = variant_progress_l1
+            metrics["progress_gt_l1_gap"] = variant_progress_l1 - real_progress_l1
+            metrics["progress_gt_l1_acc"] = (real_progress_l1 < variant_progress_l1).float()
 
     return metrics
 
@@ -244,7 +307,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     loader = DataLoader(
         val,
-        batch_size=cfg["train"]["batch_size_per_gpu"],
+        batch_size=args.batch_size or cfg["train"]["batch_size_per_gpu"],
         shuffle=False,
         num_workers=cfg["train"]["num_workers"],
         pin_memory=(device.type == "cuda"),
@@ -278,6 +341,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "depth_tgt": depth_tgt,
             "motion_tgt": motion_target_from_rgb(rgb_tgt, context_rgb),
         }
+        if "progress_tgt" in batch:
+            targets["progress_tgt"] = _to_device(batch, "progress_tgt", device)
         dataset_names = list(batch["dataset"])
         unique_datasets = sorted(set(dataset_names))
 
@@ -328,6 +393,7 @@ def main() -> None:
     ap.add_argument("--ckpt", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--max_batches", type=int, default=0, help="cap batches for quicker eval (0=all)")
+    ap.add_argument("--batch_size", type=int, default=0)
     ap.add_argument("--seed", type=int, default=None, help="validation split and shuffle seed (default: cfg data.seed)")
     ap.add_argument(
         "--variants",

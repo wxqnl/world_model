@@ -7,6 +7,7 @@ teacher, without changing the WM3D world core or policy heads.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -23,6 +24,22 @@ from PIL import Image
 
 if "bool" not in np.__dict__:
     np.bool = np.bool_  # type: ignore[attr-defined]
+
+
+def _enable_trusted_legacy_torch_load() -> None:
+    """Allow LIBERO trusted local init-state files under PyTorch 2.6+."""
+    if getattr(torch.load, "_wm3d_legacy_compat", False):
+        return
+    original_load = torch.load
+    supports_weights_only = "weights_only" in inspect.signature(original_load).parameters
+
+    def compatible_load(*args: Any, **kwargs: Any) -> Any:
+        if supports_weights_only:
+            kwargs.setdefault("weights_only", False)
+        return original_load(*args, **kwargs)
+
+    compatible_load._wm3d_legacy_compat = True  # type: ignore[attr-defined]
+    torch.load = compatible_load  # type: ignore[assignment]
 
 
 def _bootstrap_libero(root: Path) -> None:
@@ -334,6 +351,7 @@ def _init_benchmark_and_embs(cfg: Any) -> Any:
 
 def _train(args: argparse.Namespace) -> None:
     _bootstrap_libero(args.libero_root)
+    _enable_trusted_legacy_torch_load()
     _prefer_glfw_rendering()
     import numpy as np
     from torch.utils.data import DataLoader, RandomSampler
@@ -437,11 +455,12 @@ def _train(args: argparse.Namespace) -> None:
 
 def _load_rollout_algo(args: argparse.Namespace) -> tuple[Any, Any, Any]:
     _bootstrap_libero(args.libero_root)
+    _enable_trusted_legacy_torch_load()
     _prefer_glfw_rendering()
     from libero.lifelong.algos import get_algo_class
     from libero.lifelong.utils import safe_device
 
-    model_dict = torch.load(args.ckpt, map_location=args.device, weights_only=False)
+    model_dict = torch.load(args.ckpt, map_location=args.device)
     state_dict = model_dict["state_dict"]
     cfg = model_dict.get("cfg")
     previous_masks = model_dict.get("previous_masks")

@@ -41,39 +41,78 @@ def _action_stats(rows: list[dict[str, Any]]) -> tuple[np.ndarray, np.ndarray, f
     return mean, std, pos_rate
 
 
-def _frames_from_hdf5(row: dict[str, Any]) -> list[np.ndarray]:
-    hdf5_path = Path(row["hdf5_path"])
-    demo_id = str(row["demo_id"])
-    camera_key = str(row.get("camera_key") or "agentview_rgb")
-    start = int(row["context_start"])
-    T = int(row["T"])
-    with h5py.File(hdf5_path, "r") as h5:
-        obs = h5["data"][demo_id]["obs"]
-        all_frames = np.asarray(obs[camera_key])
-        if start < 0:
-            pad = np.repeat(all_frames[:1], -start, axis=0)
-            arr = np.concatenate([pad, all_frames[: start + T]], axis=0)
-        else:
-            arr = all_frames[start: start + T]
-        if arr.shape[0] < T:
-            pad = np.repeat(all_frames[-1:], T - arr.shape[0], axis=0)
-            arr = np.concatenate([arr, pad], axis=0)
+def _camera_keys_from_row(row: dict[str, Any]) -> list[str]:
+    value = row.get("camera_keys")
+    if isinstance(value, list):
+        keys = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raw = str(row.get("camera_key") or "agentview_rgb")
+        keys = [item.strip() for item in raw.split(",") if item.strip()]
+    if not keys:
+        raise ValueError("row does not contain any camera key")
+    return keys
+
+
+def _read_camera_frames(
+    obs: h5py.Group,
+    camera_key: str,
+    *,
+    start: int,
+    T: int,
+    indices: list[int] | None,
+    rotate_180: bool,
+) -> list[np.ndarray]:
+    all_frames = np.asarray(obs[camera_key])
+    if indices is not None:
+        arr = all_frames[np.asarray(indices, dtype=np.int64)]
+    elif start < 0:
+        pad = np.repeat(all_frames[:1], -start, axis=0)
+        arr = np.concatenate([pad, all_frames[: start + T]], axis=0)
+    else:
+        arr = all_frames[start: start + T]
+    if arr.shape[0] < T:
+        pad = np.repeat(all_frames[-1:], T - arr.shape[0], axis=0)
+        arr = np.concatenate([arr, pad], axis=0)
     if arr.ndim != 4:
         raise ValueError(f"expected [{T},H,W,3] or [{T},3,H,W] frames, got {arr.shape}")
     if arr.shape[1] == 3 and arr.shape[-1] != 3:
         arr = np.transpose(arr, (0, 2, 3, 1))
     if arr.shape[-1] != 3:
         raise ValueError(f"expected RGB frames with 3 channels, got {arr.shape}")
+    if rotate_180:
+        arr = arr[:, ::-1, ::-1, :]
     return [frame for frame in arr]
+
+
+def _frames_from_hdf5(row: dict[str, Any], *, rotate_180: bool = False) -> list[np.ndarray] | dict[str, list[np.ndarray]]:
+    hdf5_path = Path(row["hdf5_path"])
+    demo_id = str(row["demo_id"])
+    camera_keys = _camera_keys_from_row(row)
+    start = int(row["context_start"])
+    T = int(row["T"])
+    indices = [int(x) for x in row.get("context_indices", [])] or None
+    if indices is not None and len(indices) != T:
+        raise ValueError(f"context_indices must have length {T}, got {len(indices)}")
+    with h5py.File(hdf5_path, "r") as h5:
+        obs = h5["data"][demo_id]["obs"]
+        by_camera = {
+            camera_key: _read_camera_frames(obs, camera_key, start=start, T=T, indices=indices, rotate_180=rotate_180)
+            for camera_key in camera_keys
+        }
+    if len(camera_keys) == 1:
+        return by_camera[camera_keys[0]]
+    return by_camera
 
 
 def _lowdim_from_hdf5(row: dict[str, Any]) -> np.ndarray:
     hdf5_path = Path(row["hdf5_path"])
     demo_id = str(row["demo_id"])
     target_start = int(row["target_start"])
+    target_indices = [int(x) for x in row.get("target_indices", [])]
     with h5py.File(hdf5_path, "r") as h5:
         obs = h5["data"][demo_id]["obs"]
-        idx = min(max(target_start, 0), int(obs["ee_pos"].shape[0]) - 1)
+        raw_target = target_indices[0] if target_indices else target_start
+        idx = min(max(raw_target, 0), int(obs["ee_pos"].shape[0]) - 1)
         return np.concatenate([
             np.asarray(obs["ee_pos"][idx], dtype=np.float32).reshape(-1),
             np.asarray(obs["gripper_states"][idx], dtype=np.float32).reshape(-1),
@@ -110,6 +149,9 @@ def main() -> None:
     ap.add_argument("--action_stats", type=Path, default=None)
     ap.add_argument("--include_lowdim", action="store_true")
     ap.add_argument("--action_history_len", type=int, default=0)
+    ap.add_argument("--camera_keys", default=None, help="Comma-separated HDF5 obs camera keys to fuse.")
+    ap.add_argument("--camera_fusion", default="mean", choices=("mean", "concat"))
+    ap.add_argument("--rotate_180", action="store_true")
     ap.add_argument("--log_every", type=int, default=8)
     args = ap.parse_args()
 
@@ -136,6 +178,7 @@ def main() -> None:
         device=args.device,
         qwen_device=args.qwen_device or args.device,
         allow_zero_task_fallback=args.allow_zero_task_fallback,
+        camera_fusion=args.camera_fusion,
     )
 
     manifest_path = args.out_dir / "manifest.jsonl"
@@ -144,7 +187,10 @@ def main() -> None:
         for idx, row in enumerate(rows):
             if int(row["T"]) != args.T:
                 raise ValueError(f"row T={row['T']} does not match --T={args.T}")
-            frames = _frames_from_hdf5(row)
+            if args.camera_keys:
+                row = dict(row)
+                row["camera_keys"] = [item.strip() for item in str(args.camera_keys).split(",") if item.strip()]
+            frames = _frames_from_hdf5(row, rotate_180=bool(args.rotate_180))
             obs = tokenizer.tokenize(frames, str(row["instruction"]))
             action_tgt = np.asarray(row["action_chunk"], dtype=np.float32)
             if action_tgt.ndim != 2 or action_tgt.shape[1] != 7:
@@ -178,6 +224,9 @@ def main() -> None:
                 "target_start": row.get("target_start"),
                 "T": int(row["T"]),
                 "k": int(row["k"]),
+                "camera_keys": _camera_keys_from_row(row),
+                "camera_fusion": str(args.camera_fusion),
+                "rotate_180": bool(args.rotate_180),
                 "lowdim_state": bool(args.include_lowdim),
                 "action_history_len": int(args.action_history_len),
                 "terminal_success_tgt": float(row.get("terminal_success_tgt", 1.0)),
@@ -205,6 +254,9 @@ def main() -> None:
             "pos_rate": pos_rate,
         },
         "task_cache_dir": str(args.task_cache_dir),
+        "camera_keys": str(args.camera_keys or ""),
+        "camera_fusion": str(args.camera_fusion),
+        "rotate_180": bool(args.rotate_180),
         "lowdim_state": bool(args.include_lowdim),
         "action_history_len": int(args.action_history_len),
     }

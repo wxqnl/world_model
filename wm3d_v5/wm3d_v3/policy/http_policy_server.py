@@ -21,6 +21,7 @@ from PIL import Image
 
 from wm3d_v3.benchmarks.online_tokenizer import OnlineObservationTokenizer
 from wm3d_v3.policy import ScoreWeights, WM3DTokenPolicy
+from wm3d_v3.policy.world_model_policy import denormalize_action_cond
 
 
 def _decode_frame(payload: str) -> np.ndarray:
@@ -29,6 +30,23 @@ def _decode_frame(payload: str) -> np.ndarray:
     raw = base64.b64decode(payload)
     img = Image.open(io.BytesIO(raw)).convert("RGB")
     return np.asarray(img)
+
+
+def _decode_frames_by_camera(request: dict[str, Any]) -> list[np.ndarray] | dict[str, list[np.ndarray]]:
+    frames_by_camera = request.get("frames_by_camera")
+    if frames_by_camera is not None:
+        if not isinstance(frames_by_camera, dict) or not frames_by_camera:
+            raise ValueError("frames_by_camera must be a non-empty object")
+        decoded: dict[str, list[np.ndarray]] = {}
+        for camera_name, payloads in frames_by_camera.items():
+            if not isinstance(payloads, list) or not payloads:
+                raise ValueError(f"frames_by_camera[{camera_name!r}] must be a non-empty list")
+            decoded[str(camera_name)] = [_decode_frame(str(item)) for item in payloads]
+        return decoded
+    frames_payload = request.get("frames") or []
+    if not isinstance(frames_payload, list) or not frames_payload:
+        raise ValueError("request must include non-empty frames list or frames_by_camera object")
+    return [_decode_frame(str(item)) for item in frames_payload]
 
 
 def _optional_tensor(request: dict[str, Any], key: str, shape_last: int | None = None) -> torch.Tensor | None:
@@ -89,10 +107,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length).decode("utf-8"))
-            frames_payload = request.get("frames") or []
-            if not isinstance(frames_payload, list) or not frames_payload:
-                raise ValueError("request must include non-empty frames list")
-            frames = [_decode_frame(str(item)) for item in frames_payload]
+            frames = _decode_frames_by_camera(request)
             task_text = str(request.get("task_text") or "robot manipulation")
             obs = self.server.tokenizer.tokenize(frames, task_text)
             decision = self.server.policy.act_from_tokens(
@@ -105,11 +120,19 @@ class Handler(BaseHTTPRequestHandler):
                 action_history=_optional_tensor(request, "action_history", 7),
                 progress_state=_optional_progress_tensor(request),
             )
+            action_chunk_continuous = denormalize_action_cond(
+                decision.raw["selected_action_cond"],
+                model=self.server.policy.model,
+                binarize_gripper=False,
+            ).detach().float().cpu()
             self._send_json(
                 200,
                 {
                     "first_action_raw": decision.first_action_raw.reshape(-1, 7)[0].tolist(),
                     "action_chunk_raw": decision.action_chunk_raw.reshape(-1, 7).tolist(),
+                    "first_action_continuous_raw": action_chunk_continuous.reshape(-1, 7)[0].tolist(),
+                    "action_chunk_continuous_raw": action_chunk_continuous.reshape(-1, 7).tolist(),
+                    "selected_gripper_prob": decision.raw["selected_gripper_prob"].detach().float().cpu().reshape(-1).tolist(),
                     "selected_idx": int(decision.selected_idx.reshape(-1)[0]),
                     "selected_score": float(decision.selected_score.reshape(-1)[0]),
                     "candidate_scores": decision.candidate_scores.reshape(-1).tolist(),
@@ -130,6 +153,7 @@ def main() -> None:
     ap.add_argument("--qwen_device", default=None)
     ap.add_argument("--task_cache_dir", type=Path, default=Path("/data/Minko/datasets/cache/wm3d_v3/online_taskemb"))
     ap.add_argument("--allow_zero_task_fallback", action="store_true")
+    ap.add_argument("--camera_fusion", default="mean", choices=("mean", "concat"))
     ap.add_argument("--score_progress_weight", type=float, default=1.0)
     ap.add_argument("--score_terminal_weight", type=float, default=1.0)
     ap.add_argument("--score_plausibility_weight", type=float, default=0.0)
@@ -168,6 +192,7 @@ def main() -> None:
         device=args.device,
         qwen_device=args.qwen_device,
         allow_zero_task_fallback=args.allow_zero_task_fallback,
+        camera_fusion=args.camera_fusion,
     )
     policy = WM3DTokenPolicy.from_checkpoint(
         args.cfg,

@@ -20,6 +20,7 @@ I3D="${I3D:-/data/Minko/world_model/wm3d_v5/external/fvd_i3d/i3d_torchscript.pt}
 SUITES="${SUITES:-10,goal,object,spatial}"
 RUN_ID="${RUN_ID:-wm3d_v5_1b_stage2_worldvla_official}"
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"
+VIDEO_SIZE="${VIDEO_SIZE:-512}"
 
 mkdir -p "$RESULT_ROOT"/logs "$RESULT_ROOT"/summaries "$RESULT_ROOT"/videos "$RESULT_ROOT"/metrics
 
@@ -58,6 +59,7 @@ run_export() {
       --out_summary "$RESULT_ROOT/summaries/export_${RUN_ID}_rank${rank}.json" \
       --device cuda:0 \
       --qwen_device cuda:0 \
+      --video_size "$VIDEO_SIZE" \
       --rank "$rank" \
       --world_size "$world_size" \
       --run_id "$RUN_ID" \
@@ -68,16 +70,25 @@ run_export() {
 }
 
 run_metric() {
-  "$PY" - <<PY 2>&1 | tee "$RESULT_ROOT/metrics/official_metric_${RUN_ID}.log"
+  run_metric_folder "all" "$RESULT_ROOT/videos/$RUN_ID" "$RESULT_ROOT/metrics/official_metric_${RUN_ID}.log"
+}
+
+run_metric_folder() {
+  local label="$1"
+  local folder="$2"
+  local log_path="$3"
+
+  "$PY" - <<PY 2>&1 | tee "$log_path"
 import argparse
 import runpy
 import sys
 
+print("[metric_label] $label")
 sys.argv = [
     "calculate_world_model_performance.py",
     "--i3d_model_path", "$I3D",
-    "--folder_world_model", "$RESULT_ROOT/videos/$RUN_ID",
-    "--folder_action_world_model", "$RESULT_ROOT/videos/$RUN_ID",
+    "--folder_world_model", "$folder",
+    "--folder_action_world_model", "$folder",
 ]
 runpy.run_path(
     "$OFFICIAL_ROOT/exps_libero_world_model/calculate_world_model_performance.py",
@@ -85,6 +96,39 @@ runpy.run_path(
     init_globals={"argparse": argparse},
 )
 PY
+}
+
+split_suite_videos() {
+  local suite_root="$RESULT_ROOT/videos_by_suite/$RUN_ID"
+  rm -rf "$suite_root"
+  mkdir -p "$suite_root"
+
+  IFS=',' read -r -a suite_array <<< "$SUITES"
+  for suite in "${suite_array[@]}"; do
+    local normalized_suite="$suite"
+    if [[ "$normalized_suite" == "long" ]]; then
+      normalized_suite="10"
+    fi
+    local suite_dir="$suite_root/$normalized_suite"
+    mkdir -p "$suite_dir"
+    while IFS= read -r -d '' video_path; do
+      ln -s "$video_path" "$suite_dir/$(basename "$video_path")"
+    done < <(find "$RESULT_ROOT/videos/$RUN_ID" -maxdepth 1 -type f -name "*--episode=${normalized_suite}_*--*.mp4" -print0)
+  done
+}
+
+run_metric_by_suite() {
+  split_suite_videos
+
+  local suite_root="$RESULT_ROOT/videos_by_suite/$RUN_ID"
+  IFS=',' read -r -a suite_array <<< "$SUITES"
+  for suite in "${suite_array[@]}"; do
+    local normalized_suite="$suite"
+    if [[ "$normalized_suite" == "long" ]]; then
+      normalized_suite="10"
+    fi
+    run_metric_folder "$normalized_suite" "$suite_root/$normalized_suite" "$RESULT_ROOT/metrics/official_metric_${RUN_ID}_${normalized_suite}.log"
+  done
 }
 
 case "$cmd" in
@@ -97,13 +141,17 @@ case "$cmd" in
   metric)
     run_metric
     ;;
+  metric_by_suite)
+    run_metric_by_suite
+    ;;
   all)
     run_prepare
     run_export
     run_metric
+    run_metric_by_suite
     ;;
   *)
-    echo "usage: $0 [prepare|export|metric|all]" >&2
+    echo "usage: $0 [prepare|export|metric|metric_by_suite|all]" >&2
     exit 2
     ;;
 esac

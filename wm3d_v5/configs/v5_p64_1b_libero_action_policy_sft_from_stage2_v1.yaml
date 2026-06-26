@@ -1,0 +1,35 @@
+base_cfg: configs/v5_p64_1b_libero_action_policy_base_from_stage2_v1.yaml
+data:
+  manifest:
+  - /data/Minko/world_model/wm3d_v5/manifests/libero_action_policy_full_T16_k8_s4_v1.jsonl
+  action_stats: /0604-10T-test/wm3d_v5/cache/libero_action_policy_full_T16_k8_s4_v1/action_stats.npz
+  preload: false
+  val_frac: 0.10
+  seed: 260610
+  plan_state_dim: 17
+train:
+  init_ckpt: results/wm3d_v5_p64_1b_stage2_action_scaffold_native3d_wsd_4node_v1/ckpt/best.pt
+  device: cuda:0
+  batch_size: 32
+  num_workers: 12
+  max_steps: 10000
+  eval_every: 200
+  lr: 2.0e-4
+  weight_decay: 0.02
+  warmup_steps: 200
+  grad_clip: 1.0
+  keep_eval_ckpts: false
+  eval_ckpt_dir: eval_ckpt
+  trainable_prefixes:
+  - action_policy.
+loss:
+  pose_weight: 1.2
+  first_pose_weight: 8.0
+  delta_weight: 0.2
+  grip_weight: 2.5
+  grip_transition_weight: 18.0
+  first_grip_weight: 4.0
+  huber_delta: 0.5
+out:
+  root: /data/Minko/world_model/wm3d_v5/results/wm3d_v5_p64_1b_libero_action_policy_sft_from_stage2_v1
+  ckpt_dir: ckpt

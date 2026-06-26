@@ -1,0 +1,44 @@
+base_cfg: configs/v5_p64_1b_libero_action_policy_base_a2_v1.yaml
+data:
+  manifest:
+  - /data/Minko/world_model/wm3d_v5/manifests/libero_action_policy_full_T16_k8_s4_v1_local.jsonl
+  action_stats: /data/Minko/wm3d_v5_cache_local/libero_action_policy_full_T16_k8_s4_v1/action_stats.npz
+  preload: false
+  val_frac: 0.10
+  seed: 260610
+  plan_state_dim: 17
+train:
+  # p=1.0 history-free head retrain: action_history is ALWAYS zeroed so the only
+  # way to reduce loss is to ground BOTH pose and gripper in vision+lowdim. The
+  # p=0.5 nohistft left a copycat escape valve (half the batches kept history) so
+  # the POSE never grounded (serve cosine 0.20). Warm-start from nohistft best.pt
+  # (gripper already grounded). best.pt selected by L_serve (history-off).
+  init_ckpt: results/wm3d_v5_p64_1b_libero_action_policy_a2_nohistft_v1/ckpt/best.pt
+  device: cuda:0
+  batch_size: 8
+  num_workers: 8
+  max_steps: 4000
+  eval_every: 200
+  lr: 2.0e-4
+  lr_multipliers:
+    action_policy: 1.0
+  weight_decay: 0.02
+  warmup_steps: 100
+  grad_clip: 1.0
+  find_unused_parameters: true
+  keep_eval_ckpts: false
+  action_history_dropout: 1.0
+  val_select_metric: L_serve
+  trainable_prefixes:
+  - action_policy.
+loss:
+  pose_weight: 1.5
+  first_pose_weight: 10.0
+  delta_weight: 0.2
+  grip_weight: 2.5
+  grip_transition_weight: 18.0
+  first_grip_weight: 4.0
+  huber_delta: 0.5
+out:
+  root: /data/Minko/world_model/wm3d_v5/results/wm3d_v5_p64_1b_libero_action_policy_a2_nohistft_p1_v1
+  ckpt_dir: ckpt

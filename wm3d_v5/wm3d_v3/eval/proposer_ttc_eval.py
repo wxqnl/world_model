@@ -72,8 +72,17 @@ def _oracle_score(
     motion_tgt: torch.Tensor | None,
 ) -> torch.Tensor:
     token_mse = (out["pred_tokens"].float() - s_tgt.float()).pow(2).flatten(1).mean(dim=1)
+    depth_pred = out["depth"].float()
+    if depth_pred.shape[-2:] != depth_tgt.shape[-2:]:
+        bsz, horizon = depth_pred.shape[:2]
+        depth_pred = F.interpolate(
+            depth_pred.flatten(0, 1)[:, None],
+            size=depth_tgt.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(bsz, horizon, depth_tgt.shape[-2], depth_tgt.shape[-1])
     depth_l1 = (
-        _normalize_depth(out["depth"].float()) - _normalize_depth(depth_tgt.float())
+        _normalize_depth(depth_pred) - _normalize_depth(depth_tgt.float())
     ).abs().flatten(1).mean(dim=1)
     total = token_mse + 0.3 * depth_l1
     if motion_tgt is not None and "motion_hint" in out:

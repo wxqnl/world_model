@@ -26,6 +26,7 @@ class VGGTEncoder(torch.nn.Module):
         model_name: str = "facebook/VGGT-1B",
         token_grid: int = 8,
         return_depth: bool = False,
+        return_geom_extra: bool = False,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
@@ -35,6 +36,7 @@ class VGGTEncoder(torch.nn.Module):
         self.device = torch.device(device)
         self.token_grid = int(token_grid)
         self.return_depth = bool(return_depth)
+        self.return_geom_extra = bool(return_geom_extra)
         if dtype is None:
             major = torch.cuda.get_device_capability(self.device)[0] if self.device.type == "cuda" else 0
             dtype = torch.bfloat16 if major >= 8 else torch.float16
@@ -51,6 +53,10 @@ class VGGTEncoder(torch.nn.Module):
         Returns:
             pooled: [B, T, token_grid*token_grid, 2048] fp16
             depth: [B, T, H, W] fp16, only when return_depth=True
+            depth_conf: [B, T, H, W] fp16, only when return_geom_extra=True
+            world_points: [B, T, H, W, 3] fp16, only when return_geom_extra=True
+            world_points_conf: [B, T, H, W] fp16, only when return_geom_extra=True
+            pose_enc: [B, T, 9] fp16, only when return_geom_extra=True
         """
         if images.ndim == 4:
             images = images.unsqueeze(0)
@@ -66,8 +72,31 @@ class VGGTEncoder(torch.nn.Module):
 
         if self.return_depth:
             with torch.amp.autocast("cuda", enabled=False):
-                depth, _ = self.model.depth_head(aggregated_tokens, images=images, patch_start_idx=patch_start_idx)
+                depth, depth_conf = self.model.depth_head(
+                    aggregated_tokens,
+                    images=images,
+                    patch_start_idx=patch_start_idx,
+                )
             out["depth"] = depth.squeeze(-1).to(torch.float16)
+            if self.return_geom_extra:
+                out["depth_conf"] = depth_conf.to(torch.float16)
+        if self.return_geom_extra:
+            with torch.amp.autocast("cuda", enabled=False):
+                if getattr(self.model, "camera_head", None) is not None:
+                    pose_enc = self.model.camera_head(aggregated_tokens)[-1]
+                    out["pose_enc"] = pose_enc.to(torch.float16)
+                if getattr(self.model, "point_head", None) is not None:
+                    points, point_conf = self.model.point_head(
+                        aggregated_tokens,
+                        images=images,
+                        patch_start_idx=patch_start_idx,
+                    )
+                    out["world_points"] = points.to(torch.float16)
+                    out["world_points_conf"] = point_conf.to(torch.float16)
+            out["geom_extra_missing"] = torch.tensor(
+                int("pose_enc" not in out or "world_points" not in out or "world_points_conf" not in out),
+                device=self.device,
+            )
         return out
 
     def _pool_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:

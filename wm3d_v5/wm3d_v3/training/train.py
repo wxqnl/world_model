@@ -39,13 +39,22 @@ from wm3d_v3.models.state_stream import StateConfig
 def setup_ddp():
     if "RANK" in os.environ:
         backend = os.environ.get("WM3D_DDP_BACKEND", "nccl")
-        dist.init_process_group(backend)
+        env_rank = int(os.environ.get("RANK", "0"))
+        local = int(os.environ.get("LOCAL_RANK", env_rank))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local)
+        dist.init_process_group(backend=backend)
         rank = dist.get_rank()
         world = dist.get_world_size()
-        local = int(os.environ.get("LOCAL_RANK", rank))
-        torch.cuda.set_device(local)
         return rank, world, local
     return 0, 1, 0
+
+
+def _sampler_scope(cfg: dict, world: int, rank: int, local: int) -> tuple[int, int, str]:
+    if bool((cfg.get("data") or {}).get("node_sharded_window_cache", False)):
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE") or torch.cuda.device_count() or 1)
+        return local_world, int(local), "local-node"
+    return int(world), int(rank), "global"
 
 
 def build_model(cfg: dict) -> JointWorldModel:
@@ -191,6 +200,8 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
         int(model_cfg.get(k, 0) or 0) > 0
         for k in ("policy_lowdim_dim", "policy_object_state_dim", "policy_plan_state_dim", "policy_action_history_len")
     ) or bool(model_cfg.get("policy_use_progress", False))
+    shard_indices = data_cfg.get("window_geom_shard_indices")
+    shard_roots = data_cfg.get("window_geom_shard_roots")
     return WindowConfig(T=data_cfg["T"], k=data_cfg["k"],
                         stride=data_cfg["stride"],
                         cache_root=Path(data_cfg["cache_root"]),
@@ -205,6 +216,14 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
                         load_geom_extra=bool(data_cfg.get("load_geom_extra", False)),
                         require_geom_extra=bool(data_cfg.get("require_geom_extra", False)),
                         window_geom_subdir=data_cfg.get("window_geom_subdir", "vggt_window_geom_p64"),
+                        window_geom_shard_index=Path(data_cfg["window_geom_shard_index"])
+                        if data_cfg.get("window_geom_shard_index") else None,
+                        window_geom_shard_root=Path(data_cfg["window_geom_shard_root"])
+                        if data_cfg.get("window_geom_shard_root") else None,
+                        window_geom_shard_indices=tuple(Path(p) for p in shard_indices)
+                        if shard_indices else None,
+                        window_geom_shard_roots=tuple(Path(p) if p is not None else None for p in shard_roots)
+                        if shard_roots else None,
                         use_window_tokens=bool(data_cfg.get("use_window_tokens", False)),
                         max_windows_per_episode=int(data_cfg.get("max_windows_per_episode", 0) or 0),
                         trust_window_geom_cache=bool(data_cfg.get("trust_window_geom_cache", False)),
@@ -311,6 +330,17 @@ class WeightedDistributedSampler(Sampler[int]):
         self.epoch = int(epoch)
 
 
+def _equalized_num_samples_per_rank(local_lengths: list[int], sampler_world: int) -> int:
+    if sampler_world <= 0:
+        raise ValueError("sampler_world must be positive")
+    if not local_lengths:
+        raise ValueError("local_lengths must not be empty")
+    min_len = min(int(x) for x in local_lengths)
+    if min_len <= 0:
+        raise ValueError(f"cannot equalize empty local datasets: {local_lengths}")
+    return max(1, min_len // int(sampler_world))
+
+
 def build_datasets(cfg: dict, overfit_ids=None):
     records = read_manifest(cfg["data"]["manifest"])
     if overfit_ids:
@@ -338,7 +368,10 @@ def build_datasets(cfg: dict, overfit_ids=None):
             val_clip_ids=val_ids,
             heldout_dataset=_split_value(data_cfg, split_cfg, "heldout_dataset"),
         )
-        train_records = [r for r in records if r.clip_id in clip_split.train_clip_ids]
+        if bool(_split_value(data_cfg, split_cfg, "val_from_train", False)):
+            train_records = list(records)
+        else:
+            train_records = [r for r in records if r.clip_id in clip_split.train_clip_ids]
         val_records = [r for r in records if r.clip_id in clip_split.val_clip_ids]
         tr_ds = OXEWindowDataset(train_records, wcfg)
         val_ds = OXEWindowDataset(val_records, wcfg)
@@ -693,17 +726,63 @@ def build_optimizer_param_groups(
 
 def _all_reduce_gradients(model: torch.nn.Module, world: int) -> None:
     backend = dist.get_backend()
+    bucket_mb = float(os.environ.get("WM3D_GRAD_BUCKET_MB", "256"))
+    bucket_limit = max(1, int(bucket_mb * 1024 * 1024))
+
+    def flush_cuda_bucket(bucket: list[torch.Tensor]) -> None:
+        if not bucket:
+            return
+        flat = torch._utils._flatten_dense_tensors(bucket)
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world)
+        for grad, synced in zip(bucket, torch._utils._unflatten_dense_tensors(flat, bucket)):
+            grad.copy_(synced)
+
+    def flush_gloo_bucket(bucket: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        if not bucket:
+            return
+        cpu_tensors = [cpu for _grad, cpu in bucket]
+        flat = torch._utils._flatten_dense_tensors(cpu_tensors)
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world)
+        for (grad, _cpu), synced in zip(bucket, torch._utils._unflatten_dense_tensors(flat, cpu_tensors)):
+            grad.copy_(synced.to(device=grad.device, dtype=grad.dtype))
+
+    cuda_buckets: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+    cuda_bytes: dict[tuple[torch.device, torch.dtype], int] = {}
+    gloo_bucket: list[tuple[torch.Tensor, torch.Tensor]] = []
+    gloo_bytes = 0
+
     for param in model.parameters():
         if not param.requires_grad or param.grad is None:
             continue
-        if backend == "gloo" and param.grad.is_cuda:
-            grad_cpu = param.grad.detach().float().cpu()
-            dist.all_reduce(grad_cpu, op=dist.ReduceOp.SUM)
-            grad_cpu.div_(world)
-            param.grad.copy_(grad_cpu.to(device=param.grad.device, dtype=param.grad.dtype))
-        else:
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-            param.grad.div_(world)
+        grad = param.grad.detach()
+        if backend == "gloo" and grad.is_cuda:
+            cpu_grad = grad.float().cpu()
+            nbytes = cpu_grad.numel() * cpu_grad.element_size()
+            if gloo_bucket and gloo_bytes + nbytes > bucket_limit:
+                flush_gloo_bucket(gloo_bucket)
+                gloo_bucket = []
+                gloo_bytes = 0
+            gloo_bucket.append((param.grad, cpu_grad))
+            gloo_bytes += nbytes
+            continue
+        key = (grad.device, grad.dtype)
+        bucket = cuda_buckets.setdefault(key, [])
+        cur_bytes = cuda_bytes.get(key, 0)
+        nbytes = grad.numel() * grad.element_size()
+        if bucket and cur_bytes + nbytes > bucket_limit:
+            flush_cuda_bucket(bucket)
+            cuda_buckets[key] = []
+            cuda_bytes[key] = 0
+            bucket = cuda_buckets[key]
+            cur_bytes = 0
+        bucket.append(param.grad)
+        cuda_bytes[key] = cur_bytes + nbytes
+
+    for bucket in cuda_buckets.values():
+        flush_cuda_bucket(bucket)
+    flush_gloo_bucket(gloo_bucket)
 
 
 def _distributed_finite_count(value: torch.Tensor | bool, device: torch.device, world: int) -> int:
@@ -713,7 +792,8 @@ def _distributed_finite_count(value: torch.Tensor | bool, device: torch.device, 
         finite = bool(value)
     if world <= 1:
         return int(finite)
-    flag = torch.tensor([1 if finite else 0], device=device, dtype=torch.int32)
+    # NCCL on this cluster has failed on tiny int32 reductions before; float32 is robust.
+    flag = torch.tensor([1.0 if finite else 0.0], device=device, dtype=torch.float32)
     dist.all_reduce(flag, op=dist.ReduceOp.SUM)
     return int(flag.item())
 
@@ -810,6 +890,117 @@ def compute_evaluator_pairwise_loss(
         "L_evaluator_pairwise": torch.stack(losses).mean(),
         "evaluator_pairwise_acc": torch.stack(accs).mean(),
         "evaluator_pairwise_gap": torch.stack(gaps).mean(),
+    }
+
+
+def _context_pixel_action_zero_losses(ref: torch.Tensor) -> dict[str, torch.Tensor]:
+    zero = ref.new_zeros(())
+    return {
+        "L_context_pixel_action_rank": zero,
+        "L_context_pixel_action_separation": zero,
+        "context_pixel_action_acc": zero,
+        "context_pixel_action_gap": zero,
+        "context_pixel_action_rgb_gap": zero,
+    }
+
+
+def _parse_counterfactual_variants(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def compute_context_pixel_action_rank_loss(
+    model: torch.nn.Module,
+    s: torch.Tensor,
+    c: torch.Tensor,
+    real_out: dict,
+    action_cond: torch.Tensor | None,
+    context_rgb: torch.Tensor | None,
+    tgt: dict,
+    train_cfg: dict,
+    *,
+    step: int,
+    prior_clean_tokens: torch.Tensor | None = None,
+    policy_kwargs: dict | None = None,
+) -> dict[str, torch.Tensor]:
+    rank_weight = float(train_cfg.get("context_pixel_action_rank_weight", 0.0))
+    sep_weight = float(train_cfg.get("context_pixel_action_separation_weight", 0.0))
+    ref = real_out["pred_tokens"]
+    if rank_weight <= 0 and sep_weight <= 0:
+        return _context_pixel_action_zero_losses(ref)
+    if action_cond is None or context_rgb is None or "rgb" not in real_out or "rgb_tgt_p" not in tgt:
+        return _context_pixel_action_zero_losses(ref)
+    every = int(train_cfg.get("context_pixel_action_rank_every", 1) or 1)
+    if every > 1 and step % every != 0:
+        return _context_pixel_action_zero_losses(ref)
+    variants = _parse_counterfactual_variants(
+        train_cfg.get("context_pixel_action_rank_variants", ["zero", "sign_flip", "scaled"])
+    )
+    if not variants:
+        return _context_pixel_action_zero_losses(ref)
+
+    rgb_tgt = tgt["rgb_tgt_p"].to(device=real_out["rgb"].device, dtype=real_out["rgb"].dtype)
+    real_rgb = real_out["rgb"].float()
+    threshold = float(train_cfg.get("context_pixel_action_motion_threshold", 0.03))
+    motion_gain = float(train_cfg.get("context_pixel_action_motion_gain", 4.0))
+    if "rgb_ref_p" in tgt:
+        rgb_ref = tgt["rgb_ref_p"].to(device=real_rgb.device, dtype=real_rgb.dtype)
+    else:
+        rgb_ref = context_rgb.to(device=real_rgb.device, dtype=real_rgb.dtype)
+    motion = (rgb_tgt.float() - rgb_ref[:, None].float()).abs().mean(dim=2, keepdim=True)
+    motion_mask = (motion > threshold).to(dtype=real_rgb.dtype)
+    motion_weight = 1.0 + motion_gain * motion_mask
+
+    def weighted_l1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        err = (a.float() - b.float()).abs()
+        weight = motion_weight.to(device=err.device, dtype=err.dtype).expand_as(err)
+        return (err * weight).flatten(1).sum(dim=1) / weight.flatten(1).sum(dim=1).clamp_min(1e-6)
+
+    real_err = weighted_l1(real_rgb, rgb_tgt)
+    margin = float(train_cfg.get("context_pixel_action_rank_margin", 0.003))
+    sep_margin = float(train_cfg.get("context_pixel_action_separation_margin", 0.006))
+    scaled_factor = float(train_cfg.get("context_pixel_action_scaled_factor", 2.0))
+    rank_losses = []
+    sep_losses = []
+    accs = []
+    gaps = []
+    rgb_gaps = []
+    for variant in variants:
+        wrong_cond = _counterfactual_action_cond(action_cond, variant, step, scaled_factor=scaled_factor)
+        wrong_out = _forward_joint_model(
+            model,
+            s,
+            c,
+            action_cond=wrong_cond,
+            context_rgb=context_rgb,
+            prior_clean_tokens=prior_clean_tokens,
+            pixel=True,
+            bridging=False,
+            policy_kwargs=policy_kwargs,
+        )
+        if "rgb" not in wrong_out:
+            continue
+        wrong_rgb = wrong_out["rgb"].float()
+        wrong_err = weighted_l1(wrong_rgb, rgb_tgt)
+        rank_gap = wrong_err - real_err
+        rank_losses.append(torch.relu(margin - rank_gap).mean())
+        accs.append((rank_gap > 0).float().mean())
+        gaps.append(rank_gap.mean())
+        real_wrong_gap = weighted_l1(wrong_rgb, real_rgb.detach())
+        sep_losses.append(torch.relu(sep_margin - real_wrong_gap).mean())
+        rgb_gaps.append(real_wrong_gap.mean())
+
+    if not rank_losses:
+        return _context_pixel_action_zero_losses(ref)
+    return {
+        "L_context_pixel_action_rank": torch.stack(rank_losses).mean(),
+        "L_context_pixel_action_separation": torch.stack(sep_losses).mean(),
+        "context_pixel_action_acc": torch.stack(accs).mean(),
+        "context_pixel_action_gap": torch.stack(gaps).mean(),
+        "context_pixel_action_rgb_gap": torch.stack(rgb_gaps).mean(),
     }
 
 
@@ -1011,6 +1202,10 @@ def build_hunyuan_latent_adapter(cfg: dict, device: torch.device) -> HunyuanLate
         use_context=bool(train_cfg.get("hunyuan_use_context", True)),
         use_action=bool(train_cfg.get("hunyuan_use_action", True)),
         use_task=bool(train_cfg.get("hunyuan_use_task", True)),
+        use_point=bool(train_cfg.get("hunyuan_use_point", False)),
+        use_pose=bool(train_cfg.get("hunyuan_use_pose", False)),
+        point_dim=int(train_cfg.get("hunyuan_point_dim", 3)),
+        pose_dim=int(train_cfg.get("hunyuan_pose_dim", 9)),
     )
     adapter = HunyuanLatentAdapter(adapter_cfg).to(device)
     if bool(train_cfg.get("hunyuan_zero_init_output", False)):
@@ -1073,12 +1268,16 @@ def _compute_hunyuan_controls_loss(
     train_cfg: dict,
     rough_rgb: torch.Tensor | None = None,
     motion_hint: torch.Tensor | None = None,
+    point: torch.Tensor | None = None,
+    pose: torch.Tensor | None = None,
     prefix: str = "",
 ) -> dict[str, torch.Tensor]:
     if bool(train_cfg.get("hunyuan_detach_world", False)):
         tokens = tokens.detach()
         depth = depth.detach()
         rough_rgb = rough_rgb.detach() if rough_rgb is not None else None
+        point = point.detach() if point is not None else None
+        pose = pose.detach() if pose is not None else None
 
     delta_latents = adapter(
         tokens,
@@ -1088,6 +1287,8 @@ def _compute_hunyuan_controls_loss(
         rough_rgb=rough_rgb,
         action_cond=action_cond,
         task_emb=task_emb,
+        point=point,
+        pose=pose,
         target_latents=target_latents,
     )
     pred_latents = delta_latents
@@ -1157,6 +1358,8 @@ def compute_hunyuan_latent_loss(
         train_cfg=train_cfg,
         rough_rgb=rough_rgb,
         motion_hint=out.get("motion_hint"),
+        point=out.get("point"),
+        pose=out.get("pose_geom"),
     ))
 
     prior_enabled = bool(train_cfg.get("enable_prior_hunyuan_latent_loss", False))
@@ -1175,6 +1378,8 @@ def compute_hunyuan_latent_loss(
             train_cfg=train_cfg,
             rough_rgb=prior_rough,
             motion_hint=None,
+            point=out.get("prior_hunyuan_point"),
+            pose=out.get("prior_hunyuan_pose"),
             prefix="prior",
         ))
     return losses
@@ -1210,23 +1415,72 @@ def main():
     weighted_sampler_cfg = train_cfg.get("weighted_sampler") or cfg.get("weighted_sampler")
     sample_weights = build_dataset_sample_weights(tr_ds, weighted_sampler_cfg)
     if world > 1:
-        if sample_weights is not None:
+        sampler_world, sampler_rank, sampler_scope = _sampler_scope(cfg, world, rank, local)
+        if rank == 0 and sampler_scope != "global":
+            print(
+                f"[rank0] sampler_scope={sampler_scope} "
+                f"sampler_world={sampler_world} global_world={world}",
+                flush=True,
+            )
+        equalize_node_steps = bool(train_cfg.get("equalize_node_steps", False)) and sampler_scope == "local-node"
+        equalized_num_samples = None
+        if equalize_node_steps:
+            local_len = torch.tensor([len(tr_ds)], device=device, dtype=torch.long)
+            min_len = local_len.clone()
+            dist.all_reduce(min_len, op=dist.ReduceOp.MIN)
+            equalized_num_samples = _equalized_num_samples_per_rank(
+                [int(min_len.item())],
+                sampler_world,
+            )
+            if rank == 0:
+                print(
+                    f"[rank0] equalize_node_steps=True local_len={int(local_len.item())} "
+                    f"min_global_len={int(min_len.item())} "
+                    f"num_samples_per_local_rank={equalized_num_samples}",
+                    flush=True,
+                )
+        if sample_weights is not None or equalized_num_samples is not None:
             sampler_num_samples = None
             if isinstance(weighted_sampler_cfg, dict) and weighted_sampler_cfg.get("num_samples_per_rank") is not None:
                 sampler_num_samples = int(weighted_sampler_cfg["num_samples_per_rank"])
+            if equalized_num_samples is not None and sampler_num_samples is None:
+                sampler_num_samples = int(equalized_num_samples)
+            if sample_weights is None:
+                sample_weights = torch.ones(len(tr_ds), dtype=torch.double)
             tr_s = WeightedDistributedSampler(
                 sample_weights,
-                num_replicas=world,
-                rank=rank,
-                replacement=bool((weighted_sampler_cfg or {}).get("replacement", True)) if isinstance(weighted_sampler_cfg, dict) else True,
+                num_replicas=sampler_world,
+                rank=sampler_rank,
+                replacement=bool((weighted_sampler_cfg or {}).get("replacement", False)) if isinstance(weighted_sampler_cfg, dict) else False,
                 num_samples=sampler_num_samples,
                 seed=int((weighted_sampler_cfg or {}).get("seed", cfg["data"].get("seed", 0))) if isinstance(weighted_sampler_cfg, dict) else int(cfg["data"].get("seed", 0)),
             )
         else:
-            tr_s = DistributedSampler(tr_ds, num_replicas=world, rank=rank, shuffle=True, drop_last=True)
+            tr_s = DistributedSampler(tr_ds, num_replicas=sampler_world, rank=sampler_rank, shuffle=True, drop_last=True)
         tr_loader = DataLoader(tr_ds, batch_size=bs, sampler=tr_s, num_workers=nw,
                                 pin_memory=True, drop_last=True)
-        val_s = DistributedSampler(val_ds, num_replicas=world, rank=rank, shuffle=False)
+        if equalize_node_steps:
+            local_val_len = torch.tensor([len(val_ds)], device=device, dtype=torch.long)
+            min_val_len = local_val_len.clone()
+            dist.all_reduce(min_val_len, op=dist.ReduceOp.MIN)
+            val_num_samples = _equalized_num_samples_per_rank([int(min_val_len.item())], sampler_world)
+            if rank == 0:
+                print(
+                    f"[rank0] equalized val local_len={int(local_val_len.item())} "
+                    f"min_global_len={int(min_val_len.item())} "
+                    f"num_samples_per_local_rank={val_num_samples}",
+                    flush=True,
+                )
+            val_s = WeightedDistributedSampler(
+                torch.ones(len(val_ds), dtype=torch.double),
+                num_replicas=sampler_world,
+                rank=sampler_rank,
+                replacement=False,
+                num_samples=val_num_samples,
+                seed=int(cfg["data"].get("seed", 0)) + 100000,
+            )
+        else:
+            val_s = DistributedSampler(val_ds, num_replicas=sampler_world, rank=sampler_rank, shuffle=False)
         val_loader = DataLoader(val_ds, batch_size=bs, sampler=val_s, num_workers=nw, pin_memory=True)
     else:
         if sample_weights is not None:
@@ -1457,6 +1711,22 @@ def main():
                         cfg["train"],
                         policy_kwargs=policy_kwargs,
                     )
+                if direct_policy_only:
+                    context_pixel_action_losses = _context_pixel_action_zero_losses(losses["L_total"])
+                else:
+                    context_pixel_action_losses = compute_context_pixel_action_rank_loss(
+                        model,
+                        s_cond,
+                        c_cond,
+                        out,
+                        action_cond_model,
+                        context_rgb_cond,
+                        tgt,
+                        cfg["train"],
+                        step=step,
+                        prior_clean_tokens=prior_clean_tokens,
+                        policy_kwargs=policy_kwargs,
+                    )
                 direct_losses = compute_direct_policy_loss(
                     out,
                     tgt["action_tgt"],
@@ -1492,6 +1762,18 @@ def main():
                         + float(cfg["train"]["evaluator_candidate_ce_weight"])
                         * candidate_losses["L_evaluator_candidate_ce"]
                     )
+                if cfg["train"].get("context_pixel_action_rank_weight", 0.0):
+                    losses["L_total"] = (
+                        losses["L_total"]
+                        + float(cfg["train"]["context_pixel_action_rank_weight"])
+                        * context_pixel_action_losses["L_context_pixel_action_rank"]
+                    )
+                if cfg["train"].get("context_pixel_action_separation_weight", 0.0):
+                    losses["L_total"] = (
+                        losses["L_total"]
+                        + float(cfg["train"]["context_pixel_action_separation_weight"])
+                        * context_pixel_action_losses["L_context_pixel_action_separation"]
+                    )
                 if cfg["train"].get("direct_policy_weight", 0.0):
                     losses["L_total"] = (
                         losses["L_total"]
@@ -1510,6 +1792,7 @@ def main():
                     )
                 losses.update({k: v.detach() for k, v in rank_losses.items()})
                 losses.update({k: v.detach() for k, v in candidate_losses.items()})
+                losses.update({k: v.detach() for k, v in context_pixel_action_losses.items()})
                 losses.update({k: v.detach() for k, v in direct_losses.items()})
                 losses.update({k: v.detach() for k, v in hunyuan_losses.items()})
             loss = losses["L_total"]
@@ -1553,6 +1836,11 @@ def main():
                 cand_acc = float(losses.get("evaluator_candidate_pairwise_acc", torch.tensor(0.)).detach().float())
                 cand_sel = float(losses.get("evaluator_candidate_selected_pose_l1", torch.tensor(0.)).detach().float())
                 cand_anchor = float(losses.get("evaluator_candidate_anchor_pose_l1", torch.tensor(0.)).detach().float())
+                ctx_rank = float(losses.get("L_context_pixel_action_rank", torch.tensor(0.)).detach().float())
+                ctx_sep = float(losses.get("L_context_pixel_action_separation", torch.tensor(0.)).detach().float())
+                ctx_acc = float(losses.get("context_pixel_action_acc", torch.tensor(0.)).detach().float())
+                ctx_gap = float(losses.get("context_pixel_action_gap", torch.tensor(0.)).detach().float())
+                ctx_rgb_gap = float(losses.get("context_pixel_action_rgb_gap", torch.tensor(0.)).detach().float())
                 direct = float(losses.get("L_direct_policy", torch.tensor(0.)).detach().float())
                 direct_pose = float(losses.get("direct_policy_pose_l1", torch.tensor(0.)).detach().float())
                 direct_grip = float(losses.get("direct_policy_grip_acc", torch.tensor(0.)).detach().float())
@@ -1579,6 +1867,8 @@ def main():
                       f"pair={pair:.4f} pair_acc={pair_acc:.3f} "
                       f"cand={cand:.4f} cand_ce={cand_ce:.4f} cand_acc={cand_acc:.3f} "
                       f"cand_sel={cand_sel:.3f} cand_anchor={cand_anchor:.3f} "
+                      f"ctx_rank={ctx_rank:.4f} ctx_sep={ctx_sep:.4f} ctx_acc={ctx_acc:.3f} "
+                      f"ctx_gap={ctx_gap:.4f} ctx_rgb_gap={ctx_rgb_gap:.4f} "
                       f"direct={direct:.4f} direct_pose={direct_pose:.3f} direct_grip={direct_grip:.3f} "
                       f"lr={sched.get_last_lr()[0]:.2e}", flush=True)
             if rank == 0 and step % cfg["train"]["log_every"] == 0:

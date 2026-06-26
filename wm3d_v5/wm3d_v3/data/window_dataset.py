@@ -14,7 +14,9 @@ Cache layout:
 """
 from __future__ import annotations
 from dataclasses import dataclass
+import io
 from pathlib import Path
+import tarfile
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -37,6 +39,10 @@ class WindowConfig:
     load_geom_extra: bool = False
     require_geom_extra: bool = False
     window_geom_subdir: str = "vggt_window_geom_p64"
+    window_geom_shard_index: Path | None = None
+    window_geom_shard_root: Path | None = None
+    window_geom_shard_indices: tuple[Path, ...] | None = None
+    window_geom_shard_roots: tuple[Path | None, ...] | None = None
     use_window_tokens: bool = False
     max_windows_per_episode: int = 0
     trust_window_geom_cache: bool = False
@@ -57,6 +63,83 @@ def _safe(cid: str) -> str:
 
 def _window_geom_path(cache_root: Path, subdir: str, cid: str, start: int) -> Path:
     return cache_root / subdir / f"{cid}__start_{int(start):06d}.npz"
+
+
+def _window_geom_name(cid: str, start: int) -> str:
+    return f"{cid}__start_{int(start):06d}.npz"
+
+
+class _WindowGeomShardReader:
+    """Random-access reader for local uncompressed tar shards.
+
+    The index is a TSV with: member_name, shard_path, offset_data, size. Shards
+    must be uncompressed tar files so workers can seek directly to one npz.
+    """
+
+    def __init__(self, index_path: Path, shard_root: Path | None = None):
+        self.index_path = Path(index_path)
+        self.shard_root = Path(shard_root) if shard_root is not None else self.index_path.parent
+        self._index: dict[str, tuple[Path, int, int]] | None = None
+        self._handles: dict[Path, object] = {}
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_handles"] = {}
+        return state
+
+    def _load_index(self) -> dict[str, tuple[Path, int, int]]:
+        if self._index is not None:
+            return self._index
+        index: dict[str, tuple[Path, int, int]] = {}
+        with self.index_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 4:
+                    continue
+                name, shard, offset, size = parts
+                shard_path = Path(shard)
+                if not shard_path.is_absolute():
+                    shard_path = self.shard_root / shard_path
+                index[name] = (shard_path, int(offset), int(size))
+        self._index = index
+        return index
+
+    def has(self, name: str) -> bool:
+        return name in self._load_index()
+
+    def open_npz(self, name: str):
+        entry = self._load_index().get(name)
+        if entry is None:
+            return None
+        shard_path, offset, size = entry
+        fh = self._handles.get(shard_path)
+        if fh is None or fh.closed:
+            fh = shard_path.open("rb")
+            self._handles[shard_path] = fh
+        fh.seek(offset)
+        return np.load(io.BytesIO(fh.read(size)))
+
+
+class _CompositeWindowGeomShardReader:
+    """Try multiple independent tar-shard indexes without merging filenames."""
+
+    def __init__(self, readers: list[_WindowGeomShardReader]):
+        if not readers:
+            raise ValueError("Composite shard reader requires at least one reader")
+        self.readers = readers
+
+    def has(self, name: str) -> bool:
+        return any(reader.has(name) for reader in self.readers)
+
+    def open_npz(self, name: str):
+        for reader in self.readers:
+            npz = reader.open_npz(name)
+            if npz is not None:
+                return npz
+        return None
 
 
 def _npz_first(npz, names: tuple[str, ...]):
@@ -214,6 +297,30 @@ def _valid_window_geom(path: Path, T: int, k: int, *, require_extra: bool, requi
         return False
 
 
+def _valid_window_geom_npz(npz, T: int, k: int, *, require_extra: bool, require_pooled: bool) -> bool:
+    try:
+        if require_pooled:
+            pooled = _npz_first(npz, ("pooled", "vggt_pooled"))
+            if not _valid_len(pooled, T + k):
+                return False
+        if not require_extra:
+            return True
+        depth = _npz_first(npz, ("depth", "depth_map"))
+        point = _npz_first(npz, ("point", "world_points", "points", "point_map"))
+        point_conf = _npz_first(npz, ("point_conf", "world_points_conf", "points_conf", "conf"))
+        pose = _npz_first(npz, ("pose", "pose_enc", "camera_pose"))
+        depth_conf = _npz_first(npz, ("depth_conf", "depth_confidence"))
+        return (
+            _valid_future_len(depth, T, k)
+            and _valid_world_points(point, k)
+            and _valid_future_len(point_conf, T, k)
+            and _valid_pose(pose, k)
+            and _valid_future_len(depth_conf, T, k)
+        )
+    except Exception:
+        return False
+
+
 def _progress_from_geom_or_record(geom, rec: OXEClipRecord):
     progress_arr = _npz_first(geom, ("progress", "progress_tgt"))
     if progress_arr is not None:
@@ -255,6 +362,32 @@ class OXEWindowDataset(Dataset):
         self.cfg.cache_root = Path(self.cfg.cache_root)
         if self.cfg.action_stats is not None:
             self.cfg.action_stats = Path(self.cfg.action_stats)
+        if self.cfg.window_geom_shard_index is not None:
+            self.cfg.window_geom_shard_index = Path(self.cfg.window_geom_shard_index)
+        if self.cfg.window_geom_shard_root is not None:
+            self.cfg.window_geom_shard_root = Path(self.cfg.window_geom_shard_root)
+        shard_indices: list[Path] = []
+        shard_roots: list[Path | None] = []
+        if self.cfg.window_geom_shard_index is not None:
+            shard_indices.append(Path(self.cfg.window_geom_shard_index))
+            shard_roots.append(Path(self.cfg.window_geom_shard_root) if self.cfg.window_geom_shard_root is not None else None)
+        if self.cfg.window_geom_shard_indices is not None:
+            raw_roots = tuple(self.cfg.window_geom_shard_roots or ())
+            for idx, index_path in enumerate(self.cfg.window_geom_shard_indices):
+                shard_indices.append(Path(index_path))
+                root = raw_roots[idx] if idx < len(raw_roots) else None
+                shard_roots.append(Path(root) if root is not None else None)
+        readers = [
+            _WindowGeomShardReader(index_path, root_path)
+            for index_path, root_path in zip(shard_indices, shard_roots)
+            if Path(index_path).exists()
+        ]
+        if len(readers) == 1:
+            self._window_shards = readers[0]
+        elif len(readers) > 1:
+            self._window_shards = _CompositeWindowGeomShardReader(readers)
+        else:
+            self._window_shards = None
         self.act_mean: np.ndarray | None = None
         self.act_std: np.ndarray | None = None
         if self.cfg.action_stats is not None and Path(self.cfg.action_stats).exists():
@@ -267,8 +400,29 @@ class OXEWindowDataset(Dataset):
         missing_task_emb: list[str] = []
         init_errors: list[str] = []
         win = self.cfg.T + self.cfg.k
+        trusted_window_fast_init = (
+            self.cfg.use_window_tokens
+            and self.cfg.trust_window_geom_cache
+            and not self.cfg.load_policy_state
+            and not self.cfg.require_progress
+            and self._window_shards is None
+        )
         for r in records:
             cid = _safe(r.clip_id)
+            if trusted_window_fast_init:
+                usable = int(getattr(r, "n_frames", 0) or 0)
+                if usable < win:
+                    continue
+                if self.cfg.require_task_emb and not (self.cfg.cache_root / "qwen_taskemb" / f"{cid}.npy").exists():
+                    missing_task_emb.append(r.clip_id)
+                    continue
+                starts = list(range(0, usable - win + 1, self.cfg.stride))
+                if self.cfg.max_windows_per_episode and len(starts) > int(self.cfg.max_windows_per_episode):
+                    starts = starts[: int(self.cfg.max_windows_per_episode)]
+                self.records.append(r)
+                self._usable_frames.append(usable)
+                self._valid_starts.append(starts)
+                continue
             action_len = _cache_frame_count(self.cfg.cache_root / "actions" / f"{cid}.npy")
             if action_len is None:
                 continue
@@ -291,7 +445,6 @@ class OXEWindowDataset(Dataset):
                     self.cfg.load_geom
                     and self.cfg.use_window_tokens
                     and self.cfg.trust_window_geom_cache
-                    and not self.cfg.load_policy_state
                     and not self.cfg.require_progress
                 )
                 geom = None if skip_init_geom_decode else (
@@ -364,8 +517,9 @@ class OXEWindowDataset(Dataset):
                     starts = starts[: int(self.cfg.max_windows_per_episode)]
                 for start in starts:
                     path = _window_geom_path(self.cfg.cache_root, self.cfg.window_geom_subdir, cid, start)
+                    name = _window_geom_name(cid, start)
                     if self.cfg.trust_window_geom_cache:
-                        if path.exists():
+                        if path.exists() or (self._window_shards is not None and self._window_shards.has(name)):
                             valid_starts.append(start)
                     elif _valid_window_geom(
                         path,
@@ -375,7 +529,21 @@ class OXEWindowDataset(Dataset):
                         require_pooled=self.cfg.use_window_tokens,
                     ):
                         valid_starts.append(start)
+                    elif self._window_shards is not None and self._window_shards.has(name):
+                        with self._window_shards.open_npz(name) as d:
+                            if _valid_window_geom_npz(
+                                d,
+                                self.cfg.T,
+                                self.cfg.k,
+                                require_extra=self.cfg.require_geom_extra or self.cfg.load_geom_extra,
+                                require_pooled=self.cfg.use_window_tokens,
+                            ):
+                                valid_starts.append(start)
                 if not valid_starts:
+                    if self._window_shards is not None and self.cfg.trust_window_geom_cache:
+                        # Node-sharded tar caches may share or symlink a broader
+                        # base cache than the local window shard owns.
+                        continue
                     if self.cfg.require_geom_extra or self.cfg.use_window_tokens:
                         init_errors.append(f"{r.clip_id}: no usable window geom cache in {self.cfg.window_geom_subdir}")
                     continue
@@ -412,7 +580,10 @@ class OXEWindowDataset(Dataset):
         window_geom = None
         window_geom_path = _window_geom_path(self.cfg.cache_root, self.cfg.window_geom_subdir, cid, start)
         if self.cfg.load_geom_extra or self.cfg.require_geom_extra or self.cfg.use_window_tokens:
-            window_geom = np.load(window_geom_path) if window_geom_path.exists() else None
+            if window_geom_path.exists():
+                window_geom = np.load(window_geom_path)
+            elif self._window_shards is not None:
+                window_geom = self._window_shards.open_npz(_window_geom_name(cid, start))
         pooled = None if self.cfg.use_window_tokens else np.load(self.cfg.cache_root / self.cfg.tokens_subdir / f"{cid}.npy", mmap_mode="r")
         need_geom_file = self.cfg.load_geom or self.cfg.load_policy_state or self.cfg.require_progress
         geom_path = self.cfg.cache_root / "vggt_geom" / f"{cid}.npz"

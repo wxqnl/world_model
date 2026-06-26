@@ -57,6 +57,28 @@ def _demo_ids(group: h5py.Group, max_demos: int) -> list[str]:
     return demos[:max_demos] if max_demos > 0 else demos
 
 
+def _is_noop(action: Any, prev_action: Any | None = None, threshold: float = 1e-4) -> bool:
+    vals = list(action)
+    if prev_action is None:
+        return sum(float(x) * float(x) for x in vals[:-1]) ** 0.5 < threshold
+    prev = list(prev_action)
+    return sum(float(x) * float(x) for x in vals[:-1]) ** 0.5 < threshold and vals[-1] == prev[-1]
+
+
+def _filtered_actions(actions: Any, *, drop_noops: bool) -> tuple[list[int], list[list[float]], int]:
+    keep: list[int] = []
+    out: list[list[float]] = []
+    noops = 0
+    for idx, action in enumerate(actions):
+        prev = out[-1] if out else None
+        if drop_noops and _is_noop(action, prev):
+            noops += 1
+            continue
+        keep.append(idx)
+        out.append([float(x) for x in action[:7]])
+    return keep, out, noops
+
+
 def export_windows(
     files: list[Path],
     *,
@@ -67,6 +89,10 @@ def export_windows(
     stride: int,
     max_demos_per_file: int,
     camera_key: str,
+    camera_keys: list[str] | None = None,
+    drop_noops: bool = False,
+    target_offset: int = 0,
+    pad_episode_start: bool = False,
 ) -> dict[str, Any]:
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     rows = 0
@@ -86,15 +112,27 @@ def export_windows(
                     actions = demo["actions"]
                     obs = demo.get("obs")
                     obs_keys = sorted(obs.keys()) if obs is not None else []
-                    n = int(actions.shape[0])
-                    if n < T + k:
+                    row_camera_keys = camera_keys or [camera_key]
+                    keep_indices, filtered_actions, noops = _filtered_actions(actions, drop_noops=drop_noops)
+                    n = len(filtered_actions)
+                    first_target = T + int(target_offset)
+                    if first_target < 0:
+                        raise ValueError(f"target_offset={target_offset} makes first target index negative for T={T}")
+                    if n < first_target + k:
                         continue
                     file_demos += 1
                     demos_total += 1
                     action_lengths.append(n)
-                    for start in range(0, n - T - k + 1, stride):
-                        target_start = start + T
-                        action_chunk = actions[target_start: target_start + k].astype("float32").tolist()
+                    start_min = -first_target if pad_episode_start else 0
+                    start_max = n - first_target - k
+                    for start in range(start_min, start_max + 1, stride):
+                        target_start = start + first_target
+                        action_chunk = filtered_actions[target_start: target_start + k]
+                        context_positions = range(start, start + T)
+                        context_indices = [
+                            keep_indices[min(max(pos, 0), n - 1)]
+                            for pos in context_positions
+                        ]
                         row = {
                             "row_type": "expert_window",
                             "source_format": "libero_hdf5",
@@ -105,11 +143,18 @@ def export_windows(
                             "episode_len": n,
                             "context_start": start,
                             "target_start": target_start,
+                            "context_indices": context_indices,
+                            "target_indices": keep_indices[target_start: target_start + k],
                             "T": T,
                             "k": k,
                             "stride": stride,
+                            "target_offset": int(target_offset),
+                            "pad_episode_start": bool(pad_episode_start),
+                            "drop_noops": bool(drop_noops),
+                            "num_noops": int(noops),
                             "camera_key": camera_key,
-                            "camera_available": camera_key in obs_keys,
+                            "camera_keys": row_camera_keys,
+                            "camera_available": all(key in obs_keys for key in row_camera_keys),
                             "obs_keys": obs_keys,
                             "action_chunk": action_chunk,
                             "terminal_success_tgt": 1.0,
@@ -135,6 +180,10 @@ def export_windows(
         "stride": stride,
         "max_demos_per_file": max_demos_per_file,
         "camera_key": camera_key,
+        "camera_keys": camera_keys or [camera_key],
+        "drop_noops": bool(drop_noops),
+        "target_offset": int(target_offset),
+        "pad_episode_start": bool(pad_episode_start),
         "mean_episode_len": mean(action_lengths) if action_lengths else None,
         "positive_success_windows": rows,
         "training_signal": {
@@ -164,7 +213,16 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--max_demos_per_file", type=int, default=0)
     ap.add_argument("--camera_key", default="agentview_rgb")
+    ap.add_argument("--camera_keys", default=None, help="Comma-separated HDF5 obs camera keys to record per window.")
+    ap.add_argument("--drop_noops", action="store_true")
+    ap.add_argument("--target_offset", type=int, default=0, help="Offset from start+T for target action; -1 aligns first action to the last context frame.")
+    ap.add_argument(
+        "--pad_episode_start",
+        action="store_true",
+        help="Generate left-padded opening windows so target 0 sees a repeated first-frame context.",
+    )
     args = ap.parse_args()
+    camera_keys = [item.strip() for item in str(args.camera_keys).split(",") if item.strip()] if args.camera_keys else None
 
     files = _iter_files(args.input, args.dataset_dir)
     if not files:
@@ -181,6 +239,10 @@ def main() -> None:
         stride=args.stride,
         max_demos_per_file=args.max_demos_per_file,
         camera_key=args.camera_key,
+        camera_keys=camera_keys,
+        drop_noops=bool(args.drop_noops),
+        target_offset=int(args.target_offset),
+        pad_episode_start=bool(args.pad_episode_start),
     )
     print(json.dumps({
         "out_jsonl": str(args.out_jsonl),
