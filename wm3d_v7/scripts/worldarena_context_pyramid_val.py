@@ -40,6 +40,23 @@ def locked_grid() -> tuple[RenderConfig, ...]:
     )
 
 
+def variant_name(config: RenderConfig) -> str:
+    if config not in locked_grid():
+        raise ProtocolError("variant config is not in the locked grid")
+    return (
+        f"a{int(round(config.alpha * 100)):03d}"
+        f"_l{int(round(config.low * 100)):03d}"
+        f"_h{int(round(config.high * 100)):03d}"
+    )
+
+
+def parse_variant_name(name: str) -> RenderConfig:
+    for config in locked_grid():
+        if variant_name(config) == name:
+            return config
+    raise ProtocolError(f"unknown context-pyramid variant: {name}")
+
+
 def select_locked_panel(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Select the deterministic five-record validation panel before any decoding."""
     tasks = sorted({str(row.get("task", "")) for row in rows})
@@ -209,3 +226,124 @@ def render_context_pyramid(
     if not np.isfinite(output).all():
         raise ProtocolError("context-pyramid renderer produced NaN/Inf")
     return output.astype(np.float32)
+
+
+def _read_video_rgb(path: Path) -> np.ndarray:
+    video_path = Path(path)
+    capture = cv2.VideoCapture(str(video_path))
+    frames: list[np.ndarray] = []
+    try:
+        if not capture.isOpened():
+            raise ProtocolError(f"cannot open video: {video_path}")
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame is None:
+                raise ProtocolError(f"video returned an empty frame: {video_path}")
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        capture.release()
+    if not frames:
+        raise ProtocolError(f"video contains no decodable frames: {video_path}")
+    return np.stack(frames)
+
+
+def aligned_video_psnr(pred_path: Path, gt_path: Path) -> dict[str, Any]:
+    """Compute evaluation-only, frame-index-aligned RGB PSNR."""
+    prediction = _read_video_rgb(Path(pred_path))
+    ground_truth = _read_video_rgb(Path(gt_path))
+    if len(prediction) != len(ground_truth):
+        raise ProtocolError(
+            f"frame count mismatch: {len(prediction)} != {len(ground_truth)}"
+        )
+    height, width = prediction.shape[1:3]
+    resized_gt = np.stack(
+        [
+            cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            for frame in ground_truth
+        ]
+    )
+    error = prediction.astype(np.float64) - resized_gt.astype(np.float64)
+    mse = np.mean(error * error, axis=(1, 2, 3))
+    values = np.empty_like(mse)
+    identical = mse == 0.0
+    values[identical] = 100.0
+    values[~identical] = 10.0 * np.log10((255.0**2) / mse[~identical])
+    if not np.isfinite(values).all():
+        raise ProtocolError("PSNR contains NaN/Inf")
+    return {
+        "mean": float(values.mean()),
+        "per_frame": [float(value) for value in values],
+        "frames": int(len(values)),
+        "alignment": "frame_index",
+        "gt_resize": "cv2.INTER_AREA",
+        "evaluation_only": True,
+    }
+
+
+_AGGREGATE_KEYS = (
+    "psnr",
+    "image_quality",
+    "jepa_similarity",
+    "dynamic_degree",
+    "motion_smoothness",
+)
+
+
+def _validate_aggregate(name: str, values: Mapping[str, Any]) -> None:
+    if int(values.get("coverage", -1)) != 5:
+        raise ProtocolError(f"{name} coverage must equal five")
+    missing = [key for key in _AGGREGATE_KEYS if key not in values]
+    if missing:
+        raise ProtocolError(f"{name} aggregate is missing metrics: {missing}")
+    for key in _AGGREGATE_KEYS:
+        value = float(values[key])
+        if not np.isfinite(value):
+            raise ProtocolError(f"{name}.{key} contains NaN/Inf")
+
+
+def select_candidate(
+    baseline: Mapping[str, Any],
+    candidates: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Apply the fixed aggregate GO gate and deterministic tie-break."""
+    _validate_aggregate("baseline", baseline)
+    checks: dict[str, dict[str, bool]] = {}
+    passing: list[str] = []
+    for name, values in candidates.items():
+        config = parse_variant_name(name)
+        _validate_aggregate(name, values)
+        candidate_checks = {
+            "psnr_gain": float(values["psnr"]) - float(baseline["psnr"]) >= 0.25,
+            "image_quality": float(values["image_quality"])
+            >= float(baseline["image_quality"]),
+            "jepa_similarity": float(values["jepa_similarity"])
+            >= 0.97 * float(baseline["jepa_similarity"]),
+            "dynamic_degree": float(values["dynamic_degree"])
+            >= 0.97 * float(baseline["dynamic_degree"]),
+            "motion_smoothness": float(values["motion_smoothness"])
+            >= 0.97 * float(baseline["motion_smoothness"]),
+        }
+        checks[name] = candidate_checks
+        if all(candidate_checks.values()):
+            passing.append(name)
+        del config
+    if not passing:
+        return {"decision": "NO-GO", "selected": None, "checks": checks}
+
+    gains = {
+        name: float(candidates[name]["psnr"]) - float(baseline["psnr"])
+        for name in passing
+    }
+    best_gain = max(gains.values())
+    tied = [name for name in passing if best_gain - gains[name] <= 0.02]
+    selected = min(
+        tied,
+        key=lambda name: (
+            parse_variant_name(name).alpha,
+            parse_variant_name(name).low,
+            parse_variant_name(name).high,
+        ),
+    )
+    return {"decision": "GO", "selected": selected, "checks": checks}

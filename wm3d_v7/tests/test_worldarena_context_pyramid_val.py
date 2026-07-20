@@ -7,11 +7,15 @@ import pytest
 from scripts.worldarena_context_pyramid_val import (
     ProtocolError,
     RenderConfig,
+    aligned_video_psnr,
     blend_context_residual,
     locked_grid,
+    parse_variant_name,
     render_baseline,
     render_context_pyramid,
+    select_candidate,
     select_locked_panel,
+    variant_name,
 )
 
 
@@ -135,3 +139,100 @@ def test_baseline_matches_current_linear_resize_contract() -> None:
     )
 
     assert np.allclose(output, expected, atol=1e-7)
+
+
+def _write_video(path, frames: list[np.ndarray]) -> None:
+    height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (width, height)
+    )
+    assert writer.isOpened()
+    try:
+        for frame in frames:
+            writer.write(frame)
+    finally:
+        writer.release()
+
+
+def test_psnr_rejects_frame_count_mismatch(tmp_path) -> None:
+    pred = tmp_path / "pred.mp4"
+    gt = tmp_path / "gt.mp4"
+    black = np.zeros((16, 16, 3), dtype=np.uint8)
+    _write_video(pred, [black] * 3)
+    _write_video(gt, [black] * 4)
+
+    with pytest.raises(ProtocolError, match="frame count mismatch"):
+        aligned_video_psnr(pred, gt)
+
+
+def test_psnr_reports_finite_aligned_mean(tmp_path) -> None:
+    pred = tmp_path / "pred.mp4"
+    gt = tmp_path / "gt.mp4"
+    black = np.zeros((16, 16, 3), dtype=np.uint8)
+    white = np.full((32, 24, 3), 255, dtype=np.uint8)
+    _write_video(pred, [black, black])
+    _write_video(gt, [white, white])
+
+    result = aligned_video_psnr(pred, gt)
+
+    assert result["frames"] == 2
+    assert np.isfinite(result["mean"])
+    assert len(result["per_frame"]) == 2
+
+
+def _baseline_metrics() -> dict[str, float | int]:
+    return {
+        "psnr": 20.0,
+        "image_quality": 0.5,
+        "jepa_similarity": 0.8,
+        "dynamic_degree": 0.4,
+        "motion_smoothness": 0.6,
+        "coverage": 5,
+    }
+
+
+def test_variant_name_round_trip_uses_locked_config() -> None:
+    for config in locked_grid():
+        assert parse_variant_name(variant_name(config)) == config
+
+
+def test_select_candidate_uses_aggregate_gates_and_tie_breaks() -> None:
+    baseline = _baseline_metrics()
+    candidates = {
+        "a050_l002_h008": {**baseline, "psnr": 20.30},
+        "a075_l002_h008": {**baseline, "psnr": 20.31},
+        "a100_l002_h008": {
+            **baseline,
+            "psnr": 21.00,
+            "jepa_similarity": 0.70,
+        },
+    }
+
+    result = select_candidate(baseline, candidates)
+
+    assert result["decision"] == "GO"
+    assert result["selected"] == "a050_l002_h008"
+    assert result["checks"]["a100_l002_h008"]["jepa_similarity"] is False
+
+
+def test_select_candidate_reports_no_go_when_quality_falls() -> None:
+    baseline = _baseline_metrics()
+    result = select_candidate(
+        baseline,
+        {
+            "a050_l002_h008": {
+                **baseline,
+                "psnr": 20.5,
+                "image_quality": 0.49,
+            }
+        },
+    )
+
+    assert result["decision"] == "NO-GO"
+    assert result["selected"] is None
+
+
+def test_select_candidate_requires_exact_five_video_coverage() -> None:
+    baseline = _baseline_metrics()
+    with pytest.raises(ProtocolError, match="coverage must equal five"):
+        select_candidate({**baseline, "coverage": 4}, {})
