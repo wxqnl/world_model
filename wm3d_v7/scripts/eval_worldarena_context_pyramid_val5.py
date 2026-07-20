@@ -96,6 +96,17 @@ def build_panel_audit(
     return panel, audit
 
 
+def shard_panel(
+    panel: Sequence[Mapping[str, Any]], shard_index: int, num_shards: int
+) -> list[dict[str, Any]]:
+    if num_shards < 1 or not 0 <= shard_index < num_shards:
+        raise ProtocolError("invalid validation shard index/count")
+    selected = [dict(row) for index, row in enumerate(panel) if index % num_shards == shard_index]
+    if not selected:
+        raise ProtocolError("validation shard is empty")
+    return selected
+
+
 def _atomic_json(path: Path, value: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -267,6 +278,8 @@ def run_generation(
     config: Mapping[str, Any],
     *,
     physical_device: int,
+    shard_index: int = 0,
+    num_shards: int = 1,
     manifest_reader: Callable[[Path], list[dict[str, Any]]] = read_manifest,
     checkpoint_loader: Callable[..., tuple[Any, dict[str, Any], dict[str, Any]]] = load_checkpoint_for_eval,
 ) -> dict[str, Any]:
@@ -274,6 +287,7 @@ def run_generation(
     manifest_path = _project_path(str(config["manifest"]))
     rows = manifest_reader(manifest_path)
     panel, panel_audit = build_panel_audit(rows)
+    work_panel = shard_panel(panel, shard_index, num_shards)
     output_root = _project_path(str(config["output_root"]))
     _atomic_json(output_root / "panel_audit.json", panel_audit)
     _atomic_jsonl(output_root / "panel.jsonl", panel)
@@ -281,7 +295,7 @@ def run_generation(
 
     cached: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     missing: list[dict[str, Any]] = []
-    for row in panel:
+    for row in work_panel:
         cache_path, audit_path = _cache_paths(output_root, row)
         value = _load_valid_cache(cache_path, audit_path, str(row["id"]))
         if value is None:
@@ -335,7 +349,7 @@ def run_generation(
         )
 
     records: list[dict[str, Any]] = []
-    for row in panel:
+    for row in work_panel:
         record_id = str(row["id"])
         name = val_output_name(row)
         cache_path, audit_path = _cache_paths(output_root, row)
@@ -420,13 +434,51 @@ def run_generation(
         )
 
     summary = {
-        "schema": "wm3d_v7_worldarena_context_pyramid_val5_generation_v1",
+        "schema": "wm3d_v7_worldarena_context_pyramid_val5_generation_shard_v1",
+        "shard_index": shard_index,
+        "num_shards": num_shards,
         "coverage": len(records),
         "variants": ["baseline", *(variant_name(config) for config in locked_grid())],
         "records": records,
         "future_gt_used_for_inference": False,
     }
-    _atomic_json(output_root / "generation_summary.json", summary)
+    _atomic_json(output_root / f"generation_summary_shard_{shard_index:02d}.json", summary)
+
+    complete_records: list[dict[str, Any]] = []
+    for row in panel:
+        name = val_output_name(row)
+        cache_path, audit_path = _cache_paths(output_root, row)
+        cache = _load_valid_cache(cache_path, audit_path, str(row["id"]))
+        rendered = {
+            key: output_root / "rendered" / key / name
+            for key in ("baseline", *(variant_name(config) for config in locked_grid()))
+        }
+        if cache is None or any(not path.is_file() or path.stat().st_size <= 0 for path in rendered.values()):
+            complete_records = []
+            break
+        complete_records.append(
+            {
+                "id": str(row["id"]),
+                "name": name,
+                "episode": int(row["episode"]),
+                "cache": str(cache_path.resolve()),
+                "rendered": {key: str(path.resolve()) for key, path in rendered.items()},
+            }
+        )
+    if len(complete_records) == 5:
+        _atomic_json(
+            output_root / "generation_summary.json",
+            {
+                "schema": "wm3d_v7_worldarena_context_pyramid_val5_generation_v1",
+                "coverage": 5,
+                "variants": [
+                    "baseline",
+                    *(variant_name(config) for config in locked_grid()),
+                ],
+                "records": complete_records,
+                "future_gt_used_for_inference": False,
+            },
+        )
     return summary
 
 
@@ -434,6 +486,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--device", type=int, choices=(0, 1, 2, 3), required=True)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
     return parser.parse_args()
 
 
@@ -442,7 +496,12 @@ def main() -> None:
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     if not isinstance(config, Mapping):
         raise ProtocolError("diagnostic config must be a mapping")
-    summary = run_generation(config, physical_device=args.device)
+    summary = run_generation(
+        config,
+        physical_device=args.device,
+        shard_index=args.shard_index,
+        num_shards=args.num_shards,
+    )
     print(
         json.dumps(
             {
