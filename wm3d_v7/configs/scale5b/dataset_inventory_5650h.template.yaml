@@ -1,5 +1,5 @@
 schema: wm3d_v7_native5b_dataset_v1
-name: wm3d_v7_native5b_5650h
+name: wm3d_v7_native5b_5650h_planning
 feature_fps: 5.0
 action_fps: 30.0
 T: 24
@@ -17,6 +17,7 @@ max_aux_tokens: 8
 aux_dim: 256
 max_aux_type_id: 64
 
+# 权重是每 100 个样本的确定性采样周期，不等同于数据时长占比。
 source_order:
   - legacy_v7_formal
   - robocasa_full
@@ -26,11 +27,13 @@ source_order:
   - agibot_beta
 
 sources:
+  # 现有约495h V7 formal 含约98h旧 MG 40k；这里必须使用剔除该子集后的 residual
+  # manifest。source layout 会拒绝 provenance_dataset=robocasa365_mg。
   - name: legacy_v7_formal
     adapter: normalized_manifest
     raw_root: ${WM3D_V7_LEGACY_ROOT}
     license_id: operator_verified_v7_sources
-    nominal_hours: 495.0
+    nominal_hours: 397.0
     weight: 10
     embodiment_names: [single_arm_7d]
     split_seed: 701
@@ -38,46 +41,46 @@ sources:
   - name: robocasa_full
     adapter: lerobot
     raw_root: ${ROBOCASA_FULL_ROOT}
-    license_id: operator_verified_robocasa
-    nominal_hours: 1517.0
+    license_id: operator_verified_robocasa365_pretrain_mg
+    nominal_hours: 1615.0
     weight: 15
-    embodiment_names: [single_arm_7d]
+    embodiment_names: [robocasa_panda_omron_12d]
     split_seed: 702
     train_fraction: 0.98
   - name: agibot_2026_imitation
-    adapter: lerobot
+    adapter: lerobot_collection
     raw_root: ${AGIBOT_2026_IMITATION_ROOT}
     license_id: operator_verified_agibot_2026
     nominal_hours: 295.0
     weight: 10
-    embodiment_names: [agibot_wholebody]
+    embodiment_names: [agibot_g2_wholebody_22d]
     split_seed: 703
     train_fraction: 0.98
   - name: agibot_2026_rich
-    adapter: lerobot
+    adapter: lerobot_collection
     raw_root: ${AGIBOT_2026_RICH_ROOT}
     license_id: operator_verified_agibot_2026
     nominal_hours: 155.0
     weight: 8
-    embodiment_names: [agibot_wholebody]
+    embodiment_names: [agibot_g2_wholebody_22d]
     split_seed: 704
     train_fraction: 0.98
   - name: agibot_2026_reinforcement
-    adapter: lerobot
+    adapter: lerobot_collection
     raw_root: ${AGIBOT_2026_REINFORCEMENT_ROOT}
     license_id: operator_verified_agibot_2026
     nominal_hours: 211.0
     weight: 12
-    embodiment_names: [agibot_wholebody]
+    embodiment_names: [agibot_g2_wholebody_22d]
     split_seed: 705
     train_fraction: 0.98
   - name: agibot_beta
-    adapter: lerobot
+    adapter: lerobot_collection
     raw_root: ${AGIBOT_BETA_ROOT}
-    license_id: operator_verified_agibot_beta
+    license_id: operator_verified_agibot_beta_gated
     nominal_hours: 2976.4
     weight: 45
-    embodiment_names: [agibot_wholebody]
+    embodiment_names: [agibot_g2_wholebody_22d]
     split_seed: 706
     train_fraction: 0.98
 
@@ -97,42 +100,77 @@ embodiments:
         rate_hz: 30.0
         control_mode: discrete_gripper
     auxiliary_modalities: []
-  - name: agibot_wholebody
+
+  # robocasa365-pretrain-mg 的 action 是 4+1+3+3+1=12 维，不能按旧 7D 截断。
+  - name: robocasa_panda_omron_12d
     embodiment_id: 1
     views: [head, left_hand, right_hand]
     action_groups:
+      - name: base_motion
+        group_id: 10
+        dimensions: [base_0, base_1, base_2, base_3]
+        rate_hz: 30.0
+        control_mode: base_motion
+      - name: control_mode
+        group_id: 11
+        dimensions: [mode]
+        rate_hz: 30.0
+        control_mode: discrete_mode
+      - name: arm_translation
+        group_id: 12
+        dimensions: [dx, dy, dz]
+        rate_hz: 30.0
+        control_mode: delta_position
+      - name: arm_rotation
+        group_id: 13
+        dimensions: [dax, day, daz]
+        rate_hz: 30.0
+        control_mode: delta_axis_angle
+      - name: gripper
+        group_id: 14
+        dimensions: [close]
+        rate_hz: 30.0
+        control_mode: discrete_gripper
+    auxiliary_modalities: []
+
+  # AgiBot G2 常用转换布局：双臂 14 + 双夹爪 2 + 底盘 2 + 腰 2 + 头 2。
+  # 若冻结快照的 schema 不同，必须先拆分 embodiment，再修改本模板，禁止猜列。
+  - name: agibot_g2_wholebody_22d
+    embodiment_id: 2
+    views: [head, left_hand, right_hand]
+    action_groups:
       - name: left_arm
-        group_id: 2
+        group_id: 20
         dimensions: [j0, j1, j2, j3, j4, j5, j6]
         rate_hz: 30.0
         control_mode: joint_position
       - name: left_gripper
-        group_id: 3
+        group_id: 21
         dimensions: [close]
         rate_hz: 30.0
         control_mode: discrete_gripper
       - name: right_arm
-        group_id: 4
+        group_id: 22
         dimensions: [j0, j1, j2, j3, j4, j5, j6]
         rate_hz: 30.0
         control_mode: joint_position
       - name: right_gripper
-        group_id: 5
+        group_id: 23
         dimensions: [close]
         rate_hz: 30.0
         control_mode: discrete_gripper
       - name: base
-        group_id: 6
-        dimensions: [vx, vy, wz]
+        group_id: 24
+        dimensions: [vx, wz]
         rate_hz: 30.0
         control_mode: base_velocity
       - name: waist
-        group_id: 7
+        group_id: 25
         dimensions: [lift, yaw]
         rate_hz: 30.0
         control_mode: joint_position
       - name: head
-        group_id: 8
+        group_id: 26
         dimensions: [yaw, pitch]
         rate_hz: 30.0
         control_mode: joint_position
@@ -140,43 +178,13 @@ embodiments:
       - name: proprio
         type_id: 0
         dimensions:
-          [q0, q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13,
-           q14, q15, q16, q17, q18, q19, q20, q21, q22, q23, q24, q25,
-           q26, q27, q28, q29, q30, q31]
+          [q0, q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11,
+           q12, q13, q14, q15, q16, q17, q18, q19, q20, q21]
         rate_hz: 30.0
-      - name: left_force
-        type_id: 1
-        dimensions: [fx, fy, fz, tx, ty, tz]
-        rate_hz: 30.0
-      - name: right_force
-        type_id: 2
-        dimensions: [fx, fy, fz, tx, ty, tz]
-        rate_hz: 30.0
-      - name: left_tactile
-        type_id: 3
-        dimensions:
-          [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12,
-           t13, t14, t15]
-        rate_hz: 30.0
-      - name: right_tactile
-        type_id: 4
-        dimensions:
-          [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12,
-           t13, t14, t15]
-        rate_hz: 30.0
-      - name: lidar
-        type_id: 5
-        dimensions:
-          [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12,
-           r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23,
-           r24, r25, r26, r27, r28, r29, r30, r31, r32, r33, r34,
-           r35, r36, r37, r38, r39, r40, r41, r42, r43, r44, r45,
-           r46, r47, r48, r49, r50, r51, r52, r53, r54, r55, r56,
-           r57, r58, r59, r60, r61, r62, r63]
-        rate_hz: 10.0
 
 notes:
-  planning_snapshot: 2026-07-23
+  planning_snapshot: "2026-07-29"
   nominal_total_hours: 5649.4
   formal_target_unique_hours: 5000-8000
-  operator_requirement: split heterogeneous repositories by real embodiment before sealing
+  overlap_policy: 旧V7中的RoboCasa MG 40k必须从legacy residual剔除，再以完整1615h MG替换；禁止重复计数
+  operator_requirement: 异构机器人必须按真实 embodiment 拆分后再 seal；规划小时数不得冒充实测小时数

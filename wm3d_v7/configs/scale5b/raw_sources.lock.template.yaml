@@ -1,0 +1,66 @@
+schema: wm3d_v7_native5b_raw_sources_lock_v1
+snapshot_date: "2026-07-29"
+# 正式执行前复制为站点私有 lock，并把每个 revision 换成 40 位提交 SHA。
+# 下载器拒绝 branch/tag/占位符，防止供应商更新后静默漂移。
+sources:
+  robocasa_full:
+    repo_id: ember-lab-berkeley/robocasa365-pretrain-mg
+    repo_type: dataset
+    revision: REPLACE_WITH_40_HEX_COMMIT
+    gated: false
+    license_id: operator_must_accept_upstream_license
+    target_subdir: robocasa_full
+    materialization: lerobot_root
+    planning_hours: 1615.0
+    planning_download_tb: 0.315
+    allow_patterns: ["*"]
+    ignore_patterns: []
+  agibot_world_2026_snapshot:
+    repo_id: agibot-world/AgiBotWorld2026
+    repo_type: dataset
+    revision: REPLACE_WITH_40_HEX_COMMIT
+    gated: false
+    license_id: CC-BY-NC-SA-4.0
+    target_subdir: agibot_world_2026_snapshot
+    materialization: archive_collection
+    planning_hours_real_robot: 661.0
+    planning_download_tb: 12.8
+    allow_patterns:
+      - README.md
+      - scripts/**
+      - ImitationLearning/**
+      - RichInteraction/**
+      - ReinforcementLearning/**
+    ignore_patterns:
+      - simulation/**
+  agibot_beta_snapshot:
+    repo_id: agibot-world/AgiBotWorld-Beta
+    repo_type: dataset
+    revision: REPLACE_WITH_40_HEX_COMMIT
+    gated: true
+    license_id: operator_must_accept_gated_upstream_license
+    target_subdir: agibot_beta_snapshot
+    materialization: vendor_conversion_collection
+    planning_hours: 2976.4
+    planning_download_tb: 48.1
+    allow_patterns: ["*"]
+    ignore_patterns: []
+  agibot_alpha_converter_snapshot:
+    # Beta 当前文件树不含 README 所引用的 scripts/。Alpha 与 Beta 使用相同
+    # 官方原始目录合同，因此单独冻结 Alpha 官方转换器，不能从浮动 main 临时取脚本。
+    repo_id: agibot-world/AgiBotWorld-Alpha
+    repo_type: dataset
+    revision: REPLACE_WITH_40_HEX_COMMIT
+    gated: true
+    license_id: operator_must_accept_gated_upstream_license
+    target_subdir: agibot_alpha_converter_snapshot
+    materialization: vendor_tool_bundle
+    allow_patterns:
+      - README.md
+      - scripts/convert_to_lerobot.py
+    ignore_patterns: []
+notes:
+  - planning_hours 和 planning_download_tb 只用于采购，不能替代 scan receipt 的实测值。
+  - AgiBotWorld2026 的 Simulation 默认排除，避免重复包装混入真实机器人时长。
+  - Beta 数据快照与 Alpha 官方转换器快照必须分别有下载 receipt；转换 receipt 同时绑定二者。
+  - HF_TOKEN 必须由集群 secret manager 注入；禁止写入本文件、命令行和日志。

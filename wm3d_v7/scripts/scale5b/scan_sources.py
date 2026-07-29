@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Create the immutable vendor-neutral episode plan for V7 native 5B."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,12 +13,15 @@ from wm3d_v3.data.scale5b_contracts import (
     load_contract,
     resolve_real_directory,
     resolve_regular_file,
+    sha256_file,
 )
 from wm3d_v3.data.scale5b_sources import (
     SourceLayout,
     publish_scan_receipt,
     scan_lerobot,
+    scan_lerobot_collection,
     scan_normalized_manifest,
+    validate_collection_receipt,
     validate_episode_inputs,
     write_episode_plan,
 )
@@ -44,9 +48,7 @@ def main() -> None:
         layout_input.name,
     )
     contract = load_contract(contract_path)
-    raw_layouts = json.loads(
-        layout_path.read_text(encoding="utf-8")
-    )
+    raw_layouts = json.loads(layout_path.read_text(encoding="utf-8"))
     if raw_layouts.get("schema") != "wm3d_v7_native5b_source_layouts_v1":
         raise ValueError("source-layout collection schema mismatch")
     layouts = tuple(
@@ -57,6 +59,7 @@ def main() -> None:
         raise ValueError("source layouts must uniquely follow contract source_order")
     embodiments = {item.name: item for item in contract.embodiments}
     episodes = []
+    collection_receipts = {}
     for source in contract.sources:
         layout = by_source[source.name]
         if layout.adapter != source.adapter:
@@ -81,20 +84,17 @@ def main() -> None:
                     "from embodiment contract"
                 )
             expected_discrete = (
-                "grip" in group.control_mode
-                or "discrete" in group.control_mode
+                "grip" in group.control_mode or "discrete" in group.control_mode
             )
             if bool(mapping.discrete) != expected_discrete:
                 raise ValueError(
                     f"{source.name}: discrete semantics for {group.name} "
                     "differ from embodiment contract"
                 )
-        if tuple(
-            item.modality_name for item in layout.auxiliary_columns
-        ) != tuple(item.name for item in embodiment.auxiliary_modalities):
-            raise ValueError(
-                f"{source.name}: auxiliary modality order mismatch"
-            )
+        if tuple(item.modality_name for item in layout.auxiliary_columns) != tuple(
+            item.name for item in embodiment.auxiliary_modalities
+        ):
+            raise ValueError(f"{source.name}: auxiliary modality order mismatch")
         for mapping, modality in zip(
             layout.auxiliary_columns,
             embodiment.auxiliary_modalities,
@@ -116,6 +116,20 @@ def main() -> None:
                 split_seed=source.split_seed,
                 train_fraction=source.train_fraction,
             )
+        elif layout.adapter == "lerobot_collection":
+            source_episodes = scan_lerobot_collection(
+                root,
+                layout,
+                split_seed=source.split_seed,
+                train_fraction=source.train_fraction,
+            )
+            collection_receipt = validate_collection_receipt(root, layout)
+            if collection_receipt is not None:
+                collection_receipts[source.name] = {
+                    "path": layout.collection_receipt_path,
+                    "schema": layout.collection_receipt_schema,
+                    "sha256": sha256_file(collection_receipt),
+                }
         else:
             manifest = resolve_regular_file(
                 root,
@@ -144,9 +158,7 @@ def main() -> None:
     if output_input.exists() or output_input.is_symlink():
         output = resolve_real_directory(output_input, "dataset output root")
         if any(output.iterdir()):
-            raise FileExistsError(
-                f"dataset output root must be empty: {output}"
-            )
+            raise FileExistsError(f"dataset output root must be empty: {output}")
     else:
         parent = resolve_real_directory(
             output_input.parent,
@@ -170,6 +182,7 @@ def main() -> None:
     atomic_write_json(layouts_out, raw_layouts, exclusive=True)
     summary = write_episode_plan(plan_out, episodes)
     summary["input_validation"] = input_validation
+    summary["collection_receipts"] = collection_receipts
     receipt = publish_scan_receipt(
         receipts / "source_scan.json",
         layout_path=layouts_out,

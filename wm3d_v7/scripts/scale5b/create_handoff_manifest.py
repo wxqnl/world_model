@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bind every immutable artifact in one WM3D-V7 native-5B handoff."""
+
 from __future__ import annotations
 
 import argparse
@@ -10,6 +11,9 @@ import stat
 
 import yaml
 
+from scripts.scale5b.verify_agibot_converter_environment import (
+    validate_receipt as validate_converter_environment_receipt,
+)
 from wm3d_v3.data.scale5b_assets import verify_asset_bundle
 from wm3d_v3.data.scale5b_contracts import (
     atomic_write_json,
@@ -30,7 +34,7 @@ from wm3d_v3.training.scale5b_environment import (
 )
 
 
-SCHEMA = "wm3d_v7_native5b_handoff_manifest_v1"
+SCHEMA = "wm3d_v7_native5b_handoff_manifest_v2"
 
 
 def _regular_file(path: Path) -> Path:
@@ -65,6 +69,16 @@ def main() -> None:
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--asset-root", type=Path, required=True)
     parser.add_argument("--container-artifact", type=Path, required=True)
+    parser.add_argument(
+        "--converter-container-artifact",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
+        "--converter-environment-receipt",
+        type=Path,
+        required=True,
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -97,8 +111,7 @@ def main() -> None:
     )
     if not dataset_report["pass"]:
         raise ValueError(
-            "dataset seal verification failed:\n"
-            + "\n".join(dataset_report["errors"])
+            "dataset seal verification failed:\n" + "\n".join(dataset_report["errors"])
         )
     dataset_seal = load_seal(
         resolve_regular_file(
@@ -118,6 +131,19 @@ def main() -> None:
     )
     if canonical_sha256(dataset_asset_receipt) != asset_report["receipt_sha256"]:
         raise ValueError("dataset and supplied encoder asset receipts differ")
+
+    converter_receipt_path = _regular_file(args.converter_environment_receipt)
+    converter_receipt = validate_converter_environment_receipt(
+        converter_receipt_path,
+        check_current=False,
+    )
+    converter_bundle_root = converter_receipt_path.parent
+    converter_contract_path = converter_bundle_root / str(
+        converter_receipt["environment_contract"]
+    )
+    converter_revision_path = converter_bundle_root / str(
+        converter_receipt["lerobot_revision_file"]
+    )
 
     manifest = {
         "schema": SCHEMA,
@@ -151,6 +177,13 @@ def main() -> None:
             "bytes": asset_report["bytes"],
         },
         "container_artifact": _file_evidence(args.container_artifact),
+        "agibot_converter": {
+            "container_artifact": _file_evidence(args.converter_container_artifact),
+            "environment_receipt": _file_evidence(converter_receipt_path),
+            "environment_contract": _file_evidence(converter_contract_path),
+            "lerobot_revision_file": _file_evidence(converter_revision_path),
+            "lerobot_revision": converter_receipt["lerobot_revision"],
+        },
     }
     manifest["content_sha256"] = canonical_sha256(manifest)
     atomic_write_json(args.output.resolve(), manifest, exclusive=True)

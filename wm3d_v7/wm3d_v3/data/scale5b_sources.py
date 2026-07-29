@@ -5,6 +5,7 @@ heuristics.  This module converts supported LeRobot or normalized manifests
 into a small immutable episode plan.  Every downstream build consumes only
 that plan plus the separately sealed dataset contract and source-layout file.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -69,13 +70,8 @@ class AuxiliaryColumnSpec:
             raise ContractError(
                 "auxiliary column requires modality_name/column/indices"
             )
-        if (
-            len(result.indices) != len(set(result.indices))
-            or min(result.indices) < 0
-        ):
-            raise ContractError(
-                f"invalid auxiliary indices for {result.modality_name}"
-            )
+        if len(result.indices) != len(set(result.indices)) or min(result.indices) < 0:
+            raise ContractError(f"invalid auxiliary indices for {result.modality_name}")
         return result
 
 
@@ -93,6 +89,10 @@ class SourceLayout:
     default_task: str = "robot manipulation"
     fps_override: float | None = None
     normalized_manifest_path: str | None = None
+    collection_receipt_path: str | None = None
+    collection_receipt_schema: str | None = None
+    provenance_dataset: str | None = None
+    forbidden_provenance_datasets: tuple[str, ...] = ()
     schema: str = SOURCE_LAYOUT_SCHEMA
 
     @classmethod
@@ -110,6 +110,9 @@ class SourceLayout:
             AuxiliaryColumnSpec.from_mapping(spec)
             for spec in item.get("auxiliary_columns", ())
         )
+        item["forbidden_provenance_datasets"] = tuple(
+            str(name) for name in item.get("forbidden_provenance_datasets", ())
+        )
         result = cls(**item)
         result.validate()
         return result
@@ -117,19 +120,49 @@ class SourceLayout:
     def validate(self) -> None:
         if self.schema != SOURCE_LAYOUT_SCHEMA:
             raise ContractError(f"unsupported source layout schema {self.schema}")
-        if self.adapter not in {"lerobot", "normalized_manifest"}:
+        if self.adapter not in {
+            "lerobot",
+            "lerobot_collection",
+            "normalized_manifest",
+        }:
             raise ContractError(f"unsupported source adapter {self.adapter}")
         if self.adapter == "normalized_manifest" and not self.normalized_manifest_path:
-            raise ContractError("normalized_manifest adapter requires its manifest path")
+            raise ContractError(
+                "normalized_manifest adapter requires its manifest path"
+            )
         if self.normalized_manifest_path is not None:
             safe_relative_path(self.normalized_manifest_path)
+        if (self.collection_receipt_path is None) != (
+            self.collection_receipt_schema is None
+        ):
+            raise ContractError(
+                "collection receipt path/schema must be provided together"
+            )
+        if self.collection_receipt_path is not None:
+            if self.adapter != "lerobot_collection":
+                raise ContractError(
+                    "collection receipt only applies to lerobot_collection"
+                )
+            safe_relative_path(self.collection_receipt_path)
+            if not self.collection_receipt_schema:
+                raise ContractError("collection receipt schema cannot be empty")
+        if self.provenance_dataset is not None and not self.provenance_dataset:
+            raise ContractError("provenance_dataset cannot be empty")
+        if len(self.forbidden_provenance_datasets) != len(
+            set(self.forbidden_provenance_datasets)
+        ) or any(not name for name in self.forbidden_provenance_datasets):
+            raise ContractError(
+                "forbidden provenance datasets must be unique/non-empty"
+            )
+        if self.adapter != "normalized_manifest" and self.forbidden_provenance_datasets:
+            raise ContractError(
+                "forbidden provenance datasets only apply to normalized manifests"
+            )
         if tuple(self.view_keys) != ("head", "left_hand", "right_hand"):
             raise ContractError(
                 "source view_keys must be ordered head,left_hand,right_hand"
             )
-        available_views = [
-            key for key in self.view_keys.values() if key is not None
-        ]
+        available_views = [key for key in self.view_keys.values() if key is not None]
         if not available_views:
             raise ContractError("source layout must provide at least one RGB view")
         if len(set(available_views)) != len(available_views):
@@ -139,9 +172,7 @@ class SourceLayout:
         names = [item.group_name for item in self.action_columns]
         if len(names) != len(set(names)):
             raise ContractError("source layout has duplicate action group mappings")
-        auxiliary_names = [
-            item.modality_name for item in self.auxiliary_columns
-        ]
+        auxiliary_names = [item.modality_name for item in self.auxiliary_columns]
         if len(auxiliary_names) != len(set(auxiliary_names)):
             raise ContractError(
                 "source layout has duplicate auxiliary modality mappings"
@@ -178,6 +209,7 @@ class EpisodeDescriptor:
     views: tuple[ViewSegment, ...]
     action_columns: tuple[ActionColumnSpec, ...]
     auxiliary_columns: tuple[AuxiliaryColumnSpec, ...] = ()
+    provenance_dataset: str | None = None
     schema: str = EPISODE_PLAN_SCHEMA
 
     @classmethod
@@ -208,12 +240,16 @@ class EpisodeDescriptor:
             raise ContractError(f"invalid row interval for {self.episode_id}")
         if self.source_fps <= 0 or self.duration_seconds <= 0:
             raise ContractError(f"invalid timing for {self.episode_id}")
+        if self.provenance_dataset is not None and not self.provenance_dataset:
+            raise ContractError(f"empty provenance dataset for {self.episode_id}")
         if tuple(view.canonical_name for view in self.views) != (
             "head",
             "left_hand",
             "right_hand",
         ):
-            raise ContractError(f"{self.episode_id} does not have canonical 3-view order")
+            raise ContractError(
+                f"{self.episode_id} does not have canonical 3-view order"
+            )
         if not any(view.relative_path is not None for view in self.views):
             raise ContractError(f"{self.episode_id} has no available RGB view")
         for view in self.views:
@@ -232,10 +268,16 @@ class EpisodeDescriptor:
 
 
 def _format_template(template: str, values: Mapping[str, Any]) -> str:
-    fields = {name for _literal, name, _format, _conversion in Formatter().parse(template) if name}
+    fields = {
+        name
+        for _literal, name, _format, _conversion in Formatter().parse(template)
+        if name
+    }
     missing = fields.difference(values)
     if missing:
-        raise ContractError(f"path template misses values {sorted(missing)}: {template}")
+        raise ContractError(
+            f"path template misses values {sorted(missing)}: {template}"
+        )
     return template.format(**values)
 
 
@@ -366,6 +408,7 @@ def scan_lerobot(
     *,
     split_seed: int,
     train_fraction: float,
+    episode_namespace: str | None = None,
 ) -> list[EpisodeDescriptor]:
     """Scan both file-per-episode and shared-file LeRobot layouts."""
 
@@ -393,7 +436,9 @@ def scan_lerobot(
     tasks = _task_lookup(root)
     descriptors: list[EpisodeDescriptor] = []
     seen: set[int] = set()
-    for row in sorted(_metadata_rows(root), key=lambda item: int(item["episode_index"])):
+    for row in sorted(
+        _metadata_rows(root), key=lambda item: int(item["episode_index"])
+    ):
         episode_index = int(row["episode_index"])
         if episode_index in seen:
             raise ContractError(f"duplicate LeRobot episode {episode_index}")
@@ -442,9 +487,7 @@ def scan_lerobot(
             direct = row.get(f"videos/{feature_key}/path")
             video_candidates = [str(direct)] if direct else []
             try:
-                video_candidates.append(
-                    _format_template(video_template, video_values)
-                )
+                video_candidates.append(_format_template(video_template, video_values))
             except (KeyError, ValueError, ContractError):
                 pass
             video_chunk = int(
@@ -477,7 +520,8 @@ def scan_lerobot(
                     stop_seconds=view_stop,
                 )
             )
-        episode_id = f"{layout.source}:{episode_index:09d}"
+        namespace = "" if episode_namespace is None else f"{episode_namespace}:"
+        episode_id = f"{layout.source}:{namespace}{episode_index:09d}"
         descriptors.append(
             EpisodeDescriptor(
                 source=layout.source,
@@ -509,11 +553,87 @@ def scan_lerobot(
                 views=tuple(views),
                 action_columns=layout.action_columns,
                 auxiliary_columns=layout.auxiliary_columns,
+                provenance_dataset=layout.provenance_dataset or layout.source,
             )
         )
     if not descriptors:
         raise ContractError(f"LeRobot scan produced no episodes for {layout.source}")
     return descriptors
+
+
+def scan_lerobot_collection(
+    root: Path,
+    layout: SourceLayout,
+    *,
+    split_seed: int,
+    train_fraction: float,
+) -> list[EpisodeDescriptor]:
+    """Scan a directory containing independent LeRobot dataset roots.
+
+    AgiBot releases one LeRobot tree per archive/task. Episode indices restart
+    inside each tree, so a stable relative-root hash is included in episode IDs.
+    The nested root stays in each descriptor, avoiding vendor path heuristics in
+    the expensive encoder.
+    """
+
+    root = resolve_real_directory(root, f"{layout.source} collection root")
+    validate_collection_receipt(root, layout)
+    nested_roots: list[Path] = []
+    for info_path in sorted(root.glob("**/meta/info.json")):
+        if info_path.is_symlink() or not info_path.is_file():
+            raise ContractError(f"unsafe LeRobot metadata path {info_path}")
+        candidate = resolve_real_directory(
+            info_path.parent.parent,
+            f"{layout.source} nested LeRobot root",
+        )
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ContractError(
+                f"nested LeRobot root escapes collection: {candidate}"
+            ) from exc
+        nested_roots.append(candidate)
+    if not nested_roots:
+        raise ContractError(f"LeRobot collection has no nested meta/info.json: {root}")
+    if len(nested_roots) != len(set(nested_roots)):
+        raise ContractError(f"duplicate nested LeRobot roots under {root}")
+
+    descriptors: list[EpisodeDescriptor] = []
+    for nested_root in nested_roots:
+        relative = nested_root.relative_to(root).as_posix()
+        namespace = hashlib.sha256(relative.encode()).hexdigest()[:16]
+        descriptors.extend(
+            scan_lerobot(
+                nested_root,
+                layout,
+                split_seed=split_seed,
+                train_fraction=train_fraction,
+                episode_namespace=namespace,
+            )
+        )
+    episode_ids = [item.episode_id for item in descriptors]
+    if len(episode_ids) != len(set(episode_ids)):
+        raise ContractError(f"duplicate episode IDs in collection {root}")
+    return descriptors
+
+
+def validate_collection_receipt(
+    root: Path,
+    layout: SourceLayout,
+) -> Path | None:
+    if layout.collection_receipt_path is None:
+        return None
+    receipt = resolve_regular_file(root, layout.collection_receipt_path)
+    value = json.loads(receipt.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != layout.collection_receipt_schema
+        or value.get("complete") is not True
+    ):
+        raise ContractError(
+            f"{layout.source}: collection completion receipt 未完成或 schema 不匹配"
+        )
+    return receipt
 
 
 def scan_normalized_manifest(
@@ -534,9 +654,19 @@ def scan_normalized_manifest(
         value = EpisodeDescriptor.from_mapping(row)
         if value.source != layout.source or value.embodiment != layout.embodiment:
             raise ContractError("normalized manifest source/embodiment mismatch")
-        if expected_root is not None and Path(value.raw_root).resolve(
-            strict=True
-        ) != expected_root:
+        if value.provenance_dataset is None:
+            raise ContractError(
+                f"{value.episode_id}: normalized manifest 缺 provenance_dataset"
+            )
+        if value.provenance_dataset in layout.forbidden_provenance_datasets:
+            raise ContractError(
+                f"{value.episode_id}: forbidden provenance dataset "
+                f"{value.provenance_dataset}"
+            )
+        if (
+            expected_root is not None
+            and Path(value.raw_root).resolve(strict=True) != expected_root
+        ):
             raise ContractError(
                 f"{value.episode_id}: normalized manifest raw_root differs "
                 "from the dataset contract"
@@ -566,8 +696,7 @@ def scan_normalized_manifest(
                 )
             if expected_key is None and view.relative_path is not None:
                 raise ContractError(
-                    f"{value.episode_id}: layout forbids "
-                    f"{view.canonical_name}"
+                    f"{value.episode_id}: layout forbids {view.canonical_name}"
                 )
         # Split is recomputed so one global seed controls every adapter.
         mapping = value.as_dict()
@@ -613,9 +742,7 @@ def _sample_cell_width(
             table = parquet.read_row_group(row_group, columns=[column])
             cell = table.column(0)[row_index - cursor].as_py()
             if cell is None:
-                raise ContractError(
-                    f"{column} is null at parquet row {row_index}"
-                )
+                raise ContractError(f"{column} is null at parquet row {row_index}")
             if isinstance(cell, (list, tuple)):
                 return len(cell)
             return 1
@@ -661,9 +788,7 @@ def validate_episode_inputs(
             episode.data_row_stop,
         )
         if interval in seen_intervals:
-            raise ContractError(
-                f"duplicate parquet interval for {episode.episode_id}"
-            )
+            raise ContractError(f"duplicate parquet interval for {episode.episode_id}")
         seen_intervals.add(interval)
         files.setdefault(data_path, []).append(episode)
         for view in episode.views:
@@ -679,9 +804,7 @@ def validate_episode_inputs(
         ) + float(episode.duration_seconds)
 
     data_bytes = 0
-    for path, bound_episodes in sorted(
-        files.items(), key=lambda item: str(item[0])
-    ):
+    for path, bound_episodes in sorted(files.items(), key=lambda item: str(item[0])):
         parquet = pq.ParquetFile(path)
         total_rows = int(parquet.metadata.num_rows)
         data_bytes += path.stat().st_size
@@ -689,9 +812,7 @@ def validate_episode_inputs(
         available = set(schema.names)
         required: set[str] = set()
         for episode in bound_episodes:
-            required.update(
-                (episode.timestamp_column, episode.episode_column)
-            )
+            required.update((episode.timestamp_column, episode.episode_column))
             required.update(item.column for item in episode.action_columns)
             required.update(item.column for item in episode.auxiliary_columns)
             if episode.data_row_stop > total_rows:
@@ -701,9 +822,7 @@ def validate_episode_inputs(
                 )
         missing = required.difference(available)
         if missing:
-            raise ContractError(
-                f"{path}: missing parquet columns {sorted(missing)}"
-            )
+            raise ContractError(f"{path}: missing parquet columns {sorted(missing)}")
         representative = bound_episodes[0]
         for scalar_column in (
             representative.timestamp_column,
@@ -749,10 +868,16 @@ def validate_episode_inputs(
     }
 
 
-def write_episode_plan(path: Path, episodes: Iterable[EpisodeDescriptor]) -> dict[str, Any]:
+def write_episode_plan(
+    path: Path, episodes: Iterable[EpisodeDescriptor]
+) -> dict[str, Any]:
     values = sorted(
         (episode.as_dict() for episode in episodes),
-        key=lambda item: (item["source"], int(item["episode_index"]), item["episode_id"]),
+        key=lambda item: (
+            item["source"],
+            int(item["episode_index"]),
+            item["episode_id"],
+        ),
     )
     if not values:
         raise ContractError("cannot publish an empty episode plan")
@@ -772,7 +897,9 @@ def write_episode_plan(path: Path, episodes: Iterable[EpisodeDescriptor]) -> dic
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise FileExistsError(path)
-    temporary = path.with_name(path.name + f".tmp.{hashlib.sha256(payload).hexdigest()[:12]}")
+    temporary = path.with_name(
+        path.name + f".tmp.{hashlib.sha256(payload).hexdigest()[:12]}"
+    )
     with temporary.open("xb") as handle:
         handle.write(payload)
         handle.flush()

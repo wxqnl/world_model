@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+import platform
 import runpy
+import shutil
+import sys
+import tarfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -37,9 +42,11 @@ from wm3d_v3.data.scale5b_dataset import (
 from wm3d_v3.data.scale5b_sources import (
     ActionColumnSpec,
     EpisodeDescriptor,
+    SourceLayout,
     ViewSegment,
     deterministic_split,
     plan_shard,
+    scan_lerobot_collection,
     validate_episode_inputs,
 )
 
@@ -183,9 +190,7 @@ def test_grouped_action_alignment_and_deterministic_partition() -> None:
             )
         },
         embodiment=embodiment,
-        normalizations={
-            "force": ActionNormalization(np.zeros(2), np.ones(2))
-        },
+        normalizations={"force": ActionNormalization(np.zeros(2), np.ones(2))},
         max_aux_tokens=8,
         aux_dim=256,
         max_aux_type_id=64,
@@ -211,9 +216,7 @@ def test_grouped_action_alignment_and_deterministic_partition() -> None:
             )
         },
         embodiment=embodiment,
-        normalizations={
-            "force": ActionNormalization(np.zeros(2), np.ones(2))
-        },
+        normalizations={"force": ActionNormalization(np.zeros(2), np.ones(2))},
         max_aux_tokens=8,
         aux_dim=256,
         max_aux_type_id=64,
@@ -236,9 +239,7 @@ def test_quantized_random_access_dataset(tmp_path: Path) -> None:
     tokens = torch.randn(40, 3, 144, 2048, dtype=torch.float16)
     tokens[:, 2] = 500.0
     tokens_q, tokens_scale = quantize_per_vector(tokens)
-    summary_q, summary_scale = quantize_per_vector(
-        tokens.float().mean(dim=(1, 2))
-    )
+    summary_q, summary_scale = quantize_per_vector(tokens.float().mean(dim=(1, 2)))
     jpeg_writer = JpegPackWriter(tmp_path / "payload" / "rgb.jpgpack", quality=95)
     for frame in range(40):
         image = torch.full((3, 3, 32, 32), frame * 5, dtype=torch.uint8)
@@ -248,16 +249,18 @@ def test_quantized_random_access_dataset(tmp_path: Path) -> None:
         {
             "view_tokens_q": tokens_q,
             "view_tokens_scale": tokens_scale,
-                "view_mask": torch.tensor(
-                    [[True, True, False]], dtype=torch.bool
-                ).expand(40, -1).contiguous(),
+            "view_mask": torch.tensor([[True, True, False]], dtype=torch.bool)
+            .expand(40, -1)
+            .contiguous(),
             "rgb_offsets": offsets,
             "rgb_lengths": lengths,
             "depth": torch.ones(40, 3, 144, dtype=torch.float16),
             "point": torch.zeros(40, 3, 144, 3, dtype=torch.float16),
-                "geometry_confidence": torch.tensor(
-                    [[[1.0], [1.0], [0.0]]], dtype=torch.float16
-                ).expand(40, 3, 144).contiguous(),
+            "geometry_confidence": torch.tensor(
+                [[[1.0], [1.0], [0.0]]], dtype=torch.float16
+            )
+            .expand(40, 3, 144)
+            .contiguous(),
             "camera_pose": torch.zeros(40, 3, 9),
             "frame_summary_q": summary_q,
             "frame_summary_scale": summary_scale,
@@ -271,9 +274,9 @@ def test_quantized_random_access_dataset(tmp_path: Path) -> None:
             "action_values": torch.zeros(40, 2, 6, 4),
             "action_dim_mask": torch.ones(40, 2, 6, 4, dtype=torch.bool),
             "contact": torch.zeros(40, 2, 6),
-            "contact_mask": torch.tensor(
-                [[[False] * 6, [True] * 6]], dtype=torch.bool
-            ).expand(40, -1, -1).contiguous(),
+            "contact_mask": torch.tensor([[[False] * 6, [True] * 6]], dtype=torch.bool)
+            .expand(40, -1, -1)
+            .contiguous(),
         },
         tmp_path / "payload" / "actions.safetensors",
     )
@@ -328,6 +331,85 @@ def test_quantized_random_access_dataset(tmp_path: Path) -> None:
     assert sample["target_contact_mask"][:, 1].all()
 
 
+def test_lerobot_collection_namespaces_restarted_episode_indices(
+    tmp_path: Path,
+) -> None:
+    collection = tmp_path / "collection"
+
+    def make_nested(relative: str, value: float) -> Path:
+        root = collection / relative
+        (root / "meta").mkdir(parents=True)
+        (root / "data" / "chunk-000").mkdir(parents=True)
+        (root / "videos" / "chunk-000" / "rgb").mkdir(parents=True)
+        (root / "meta" / "info.json").write_text(
+            json.dumps({"fps": 10.0}), encoding="utf-8"
+        )
+        (root / "meta" / "episodes.jsonl").write_text(
+            json.dumps(
+                {
+                    "episode_index": 0,
+                    "length": 4,
+                    "task": f"task-{relative}",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        pq.write_table(
+            pa.table(
+                {
+                    "timestamp": [0.0, 0.1, 0.2, 0.3],
+                    "episode_index": [0, 0, 0, 0],
+                    "action": [[value] * 7] * 4,
+                }
+            ),
+            root / "data" / "chunk-000" / "episode_000000.parquet",
+        )
+        (root / "videos" / "chunk-000" / "rgb" / "episode_000000.mp4").write_bytes(
+            b"metadata-only-video"
+        )
+        return root
+
+    first = make_nested("task-a/dataset", 0.0)
+    second = make_nested("task-b/dataset", 1.0)
+    layout = SourceLayout.from_mapping(
+        {
+            "source": "agibot",
+            "adapter": "lerobot_collection",
+            "embodiment": "wholebody",
+            "view_keys": {
+                "head": "rgb",
+                "left_hand": None,
+                "right_hand": None,
+            },
+            "action_columns": [
+                {
+                    "group_name": "arm",
+                    "column": "action",
+                    "indices": [0, 1, 2, 3, 4, 5],
+                },
+                {
+                    "group_name": "gripper",
+                    "column": "action",
+                    "indices": [6],
+                    "discrete": True,
+                },
+            ],
+        }
+    )
+    episodes = scan_lerobot_collection(
+        collection,
+        layout,
+        split_seed=17,
+        train_fraction=0.8,
+    )
+    assert len(episodes) == 2
+    assert len({episode.episode_id for episode in episodes}) == 2
+    assert {Path(episode.raw_root) for episode in episodes} == {first, second}
+    assert all(episode.episode_index == 0 for episode in episodes)
+    assert all(episode.episode_id.startswith("agibot:") for episode in episodes)
+
+
 def test_episode_input_validation_checks_parquet_width_and_video(
     tmp_path: Path,
 ) -> None:
@@ -338,9 +420,7 @@ def test_episode_input_validation_checks_parquet_width_and_video(
             {
                 "timestamp": pa.array([0.0, 0.1, 0.2, 0.3]),
                 "episode_index": pa.array([7, 7, 7, 7]),
-                "action": pa.array(
-                    [[0.0] * 7, [0.1] * 7, [0.2] * 7, [0.3] * 7]
-                ),
+                "action": pa.array([[0.0] * 7, [0.1] * 7, [0.2] * 7, [0.3] * 7]),
             }
         ),
         raw / "episode.parquet",
@@ -383,6 +463,66 @@ def test_episode_input_validation_checks_parquet_width_and_video(
         validate_episode_inputs((invalid,))
 
 
+def test_legacy_residual_manifest_excludes_old_mg_by_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = runpy.run_path("scripts/scale5b/prepare_legacy_residual_manifest.py")
+    action_columns = (
+        ActionColumnSpec("arm", "action", (0, 1, 2, 3, 4, 5)),
+        ActionColumnSpec("gripper", "action", (6,), discrete=True),
+    )
+    rows = []
+    for index, provenance in enumerate(("droid", "robocasa365_mg")):
+        descriptor = EpisodeDescriptor(
+            source="legacy_v7_formal",
+            episode_id=f"legacy:{index}",
+            episode_index=index,
+            embodiment="single_arm_7d",
+            split="train",
+            task_text="pick",
+            raw_root=str(tmp_path),
+            data_relative_path=f"episode-{index}.parquet",
+            data_row_start=0,
+            data_row_stop=20,
+            timestamp_column="timestamp",
+            episode_column="episode_index",
+            source_fps=10.0,
+            duration_seconds=2.0,
+            views=(
+                ViewSegment("head", "head", f"head-{index}.mp4", 0.0, 2.0),
+                ViewSegment("left_hand", None, None, 0.0, 2.0),
+                ViewSegment("right_hand", None, None, 0.0, 2.0),
+            ),
+            action_columns=action_columns,
+            provenance_dataset=provenance,
+        )
+        rows.append(descriptor.as_dict())
+    source = tmp_path / "native5b_episode_manifest_full.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    output = tmp_path / "native5b_episode_manifest.jsonl"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prepare_legacy_residual_manifest.py",
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--exclude-provenance",
+            "robocasa365_mg",
+        ],
+    )
+    module["main"]()
+    result = json.loads(capsys.readouterr().out)
+    assert result["kept_episodes"] == 1
+    assert result["excluded"]["robocasa365_mg"]["episodes"] == 1
+    residual = json.loads(output.read_text(encoding="utf-8"))
+    assert residual["provenance_dataset"] == "droid"
+
+
 def test_action_statistics_global_budget_is_bounded_and_deterministic() -> None:
     module = runpy.run_path("scripts/scale5b/build_action_stats.py")
     allocate = module["_episode_sample_positions"]
@@ -413,9 +553,7 @@ def test_action_statistics_global_budget_is_bounded_and_deterministic() -> None:
         assert np.array_equal(left, right)
         assert len(left) == len(np.unique(left))
         assert np.all(left >= 0)
-        assert np.all(
-            left < episode.data_row_stop - episode.data_row_start
-        )
+        assert np.all(left < episode.data_row_stop - episode.data_row_start)
     all_rows = allocate(episodes, sample_budget=10_000, seed_text="all")
     assert sum(len(value) for value in all_rows.values()) == 33
 
@@ -546,3 +684,547 @@ def test_merge_binds_worker_summaries_and_rejects_payload_aliases(
     )
     with pytest.raises(ValueError, match="unexpected non-committed"):
         committed_names(receipt_root)
+
+
+def test_raw_source_lock_is_immutable_and_gated_dry_run_needs_no_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = runpy.run_path("scripts/scale5b/download_raw_snapshots.py")
+    lock = {
+        "schema": "wm3d_v7_native5b_raw_sources_lock_v1",
+        "sources": {
+            "beta": {
+                "repo_id": "agibot-world/AgiBotWorld-Beta",
+                "repo_type": "dataset",
+                "revision": "a" * 40,
+                "target_subdir": "beta",
+                "gated": True,
+                "allow_patterns": [],
+                "ignore_patterns": [],
+            }
+        },
+    }
+    lock_path = tmp_path / "raw.lock.yaml"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    assert module["_load_lock"](lock_path)["sources"]["beta"]["gated"]
+
+    tool_root = tmp_path / "tool"
+    (tool_root / "scripts").mkdir(parents=True)
+    tool = tool_root / "scripts" / "convert_to_lerobot.py"
+    tool.write_text("# official converter\n", encoding="utf-8")
+    files, total_bytes, payload_sha256 = module["_payload_inventory"](
+        tool_root,
+        hash_content=True,
+    )
+    assert files == 1
+    assert total_bytes == tool.stat().st_size
+    assert payload_sha256 == {"scripts/convert_to_lerobot.py": sha256_file(tool)}
+    receipt = {
+        "schema": module["RECEIPT_SCHEMA"],
+        "complete": True,
+        "source": "tool",
+        "repo_id": "owner/repo",
+        "revision": "a" * 40,
+        "resolved_revision": "a" * 40,
+        "target": str(tool_root),
+        "allow_patterns": [],
+        "ignore_patterns": [],
+        "payload_files": files,
+        "payload_bytes": total_bytes,
+        "payload_sha256": payload_sha256,
+    }
+    receipt_path = tool_root / ".wm3d_v7_download_receipt.json"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    source = {
+        "repo_id": "owner/repo",
+        "revision": "a" * 40,
+        "allow_patterns": [],
+        "ignore_patterns": [],
+        "materialization": "vendor_tool_bundle",
+    }
+    assert module["_receipt_matches"](receipt_path, "tool", source, tool_root)
+    tool.write_text("# modified converter\n", encoding="utf-8")
+    assert not module["_receipt_matches"](
+        receipt_path,
+        "tool",
+        source,
+        tool_root,
+    )
+
+    raw_root = tmp_path / "raw"
+    raw_root.mkdir()
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "download_raw_snapshots.py",
+            "--lock",
+            str(lock_path),
+            "--raw-root",
+            str(raw_root),
+            "--dry-run",
+        ],
+    )
+    module["main"]()
+    result = json.loads(capsys.readouterr().out)
+    assert result["pass"] is True
+    assert result["results"][0]["status"] == "dry_run"
+    assert not (raw_root / "beta").exists()
+
+    lock["sources"]["beta"]["revision"] = "main"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    with pytest.raises(ValueError, match="40 位小写提交 SHA"):
+        module["_load_lock"](lock_path)
+
+
+def test_archive_extractor_rejects_path_escape_and_special_names() -> None:
+    module = runpy.run_path("scripts/scale5b/safe_extract_lerobot_collection.py")
+    member_relative = module["_member_relative"]
+    assert member_relative("task/meta/info.json") == Path("task/meta/info.json")
+    for unsafe in ("", "/absolute/file", "../escape", "task/../../escape"):
+        with pytest.raises(ValueError, match="归档成员路径不安全"):
+            member_relative(unsafe)
+
+
+def test_archive_collection_finalize_binds_download_and_exact_archive_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = runpy.run_path("scripts/scale5b/safe_extract_lerobot_collection.py")
+    snapshot = tmp_path / "snapshot"
+    archive_root = snapshot / "ImitationLearning"
+    archive_root.mkdir(parents=True)
+    archive = archive_root / "part-000.tar"
+    with tarfile.open(archive, mode="w") as handle:
+        payload = b'{"fps": 5}'
+        info = tarfile.TarInfo("dataset/meta/info.json")
+        info.size = len(payload)
+        handle.addfile(info, io.BytesIO(payload))
+    download_receipt = snapshot / ".wm3d_v7_download_receipt.json"
+    download_receipt.write_text(
+        json.dumps(
+            {
+                "schema": "wm3d_v7_native5b_raw_download_receipt_v1",
+                "complete": True,
+                "target": str(snapshot),
+                "revision": "a" * 40,
+                "resolved_revision": "a" * 40,
+                "payload_files": 1,
+                "payload_bytes": archive.stat().st_size,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "collection"
+    output.mkdir()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safe_extract_lerobot_collection.py",
+            "--archive-root",
+            str(archive_root),
+            "--output-root",
+            str(output),
+        ],
+    )
+    module["main"]()
+    assert json.loads(capsys.readouterr().out)["pass"] is True
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safe_extract_lerobot_collection.py",
+            "--archive-root",
+            str(archive_root),
+            "--output-root",
+            str(output),
+            "--finalize",
+            "--download-receipt",
+            str(download_receipt),
+        ],
+    )
+    module["main"]()
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "finalized"
+    assert result["archives"] == 1
+    assert result["lerobot_roots"] == 1
+    final = output / ".wm3d_v7_collection_materialization_receipt.json"
+    assert final.is_file()
+    archive_bytes = bytearray(archive.read_bytes())
+    archive_bytes[-1] ^= 1
+    archive.write_bytes(archive_bytes)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "safe_extract_lerobot_collection.py",
+            "--archive-root",
+            str(archive_root),
+            "--output-root",
+            str(output),
+        ],
+    )
+    with pytest.raises(FileExistsError, match="无匹配完成 receipt"):
+        module["main"]()
+
+
+def test_agibot_beta_materialization_is_exact_and_reentrant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = runpy.run_path("scripts/scale5b/safe_materialize_agibot_beta.py")
+    snapshot = tmp_path / "agibot_beta_snapshot"
+    (snapshot / "task_info").mkdir(parents=True)
+    (snapshot / "observations" / "327").mkdir(parents=True)
+    (snapshot / "parameters").mkdir()
+    (snapshot / "proprio_stats").mkdir()
+    episodes = (648642, 648649)
+    (snapshot / "task_info" / "task_327.json").write_text(
+        json.dumps(
+            [{"task_id": 327, "episode_id": episode_id} for episode_id in episodes]
+        ),
+        encoding="utf-8",
+    )
+    revision = "a" * 40
+    (snapshot / ".wm3d_v7_download_receipt.json").write_text(
+        json.dumps(
+            {
+                "schema": "wm3d_v7_native5b_raw_download_receipt_v1",
+                "complete": True,
+                "source": "agibot_beta_snapshot",
+                "repo_id": "agibot-world/AgiBotWorld-Beta",
+                "revision": revision,
+                "resolved_revision": revision,
+                "target": str(snapshot),
+                "payload_files": 4,
+                "payload_bytes": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def write_tar(path: Path, members: dict[str, bytes]) -> None:
+        with tarfile.open(path, mode="w") as archive:
+            directory = tarfile.TarInfo("327/")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+            for name, payload in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+
+    write_tar(
+        snapshot / "observations" / "327" / "648642-648649.tar",
+        {
+            f"{episode_id}/videos/head.mp4": f"video-{episode_id}".encode()
+            for episode_id in episodes
+        },
+    )
+    write_tar(
+        snapshot / "parameters" / "648642-648649.tar",
+        {f"327/{episode_id}/camera/intrinsics.json": b"{}" for episode_id in episodes},
+    )
+    write_tar(
+        snapshot / "proprio_stats" / "648642-648649.tar",
+        {
+            f"proprio_stats/327/{episode_id}/proprio_stats.h5": b"stats"
+            for episode_id in episodes
+        },
+    )
+
+    output_parent = tmp_path / "materialized"
+    output_parent.mkdir()
+    task_list_module = runpy.run_path("scripts/scale5b/list_agibot_beta_tasks.py")
+    task_list_path = output_parent / "task_ids.txt"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "list_agibot_beta_tasks.py",
+            "--raw-root",
+            str(snapshot),
+            "--output",
+            str(task_list_path),
+        ],
+    )
+    task_list_module["main"]()
+    assert task_list_path.read_text(encoding="utf-8") == "327\n"
+    output = output_parent / "agibot_beta_raw"
+    prepared = module["_prepare"](snapshot, output)
+    assert prepared["tasks"] == 1
+    assert prepared["episodes"] == 2
+    extracted = module["_extract"](
+        snapshot,
+        output,
+        shard_id=0,
+        num_shards=1,
+    )
+    assert extracted["archives"] == 3
+    assert {item["status"] for item in extracted["results"]} == {"extracted"}
+    repeated = module["_extract"](
+        snapshot,
+        output,
+        shard_id=0,
+        num_shards=1,
+    )
+    assert {item["status"] for item in repeated["results"]} == {"already_complete"}
+    finalized = module["_finalize"](snapshot, output)
+    assert finalized["complete"] is True
+    assert finalized["archives"] == 3
+    assert finalized["episodes"] == 2
+    converter_module = runpy.run_path("scripts/scale5b/convert_agibot_beta_task.py")
+    receipt_path, receipt = converter_module["_materialization_receipt"](output)
+    assert receipt_path.name == ".wm3d_v7_beta_materialization_receipt.json"
+    assert (
+        receipt["materialization_plan_sha256"]
+        == finalized["materialization_plan_sha256"]
+    )
+    converted = tmp_path / "converted"
+    converted.mkdir()
+    task_root = converted / "task_000327"
+    (task_root / "meta").mkdir(parents=True)
+    (task_root / "meta" / "info.json").write_text("{}", encoding="utf-8")
+    converter_snapshot = tmp_path / "agibot_alpha_converter_snapshot"
+    (converter_snapshot / "scripts").mkdir(parents=True)
+    converter = converter_snapshot / "scripts" / "convert_to_lerobot.py"
+    converter.write_text("# frozen converter\n", encoding="utf-8")
+    converter_revision = "b" * 40
+    converter_download_receipt = converter_snapshot / ".wm3d_v7_download_receipt.json"
+    converter_download_receipt.write_text(
+        json.dumps(
+            {
+                "schema": converter_module["DOWNLOAD_RECEIPT_SCHEMA"],
+                "complete": True,
+                "source": converter_module["CONVERTER_SOURCE"],
+                "repo_id": converter_module["CONVERTER_REPO_ID"],
+                "revision": converter_revision,
+                "resolved_revision": converter_revision,
+                "target": str(converter_snapshot),
+                "payload_files": 1,
+                "payload_bytes": converter.stat().st_size,
+                "payload_sha256": {
+                    "scripts/convert_to_lerobot.py": sha256_file(converter)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    frozen_receipt_path, frozen_receipt = converter_module["_converter_receipt"](
+        converter,
+        converter_download_receipt,
+    )
+    assert frozen_receipt_path == converter_download_receipt
+    assert frozen_receipt["revision"] == converter_revision
+    environment_module = runpy.run_path(
+        "scripts/scale5b/verify_agibot_converter_environment.py"
+    )
+    environment_root = tmp_path / "agibot_converter_environment"
+    environment_root.mkdir()
+    formal_environment_contract = json.loads(
+        Path(
+            "environments/scale5b/agibot_converter_environment_contract.json"
+        ).read_text(encoding="utf-8")
+    )
+    environment_contract = {
+        "schema": environment_module["CONTRACT_SCHEMA"],
+        "python": platform.python_version(),
+        "lerobot": {
+            "version": "0.1.0",
+            "revision": formal_environment_contract["lerobot"]["revision"],
+        },
+        "packages": {},
+        "required_imports": [],
+        "required_commands": [],
+    }
+    environment_contract_path = environment_root / "environment_contract.json"
+    environment_contract_path.write_text(
+        json.dumps(environment_contract),
+        encoding="utf-8",
+    )
+    revision_file = environment_root / "LEROBOT_REVISION"
+    revision_file.write_text(
+        formal_environment_contract["lerobot"]["revision"] + "\n",
+        encoding="utf-8",
+    )
+    environment_receipt_path = environment_root / "environment_receipt.json"
+    environment_receipt = environment_module["current_environment"](
+        contract_path=environment_contract_path,
+        revision_file=revision_file,
+    )
+    environment_receipt["created_at_utc"] = "2026-07-29T00:00:00+00:00"
+    environment_receipt_path.write_text(
+        json.dumps(environment_receipt),
+        encoding="utf-8",
+    )
+    portable_bundle = tmp_path / "portable_converter_environment"
+    portable_bundle.mkdir()
+    for source in (
+        environment_contract_path,
+        revision_file,
+        environment_receipt_path,
+    ):
+        shutil.copyfile(source, portable_bundle / source.name)
+    portable_receipt = portable_bundle / environment_receipt_path.name
+    portable_value = environment_module["validate_receipt"](
+        portable_receipt,
+        check_current=False,
+    )
+    assert portable_value["lerobot_revision"] == environment_receipt["lerobot_revision"]
+    (portable_bundle / "LEROBOT_REVISION").write_text(
+        "0" * 40 + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="内容与绑定文件不匹配"):
+        environment_module["validate_receipt"](
+            portable_receipt,
+            check_current=False,
+        )
+    frozen_environment_path, frozen_environment = converter_module[
+        "_converter_environment_receipt"
+    ](environment_receipt_path)
+    assert frozen_environment_path == environment_receipt_path
+    assert (
+        frozen_environment["lerobot_revision"]
+        == formal_environment_contract["lerobot"]["revision"]
+    )
+    task_list = tmp_path / "task_ids.txt"
+    task_list.write_text("327\n", encoding="utf-8")
+    conversion_receipt = {
+        "schema": converter_module["RECEIPT_SCHEMA"],
+        "complete": True,
+        "task_id": 327,
+        "converter_sha256": sha256_file(converter),
+        "converter_download_receipt_sha256": sha256_file(converter_download_receipt),
+        "converter_environment_receipt_sha256": sha256_file(environment_receipt_path),
+        "lerobot_revision": frozen_environment["lerobot_revision"],
+        "raw_root": str(output),
+        "materialization_receipt_sha256": sha256_file(receipt_path),
+        "lerobot_roots": ["."],
+    }
+    (task_root / ".wm3d_v7_conversion_receipt.json").write_text(
+        json.dumps(conversion_receipt),
+        encoding="utf-8",
+    )
+    conversion_final = converter_module["_finalize_collection"](
+        raw_root=output,
+        output_root=converted,
+        converter=converter,
+        converter_download_receipt=converter_download_receipt,
+        converter_environment_receipt=environment_receipt_path,
+        task_list=task_list,
+        materialization_receipt=receipt_path,
+    )
+    assert conversion_final["status"] == "finalized"
+    assert conversion_final["tasks"] == 1
+    assert (converted / ".wm3d_v7_beta_conversion_collection_receipt.json").is_file()
+    for category in ("observations", "parameters", "proprio_stats"):
+        assert {
+            int(path.name) for path in (output / category / "327").iterdir()
+        } == set(episodes)
+    with pytest.raises(ValueError, match="归档成员路径不安全"):
+        module["_normalized_member"](
+            "parameters/example.tar",
+            "../../escape",
+            task_ids={327},
+            episode_to_task={648642: 327},
+        )
+
+
+def test_planning_templates_compile_and_bind_grouped_action_widths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = runpy.run_path("scripts/scale5b/compile_dataset_contract.py")
+    variable_names = (
+        "WM3D_V7_LEGACY_ROOT",
+        "ROBOCASA_FULL_ROOT",
+        "AGIBOT_2026_IMITATION_ROOT",
+        "AGIBOT_2026_RICH_ROOT",
+        "AGIBOT_2026_REINFORCEMENT_ROOT",
+        "AGIBOT_BETA_ROOT",
+    )
+    for index, name in enumerate(variable_names):
+        monkeypatch.setenv(name, str(tmp_path / f"source-{index}"))
+    inventory = module["yaml"].safe_load(
+        Path("configs/scale5b/dataset_inventory_5650h.template.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    contract = DatasetContract.from_mapping(module["_expand"](inventory))
+    assert len(contract.sha256) == 64
+    assert contract.source_weights == {
+        "legacy_v7_formal": 10,
+        "robocasa_full": 15,
+        "agibot_2026_imitation": 10,
+        "agibot_2026_rich": 8,
+        "agibot_2026_reinforcement": 12,
+        "agibot_beta": 45,
+    }
+    assert sum(source.nominal_hours for source in contract.sources) == pytest.approx(
+        5649.4
+    )
+    assert {source.adapter for source in contract.sources[2:]} == {"lerobot_collection"}
+
+    raw_layouts = json.loads(
+        Path("configs/scale5b/source_layouts_5650h.template.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    layouts = {item["source"]: item for item in raw_layouts["layouts"]}
+    assert set(layouts) == set(contract.source_order)
+    assert layouts["legacy_v7_formal"]["forbidden_provenance_datasets"] == [
+        "robocasa365_mg"
+    ]
+    robocasa_width = sum(
+        len(item["indices"]) for item in layouts["robocasa_full"]["action_columns"]
+    )
+    agibot_width = sum(
+        len(item["indices"]) for item in layouts["agibot_beta"]["action_columns"]
+    )
+    assert robocasa_width == 12
+    assert agibot_width == 22
+
+    raw_lock = module["yaml"].safe_load(
+        Path("configs/scale5b/raw_sources.lock.template.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    converter_source = raw_lock["sources"]["agibot_alpha_converter_snapshot"]
+    assert converter_source["repo_id"] == "agibot-world/AgiBotWorld-Alpha"
+    assert converter_source["gated"] is True
+    assert converter_source["allow_patterns"] == [
+        "README.md",
+        "scripts/convert_to_lerobot.py",
+    ]
+    converter_environment = json.loads(
+        Path(
+            "environments/scale5b/agibot_converter_environment_contract.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert (
+        converter_environment["schema"]
+        == "wm3d_v7_native5b_agibot_converter_environment_contract_v1"
+    )
+    assert converter_environment["python"] == "3.10.15"
+    assert converter_environment["lerobot"] == {
+        "version": "0.1.0",
+        "revision": "8e7d6970eaf5a64b8af6ec45586d201b8ca9ef16",
+        "source_url": (
+            "https://github.com/huggingface/lerobot/archive/"
+            "8e7d6970eaf5a64b8af6ec45586d201b8ca9ef16.tar.gz"
+        ),
+        "source_sha256": (
+            "51e51e7e2d91c46db3bb4ccb9604d55776d9f9f90389465ed2603fe9f9bbc702"
+        ),
+        "pyproject_sha256": (
+            "34a923b9d6739c52d63af14d20282d5cbebbc78a46a81d76600ad33ae4057d66"
+        ),
+        "poetry_lock_sha256": (
+            "fabc7c9544e0073cabc2cf351c38b92a6f6578f343320be91a65c4050a7a10d3"
+        ),
+    }

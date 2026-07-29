@@ -1,135 +1,144 @@
-# WM3D-V7 native 5B architecture
+# WM3D-V7 Native 5B 架构与参数组成
 
-## Scope
+## 1. 设计边界
 
-This is a scaled **native WM3D-V7 world model**. It does not import later V8
-components, language-model reasoning lanes, video generators, or VLA policy
-backbones. Text is encoded once, offline, into the existing 2048-D V7 task
-interface. During training and inference the only online learned model is the
-native WM3D core.
+这是把 V7 的 **native 3D world model core** 放大并训练充分，而不是在视觉语言
+模型上接 action head。在线模型没有 Qwen/VLA/Wan；VGGT 和文本 encoder 只负责离线
+生成观测证据。WM3D core 仍然拥有显式未来世界和原生动作动力学。
 
 ```mermaid
 flowchart LR
-    subgraph OBS["Past observations: T=24 at 5 Hz"]
-      RGB["Head + left wrist + right wrist RGB"]
-      AUX["Proprio / force / tactile / LiDAR"]
-      ACTX["Past grouped actions at 30 Hz"]
-      MEM["30–60 s low-rate memory"]
-      TXT["Task text"]
+    subgraph OBS["过去观测：T=24，5 Hz"]
+      RGB["头部 + 左手 + 右手 RGB"]
+      AUX["proprio / force / tactile / LiDAR（带 mask）"]
+      PACT["过去 grouped action，30 Hz"]
+      MEM["30–60 秒低频 memory"]
+      TXT["任务文本"]
     end
 
-    TXT -->|"offline frozen T5; 2048-D"| TASK["Task embedding"]
-    RGB -->|"offline frozen VGGT"| VG["Per-view 12x12x2048 tokens\n+ depth/point/camera/confidence evidence"]
-    VG --> FUSE["View-axis attention + masked fusion"]
-    AUX --> AUXTOK["Typed masked auxiliary tokens"]
-    ACTX --> ATOK["Embodiment-aware grouped action tokenizer"]
+    TXT -->|"离线冻结 T5 → 2048D"| TASK["task embedding"]
+    RGB -->|"离线冻结 VGGT"| VG["每视角 12×12×2048 token
++ depth/point/camera/confidence"]
+    VG --> FUSE["仅视角轴 attention + mask fusion"]
+    AUX --> AUXTOK["typed auxiliary token"]
+    PACT --> ATOK["embodiment-aware action tokenizer"]
 
-    FUSE --> STATE["Native state trunk\n2560 hidden, 32 layers\nfactorized spatial + causal temporal attention"]
+    FUSE --> STATE["原生 world state trunk
+2560 hidden / 32 layers
+空间-时间分解 attention"]
     AUXTOK --> STATE
     MEM --> STATE
     TASK --> STATE
-    ATOK --> ACTION["Native action trunk\n2048 hidden, 24 layers\ncausal grouped-action attention"]
+    ATOK --> ACTION["原生 action trunk
+2048 hidden / 24 layers
+高频 grouped action"]
     TASK --> ACTION
+    STATE <-->|"10 个分层 state↔action bridge"| ACTION
 
-    STATE <-->|"10 latent state/action bridges"| ACTION
-    FACT["Future factual action\nworld-dynamics conditioning only"] -->|"future state queries only"| STATE
-
-    STATE --> TOK["Future native world tokens\nK x 12x12 x 2048"]
-    STATE --> OUTRGB["Explicit multi-view RGB\n384x384"]
-    STATE --> GEOM["Explicit depth + point + confidence\n+ camera pose"]
-    ACTION --> AOUT["Grouped native action distribution\npose/joints/gripper/base/waist/head"]
+    FACT["未来 factual action"] -->|"只写 future-state query"| STATE
+    STATE --> WTOK["未来原生 world token：K×12×12×2048"]
+    STATE --> RGBOUT["显式多视角 RGB：384×384"]
+    STATE --> GEO["显式 depth / point / camera / confidence"]
+    ACTION --> AOUT["关节/末端/夹爪/底盘/腰/头动作分布"]
 ```
 
-## Frozen representation contract
+## 2. 精确参数组成
 
-| Component | Value | Reason |
-|---|---:|---|
-| Context `T` | 24 | 4.8 s at 5 Hz |
-| Spatial tokens `P` | 144 | explicit 12x12 spatial lattice |
-| Future `K` | 16 | 3.2 s at 5 Hz |
-| External token width | 2048 | preserves the VGGT/V7 representation interface |
-| State hidden | 2560 | increases world-model capacity without inflating cache I/O |
-| State trunk | 32 layers, 20 heads | native world dynamics |
-| Action hidden | 2048 | dedicated high-capacity action dynamics |
-| Action trunk | 24 layers, 16 heads | native grouped action prediction |
-| Bridges | 10 | recurrent state/action exchange throughout depth |
-| Action cadence | 6 substeps/frame | 30 Hz action under 5 Hz visual state |
-| Views | 3, individually masked | missing cameras never become fake black evidence |
-| Low-rate memory | 12 slots by default | long task state without setting `T=64` |
+下表由 `scripts/scale5b/report_parameter_budget.py` 在 meta device 上计算，不是手工
+估算。默认配置精确总参数为 **4,956,589,929**。
 
-The exact default parameter count is `4,956,589,929`, tested on a meta device.
-The major groups are:
+| 模块 | 参数量 | 占比 | 为什么这样分配 |
+|---|---:|---:|---|
+| 原生 world state trunk | 3,250,831,360 | 65.5860% | 最大预算给时空状态、物理变化和 RGB/几何共同表征 |
+| 原生 grouped-action trunk | 1,195,474,944 | 24.1189% | action 不是小 head，而是一条独立 24 层高频动力学主干 |
+| 10 个 state↔action bridge | 424,719,360 | 8.5688% | 让动作与世界状态在深层多次交互，而非末端拼接 |
+| 接口投影、memory、位置/查询参数 | 55,055,872 | 1.1108% | 对齐 2048D 外部接口、长期记忆与未来 query |
+| 三视角 fuser | 16,783,360 | 0.3386% | 融合三相机，但不把容量浪费在重复 encoder 上 |
+| 显式 RGB head | 9,357,443 | 0.1888% | 清晰度主要来自高分辨率 state lattice；head 只做残差上采样 |
+| depth/point/camera/confidence head | 3,959,840 | 0.0799% | 保持显式原生 3D 监督，而非 latent-only 3D |
+| 动作分布 head | 407,750 | 0.0082% | 大部分动作能力在 action trunk，head 只参数化均值/尺度/contact |
 
-| Group | Parameters |
-|---|---:|
-| State trunk | 3,250,831,360 |
-| Action trunk | 1,195,474,944 |
-| State/action bridges | 424,719,360 |
-| Remaining fusion, embeddings, and explicit heads | 85,564,265 |
+复算命令：
 
-## Why the sequence is tractable
+```bash
+cd /workspace/wm3d_v7
+export PYTHONPATH=/workspace/wm3d_v7
+/opt/wm3d/bin/python scripts/scale5b/report_parameter_budget.py \
+  --config configs/scale5b/wm3d_v7_native5b_h200.template.yaml \
+  --format markdown
+```
 
-The raw representation contains `(T+K)*P = 40*144 = 5,760` state tokens per
-sample. A global dense 5,760-token attention layer is not used.
+如果输出不是 `4,956,589,929`，正式版本直接拒绝发布。
 
-Each state layer alternates:
+## 3. 为什么是 T=24、P=144、K=16、D=2048
 
-- spatial attention over 144 patches independently for every frame;
-- causal temporal attention over 40 frames independently for every patch;
-- SwiGLU feed-forward processing.
+| 项目 | 旧 V7 | 5B 默认 | 设计理由 |
+|---|---:|---:|---|
+| 上下文 `T` | 16 | 24 | 5 Hz 下从 3.2 秒扩到 4.8 秒，覆盖更多接触前因 |
+| 空间 `P` | 64 | 144 | 从 8×8 增到 12×12，显著增加细物体、手指和边缘信息 |
+| 未来 `K` | 8 | 16 | 从 1.6 秒扩到 3.2 秒，学习更长动作后果 |
+| 外部 token `D` | 2048 | 2048 | 保持 VGGT/cache 接口；增加 D 会放大 100TB 级 I/O，不会自动增加信息 |
+| state hidden | 1600 | 2560 | 真正把容量加到 world model 内部，而不是缓存向量 |
 
-This preserves native spatial/temporal state while avoiding quadratic global
-attention. Multi-camera attention is restricted to the view axis before the
-state trunk.
+每个样本有 `(T+K)×P = 40×144 = 5,760` 个 state 位置。若使用全局 dense
+attention，计算和显存会失控。因此每个 state layer 分解为：
 
-## Native action ownership
+1. 每帧独立对 144 个空间位置做 spatial attention；
+2. 每个 patch 独立沿 40 帧做 causal temporal attention；
+3. SwiGLU FFN；
+4. 每 4 层读一次低频 memory；指定的 10 层与 action trunk 双向交互。
 
-Actions are not a seven-value afterthought. Each embodiment declares ordered
-groups with independent dimensions and masks. The default maximum interface is
-eight groups, sixteen dimensions per group, and six 30 Hz substeps per 5 Hz
-frame. The model predicts:
+这保留显式时空 lattice，同时避免 `5,760²` 全局 attention。
 
-- a mean and log scale for every valid continuous action dimension;
-- contact/gripper logits;
-- the entire `K`-frame high-rate action horizon.
+## 4. 为什么 state trunk 占 65.6%
 
-The action trunk receives past actions, task conditioning, embodiment/group
-identities, learned future action queries, and state summaries. It never
-receives future target actions.
+目标是更强的 world model、RGB 和 depth，所以大约三分之二参数必须留在原生状态
+动力学。RGB、depth、point、camera 并不是四套互不相干的网络，它们共享同一未来
+state；这样 3D 几何会约束 RGB，动作后果也能约束几何。如果把大量参数堆到 RGB
+生成器，容易得到“画面更好但物理和动作更弱”的视频模型，这不是 V7 的目标。
 
-## No-future-leak invariant
+`P=144`、384×384 显式 RGB、Charbonnier + gradient + Laplacian loss 用于缓解模糊。
+但 5B 参数本身不能保证清晰：1k canary 必须检查边缘频谱、运动区域和多视角一致性。
+若仍模糊，优先增加 `rgb_hidden`/解码监督帧数或提高有效 RGB 数据质量；不要先把
+外部 token D 从 2048 暴力放大。
 
-Future factual actions are needed to learn controllable world dynamics, but
-they must not leak into the policy prediction:
+## 5. 为什么 action trunk 占 24.1%
 
-1. factual future actions are projected only into future state queries;
-2. temporal state attention is causal;
-3. action-to-state bridging may affect future world prediction;
-4. state-to-action bridging reads only the first `T` context-state summaries;
-5. future action inputs are learned queries, not teacher-forced targets.
+V7 旧的固定 7D 接口无法覆盖双臂、底盘、腰、头和不同末端。5B 版使用：
 
-A gradient test asserts that predicted actions have exactly zero dependency on
-future factual action tensors while predicted world state does change.
+- 最多 8 个 action group；每组最多 16 维；
+- 每个 group 独立维度 mask、控制模式、embodiment/group embedding；
+- 视觉 5 Hz、动作 30 Hz，每帧 6 个 substep；
+- 连续维度预测均值和 log-scale；离散夹爪/contact 预测 logits；
+- action trunk 读取 task、过去动作、上下文 state summary 和 learned future query；
+- world state 同时可由未来 factual action 条件化，以学习可控动力学。
 
-## Explicit supervision
+这使动作能力来自 1.2B 的原生 action dynamics，而不是几十万参数的末端 head。
 
-The state trunk owns all native outputs:
+## 6. 未来信息不泄漏
 
-- quantized-token reconstruction and cosine alignment;
-- four selected future RGB frames during training, with Charbonnier,
-  gradient, and Laplacian losses;
-- per-view depth, 3D points, geometry confidence, and camera pose;
-- all `K` world tokens for future rollout.
+未来 factual action 只用于“给定动作会发生什么”的世界预测，不能偷喂给动作预测：
 
-The RGB decoder is learned residual upsampling from the 12x12 future state,
-not an attached video diffusion model. More RGB frames can be decoded during
-evaluation; the four-frame training subset controls activation memory.
+1. factual future action 只投影到 future-state query；
+2. state temporal attention 是 causal；
+3. state→action bridge 只读取前 `T` 个上下文 state summary；
+4. future action 输入是 learned query，不是 target action；
+5. 单测要求 action 输出对未来 factual action 的梯度严格为零，而 world 输出会变化。
 
-## Non-negotiable boundaries
+## 7. 显式输出与损失
 
-- No imports or config values from V8, A2, Qwen, Wan, or VLA code.
-- No latent-only 3D prediction: explicit depth/point/camera outputs remain.
-- No silent single-view substitution: every view has a validity mask.
-- No fixed-7D action assumption.
-- No implicit downloads during data encoding or training.
-- No implicit `latest` resume.
+- 所有 `K=16` future world token：MSE + cosine；
+- 选定未来帧的三视角 RGB：Charbonnier + gradient + Laplacian；
+- depth：log-depth + gradient；
+- 3D point、geometry confidence、camera pose；
+- grouped action NLL、速度平滑、contact/gripper；
+- 所有缺失相机/传感器/动作维度都有显式 mask，NaN 不会变成事实。
+
+## 8. 不可突破的边界
+
+- 不导入 V8/A2/Qwen/Wan/VLA；
+- 不把 3D 变成 latent-only 预测；
+- 不用黑图冒充缺失相机；
+- 不退化为固定 7D action；
+- 训练和 cache 节点不隐式联网下载；
+- 不从 `latest` 恢复，只认 `step_XXXXXXXX/COMMITTED.json`。
