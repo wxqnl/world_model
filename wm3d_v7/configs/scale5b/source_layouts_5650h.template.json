@@ -1,0 +1,174 @@
+{
+  "schema": "wm3d_v7_native5b_source_layouts_v1",
+  "layouts": [
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "source": "legacy_v7_formal",
+      "adapter": "normalized_manifest",
+      "embodiment": "single_arm_7d",
+      "normalized_manifest_path": "native5b_episode_manifest.jsonl",
+      "view_keys": {
+        "head": "head",
+        "left_hand": "left_hand",
+        "right_hand": null
+      },
+      "action_columns": [
+        {"group_name": "arm", "column": "action", "indices": [0, 1, 2, 3, 4, 5]},
+        {"group_name": "gripper", "column": "action", "indices": [6], "discrete": true}
+      ],
+      "auxiliary_columns": [],
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "default_task": "robot manipulation"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "source": "robocasa_full",
+      "adapter": "lerobot",
+      "embodiment": "single_arm_7d",
+      "view_keys": {
+        "head": "observation.images.agentview",
+        "left_hand": "observation.images.robot0_eye_in_hand",
+        "right_hand": null
+      },
+      "action_columns": [
+        {"group_name": "arm", "column": "action", "indices": [0, 1, 2, 3, 4, 5]},
+        {"group_name": "gripper", "column": "action", "indices": [6], "discrete": true}
+      ],
+      "auxiliary_columns": [],
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "task_column": "task_index",
+      "default_task": "robot manipulation"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "source": "agibot_2026_imitation",
+      "adapter": "lerobot",
+      "embodiment": "agibot_wholebody",
+      "view_keys": {
+        "head": "observation.images.head",
+        "left_hand": "observation.images.left_wrist",
+        "right_hand": "observation.images.right_wrist"
+      },
+      "action_columns": [
+        {"group_name": "left_arm", "column": "action", "indices": [0, 1, 2, 3, 4, 5, 6]},
+        {"group_name": "left_gripper", "column": "action", "indices": [7], "discrete": true},
+        {"group_name": "right_arm", "column": "action", "indices": [8, 9, 10, 11, 12, 13, 14]},
+        {"group_name": "right_gripper", "column": "action", "indices": [15], "discrete": true},
+        {"group_name": "base", "column": "action", "indices": [16, 17, 18]},
+        {"group_name": "waist", "column": "action", "indices": [19, 20]},
+        {"group_name": "head", "column": "action", "indices": [21, 22]}
+      ],
+      "auxiliary_columns": [
+        {"modality_name": "proprio", "column": "observation.state", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]},
+        {"modality_name": "left_force", "column": "observation.force.left", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "right_force", "column": "observation.force.right", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "left_tactile", "column": "observation.tactile.left", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "right_tactile", "column": "observation.tactile.right", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "lidar", "column": "observation.lidar", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]}
+      ],
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "task_column": "task_index",
+      "default_task": "whole-body robot manipulation"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "source": "agibot_2026_rich",
+      "adapter": "lerobot",
+      "embodiment": "agibot_wholebody",
+      "view_keys": {
+        "head": "observation.images.head",
+        "left_hand": "observation.images.left_wrist",
+        "right_hand": "observation.images.right_wrist"
+      },
+      "action_columns": [
+        {"group_name": "left_arm", "column": "action", "indices": [0, 1, 2, 3, 4, 5, 6]},
+        {"group_name": "left_gripper", "column": "action", "indices": [7], "discrete": true},
+        {"group_name": "right_arm", "column": "action", "indices": [8, 9, 10, 11, 12, 13, 14]},
+        {"group_name": "right_gripper", "column": "action", "indices": [15], "discrete": true},
+        {"group_name": "base", "column": "action", "indices": [16, 17, 18]},
+        {"group_name": "waist", "column": "action", "indices": [19, 20]},
+        {"group_name": "head", "column": "action", "indices": [21, 22]}
+      ],
+      "auxiliary_columns": [
+        {"modality_name": "proprio", "column": "observation.state", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]},
+        {"modality_name": "left_force", "column": "observation.force.left", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "right_force", "column": "observation.force.right", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "left_tactile", "column": "observation.tactile.left", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "right_tactile", "column": "observation.tactile.right", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "lidar", "column": "observation.lidar", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]}
+      ],
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "task_column": "task_index",
+      "default_task": "whole-body robot interaction"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "source": "agibot_2026_reinforcement",
+      "adapter": "lerobot",
+      "embodiment": "agibot_wholebody",
+      "view_keys": {
+        "head": "observation.images.head",
+        "left_hand": "observation.images.left_wrist",
+        "right_hand": "observation.images.right_wrist"
+      },
+      "action_columns": [
+        {"group_name": "left_arm", "column": "action", "indices": [0, 1, 2, 3, 4, 5, 6]},
+        {"group_name": "left_gripper", "column": "action", "indices": [7], "discrete": true},
+        {"group_name": "right_arm", "column": "action", "indices": [8, 9, 10, 11, 12, 13, 14]},
+        {"group_name": "right_gripper", "column": "action", "indices": [15], "discrete": true},
+        {"group_name": "base", "column": "action", "indices": [16, 17, 18]},
+        {"group_name": "waist", "column": "action", "indices": [19, 20]},
+        {"group_name": "head", "column": "action", "indices": [21, 22]}
+      ],
+      "auxiliary_columns": [
+        {"modality_name": "proprio", "column": "observation.state", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]},
+        {"modality_name": "left_force", "column": "observation.force.left", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "right_force", "column": "observation.force.right", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "left_tactile", "column": "observation.tactile.left", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "right_tactile", "column": "observation.tactile.right", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "lidar", "column": "observation.lidar", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]}
+      ],
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "task_column": "task_index",
+      "default_task": "whole-body robot reinforcement trajectory"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "source": "agibot_beta",
+      "adapter": "lerobot",
+      "embodiment": "agibot_wholebody",
+      "view_keys": {
+        "head": "observation.images.head",
+        "left_hand": "observation.images.left_wrist",
+        "right_hand": "observation.images.right_wrist"
+      },
+      "action_columns": [
+        {"group_name": "left_arm", "column": "action", "indices": [0, 1, 2, 3, 4, 5, 6]},
+        {"group_name": "left_gripper", "column": "action", "indices": [7], "discrete": true},
+        {"group_name": "right_arm", "column": "action", "indices": [8, 9, 10, 11, 12, 13, 14]},
+        {"group_name": "right_gripper", "column": "action", "indices": [15], "discrete": true},
+        {"group_name": "base", "column": "action", "indices": [16, 17, 18]},
+        {"group_name": "waist", "column": "action", "indices": [19, 20]},
+        {"group_name": "head", "column": "action", "indices": [21, 22]}
+      ],
+      "auxiliary_columns": [
+        {"modality_name": "proprio", "column": "observation.state", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]},
+        {"modality_name": "left_force", "column": "observation.force.left", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "right_force", "column": "observation.force.right", "indices": [0, 1, 2, 3, 4, 5]},
+        {"modality_name": "left_tactile", "column": "observation.tactile.left", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "right_tactile", "column": "observation.tactile.right", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]},
+        {"modality_name": "lidar", "column": "observation.lidar", "indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]}
+      ],
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "task_column": "task_index",
+      "default_task": "whole-body robot manipulation"
+    }
+  ],
+  "operator_note": "Run inspect_lerobot_schema.py for every frozen snapshot and replace any camera/action field that differs before scan_sources.py."
+}

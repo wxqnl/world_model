@@ -1,0 +1,182 @@
+schema: wm3d_v7_native5b_dataset_v1
+name: wm3d_v7_native5b_5650h
+feature_fps: 5.0
+action_fps: 30.0
+T: 24
+P: 144
+K: 16
+token_dim: 2048
+task_dim: 2048
+num_views: 3
+max_action_groups: 8
+max_action_dim: 16
+action_substeps: 6
+max_group_id: 64
+max_embodiments: 256
+max_aux_tokens: 8
+aux_dim: 256
+max_aux_type_id: 64
+
+source_order:
+  - legacy_v7_formal
+  - robocasa_full
+  - agibot_2026_imitation
+  - agibot_2026_rich
+  - agibot_2026_reinforcement
+  - agibot_beta
+
+sources:
+  - name: legacy_v7_formal
+    adapter: normalized_manifest
+    raw_root: ${WM3D_V7_LEGACY_ROOT}
+    license_id: operator_verified_v7_sources
+    nominal_hours: 495.0
+    weight: 10
+    embodiment_names: [single_arm_7d]
+    split_seed: 701
+    train_fraction: 0.98
+  - name: robocasa_full
+    adapter: lerobot
+    raw_root: ${ROBOCASA_FULL_ROOT}
+    license_id: operator_verified_robocasa
+    nominal_hours: 1517.0
+    weight: 15
+    embodiment_names: [single_arm_7d]
+    split_seed: 702
+    train_fraction: 0.98
+  - name: agibot_2026_imitation
+    adapter: lerobot
+    raw_root: ${AGIBOT_2026_IMITATION_ROOT}
+    license_id: operator_verified_agibot_2026
+    nominal_hours: 295.0
+    weight: 10
+    embodiment_names: [agibot_wholebody]
+    split_seed: 703
+    train_fraction: 0.98
+  - name: agibot_2026_rich
+    adapter: lerobot
+    raw_root: ${AGIBOT_2026_RICH_ROOT}
+    license_id: operator_verified_agibot_2026
+    nominal_hours: 155.0
+    weight: 8
+    embodiment_names: [agibot_wholebody]
+    split_seed: 704
+    train_fraction: 0.98
+  - name: agibot_2026_reinforcement
+    adapter: lerobot
+    raw_root: ${AGIBOT_2026_REINFORCEMENT_ROOT}
+    license_id: operator_verified_agibot_2026
+    nominal_hours: 211.0
+    weight: 12
+    embodiment_names: [agibot_wholebody]
+    split_seed: 705
+    train_fraction: 0.98
+  - name: agibot_beta
+    adapter: lerobot
+    raw_root: ${AGIBOT_BETA_ROOT}
+    license_id: operator_verified_agibot_beta
+    nominal_hours: 2976.4
+    weight: 45
+    embodiment_names: [agibot_wholebody]
+    split_seed: 706
+    train_fraction: 0.98
+
+embodiments:
+  - name: single_arm_7d
+    embodiment_id: 0
+    views: [head, left_hand, right_hand]
+    action_groups:
+      - name: arm
+        group_id: 0
+        dimensions: [x, y, z, roll, pitch, yaw]
+        rate_hz: 30.0
+        control_mode: delta_pose
+      - name: gripper
+        group_id: 1
+        dimensions: [close]
+        rate_hz: 30.0
+        control_mode: discrete_gripper
+    auxiliary_modalities: []
+  - name: agibot_wholebody
+    embodiment_id: 1
+    views: [head, left_hand, right_hand]
+    action_groups:
+      - name: left_arm
+        group_id: 2
+        dimensions: [j0, j1, j2, j3, j4, j5, j6]
+        rate_hz: 30.0
+        control_mode: joint_position
+      - name: left_gripper
+        group_id: 3
+        dimensions: [close]
+        rate_hz: 30.0
+        control_mode: discrete_gripper
+      - name: right_arm
+        group_id: 4
+        dimensions: [j0, j1, j2, j3, j4, j5, j6]
+        rate_hz: 30.0
+        control_mode: joint_position
+      - name: right_gripper
+        group_id: 5
+        dimensions: [close]
+        rate_hz: 30.0
+        control_mode: discrete_gripper
+      - name: base
+        group_id: 6
+        dimensions: [vx, vy, wz]
+        rate_hz: 30.0
+        control_mode: base_velocity
+      - name: waist
+        group_id: 7
+        dimensions: [lift, yaw]
+        rate_hz: 30.0
+        control_mode: joint_position
+      - name: head
+        group_id: 8
+        dimensions: [yaw, pitch]
+        rate_hz: 30.0
+        control_mode: joint_position
+    auxiliary_modalities:
+      - name: proprio
+        type_id: 0
+        dimensions:
+          [q0, q1, q2, q3, q4, q5, q6, q7, q8, q9, q10, q11, q12, q13,
+           q14, q15, q16, q17, q18, q19, q20, q21, q22, q23, q24, q25,
+           q26, q27, q28, q29, q30, q31]
+        rate_hz: 30.0
+      - name: left_force
+        type_id: 1
+        dimensions: [fx, fy, fz, tx, ty, tz]
+        rate_hz: 30.0
+      - name: right_force
+        type_id: 2
+        dimensions: [fx, fy, fz, tx, ty, tz]
+        rate_hz: 30.0
+      - name: left_tactile
+        type_id: 3
+        dimensions:
+          [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12,
+           t13, t14, t15]
+        rate_hz: 30.0
+      - name: right_tactile
+        type_id: 4
+        dimensions:
+          [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12,
+           t13, t14, t15]
+        rate_hz: 30.0
+      - name: lidar
+        type_id: 5
+        dimensions:
+          [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12,
+           r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23,
+           r24, r25, r26, r27, r28, r29, r30, r31, r32, r33, r34,
+           r35, r36, r37, r38, r39, r40, r41, r42, r43, r44, r45,
+           r46, r47, r48, r49, r50, r51, r52, r53, r54, r55, r56,
+           r57, r58, r59, r60, r61, r62, r63]
+        rate_hz: 10.0
+
+notes:
+  planning_snapshot: 2026-07-23
+  nominal_total_hours: 5649.4
+  formal_target_unique_hours: 5000-8000
+  operator_requirement: split heterogeneous repositories by real embodiment before sealing
