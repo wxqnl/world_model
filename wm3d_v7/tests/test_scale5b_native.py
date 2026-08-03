@@ -63,9 +63,7 @@ def _tiny_inputs(batch: int = 2) -> dict[str, torch.Tensor]:
         "view_mask": torch.ones(batch, 3, 3, dtype=torch.bool),
         "task_embedding": torch.randn(batch, 12),
         "context_action_values": torch.randn(batch, 3, 3, 2, 4),
-        "context_action_dim_mask": torch.ones(
-            batch, 3, 3, 2, 4, dtype=torch.bool
-        ),
+        "context_action_dim_mask": torch.ones(batch, 3, 3, 2, 4, dtype=torch.bool),
         "future_factual_action_values": torch.randn(batch, 2, 3, 2, 4),
         "future_factual_action_dim_mask": torch.ones(
             batch, 2, 3, 2, 4, dtype=torch.bool
@@ -91,9 +89,7 @@ def test_default_parameter_budget_is_frozen() -> None:
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_multiview_forward_backward_and_native_losses(checkpointing: bool) -> None:
     torch.manual_seed(4)
-    model = NativeWM3D5B(
-        _tiny_config(activation_checkpointing=checkpointing)
-    )
+    model = NativeWM3D5B(_tiny_config(activation_checkpointing=checkpointing))
     inputs = _tiny_inputs()
     output = model(**inputs)
     action_mask = inputs["future_factual_action_dim_mask"]
@@ -106,9 +102,7 @@ def test_multiview_forward_backward_and_native_losses(checkpointing: bool) -> No
         ),
         "target_depth": torch.rand_like(output["depth"]) + 0.1,
         "target_point": torch.randn_like(output["point"]),
-        "target_geometry_confidence": torch.rand_like(
-            output["geometry_confidence"]
-        ),
+        "target_geometry_confidence": torch.rand_like(output["geometry_confidence"]),
         "target_camera_pose": torch.randn_like(output["camera_pose"]),
         "target_action_values": torch.randn_like(output["action_mean"]),
         "target_action_dim_mask": action_mask,
@@ -149,11 +143,13 @@ def test_step_addressed_sampler_exact_mix_disjoint_and_resumable() -> None:
         "composite": 20,
         "mg": 20,
     }
-    spans = {name: (index * 10_000, (index + 1) * 10_000) for index, name in enumerate(names)}
+    spans = {
+        name: (index * 10_000, (index + 1) * 10_000) for index, name in enumerate(names)
+    }
     schedule = ExactSourceSchedule(names, weights, seed=11)
-    assert Counter(schedule.address(step).source_name for step in range(100)) == Counter(
-        weights
-    )
+    assert Counter(
+        schedule.address(step).source_name for step in range(100)
+    ) == Counter(weights)
     uninterrupted = [
         list(
             StepAddressedBatchSampler(

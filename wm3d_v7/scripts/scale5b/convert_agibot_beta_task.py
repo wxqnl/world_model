@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         "--converter-environment-receipt",
         type=Path,
         required=True,
-        help="独立 LeRobot dataset-v2 转换镜像内的 environment receipt。",
+        help="独立 LeRobot dataset-v2 转换 venv 的 environment receipt。",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--task-id", type=int)

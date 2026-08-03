@@ -1,6 +1,6 @@
 {
   "schema": "wm3d_v7_native5b_agibot_converter_environment_contract_v1",
-  "python": "3.10.15",
+  "python_major_minor": "3.10",
   "lerobot": {
     "version": "0.1.0",
     "revision": "8e7d6970eaf5a64b8af6ec45586d201b8ca9ef16",
@@ -10,6 +10,7 @@
     "poetry_lock_sha256": "fabc7c9544e0073cabc2cf351c38b92a6f6578f343320be91a65c4050a7a10d3"
   },
   "packages": {
+    "av": "13.1.0",
     "datasets": "3.0.1",
     "einops": "0.8.0",
     "h5py": "3.12.1",
@@ -22,6 +23,7 @@
     "torchvision": "0.19.1"
   },
   "required_imports": [
+    "av",
     "cv2",
     "datasets",
     "einops",
@@ -39,6 +41,7 @@
   "notes": [
     "这是 CPU 数据转换环境，不是 WM3D 正式训练环境。",
     "锁定的 LeRobot 提交早于 dataset v3，保留冻结 AgiBot converter 所需的 dataset-v2 create/add_frame/save_episode/consolidate API。",
-    "最终 OCI/SIF 镜像 digest 与生成的环境 receipt 都是 release 的强制输入。"
+    "固定 venv 的环境 receipt 是 release 的强制输入。",
+    "上游锁文件误写了已下架的 pyav 发行名；bootstrap 只在构建副本中改为官方 av==13.1.0，并锁定 CPython 3.10 Linux x86_64 wheel SHA256=1d568c4d7a36df52c0774d52e6d730148775ead16daed81c10dafc2569b5a38d。"
   ]
 }

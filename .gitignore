@@ -1,48 +1,35 @@
-# ===== Heavy training artifacts (NEVER push) =====
+# 训练产物与数据
 results/
 **/ckpt/
 **/checkpoints/
+**/cache/
 *.pt
 *.pth
 *.ckpt
 *.bin
 *.safetensors
 
-# ===== Data caches =====
-**/cache/
+# Python / 测试
 **/__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# ===== Build / packaging =====
+*.py[cod]
 *.egg-info/
 build/
 dist/
-.eggs/
-
-# ===== Editors / test =====
-.vscode/
-.idea/
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
-.ipynb_checkpoints/
+.mypy_cache/
 
-# ===== Env =====
+# 本地站点配置和密钥
 .env
-.venv
+site.env
+*.site.env
+.hf_token
+.venv/
 venv/
 
-# ===== OS =====
+# 编辑器 / 系统
+.vscode/
+.idea/
+.ipynb_checkpoints/
 .DS_Store
 Thumbs.db
-
-# ===== Large media at repo root (we'll keep small ones below) =====
-# (root .gif kept since it's only 1.2M)
-
-# ===== Old versions / out-of-scope dirs for this push =====
-wm3d/
-
-# ===== Local-only meta-backup of old git dir =====
-.world_model_git_backup/

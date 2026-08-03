@@ -1,4 +1,5 @@
 """Leak-free three-view VGGT cache encoder for native WM3D-V7 5B."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -31,14 +32,12 @@ def _pool_vector_grid(value: torch.Tensor, grid: int) -> torch.Tensor:
         raise ValueError(f"expected vector image grid, got {tuple(value.shape)}")
     batch, frames, height, width, channels = value.shape
     pooled = F.adaptive_avg_pool2d(
-        value.permute(0, 1, 4, 2, 3).reshape(
-            batch * frames, channels, height, width
-        ).float(),
+        value.permute(0, 1, 4, 2, 3)
+        .reshape(batch * frames, channels, height, width)
+        .float(),
         (grid, grid),
     )
-    return pooled.reshape(batch, frames, channels, grid * grid).permute(
-        0, 1, 3, 2
-    )
+    return pooled.reshape(batch, frames, channels, grid * grid).permute(0, 1, 3, 2)
 
 
 class Native5BVGGTEncoder(torch.nn.Module):
@@ -137,9 +136,7 @@ class Native5BVGGTEncoder(torch.nn.Module):
             -1,
         )
         if active_tokens.shape[-1] != 2048:
-            raise RuntimeError(
-                f"VGGT token dim drifted to {active_tokens.shape[-1]}"
-            )
+            raise RuntimeError(f"VGGT token dim drifted to {active_tokens.shape[-1]}")
         active_depth = _pool_scalar_grid(encoded["depth"], self.grid).reshape(
             batch,
             times,
@@ -176,9 +173,7 @@ class Native5BVGGTEncoder(torch.nn.Module):
             -1,
         )
         if active_pose.shape[-1] < 9:
-            raise RuntimeError(
-                f"VGGT pose dim {active_pose.shape[-1]} is below 9"
-            )
+            raise RuntimeError(f"VGGT pose dim {active_pose.shape[-1]} is below 9")
         active_pose = active_pose[..., :9]
 
         view_tokens = active_tokens.new_zeros(
@@ -188,12 +183,8 @@ class Native5BVGGTEncoder(torch.nn.Module):
             self.grid * self.grid,
             active_tokens.shape[-1],
         )
-        depth = active_depth.new_zeros(
-            batch, times, views, self.grid * self.grid
-        )
-        point = active_point.new_zeros(
-            batch, times, views, self.grid * self.grid, 3
-        )
+        depth = active_depth.new_zeros(batch, times, views, self.grid * self.grid)
+        point = active_point.new_zeros(batch, times, views, self.grid * self.grid, 3)
         confidence = active_confidence.new_zeros(
             batch, times, views, self.grid * self.grid
         )

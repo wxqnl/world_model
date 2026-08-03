@@ -1,4 +1,5 @@
 """Transactional FSDP2/DCP checkpoints for native WM3D-V7 5B."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -75,7 +76,9 @@ def _fsync_tree(path: Path) -> None:
 
     root = Path(path)
     if root.is_symlink() or not root.is_dir():
-        raise CheckpointIntegrityError(f"checkpoint tree is not a real directory: {root}")
+        raise CheckpointIntegrityError(
+            f"checkpoint tree is not a real directory: {root}"
+        )
     files = _regular_files(root)
     for file_path in files:
         flags = os.O_RDONLY
@@ -224,7 +227,9 @@ class Native5BCheckpointManager:
         metadata: Mapping[str, Any],
     ) -> Path:
         if not dist.is_initialized():
-            raise CheckpointIntegrityError("distributed checkpoint requires process group")
+            raise CheckpointIntegrityError(
+                "distributed checkpoint requires process group"
+            )
         rank = dist.get_rank()
         world = dist.get_world_size()
         final = self.root / checkpoint_name(step)
@@ -259,9 +264,7 @@ class Native5BCheckpointManager:
         dist.barrier()
 
         options = StateDictOptions(full_state_dict=False, cpu_offload=False)
-        model_state, optimizer_state = get_state_dict(
-            model, optimizer, options=options
-        )
+        model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
         dcp_error: Exception | None = None
         try:
             dcp.save(
@@ -318,9 +321,7 @@ class Native5BCheckpointManager:
                     "manifest_content_sha256": canonical_sha256(manifest_value),
                     "run_lineage": complete_metadata["run_lineage"],
                 }
-                atomic_write_json(
-                    temporary / "COMMITTED.json", commit, exclusive=True
-                )
+                atomic_write_json(temporary / "COMMITTED.json", commit, exclusive=True)
                 _fsync_tree(temporary)
                 os.replace(temporary, final)
                 _fsync_directory(self.root)
@@ -351,7 +352,9 @@ class Native5BCheckpointManager:
         metadata_path = path / "metadata.json"
         for required in (commit_path, manifest_path, metadata_path):
             if required.is_symlink() or not required.is_file():
-                raise CheckpointIntegrityError(f"missing checkpoint control file {required}")
+                raise CheckpointIntegrityError(
+                    f"missing checkpoint control file {required}"
+                )
         commit = json.loads(commit_path.read_text(encoding="utf-8"))
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -405,9 +408,7 @@ class Native5BCheckpointManager:
                 errors.append(f"{relative}: {exc}")
                 continue
             if info.st_size != int(evidence["size"]):
-                errors.append(
-                    f"{relative}: size {info.st_size} != {evidence['size']}"
-                )
+                errors.append(f"{relative}: size {info.st_size} != {evidence['size']}")
                 continue
             digest = sha256_file(file_path)
             if digest != evidence["sha256"]:
@@ -465,9 +466,7 @@ class Native5BCheckpointManager:
             )
         metadata = result[0]["metadata"]
         options = StateDictOptions(full_state_dict=False, cpu_offload=False)
-        model_state, optimizer_state = get_state_dict(
-            model, optimizer, options=options
-        )
+        model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
         state = {"model": model_state, "optimizer": optimizer_state}
         dcp_error: Exception | None = None
         try:

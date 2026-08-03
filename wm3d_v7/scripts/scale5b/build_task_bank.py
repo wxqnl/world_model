@@ -5,6 +5,7 @@ This is an offline conditioning encoder, not an online VLA path.  The formal
 default uses a pinned T5 encoder whose hidden size is exactly the V7 task
 interface dimension.  The training graph contains only the native WM3D core.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -57,7 +58,9 @@ def _read_tasks(path: Path) -> list[str]:
             tasks.add(text)
     if not tasks:
         raise ValueError("episode plan has no tasks")
-    return sorted(tasks, key=lambda text: (hashlib.sha256(text.encode()).hexdigest(), text))
+    return sorted(
+        tasks, key=lambda text: (hashlib.sha256(text.encode()).hexdigest(), text)
+    )
 
 
 def _atomic_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
@@ -91,14 +94,9 @@ def main() -> None:
     asset_root = args.asset_root.resolve(strict=True)
     asset_receipt = asset_report["receipt"]
     task_asset = asset_receipt["assets"]["task_model"]
-    if (
-        task_asset["repo_id"] != args.model
-        or task_asset["revision"] != args.revision
-    ):
+    if task_asset["repo_id"] != args.model or task_asset["revision"] != args.revision:
         raise ValueError("task model/revision differs from the asset receipt")
-    task_snapshot = (
-        asset_root / str(task_asset["path"])
-    ).resolve(strict=True)
+    task_snapshot = (asset_root / str(task_asset["path"])).resolve(strict=True)
     tokenizer = AutoTokenizer.from_pretrained(
         str(task_snapshot),
         local_files_only=True,
@@ -112,7 +110,9 @@ def main() -> None:
     ).to(args.device)
     model.requires_grad_(False).eval()
     if int(model.config.d_model) != 2048:
-        raise ValueError(f"task encoder hidden size is {model.config.d_model}, not 2048")
+        raise ValueError(
+            f"task encoder hidden size is {model.config.d_model}, not 2048"
+        )
     chunks: list[torch.Tensor] = []
     with torch.inference_mode():
         for start in range(0, len(tasks), args.batch_size):
@@ -168,9 +168,7 @@ def main() -> None:
                 "tasks": len(tasks),
                 "bank_sha256": value["embeddings_sha256"],
                 "index_sha256": sha256_file(index_path),
-                "encoder_asset_receipt_sha256": canonical_sha256(
-                    asset_receipt
-                ),
+                "encoder_asset_receipt_sha256": canonical_sha256(asset_receipt),
             },
             sort_keys=True,
         )

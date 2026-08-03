@@ -1032,7 +1032,7 @@ def test_agibot_beta_materialization_is_exact_and_reentrant(
     )
     environment_contract = {
         "schema": environment_module["CONTRACT_SCHEMA"],
-        "python": platform.python_version(),
+        "python_major_minor": ".".join(platform.python_version_tuple()[:2]),
         "lerobot": {
             "version": "0.1.0",
             "revision": formal_environment_contract["lerobot"]["revision"],
@@ -1210,7 +1210,7 @@ def test_planning_templates_compile_and_bind_grouped_action_widths(
         converter_environment["schema"]
         == "wm3d_v7_native5b_agibot_converter_environment_contract_v1"
     )
-    assert converter_environment["python"] == "3.10.15"
+    assert converter_environment["python_major_minor"] == "3.10"
     assert converter_environment["lerobot"] == {
         "version": "0.1.0",
         "revision": "8e7d6970eaf5a64b8af6ec45586d201b8ca9ef16",

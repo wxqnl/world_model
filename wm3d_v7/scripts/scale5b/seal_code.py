@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Seal the complete V7 native-5B runtime surface for cluster handoff."""
+"""Seal the complete WM3D-V7 training runtime surface."""
+
 from __future__ import annotations
 
 import argparse
@@ -32,13 +33,14 @@ DEFAULT_PATTERNS = (
     "wm3d_v3/training/__init__.py",
     "wm3d_v3/training/scale5b_*.py",
     "wm3d_v3/training/train_native5b.py",
+    "wm3d_v3/training/eval_native5b.py",
     "scripts/scale5b/*",
     "configs/scale5b/*",
+    "configs/examples/*",
     "environments/scale5b/*",
     "tests/test_scale5b_*.py",
     "tests/scale5b_fsdp2_smoke.py",
-    "README_SCALE5B.md",
-    "docs/scale5b/*",
+    "run_v7.sh",
 )
 
 
@@ -57,9 +59,7 @@ def _files(root: Path, patterns: Iterable[str]) -> list[Path]:
         if not matches:
             raise ValueError(f"code seal pattern matched nothing: {pattern}")
         for path in matches:
-            if "__pycache__" in path.parts or path.name.endswith(
-                (".pyc", ".pyo")
-            ):
+            if "__pycache__" in path.parts or path.name.endswith((".pyc", ".pyo")):
                 continue
             if path.is_symlink():
                 raise ValueError(f"code seal forbids symlink: {path}")

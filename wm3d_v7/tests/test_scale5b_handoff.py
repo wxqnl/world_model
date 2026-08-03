@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -177,11 +178,14 @@ def test_code_receipt_rejects_dirty_scope(tmp_path: Path) -> None:
         )
     receipt["scoped_git_status"] = ""
     path.write_text(json.dumps(receipt), encoding="utf-8")
-    assert verify_code_receipt(
-        path,
-        expected_sha256=canonical_sha256(receipt),
-        repo_root=root,
-    )["git_commit"] == "a" * 40
+    assert (
+        verify_code_receipt(
+            path,
+            expected_sha256=canonical_sha256(receipt),
+            repo_root=root,
+        )["git_commit"]
+        == "a" * 40
+    )
 
 
 def _materialization_contract() -> DatasetContract:
@@ -326,12 +330,7 @@ def test_materialize_config_verifies_full_seal_and_has_no_placeholders(
         sys.executable,
         str(repo_root / "scripts" / "scale5b" / "materialize_config.py"),
         "--template",
-        str(
-            repo_root
-            / "configs"
-            / "scale5b"
-            / "wm3d_v7_native5b_h200.template.yaml"
-        ),
+        str(repo_root / "configs" / "scale5b" / "wm3d_v7_native5b_h200.template.yaml"),
         "--dataset-root",
         str(dataset_root),
         "--code-receipt",
@@ -442,10 +441,7 @@ def test_preflight_requires_full_eight_gpu_nvlink_clique() -> None:
     header = "        " + " ".join(f"GPU{index}" for index in range(8))
     rows = []
     for source in range(8):
-        links = [
-            "X" if source == target else "NV18"
-            for target in range(8)
-        ]
+        links = ["X" if source == target else "NV18" for target in range(8)]
         rows.append(f"GPU{source} " + " ".join(links) + " 0-31")
     topology = "\n".join([header, *rows])
     assert _parse_nvlink_topology(topology)["pass"]
@@ -462,26 +458,67 @@ def test_preflight_parses_infiniband_rate_fail_closed() -> None:
         _parse_ib_rate_gbps("0 Gb/sec")
 
 
-def test_container_requires_explicit_digest_pinned_base_image() -> None:
+def test_environment_setup_uses_plain_venv_and_no_container() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    dockerfile = (
-        repo_root / "environments" / "scale5b" / "Dockerfile"
+    setup_script = (
+        repo_root / "environments" / "scale5b" / "bootstrap_environment.sh"
     ).read_text(encoding="utf-8")
-    assert dockerfile.splitlines()[1] == "ARG BASE_IMAGE"
-    assert "ARG BASE_IMAGE=" not in dockerfile
-    build_script = (
-        repo_root / "environments" / "scale5b" / "build_image.sh"
-    ).read_text(encoding="utf-8")
-    assert "@sha256:[0-9a-f]{64}" in build_script
+    assert '-m venv "${ENV_PREFIX}"' in setup_script
+    assert "docker" not in setup_script.lower()
+    assert "micromamba" not in setup_script.lower()
+
+
+def test_lerobot_converter_repair_is_exact_and_fail_closed() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    module = __import__(
+        "scripts.scale5b.prepare_lerobot_converter_build",
+        fromlist=["normalize_requirements"],
+    )
+    newline = bytes((10,))
+    continuation = bytes((92, 10))
+    block = (
+        b'pyav==13.1.0 ; python_version >= "3.10" '
+        + continuation
+        + b"    --hash=sha256:deadbeef"
+        + newline
+    )
+    raw = b"first==1" + newline + block + b"last==1" + newline
+    normalized = module.normalize_requirements(
+        raw,
+        expected_block_sha256=hashlib.sha256(block).hexdigest(),
+    )
+    assert b"pyav==" not in normalized
+    assert b"av==13.1.0" in normalized
+    assert module.OFFICIAL_AV_CP310_LINUX_X86_64_SHA256.encode() in normalized
+    with pytest.raises(ValueError, match="拒绝静默修补"):
+        module.normalize_requirements(raw, expected_block_sha256="0" * 64)
+
+    original = b"[tool.poetry.dependencies]" + newline + b'pyav = ">=12.0.5"' + newline
+    expected = original.replace(b"pyav", b"av")
+    patched = module.patch_pyproject(
+        original,
+        original_sha256=hashlib.sha256(original).hexdigest(),
+        patched_sha256=hashlib.sha256(expected).hexdigest(),
+    )
+    assert patched == expected
+
+    contract = json.loads(
+        (
+            repo_root
+            / "environments"
+            / "scale5b"
+            / "agibot_converter_environment_contract.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert contract["packages"]["av"] == "13.1.0"
+    assert "av" in contract["required_imports"]
 
 
 def test_requirements_lock_exactly_matches_environment_contract() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     environment_root = repo_root / "environments" / "scale5b"
     contract = json.loads(
-        (environment_root / "environment_contract.json").read_text(
-            encoding="utf-8"
-        )
+        (environment_root / "environment_contract.json").read_text(encoding="utf-8")
     )
     expected = {
         canonicalize_name(name): str(version)
@@ -489,8 +526,10 @@ def test_requirements_lock_exactly_matches_environment_contract() -> None:
     }
     locked = {}
     for raw_line in (
-        environment_root / "requirements.lock"
-    ).read_text(encoding="utf-8").splitlines():
+        (environment_root / "requirements.lock")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -503,9 +542,9 @@ def test_planning_inventory_and_source_layouts_remain_aligned() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_root = repo_root / "configs" / "scale5b"
     inventory = yaml.safe_load(
-        (
-            config_root / "dataset_inventory_5650h.template.yaml"
-        ).read_text(encoding="utf-8")
+        (config_root / "dataset_inventory_5650h.template.yaml").read_text(
+            encoding="utf-8"
+        )
     )
     source_names = [source["name"] for source in inventory["sources"]]
     assert inventory["source_order"] == source_names
@@ -518,38 +557,34 @@ def test_planning_inventory_and_source_layouts_remain_aligned() -> None:
         float(inventory["notes"]["nominal_total_hours"])
     )
     layouts = json.loads(
-        (
-            config_root / "source_layouts_5650h.template.json"
-        ).read_text(encoding="utf-8")
+        (config_root / "source_layouts_5650h.template.json").read_text(encoding="utf-8")
     )
     assert [layout["source"] for layout in layouts["layouts"]] == source_names
 
 
 def test_data_pipeline_keeps_bootstrap_outside_formal_dataset_root() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    guide = (
-        repo_root / "docs" / "scale5b" / "DATA_PIPELINE.md"
-    ).read_text(encoding="utf-8")
-    assert "export BOOTSTRAP_ROOT=" in guide
-    assert 'test ! -e "${DATASET_ROOT}"' in guide
-    assert '"${DATASET_ROOT}/bootstrap' not in guide
-    assert '--output "${BOOTSTRAP_ROOT}/dataset_contract.json"' in guide
-    assert "GLOBAL_SAMPLE_BUDGET" in guide
+    pipeline = (repo_root / "scripts" / "scale5b" / "pipeline_native5b.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'self.bootstrap = self.release / "dataset_bootstrap"' in pipeline
+    assert 'contract = self.bootstrap / "dataset_contract.json"' in pipeline
+    assert 'self.dataset / "bootstrap"' not in pipeline
+    assert "GLOBAL_SAMPLE_BUDGET" in pipeline
 
 
 def test_canary_template_preserves_formal_model_data_and_loss_contract() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_root = repo_root / "configs" / "scale5b"
     formal = yaml.safe_load(
-        (
-            config_root / "wm3d_v7_native5b_h200.template.yaml"
-        ).read_text(encoding="utf-8")
+        (config_root / "wm3d_v7_native5b_h200.template.yaml").read_text(
+            encoding="utf-8"
+        )
     )
     canary = yaml.safe_load(
-        (
-            config_root
-            / "wm3d_v7_native5b_h200_canary1k.template.yaml"
-        ).read_text(encoding="utf-8")
+        (config_root / "wm3d_v7_native5b_h200_canary1k.template.yaml").read_text(
+            encoding="utf-8"
+        )
     )
     for section in ("model", "data", "distributed", "optimizer", "loss"):
         assert canary[section] == formal[section]

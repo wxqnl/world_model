@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Create or verify the pinned V7 native-5B container receipt."""
+"""Create or verify the pinned WM3D-V7 Python environment receipt."""
+
 from __future__ import annotations
 
 import argparse

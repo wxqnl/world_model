@@ -6,6 +6,7 @@ symmetric int8 values with one FP16 scale per vector.  RGB supervision is
 stored as independently decodable JPEG records in an append-only pack, so a
 random training window never has to decode an entire source video.
 """
+
 from __future__ import annotations
 
 import os
@@ -42,9 +43,13 @@ def dequantize_per_vector(
     """Restore a tensor written by :func:`quantize_per_vector`."""
 
     if quantized.dtype != torch.int8:
-        raise CodecIntegrityError(f"quantized values must be int8, got {quantized.dtype}")
+        raise CodecIntegrityError(
+            f"quantized values must be int8, got {quantized.dtype}"
+        )
     if scale.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
-        raise CodecIntegrityError(f"quantization scale must be floating, got {scale.dtype}")
+        raise CodecIntegrityError(
+            f"quantization scale must be floating, got {scale.dtype}"
+        )
     if quantized.shape[:-1] + (1,) != scale.shape:
         raise CodecIntegrityError(
             f"quantized/scale shapes disagree: {quantized.shape} vs {scale.shape}"
@@ -91,7 +96,9 @@ class JpegPackWriter:
             encoded = encode_jpeg(image.contiguous(), quality=self.quality)
             payload = encoded.numpy().tobytes()
             if not payload.startswith(b"\xff\xd8") or not payload.endswith(b"\xff\xd9"):
-                raise CodecIntegrityError("torchvision produced a malformed JPEG record")
+                raise CodecIntegrityError(
+                    "torchvision produced a malformed JPEG record"
+                )
             written = 0
             while written < len(payload):
                 count = os.write(self._fd, payload[written:])

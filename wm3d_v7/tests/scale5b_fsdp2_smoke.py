@@ -1,4 +1,5 @@
 """Two-GPU FSDP2 + DCP smoke for native WM3D-V7 5B infrastructure."""
+
 from __future__ import annotations
 
 import argparse
@@ -71,16 +72,12 @@ def _inputs(device: torch.device) -> dict[str, torch.Tensor]:
         "context_action_dim_mask": torch.ones(
             batch, 3, 3, 2, 4, dtype=torch.bool, device=device
         ),
-        "future_factual_action_values": torch.randn(
-            batch, 2, 3, 2, 4, device=device
-        ),
+        "future_factual_action_values": torch.randn(batch, 2, 3, 2, 4, device=device),
         "future_factual_action_dim_mask": torch.ones(
             batch, 2, 3, 2, 4, dtype=torch.bool, device=device
         ),
         "action_group_ids": torch.tensor([[0, 1, 2]], device=device),
-        "action_group_mask": torch.ones(
-            batch, 3, dtype=torch.bool, device=device
-        ),
+        "action_group_mask": torch.ones(batch, 3, dtype=torch.bool, device=device),
         "embodiment_ids": torch.zeros(batch, dtype=torch.long, device=device),
     }
 

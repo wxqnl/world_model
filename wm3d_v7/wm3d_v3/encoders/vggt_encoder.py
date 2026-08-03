@@ -3,6 +3,7 @@
 The training code expects VGGT tokens pooled to either 8x8 (64 tokens) or
 16x16 (256 tokens), plus optional full-resolution 224x224 depth maps.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -97,12 +98,18 @@ class VGGTEncoder(torch.nn.Module):
         self.vggt_source_file = str(source_file)
         self.local_files_only = bool(local_files_only)
         if dtype is None:
-            major = torch.cuda.get_device_capability(self.device)[0] if self.device.type == "cuda" else 0
+            major = (
+                torch.cuda.get_device_capability(self.device)[0]
+                if self.device.type == "cuda"
+                else 0
+            )
             dtype = torch.bfloat16 if major >= 8 else torch.float16
         self.dtype = dtype
-        self.model = VGGT.from_pretrained(
-            str(snapshot_path), local_files_only=True
-        ).to(self.device).eval()
+        self.model = (
+            VGGT.from_pretrained(str(snapshot_path), local_files_only=True)
+            .to(self.device)
+            .eval()
+        )
 
     @torch.inference_mode()
     def forward(self, images: torch.Tensor) -> dict[str, Any]:
@@ -119,7 +126,9 @@ class VGGTEncoder(torch.nn.Module):
         if images.ndim == 4:
             images = images.unsqueeze(0)
         images = images.to(self.device, non_blocking=True)
-        with torch.amp.autocast("cuda", dtype=self.dtype, enabled=self.device.type == "cuda"):
+        with torch.amp.autocast(
+            "cuda", dtype=self.dtype, enabled=self.device.type == "cuda"
+        ):
             aggregated_tokens, patch_start_idx = self.model.aggregator(images)
 
         tokens = aggregated_tokens[-1]
@@ -129,14 +138,20 @@ class VGGTEncoder(torch.nn.Module):
         out: dict[str, Any] = {"pooled": pooled}
         missing: list[str] = []
 
-        need_depth_head = self.return_depth or self.return_depth_conf or self.return_geom_extra
+        need_depth_head = (
+            self.return_depth or self.return_depth_conf or self.return_geom_extra
+        )
         if need_depth_head:
             depth_head = getattr(self.model, "depth_head", None)
             if depth_head is None:
                 missing.append("depth_head")
             else:
                 with torch.amp.autocast("cuda", enabled=False):
-                    depth, depth_conf = depth_head(aggregated_tokens, images=images, patch_start_idx=patch_start_idx)
+                    depth, depth_conf = depth_head(
+                        aggregated_tokens,
+                        images=images,
+                        patch_start_idx=patch_start_idx,
+                    )
                 if self.return_depth:
                     out["depth"] = depth.squeeze(-1).to(torch.float16)
                 if self.return_depth_conf or self.return_geom_extra:
@@ -148,14 +163,18 @@ class VGGTEncoder(torch.nn.Module):
                 missing.append("camera_head")
             else:
                 with torch.amp.autocast("cuda", enabled=False):
-                    out["pose_enc"] = camera_head(aggregated_tokens)[-1].to(torch.float16)
+                    out["pose_enc"] = camera_head(aggregated_tokens)[-1].to(
+                        torch.float16
+                    )
             point_head = getattr(self.model, "point_head", None)
             if point_head is None:
                 missing.append("point_head")
             else:
                 with torch.amp.autocast("cuda", enabled=False):
                     world_points, world_points_conf = point_head(
-                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
+                        aggregated_tokens,
+                        images=images,
+                        patch_start_idx=patch_start_idx,
                     )
                 out["world_points"] = world_points.to(torch.float16)
                 out["world_points_conf"] = world_points_conf.to(torch.float16)

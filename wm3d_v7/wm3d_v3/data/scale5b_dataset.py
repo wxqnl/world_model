@@ -21,6 +21,7 @@ Action safetensors shards contain frame-aligned high-rate tensors:
 Parquet rows point to immutable shard offsets.  This avoids duplicating the
 same encoded frame across overlapping T24/K16 windows.
 """
+
 from __future__ import annotations
 
 from bisect import bisect_right
@@ -144,10 +145,7 @@ class ParquetWindowIndex:
         group_index = bisect_right(self._ends, index)
         file_index, row_group, start = self._groups[group_index]
         row = self._table(file_index, row_group).slice(index - start, 1)
-        return {
-            name: row.column(name)[0].as_py()
-            for name in row.column_names
-        }
+        return {name: row.column(name)[0].as_py() for name in row.column_names}
 
 
 class _SafeTensorShard:
@@ -173,9 +171,7 @@ class _SafeTensorShard:
             keys = set(handle.keys())
             missing = set(slices).difference(keys)
             if missing:
-                raise DataIntegrityError(
-                    f"{relative} misses tensors {sorted(missing)}"
-                )
+                raise DataIntegrityError(f"{relative} misses tensors {sorted(missing)}")
             for name, bounds in slices.items():
                 if bounds is None:
                     output[name] = handle.get_tensor(name)
@@ -307,7 +303,9 @@ def _pad_vector(
     fill: int | bool,
 ) -> torch.Tensor:
     if len(values) > length:
-        raise DataIntegrityError(f"metadata vector length {len(values)} exceeds {length}")
+        raise DataIntegrityError(
+            f"metadata vector length {len(values)} exceeds {length}"
+        )
     return torch.tensor(list(values) + [fill] * (length - len(values)), dtype=dtype)
 
 
@@ -377,7 +375,9 @@ class Native5BSourceDataset(Dataset[dict[str, torch.Tensor]]):
         ]
         output = torch.zeros((slots, dim), dtype=torch.bfloat16)
         if any(valid):
-            valid_positions = [position for position, keep in zip(positions, valid) if keep]
+            valid_positions = [
+                position for position, keep in zip(positions, valid) if keep
+            ]
             start, stop = min(valid_positions), max(valid_positions) + 1
             summary = self.shards.optional_quantized(
                 feature_relative,
@@ -460,8 +460,7 @@ class Native5BSourceDataset(Dataset[dict[str, torch.Tensor]]):
                 f"window {row['window_id']} contains a frame with no valid view"
             )
         confidence = (
-            feature["geometry_confidence"].float().clamp_min(0.0)
-            * view_mask[..., None]
+            feature["geometry_confidence"].float().clamp_min(0.0) * view_mask[..., None]
         )
         confidence_sum = confidence.sum(dim=1)
         if not bool((confidence_sum[T : T + K] > 0.0).all()):

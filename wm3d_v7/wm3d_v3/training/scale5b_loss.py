@@ -3,6 +3,7 @@
 All terms supervise explicit native outputs.  There is no video-generator,
 VLA, language-model or latent-3D ownership path in this objective.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -51,7 +52,9 @@ def _masked_mean(
 
 
 def _image_gradient(image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return image[..., :, 1:] - image[..., :, :-1], image[..., 1:, :] - image[..., :-1, :]
+    return image[..., :, 1:] - image[..., :, :-1], image[..., 1:, :] - image[
+        ..., :-1, :
+    ]
 
 
 def _image_laplacian(image: torch.Tensor) -> torch.Tensor:
@@ -122,14 +125,15 @@ def native5b_loss(
         )
     token_mse = F.mse_loss(pred_tokens.float(), target_tokens.float())
     token_cosine = (
-        1.0
-        - F.cosine_similarity(pred_tokens.float(), target_tokens.float(), dim=-1)
+        1.0 - F.cosine_similarity(pred_tokens.float(), target_tokens.float(), dim=-1)
     ).mean()
 
     rgb = output["rgb"]
     target_rgb = batch["target_rgb"].to(dtype=rgb.dtype)
     if rgb.shape != target_rgb.shape:
-        raise ValueError(f"RGB target shape {target_rgb.shape} != prediction {rgb.shape}")
+        raise ValueError(
+            f"RGB target shape {target_rgb.shape} != prediction {rgb.shape}"
+        )
     target_view_mask = batch["target_view_mask"].bool()
     rgb_indices = output["rgb_frame_indices"].to(
         device=target_view_mask.device,
@@ -151,10 +155,7 @@ def native5b_loss(
         + _masked_mean((pred_dy - target_dy).abs(), rgb_view_mask, epsilon)
     )
     rgb_laplacian = _masked_mean(
-        (
-            _image_laplacian(rgb.float())
-            - _image_laplacian(target_rgb.float())
-        ).abs(),
+        (_image_laplacian(rgb.float()) - _image_laplacian(target_rgb.float())).abs(),
         rgb_view_mask,
         epsilon,
     )
@@ -171,12 +172,11 @@ def native5b_loss(
         )
     depth_log_error = depth.log() - target_depth.log()
     depth_log_mean = _masked_mean(depth_log_error, confidence_mask, epsilon)
-    depth_log = _masked_mean(
-        depth_log_error.square(), confidence_mask, epsilon
-    ) - 0.5 * depth_log_mean.square()
-    depth_gradient = (
-        depth_log_error[:, 1:] - depth_log_error[:, :-1]
-    ).abs()
+    depth_log = (
+        _masked_mean(depth_log_error.square(), confidence_mask, epsilon)
+        - 0.5 * depth_log_mean.square()
+    )
+    depth_gradient = (depth_log_error[:, 1:] - depth_log_error[:, :-1]).abs()
     depth_gradient = _masked_mean(
         depth_gradient, confidence_mask[:, 1:] & confidence_mask[:, :-1], epsilon
     )
@@ -190,8 +190,8 @@ def native5b_loss(
     point_loss = _masked_mean(point, confidence_mask, epsilon)
     geometry_confidence = _masked_mean(
         F.binary_cross_entropy(
-        output["geometry_confidence"].float().clamp(epsilon, 1.0 - epsilon),
-        batch["target_geometry_confidence"].float().clamp(0.0, 1.0),
+            output["geometry_confidence"].float().clamp(epsilon, 1.0 - epsilon),
+            batch["target_geometry_confidence"].float().clamp(0.0, 1.0),
             reduction="none",
         ),
         geometry_view_mask,
@@ -214,7 +214,10 @@ def native5b_loss(
     action_mask = batch["target_action_dim_mask"].bool()
     group_mask = batch["action_group_mask"].bool()[:, None, :, None, None]
     action_mask = action_mask & group_mask
-    if action_mean.shape != target_action.shape or action_mask.shape != target_action.shape:
+    if (
+        action_mean.shape != target_action.shape
+        or action_mask.shape != target_action.shape
+    ):
         raise ValueError("grouped action prediction/target/mask shapes do not match")
     inverse_variance = torch.exp(-2.0 * action_log_scale)
     action_nll_values = (
@@ -229,10 +232,7 @@ def native5b_loss(
     velocity_mask = action_mask[:, 1:] & action_mask[:, :-1]
     action_velocity = _masked_mean(velocity_error, velocity_mask, epsilon)
     contact_mask = batch["target_contact_mask"].bool()
-    contact_mask = (
-        contact_mask
-        & batch["action_group_mask"].bool()[:, None, :, None]
-    )
+    contact_mask = contact_mask & batch["action_group_mask"].bool()[:, None, :, None]
     if contact_mask.shape != batch["target_contact"].shape:
         raise ValueError("contact target/mask shapes do not match")
     action_contact = _masked_mean(
@@ -244,9 +244,7 @@ def native5b_loss(
         contact_mask,
         epsilon,
     )
-    action_log_scale_reg = _masked_mean(
-        action_log_scale.square(), action_mask, epsilon
-    )
+    action_log_scale_reg = _masked_mean(action_log_scale.square(), action_mask, epsilon)
 
     raw = {
         "token_mse": token_mse,

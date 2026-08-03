@@ -16,6 +16,7 @@ The no-leak contract is structural:
 That lets factual actions condition world dynamics without turning action
 prediction into a teacher-forced identity map.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -51,9 +52,7 @@ class Native5BConfig:
     action_layers: int = 24
     action_heads: int = 16
     action_ff_mult: float = 8.0 / 3.0
-    bridge_layers_state: tuple[int, ...] = (
-        2, 5, 8, 11, 14, 17, 20, 23, 26, 29
-    )
+    bridge_layers_state: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29)
     bridge_heads: int = 16
 
     view_hidden: int = 1024
@@ -97,7 +96,9 @@ class Native5BConfig:
             (self.view_hidden, self.view_heads, "view"),
         ):
             if hidden % heads:
-                raise ValueError(f"{name} hidden={hidden} is not divisible by heads={heads}")
+                raise ValueError(
+                    f"{name} hidden={hidden} is not divisible by heads={heads}"
+                )
         if len(set(self.bridge_layers_state)) != len(self.bridge_layers_state):
             raise ValueError("bridge_layers_state contains duplicates")
         if any(i < 0 or i >= self.state_layers for i in self.bridge_layers_state):
@@ -178,7 +179,9 @@ class SelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, query_dim: int, context_dim: int, heads: int, dropout: float = 0.0):
+    def __init__(
+        self, query_dim: int, context_dim: int, heads: int, dropout: float = 0.0
+    ):
         super().__init__()
         if query_dim % heads:
             raise ValueError("cross-attention query dim must be divisible by heads")
@@ -280,7 +283,9 @@ class FactorizedStateBlock(nn.Module):
         spatial = spatial + self.spatial(self.spatial_norm(spatial))
         x = spatial.view(batch, frames, patches, dim)
         temporal = x.transpose(1, 2).reshape(batch * patches, frames, dim)
-        temporal = temporal + self.temporal(self.temporal_norm(temporal), is_causal=True)
+        temporal = temporal + self.temporal(
+            self.temporal_norm(temporal), is_causal=True
+        )
         x = temporal.view(batch, patches, frames, dim).transpose(1, 2)
         return x + self.ff(self.ff_norm(x))
 
@@ -373,7 +378,9 @@ class GroupedActionTokenizer(nn.Module):
         dim_mask: torch.Tensor,
     ) -> torch.Tensor:
         if values.shape != dim_mask.shape:
-            raise ValueError("action values and dimension mask must have identical shape")
+            raise ValueError(
+                "action values and dimension mask must have identical shape"
+            )
         expected = (
             self.cfg.max_action_groups,
             self.cfg.action_substeps,
@@ -384,7 +391,9 @@ class GroupedActionTokenizer(nn.Module):
                 f"action suffix must be {expected}, got {tuple(values.shape[-3:])}"
             )
         masked = values * dim_mask.to(dtype=values.dtype)
-        return torch.cat((masked.flatten(-2), dim_mask.to(values.dtype).flatten(-2)), dim=-1)
+        return torch.cat(
+            (masked.flatten(-2), dim_mask.to(values.dtype).flatten(-2)), dim=-1
+        )
 
     def policy_tokens(
         self,
@@ -543,13 +552,19 @@ class NativeRGBDecoder(nn.Module):
         )
         if not indices:
             empty = future_state.new_empty(
-                future_state.shape[0], 0, self.cfg.num_views, 3,
-                self.cfg.rgb_size, self.cfg.rgb_size
+                future_state.shape[0],
+                0,
+                self.cfg.num_views,
+                3,
+                self.cfg.rgb_size,
+                self.cfg.rgb_size,
             )
             return empty, torch.empty(0, dtype=torch.long, device=future_state.device)
         if any(index < 0 or index >= future_state.shape[1] for index in indices):
             raise ValueError("RGB decode index is outside the future horizon")
-        index_tensor = torch.tensor(indices, dtype=torch.long, device=future_state.device)
+        index_tensor = torch.tensor(
+            indices, dtype=torch.long, device=future_state.device
+        )
         selected = future_state.index_select(1, index_tensor)
         x = self.in_proj(selected)[:, :, None] + self.view_embed
         batch, frames, views, patches, channels = x.shape
@@ -557,9 +572,7 @@ class NativeRGBDecoder(nn.Module):
             batch * frames * views, channels, self.grid, self.grid
         )
         rgb = torch.sigmoid(self.out(self.decoder(x)))
-        rgb = rgb.view(
-            batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
-        )
+        rgb = rgb.view(batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size)
         return rgb, index_tensor
 
 
@@ -579,9 +592,7 @@ class NativeWM3D5B(nn.Module):
         self.future_state_queries = nn.Parameter(
             torch.empty(1, cfg.K, cfg.P, cfg.state_hidden)
         )
-        self.action_time = nn.Parameter(
-            torch.empty(1, frames, 1, cfg.action_hidden)
-        )
+        self.action_time = nn.Parameter(torch.empty(1, frames, 1, cfg.action_hidden))
         for parameter in (
             self.state_time,
             self.state_space,
@@ -638,10 +649,14 @@ class NativeWM3D5B(nn.Module):
         del dtype
         frames = self.cfg.T + self.cfg.K
         groups = self.cfg.max_action_groups
-        time_ids = torch.arange(frames, device=group_mask.device).repeat_interleave(groups)
+        time_ids = torch.arange(frames, device=group_mask.device).repeat_interleave(
+            groups
+        )
         causal = time_ids[None, :] <= time_ids[:, None]
-        valid = group_mask[:, None, :].expand(batch, frames, groups).reshape(
-            batch, frames * groups
+        valid = (
+            group_mask[:, None, :]
+            .expand(batch, frames, groups)
+            .reshape(batch, frames * groups)
         )
         allowed = causal[None, None] & valid[:, None, None, :]
         return allowed
@@ -693,7 +708,9 @@ class NativeWM3D5B(nn.Module):
             )
         batch = world_tokens.shape[0]
         if view_mask is None:
-            raise ValueError("production multiview input requires an explicit view_mask")
+            raise ValueError(
+                "production multiview input requires an explicit view_mask"
+            )
         context_state = self.view_fuser(world_tokens, view_mask)
         context_state = self.fused_input_norm(context_state)
         if tuple(action_group_ids.shape) != (batch, cfg.max_action_groups):
@@ -723,9 +740,7 @@ class NativeWM3D5B(nn.Module):
                 cfg.max_aux_tokens,
                 cfg.aux_dim,
             ):
-                raise ValueError(
-                    "aux_tokens must be [B,T,max_aux_tokens,aux_dim]"
-                )
+                raise ValueError("aux_tokens must be [B,T,max_aux_tokens,aux_dim]")
             if aux_mask is None or tuple(aux_mask.shape) != (
                 batch,
                 cfg.T,
@@ -747,14 +762,14 @@ class NativeWM3D5B(nn.Module):
             embodiment_ids,
             action_group_mask,
         )
-        action = action + self.action_time + self.task_action(task_embedding)[:, None, None]
+        action = (
+            action + self.action_time + self.task_action(task_embedding)[:, None, None]
+        )
         allowed = self._action_allowed_mask(batch, action_group_mask, action.dtype)
 
         action_i = 0
         for state_i, state_block in enumerate(self.state_blocks):
-            state = self._run(
-                state_block, state, enabled=cfg.activation_checkpointing
-            )
+            state = self._run(state_block, state, enabled=cfg.activation_checkpointing)
             for _ in range(self._action_steps[state_i]):
                 action = self._run(
                     self.action_blocks[action_i],

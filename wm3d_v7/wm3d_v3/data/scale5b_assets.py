@@ -1,4 +1,5 @@
 """Portable, immutable offline-encoder assets for WM3D-V7 native 5B."""
+
 from __future__ import annotations
 
 import json
@@ -109,9 +110,7 @@ def verify_asset_bundle(
         if asset_path.is_symlink() or not asset_path.is_dir():
             errors.append(f"{name}: missing real asset directory {asset_path}")
     if errors:
-        raise ContractError(
-            "encoder asset verification failed:\n" + "\n".join(errors)
-        )
+        raise ContractError("encoder asset verification failed:\n" + "\n".join(errors))
     return {
         "pass": True,
         "receipt": receipt,

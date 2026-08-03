@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Verify the portable offline-encoder bundle before array submission."""
+
 from __future__ import annotations
 
 import argparse

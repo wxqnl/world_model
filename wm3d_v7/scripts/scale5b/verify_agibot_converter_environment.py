@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成或复核 AgiBot dataset-v2 转换镜像的运行时 receipt。"""
+"""生成或复核 AgiBot dataset-v2 转换 venv 的运行时 receipt。"""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def _contract(path: Path) -> tuple[Path, dict[str, Any]]:
     commands = value.get("required_commands")
     if (
         value.get("schema") != CONTRACT_SCHEMA
-        or not isinstance(value.get("python"), str)
+        or value.get("python_major_minor") != "3.10"
         or not isinstance(lerobot, dict)
         or len(str(lerobot.get("revision", ""))) != 40
         or not isinstance(packages, dict)
@@ -94,9 +94,11 @@ def current_environment(
     if revision_file.name != REVISION_BUNDLE_NAME:
         raise ValueError(f"LeRobot revision 文件名必须是 {REVISION_BUNDLE_NAME}")
     python_version = platform.python_version()
-    if python_version != contract["python"]:
+    python_major_minor = ".".join(python_version.split(".")[:2])
+    if python_major_minor != contract["python_major_minor"]:
         raise ValueError(
-            f"Python 版本不匹配: expected={contract['python']} actual={python_version}"
+            "Python 版本不匹配: "
+            f"expected={contract['python_major_minor']}.x actual={python_version}"
         )
     expected_revision = str(contract["lerobot"]["revision"])
     actual_revision = revision_file.read_text(encoding="utf-8").strip()
@@ -196,7 +198,8 @@ def validate_receipt(
     if (
         value.get("environment_contract_sha256") != sha256_file(contract)
         or value.get("lerobot_revision_file_sha256") != sha256_file(revision_file)
-        or value.get("python_version") != contract_value["python"]
+        or ".".join(str(value.get("python_version", "")).split(".")[:2])
+        != contract_value["python_major_minor"]
         or value.get("lerobot_revision") != revision
         or revision != contract_value["lerobot"]["revision"]
         or packages != contract_value["packages"]

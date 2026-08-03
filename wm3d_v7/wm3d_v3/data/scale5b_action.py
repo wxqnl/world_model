@@ -1,4 +1,5 @@
 """Embodiment-aware high-rate action alignment for native WM3D-V7 5B."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -178,17 +179,13 @@ def align_grouped_actions(
         normalized = normalized.reshape(
             visual_timestamps.size, action_substeps, dimension
         )
-        valid = valid.reshape(
-            visual_timestamps.size, action_substeps, dimension
-        )
+        valid = valid.reshape(visual_timestamps.size, action_substeps, dimension)
         values[:, slot, :, :dimension] = normalized
         dim_mask[:, slot, :, :dimension] = valid
         group_ids[slot] = int(group.group_id)
         group_mask[slot] = True
         if discrete:
-            contact[:, slot] = (
-                normalized[..., -1] > 0.0
-            ).astype(np.float32)
+            contact[:, slot] = (normalized[..., -1] > 0.0).astype(np.float32)
             contact_mask[:, slot] = valid[..., -1]
 
     return {
@@ -238,9 +235,7 @@ def align_auxiliary_tokens(
     )
     for slot, modality in enumerate(embodiment.auxiliary_modalities):
         if modality.name not in modality_series:
-            raise ContractError(
-                f"missing raw auxiliary modality {modality.name}"
-            )
+            raise ContractError(f"missing raw auxiliary modality {modality.name}")
         if modality.name not in normalizations:
             raise ContractError(
                 f"missing normalization for auxiliary modality {modality.name}"
@@ -267,8 +262,8 @@ def align_auxiliary_tokens(
         tokens[:, slot, int(modality.type_id)] = 1.0
         start = int(max_aux_type_id)
         tokens[:, slot, start : start + dimension] = normalized
-        tokens[:, slot, start + dimension : start + 2 * dimension] = (
-            valid.astype(np.float32)
+        tokens[:, slot, start + dimension : start + 2 * dimension] = valid.astype(
+            np.float32
         )
         mask[:, slot] = valid.any(axis=-1)
 

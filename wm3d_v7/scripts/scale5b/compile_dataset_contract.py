@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Compile an operator-edited YAML inventory into canonical strict JSON."""
+
 from __future__ import annotations
 
 import argparse
@@ -53,7 +54,9 @@ def main() -> None:
     contract = DatasetContract.from_mapping(raw)
     weight_total = sum(contract.source_weights.values())
     if weight_total != 100 and not args.allow_non_100_cycle:
-        raise ValueError(f"formal source sampling weights total {weight_total}, not 100")
+        raise ValueError(
+            f"formal source sampling weights total {weight_total}, not 100"
+        )
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(output, contract.as_dict(), exclusive=True)
@@ -64,7 +67,9 @@ def main() -> None:
                 "output": str(output),
                 "dataset_contract_sha256": contract.sha256,
                 "source_weights": contract.source_weights,
-                "nominal_hours": sum(source.nominal_hours for source in contract.sources),
+                "nominal_hours": sum(
+                    source.nominal_hours for source in contract.sources
+                ),
             },
             sort_keys=True,
         )

@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 PYTHON_BIN="${PYTHON_BIN:-/opt/wm3d/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/wm3d/bin/torchrun}"
+ENV_PREFIX="$(dirname "$(dirname "${PYTHON_BIN}")")"
+ENVIRONMENT_CONTRACT="${ENVIRONMENT_CONTRACT:-${REPO_ROOT}/environments/scale5b/environment_contract.json}"
+ENVIRONMENT_RECEIPT="${TRAIN_ENV_RECEIPT:-${ENV_PREFIX}/environment_receipt.json}"
+export ENVIRONMENT_RECEIPT
 
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -12,14 +16,15 @@ export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 EXPECTED_ENV_SHA="$(
   "${PYTHON_BIN}" - <<'PY'
 import json
+import os
 from wm3d_v3.data.scale5b_contracts import canonical_sha256
-with open("/opt/wm3d/environment_receipt.json", encoding="utf-8") as handle:
+with open(os.environ["ENVIRONMENT_RECEIPT"], encoding="utf-8") as handle:
     print(canonical_sha256(json.load(handle)))
 PY
 )"
 "${PYTHON_BIN}" scripts/scale5b/verify_environment.py \
-  --contract /opt/wm3d/environment_contract.json \
-  --receipt /opt/wm3d/environment_receipt.json \
+  --contract "${ENVIRONMENT_CONTRACT}" \
+  --receipt "${ENVIRONMENT_RECEIPT}" \
   --expected-sha256 "${EXPECTED_ENV_SHA}"
 
 "${PYTHON_BIN}" -m compileall -q \
@@ -29,6 +34,7 @@ PY
   wm3d_v3/models/native5b.py \
   wm3d_v3/training \
   scripts/scale5b \
+  run_v7.sh \
   tests/test_scale5b_native.py \
   tests/test_scale5b_data_pipeline.py \
   tests/test_scale5b_handoff.py \
@@ -41,6 +47,7 @@ PY
   wm3d_v3/models/native5b.py \
   wm3d_v3/training/scale5b_*.py \
   wm3d_v3/training/train_native5b.py \
+  wm3d_v3/training/eval_native5b.py \
   scripts/scale5b \
   tests/test_scale5b_*.py \
   tests/scale5b_fsdp2_smoke.py
@@ -63,7 +70,10 @@ PY
 
 while IFS= read -r script; do
   bash -n "${script}"
-done < <(find scripts/scale5b environments/scale5b -type f -name '*.sh' | sort)
+done < <(
+  find scripts/scale5b environments/scale5b -type f -name '*.sh' -print
+  printf '%s\n' run_v7.sh
+)
 
 if [[ "${RUN_GPU_SMOKE:-0}" == "1" ]]; then
   : "${GPU_SMOKE_ROOT:?Set a new absolute checkpoint root for the 2-GPU smoke}"

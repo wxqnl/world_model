@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Control-plane or full-payload verifier for a sealed V7 5B dataset."""
+
 from __future__ import annotations
 
 import argparse
@@ -63,8 +64,7 @@ def _verify_part_payload(root: Path, relative: str) -> dict[str, int]:
         or commit.get("schema") != PART_COMMIT_SCHEMA
         or commit.get("part_name") != part.name
         or sha256_file(manifest_path) != commit.get("manifest_sha256")
-        or canonical_sha256(manifest)
-        != commit.get("manifest_content_sha256")
+        or canonical_sha256(manifest) != commit.get("manifest_content_sha256")
         or not isinstance(files, dict)
         or set(files) != PART_PAYLOAD_FILES
     ):
@@ -183,9 +183,7 @@ def _sample_windows(
                 if active
             }
             contact_valid = int(sample["target_contact_mask"].sum())
-            expects_contact = bool(
-                active_group_ids.intersection(discrete_group_ids)
-            )
+            expects_contact = bool(active_group_ids.intersection(discrete_group_ids))
             if expects_contact != (contact_valid > 0):
                 raise ValueError(
                     f"{source}[{index}] contact mask disagrees with "
@@ -209,12 +207,12 @@ def main() -> None:
     root = resolve_real_directory(args.dataset_root, "dataset root")
     report = verify_dataset_seal(root)
     if not report["pass"]:
-        raise ValueError("control-plane verification failed:\n" + "\n".join(report["errors"]))
+        raise ValueError(
+            "control-plane verification failed:\n" + "\n".join(report["errors"])
+        )
     output: dict[str, Any] = {"pass": True, "mode": args.mode, "control": report}
     if args.mode == "deep":
-        seal = load_seal(
-            resolve_regular_file(root, "receipts/dataset_seal.json")
-        )
+        seal = load_seal(resolve_regular_file(root, "receipts/dataset_seal.json"))
         manifest_paths = sorted(
             relative
             for relative in seal.payload_manifest_files

@@ -59,8 +59,10 @@ if [[ -e "${NODE_LOG}" ]]; then
   echo "Refusing to append/overwrite formal node log: ${NODE_LOG}" >&2
   exit 2
 fi
-if [[ ! -x /opt/wm3d/bin/torchrun || ! -x /opt/wm3d/bin/python ]]; then
-  echo "Pinned /opt/wm3d runtime is missing torchrun/python" >&2
+PYTHON_BIN="${PYTHON_BIN:-/opt/wm3d/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/wm3d/bin/torchrun}"
+if [[ ! -x "${TORCHRUN_BIN}" || ! -x "${PYTHON_BIN}" ]]; then
+  echo "Pinned runtime is missing torchrun/python: ${TORCHRUN_BIN} ${PYTHON_BIN}" >&2
   exit 2
 fi
 mkdir -p "$(dirname "${NODE_LOG}")" "$(dirname "${PREFLIGHT_REPORT}")"
@@ -92,7 +94,7 @@ COMMON_ARGS=(
 )
 
 echo "[$(date --iso-8601=seconds)] V7 native5b distributed preflight run=${RDZV_ID}"
-/opt/wm3d/bin/torchrun \
+"${TORCHRUN_BIN}" \
   "${COMMON_ARGS[@]}" \
   --master-port="${MASTER_PORT}" \
   scripts/scale5b/preflight_cluster.py \
@@ -126,7 +128,7 @@ if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
 fi
 
 echo "[$(date --iso-8601=seconds)] V7 native5b formal training run=${RDZV_ID}"
-/opt/wm3d/bin/torchrun \
+"${TORCHRUN_BIN}" \
   "${COMMON_ARGS[@]}" \
   --master-port="${TRAIN_PORT}" \
   wm3d_v3/training/train_native5b.py \

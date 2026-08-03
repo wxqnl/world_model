@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build a portable no-symlink VGGT/T5 asset bundle for offline encoding."""
+
 from __future__ import annotations
 
 import argparse

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Merge committed V7 5B encoder parts and publish the dataset seal."""
+
 from __future__ import annotations
 
 import argparse
@@ -72,7 +73,10 @@ def _verify_part(path: Path, expected: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"part is not safely committed: {path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     commit = json.loads(commit_path.read_text(encoding="utf-8"))
-    if manifest.get("schema") != PART_SCHEMA or commit.get("schema") != PART_COMMIT_SCHEMA:
+    if (
+        manifest.get("schema") != PART_SCHEMA
+        or commit.get("schema") != PART_COMMIT_SCHEMA
+    ):
         raise ValueError(f"part schema mismatch: {path}")
     if manifest.get("part_name") != path.name or commit.get("part_name") != path.name:
         raise ValueError(f"part identity mismatch: {path}")
@@ -89,9 +93,7 @@ def _verify_part(path: Path, expected: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"part worker/index identity mismatch: {path}")
     if sha256_file(manifest_path) != commit.get("manifest_sha256"):
         raise ValueError(f"part manifest digest mismatch: {path}")
-    if canonical_sha256(manifest) != commit.get(
-        "manifest_content_sha256"
-    ):
+    if canonical_sha256(manifest) != commit.get("manifest_content_sha256"):
         raise ValueError(f"part canonical manifest digest mismatch: {path}")
     for key, value in expected.items():
         if manifest.get(key) != value:
@@ -133,8 +135,7 @@ class _RotatingParquetWriters:
         key = (split, source)
         state = self.state.get(key)
         if state is None or (
-            state["rows"] > 0
-            and state["rows"] + table.num_rows > self.maximum_rows
+            state["rows"] > 0 and state["rows"] + table.num_rows > self.maximum_rows
         ):
             if state is not None:
                 state["writer"].close()
@@ -189,9 +190,7 @@ def _load_worker_receipts(
         shard_part_indices: list[int] = []
         for part in parts:
             if not isinstance(part, dict):
-                raise ValueError(
-                    f"encoder worker part summary is invalid: {path}"
-                )
+                raise ValueError(f"encoder worker part summary is invalid: {path}")
             part_name = str(part.get("part", ""))
             match = PART_NAME_RE.fullmatch(part_name)
             if (
@@ -200,9 +199,7 @@ def _load_worker_receipts(
                 or int(part.get("frames", 0)) <= 0
                 or int(part.get("windows", 0)) <= 0
             ):
-                raise ValueError(
-                    f"encoder worker part summary is invalid: {path}"
-                )
+                raise ValueError(f"encoder worker part summary is invalid: {path}")
             part_index = int(match.group(2))
             shard_part_indices.append(part_index)
             if part_name in part_summaries:
@@ -275,9 +272,7 @@ def main() -> None:
         "episode_plan_sha256": root / "control" / "episode_plan.jsonl",
         "action_stats_sha256": root / "control" / "action_stats.json",
         "task_index_sha256": root / "control" / "task_index.json",
-        "encoder_asset_receipt_sha256": root
-        / "control"
-        / "encoder_asset_receipt.json",
+        "encoder_asset_receipt_sha256": root / "control" / "encoder_asset_receipt.json",
     }
     for key, path in direct_evidence.items():
         path = resolve_regular_file(root, path.relative_to(root).as_posix())
@@ -315,9 +310,7 @@ def main() -> None:
                 int(manifest.get("frames", -1)) != summary["frames"]
                 or int(manifest.get("windows", -1)) != summary["windows"]
             ):
-                raise ValueError(
-                    f"{part_name}: worker receipt/manifest count mismatch"
-                )
+                raise ValueError(f"{part_name}: worker receipt/manifest count mismatch")
             payload_manifest_relatives.extend(
                 [
                     f"payload/parts/{part_name}/manifest.json",
@@ -380,18 +373,14 @@ def main() -> None:
                     "feature_shard": (
                         f"payload/parts/{part_name}/features.safetensors"
                     ),
-                    "action_shard": (
-                        f"payload/parts/{part_name}/actions.safetensors"
-                    ),
+                    "action_shard": (f"payload/parts/{part_name}/actions.safetensors"),
                     "rgb_pack": f"payload/parts/{part_name}/rgb.jpgpack",
                 }
                 if any(
                     str(row[name]) != expected
                     for name, expected in expected_paths.items()
                 ):
-                    raise ValueError(
-                        f"{part_name}: window payload path mismatch"
-                    )
+                    raise ValueError(f"{part_name}: window payload path mismatch")
                 if (
                     str(row["source"]) not in contract.source_order
                     or str(row["split"]) not in {"train", "val", "test"}
@@ -401,10 +390,8 @@ def main() -> None:
                     or int(row["frame_offset"]) + int(row["frame_count"])
                     > int(manifest["frames"])
                     or int(row["episode_frame_start"]) < 0
-                    or int(row["episode_frame_stop"])
-                    > int(manifest["frames"])
-                    or int(row["episode_frame_start"])
-                    > int(row["frame_offset"])
+                    or int(row["episode_frame_stop"]) > int(manifest["frames"])
+                    or int(row["episode_frame_start"]) > int(row["frame_offset"])
                     or int(row["episode_frame_stop"])
                     < int(row["frame_offset"]) + int(row["frame_count"])
                 ):
@@ -425,9 +412,7 @@ def main() -> None:
         database.close()
     for source in contract.source_order:
         if counts[source]["train"] <= 0 or counts[source]["val"] <= 0:
-            raise ValueError(
-                f"{source}: sealed index lacks train or val windows"
-            )
+            raise ValueError(f"{source}: sealed index lacks train or val windows")
     (temporary_indexes / "window_ids.sqlite").unlink()
     for suffix in ("-wal", "-shm"):
         sidecar = temporary_indexes / f"window_ids.sqlite{suffix}"

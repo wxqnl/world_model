@@ -1,4 +1,5 @@
 """Distributed runtime primitives for native WM3D-V7 5B."""
+
 from __future__ import annotations
 
 import ast
@@ -277,11 +278,7 @@ def assert_v7_native_dependency_boundary(paths: Iterable[Path]) -> None:
                         violations.append(f"{path}: forbidden import {module}")
         elif path.suffix in {".json", ".yaml", ".yml"}:
             text = path.read_text(encoding="utf-8")
-            value = (
-                json.loads(text)
-                if path.suffix == ".json"
-                else yaml.safe_load(text)
-            )
+            value = json.loads(text) if path.suffix == ".json" else yaml.safe_load(text)
             for token in _walk_config_strings(value):
                 match = _FORBIDDEN_CONFIG_TOKEN.search(token.lower())
                 if match:

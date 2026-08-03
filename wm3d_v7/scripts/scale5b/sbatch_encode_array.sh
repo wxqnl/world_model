@@ -22,12 +22,17 @@ for value in "${REPO_ROOT}" "${DATASET_ROOT}" "${ENCODER_ASSET_ROOT}"; do
     exit 2
   fi
 done
-if [[ "${SLURM_ARRAY_TASK_MIN:-}" != "0" ]]; then
+if [[ "${RESUME_ARRAY:-0}" != "1" && "${SLURM_ARRAY_TASK_MIN:-}" != "0" ]]; then
   echo "The formal encoder array must start at zero" >&2
   exit 2
 fi
-if [[ "${SLURM_ARRAY_TASK_COUNT:-0}" != "${NUM_SHARDS}" ]]; then
+if [[ "${RESUME_ARRAY:-0}" != "1" \
+  && "${SLURM_ARRAY_TASK_COUNT:-0}" != "${NUM_SHARDS}" ]]; then
   echo "Slurm array count must equal NUM_SHARDS" >&2
+  exit 2
+fi
+if (( SLURM_ARRAY_TASK_ID < 0 || SLURM_ARRAY_TASK_ID >= NUM_SHARDS )); then
+  echo "SLURM_ARRAY_TASK_ID is outside [0, NUM_SHARDS)" >&2
   exit 2
 fi
 

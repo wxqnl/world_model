@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Distributed fail-closed preflight for the 64/128 H200 V7 5B launch."""
+
 from __future__ import annotations
 
 import argparse
@@ -94,9 +95,7 @@ def _gpu_report(local_rank: int) -> dict[str, Any]:
         "--format=csv,noheader,nounits",
     )
     pids = sorted(
-        int(line.strip())
-        for line in compute.splitlines()
-        if line.strip().isdigit()
+        int(line.strip()) for line in compute.splitlines() if line.strip().isdigit()
     )
     return {
         "name": values[0],
@@ -234,9 +233,7 @@ def _local_report(config: dict[str, Any], context: Any) -> dict[str, Any]:
             )
         environment_receipt = verify_environment_receipt(
             Path(config["run"]["environment_receipt_path"]),
-            expected_sha256=str(
-                config["run"]["environment_receipt_sha256"]
-            ),
+            expected_sha256=str(config["run"]["environment_receipt_sha256"]),
             contract_path=Path(config["run"]["environment_contract_path"]),
             check_current=True,
         )
@@ -254,14 +251,10 @@ def _local_report(config: dict[str, Any], context: Any) -> dict[str, Any]:
         if "H200" not in gpu["name"].upper():
             errors.append(f"GPU is not H200: {gpu['name']}")
         if gpu["memory_total_mib"] < 135_000:
-            errors.append(
-                f"GPU HBM below 135000 MiB: {gpu['memory_total_mib']}"
-            )
+            errors.append(f"GPU HBM below 135000 MiB: {gpu['memory_total_mib']}")
         if gpu["uncorrected_volatile"] or gpu["uncorrected_aggregate"]:
             errors.append(f"uncorrected ECC is non-zero: {gpu}")
-        external_pids = [
-            pid for pid in gpu["compute_pids"] if pid != os.getpid()
-        ]
+        external_pids = [pid for pid in gpu["compute_pids"] if pid != os.getpid()]
         if external_pids:
             errors.append(f"GPU has external compute PIDs {external_pids}")
     except Exception as exc:
@@ -272,15 +265,11 @@ def _local_report(config: dict[str, Any], context: Any) -> dict[str, Any]:
         errors.append(f"NVLink topology qualification failed: {exc}")
     try:
         ib = _ib_report()
-        active_ib = [
-            item for item in ib if "ACTIVE" in str(item["state"]).upper()
-        ]
+        active_ib = [item for item in ib if "ACTIVE" in str(item["state"]).upper()]
         if not active_ib:
             errors.append("no active InfiniBand port")
         else:
-            minimum_ib_rate = float(
-                config["distributed"]["minimum_ib_rate_gbps"]
-            )
+            minimum_ib_rate = float(config["distributed"]["minimum_ib_rate_gbps"])
             active_rates: list[float] = []
             for item in active_ib:
                 try:
@@ -302,10 +291,7 @@ def _local_report(config: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         soft_memlock, _hard_memlock = resource.getrlimit(resource.RLIMIT_MEMLOCK)
         soft_nofile, _hard_nofile = resource.getrlimit(resource.RLIMIT_NOFILE)
-        if (
-            soft_memlock != resource.RLIM_INFINITY
-            and soft_memlock < 1 << 30
-        ):
+        if soft_memlock != resource.RLIM_INFINITY and soft_memlock < 1 << 30:
             errors.append(f"memlock ulimit is too low: {soft_memlock}")
         if soft_nofile < 1_048_576:
             errors.append(f"nofile ulimit is below 1048576: {soft_nofile}")
@@ -326,9 +312,7 @@ def _local_report(config: dict[str, Any], context: Any) -> dict[str, Any]:
             dataset_free = _available_bytes(data_root)
             minimum_data_free = int(config["data"]["minimum_free_bytes"])
             if dataset_free < minimum_data_free:
-                errors.append(
-                    f"dataset free bytes too low: {dataset_free}"
-                )
+                errors.append(f"dataset free bytes too low: {dataset_free}")
     except Exception as exc:
         errors.append(f"dataset-volume qualification failed: {exc}")
     try:
@@ -338,9 +322,7 @@ def _local_report(config: dict[str, Any], context: Any) -> dict[str, Any]:
             output_free = 0
         else:
             output_free = _available_bytes(output_parent)
-            minimum_free = int(
-                config["distributed"]["minimum_output_free_bytes"]
-            )
+            minimum_free = int(config["distributed"]["minimum_output_free_bytes"])
             if output_free < minimum_free:
                 errors.append(f"output free bytes too low: {output_free}")
     except Exception as exc:
@@ -352,12 +334,8 @@ def _local_report(config: dict[str, Any], context: Any) -> dict[str, Any]:
     bandwidth = -1.0
     try:
         bandwidth = _all_reduce_gbps(context.device)
-        if bandwidth < float(
-            config["distributed"]["minimum_allreduce_gbps"]
-        ):
-            errors.append(
-                f"all-reduce throughput too low: {bandwidth:.3f} GB/s"
-            )
+        if bandwidth < float(config["distributed"]["minimum_allreduce_gbps"]):
+            errors.append(f"all-reduce throughput too low: {bandwidth:.3f} GB/s")
     except Exception as exc:
         errors.append(f"all-reduce qualification failed: {exc}")
     return {
@@ -408,17 +386,12 @@ def _aggregate_reports(
 
     expected_nodes = context.world_size // 8
     if len(host_to_ranks) != expected_nodes:
-        errors.append(
-            f"host count {len(host_to_ranks)} != expected {expected_nodes}"
-        )
+        errors.append(f"host count {len(host_to_ranks)} != expected {expected_nodes}")
     for hostname, ranks in host_to_ranks.items():
         if len(ranks) != 8:
             errors.append(f"{hostname} has {len(ranks)} ranks, not 8")
 
-    uuids = [
-        str(report.get("gpu", {}).get("uuid", ""))
-        for report in valid_reports
-    ]
+    uuids = [str(report.get("gpu", {}).get("uuid", "")) for report in valid_reports]
     if any(not value for value in uuids):
         errors.append("one or more GPU UUIDs are missing")
     elif len(set(uuids)) != len(uuids):
@@ -435,9 +408,7 @@ def _aggregate_reports(
     for hostname, ranks in host_to_ranks.items():
         topology_digests = {
             str(
-                reports_by_rank.get(rank, {})
-                .get("nvlink", {})
-                .get("matrix_sha256", "")
+                reports_by_rank.get(rank, {}).get("nvlink", {}).get("matrix_sha256", "")
             )
             for rank in ranks
         }
@@ -453,9 +424,7 @@ def _aggregate_reports(
         )
         dataset_receipt_sha = dataset_report.get("receipt_sha256")
         if not dataset_report["pass"]:
-            errors.extend(
-                f"dataset: {error}" for error in dataset_report["errors"]
-            )
+            errors.extend(f"dataset: {error}" for error in dataset_report["errors"])
     except Exception as exc:
         errors.append(f"dataset seal qualification failed: {exc}")
 
@@ -487,12 +456,8 @@ def _aggregate_reports(
         "training_contract_sha256": contract_sha,
         "dataset_receipt_sha256": dataset_receipt_sha,
         "code_receipt_sha256": code_receipt_sha,
-        "environment_receipt_sha256": config["run"].get(
-            "environment_receipt_sha256"
-        ),
-        "environment_fingerprint_sha256": next(
-            iter(environment_fingerprints), None
-        ),
+        "environment_receipt_sha256": config["run"].get("environment_receipt_sha256"),
+        "environment_fingerprint_sha256": next(iter(environment_fingerprints), None),
         "ranks": gathered,
     }
 
@@ -506,9 +471,7 @@ def main() -> None:
     context = initialize_distributed()
     try:
         local = _local_report(config, context)
-        expected_world_size = int(
-            config["distributed"]["expected_world_size"]
-        )
+        expected_world_size = int(config["distributed"]["expected_world_size"])
         if context.world_size != expected_world_size:
             local["errors"].append(
                 f"world size {context.world_size} != {expected_world_size}"

@@ -4,6 +4,7 @@ Launch only through torchrun/Slurm wrappers in ``scripts/scale5b``.  The
 trainer uses FSDP2/HSDP, a step-addressed exact-ratio sampler and transactional
 Distributed Checkpoint shards.  It never resumes an implicit ``latest`` path.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -322,17 +323,13 @@ def _environment_preflight(
         contract_path = Path(config["run"]["environment_contract_path"])
         contract = load_environment_contract(contract_path)
         contract_sha = canonical_sha256(contract)
-        if contract_sha != str(
-            config["run"]["environment_contract_sha256"]
-        ):
+        if contract_sha != str(config["run"]["environment_contract_sha256"]):
             raise RuntimeContractError(
                 "configured environment contract SHA does not match file"
             )
         receipt = verify_environment_receipt(
             Path(config["run"]["environment_receipt_path"]),
-            expected_sha256=str(
-                config["run"]["environment_receipt_sha256"]
-            ),
+            expected_sha256=str(config["run"]["environment_receipt_sha256"]),
             contract_path=contract_path,
             check_current=True,
         )
@@ -340,9 +337,7 @@ def _environment_preflight(
             "ok": True,
             "rank": context.rank,
             "receipt": receipt,
-            "fingerprint_sha256": receipt["environment"][
-                "fingerprint_sha256"
-            ],
+            "fingerprint_sha256": receipt["environment"]["fingerprint_sha256"],
         }
     except Exception as exc:
         local = {
@@ -426,9 +421,7 @@ def _forward(
         "context_action_values": batch["context_action_values"],
         "context_action_dim_mask": batch["context_action_dim_mask"],
         "future_factual_action_values": batch["future_factual_action_values"],
-        "future_factual_action_dim_mask": batch[
-            "future_factual_action_dim_mask"
-        ],
+        "future_factual_action_dim_mask": batch["future_factual_action_dim_mask"],
         "action_group_ids": batch["action_group_ids"],
         "action_group_mask": batch["action_group_mask"],
         "embodiment_ids": batch["embodiment_ids"],
@@ -444,8 +437,7 @@ def _forward(
 
 def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
     payload = (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode("utf-8")
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
     try:
@@ -539,12 +531,10 @@ def main() -> None:
             "dataset_receipt_sha256": receipt.sha256,
             "dataset_report": data_report,
             "code_receipt_sha256": canonical_sha256(code_receipt),
-            "environment_receipt_sha256": canonical_sha256(
-                environment_receipt
-            ),
-            "environment_fingerprint_sha256": environment_receipt[
-                "environment"
-            ]["fingerprint_sha256"],
+            "environment_receipt_sha256": canonical_sha256(environment_receipt),
+            "environment_fingerprint_sha256": environment_receipt["environment"][
+                "fingerprint_sha256"
+            ],
             **hardware_report,
         }
         if context.is_rank0:
@@ -586,15 +576,11 @@ def main() -> None:
             "dataset_receipt_sha256": receipt.sha256,
             "dataset_contract_sha256": contract.sha256,
             "code_receipt_sha256": canonical_sha256(code_receipt),
-            "environment_contract_sha256": run_cfg[
-                "environment_contract_sha256"
+            "environment_contract_sha256": run_cfg["environment_contract_sha256"],
+            "environment_receipt_sha256": canonical_sha256(environment_receipt),
+            "environment_fingerprint_sha256": environment_receipt["environment"][
+                "fingerprint_sha256"
             ],
-            "environment_receipt_sha256": canonical_sha256(
-                environment_receipt
-            ),
-            "environment_fingerprint_sha256": environment_receipt[
-                "environment"
-            ]["fingerprint_sha256"],
             "parameter_counts": parameter_counts,
             "world_size": context.world_size,
             "shard_degree": int(config["distributed"]["shard_degree"]),
@@ -608,9 +594,7 @@ def main() -> None:
                     raise RuntimeContractError("output root may not be a symlink")
                 output_root.mkdir(parents=True, exist_ok=True)
                 if run_contract_path.exists():
-                    existing = json.loads(
-                        run_contract_path.read_text(encoding="utf-8")
-                    )
+                    existing = json.loads(run_contract_path.read_text(encoding="utf-8"))
                     if existing != run_contract:
                         raise RuntimeContractError(
                             "existing run contract does not match"
@@ -620,9 +604,7 @@ def main() -> None:
                         raise RuntimeContractError(
                             "non-empty output root has no run contract"
                         )
-                    atomic_write_json(
-                        run_contract_path, run_contract, exclusive=True
-                    )
+                    atomic_write_json(run_contract_path, run_contract, exclusive=True)
                 run_status[0] = {"ok": True}
             except Exception as exc:
                 run_status[0] = {
@@ -663,7 +645,9 @@ def main() -> None:
             start_step = int(metadata["step"])
         total_steps = int(train_cfg["total_steps"])
         if start_step >= total_steps:
-            raise RuntimeContractError("resume checkpoint is already at/after total_steps")
+            raise RuntimeContractError(
+                "resume checkpoint is already at/after total_steps"
+            )
 
         train_dataset = _build_dataset(config, contract, split="train")
         val_dataset = _build_dataset(config, contract, split="val")
@@ -730,9 +714,10 @@ def main() -> None:
                 losses = native5b_loss(output, batch, loss_cfg)
                 (losses["total"] / grad_accumulation).backward()
                 for name, value in losses.items():
-                    accumulated[name] = accumulated.get(
-                        name, torch.zeros_like(value)
-                    ) + value.detach() / grad_accumulation
+                    accumulated[name] = (
+                        accumulated.get(name, torch.zeros_like(value))
+                        + value.detach() / grad_accumulation
+                    )
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), float(train_cfg["gradient_clip"])
             )
@@ -758,9 +743,7 @@ def main() -> None:
                     print(json.dumps(record, sort_keys=True), flush=True)
                     _append_jsonl(log_path, record)
             if validate_every > 0 and completed_step % validate_every == 0:
-                validation = _validate(
-                    model, val_dataset, config, context, loss_cfg
-                )
+                validation = _validate(model, val_dataset, config, context, loss_cfg)
                 if context.is_rank0:
                     record = {"step": completed_step, "validation": validation}
                     print(json.dumps(record, sort_keys=True), flush=True)
@@ -780,12 +763,8 @@ def main() -> None:
                             environment_receipt
                         ),
                         "initial_seed": seed,
-                        "shard_degree": int(
-                            config["distributed"]["shard_degree"]
-                        ),
-                        "global_batch_size": int(
-                            train_cfg["global_batch_size"]
-                        ),
+                        "shard_degree": int(config["distributed"]["shard_degree"]),
+                        "global_batch_size": int(train_cfg["global_batch_size"]),
                         "parameter_count": parameter_counts["total"],
                     },
                 )

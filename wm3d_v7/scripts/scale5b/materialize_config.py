@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Bind a V7 native-5B template to one sealed dataset/code/topology."""
+
 from __future__ import annotations
 
 import argparse
@@ -122,23 +123,16 @@ def main() -> None:
     dataset_root = _real_directory(args.dataset_root, "dataset root")
     contract_relative = "control/dataset_contract.json"
     receipt_relative = "receipts/dataset_seal.json"
-    contract = load_contract(
-        resolve_regular_file(dataset_root, contract_relative)
-    )
-    receipt = load_seal(
-        resolve_regular_file(dataset_root, receipt_relative)
-    )
+    contract = load_contract(resolve_regular_file(dataset_root, contract_relative))
+    receipt = load_seal(resolve_regular_file(dataset_root, receipt_relative))
     if contract.sha256 != receipt.dataset_contract_sha256:
         raise ValueError("dataset contract/seal mismatch")
     seal_report = verify_dataset_seal(dataset_root, receipt_relative)
     if not seal_report["pass"]:
         raise ValueError(
-            "dataset seal verification failed:\n"
-            + "\n".join(seal_report["errors"])
+            "dataset seal verification failed:\n" + "\n".join(seal_report["errors"])
         )
-    code_receipt_path, code_receipt_value = _load_regular_json(
-        args.code_receipt
-    )
+    code_receipt_path, code_receipt_value = _load_regular_json(args.code_receipt)
     code_receipt_sha = canonical_sha256(code_receipt_value)
     verify_code_receipt(
         code_receipt_path,
@@ -223,16 +217,14 @@ def main() -> None:
             {
                 "pass": True,
                 "output_config": str(output),
-                "training_contract_sha256": config["run"][
-                    "training_contract_sha256"
-                ],
+                "training_contract_sha256": config["run"]["training_contract_sha256"],
                 "dataset_seal_sha256": receipt.sha256,
                 "code_receipt_sha256": code_receipt_sha,
                 "environment_contract_sha256": environment_contract_sha,
                 "environment_receipt_sha256": environment_receipt_sha,
-                "environment_fingerprint_sha256": environment_receipt[
-                    "environment"
-                ]["fingerprint_sha256"],
+                "environment_fingerprint_sha256": environment_receipt["environment"][
+                    "fingerprint_sha256"
+                ],
                 "world_size": args.world_size,
                 "global_batch_size": args.global_batch_size,
                 "gradient_accumulation": accumulation,

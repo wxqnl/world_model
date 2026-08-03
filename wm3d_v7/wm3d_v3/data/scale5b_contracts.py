@@ -10,6 +10,7 @@ Normal launch preflight verifies the complete control plane and payload
 metadata.  A separate deep verifier can re-hash every payload shard before a
 formal data release without forcing every training restart to scan 100 TB.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -93,7 +94,9 @@ def resolve_real_directory(path: Path, field_name: str = "directory") -> Path:
     try:
         info = os.lstat(input_path)
     except OSError as exc:
-        raise ContractError(f"{field_name} is unavailable: {input_path}: {exc}") from exc
+        raise ContractError(
+            f"{field_name} is unavailable: {input_path}: {exc}"
+        ) from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise ContractError(f"{field_name} is not a real directory: {input_path}")
     return input_path.resolve(strict=True)
@@ -174,7 +177,9 @@ class ActionGroupSpec:
         for dimension in self.dimensions:
             _validate_name(dimension, f"{self.name} dimension")
         if not 5.0 <= float(self.rate_hz) <= 100.0:
-            raise ContractError(f"unsupported action rate for {self.name}: {self.rate_hz}")
+            raise ContractError(
+                f"unsupported action rate for {self.name}: {self.rate_hz}"
+            )
         _validate_name(self.control_mode, f"{self.name} control mode")
         _validate_name(self.normalization, f"{self.name} normalization")
 
@@ -248,7 +253,9 @@ class EmbodimentSpec:
         if not 0 <= int(self.embodiment_id) < int(max_embodiments):
             raise ContractError(f"embodiment_id out of range for {self.name}")
         if not self.views or len(self.views) > int(max_views):
-            raise ContractError(f"{self.name} has invalid view count: {len(self.views)}")
+            raise ContractError(
+                f"{self.name} has invalid view count: {len(self.views)}"
+            )
         if len(set(self.views)) != len(self.views):
             raise ContractError(f"duplicate views for embodiment {self.name}")
         for view in self.views:
@@ -378,7 +385,9 @@ class DatasetContract:
         if expected_substeps != int(expected_substeps):
             raise ContractError("action_fps must be an integer multiple of feature_fps")
         if int(expected_substeps) != int(self.action_substeps):
-            raise ContractError("action_substeps does not match action_fps / feature_fps")
+            raise ContractError(
+                "action_substeps does not match action_fps / feature_fps"
+            )
         if (self.T, self.P, self.K, self.token_dim) != (24, 144, 16, 2048):
             raise ContractError(
                 "production native5b representation must be T24/P144/K16/D2048"
@@ -396,7 +405,9 @@ class DatasetContract:
             )
         sources = {source.name: source for source in self.sources}
         embodiments = {item.name: item for item in self.embodiments}
-        if len(sources) != len(self.sources) or len(embodiments) != len(self.embodiments):
+        if len(sources) != len(self.sources) or len(embodiments) != len(
+            self.embodiments
+        ):
             raise ContractError("source and embodiment names must be unique")
         if tuple(self.source_order) != tuple(source.name for source in self.sources):
             raise ContractError("source_order must exactly match sources order")
@@ -510,7 +521,9 @@ def evidence_for(root: Path, relatives: Iterable[str]) -> dict[str, FileEvidence
     result: dict[str, FileEvidence] = {}
     for relative in sorted(set(str(value) for value in relatives)):
         path = resolve_regular_file(root, relative)
-        result[relative] = FileEvidence(size=path.stat().st_size, sha256=sha256_file(path))
+        result[relative] = FileEvidence(
+            size=path.stat().st_size, sha256=sha256_file(path)
+        )
     return result
 
 
@@ -552,9 +565,7 @@ def load_seal(path: Path) -> DatasetSeal:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise ContractError(f"dataset seal is not a regular file: {input_path}")
     resolved = input_path.resolve(strict=True)
-    return DatasetSeal.from_mapping(
-        json.loads(resolved.read_text(encoding="utf-8"))
-    )
+    return DatasetSeal.from_mapping(json.loads(resolved.read_text(encoding="utf-8")))
 
 
 def verify_dataset_seal(

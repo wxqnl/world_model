@@ -5,6 +5,7 @@ optimizer step, world size, rank, micro-batch size and gradient accumulation,
 it reconstructs every local sample directly.  Formal recovery therefore only
 needs a committed optimizer step and the sealed data/config digests.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
@@ -76,10 +77,14 @@ class ExactSourceSchedule:
         seed: int,
     ) -> None:
         self.source_order = tuple(str(value) for value in source_order)
-        if not self.source_order or len(set(self.source_order)) != len(self.source_order):
+        if not self.source_order or len(set(self.source_order)) != len(
+            self.source_order
+        ):
             raise SamplingContractError("source_order must be non-empty and unique")
         if set(self.source_order) != set(source_weights):
-            raise SamplingContractError("source weights must exactly match source_order")
+            raise SamplingContractError(
+                "source weights must exactly match source_order"
+            )
         self.weights = {name: int(source_weights[name]) for name in self.source_order}
         if any(value <= 0 for value in self.weights.values()):
             raise SamplingContractError("all source weights must be positive integers")
@@ -93,8 +98,7 @@ class ExactSourceSchedule:
     @property
     def fractions(self) -> dict[str, float]:
         return {
-            name: self.weights[name] / self.cycle_length
-            for name in self.source_order
+            name: self.weights[name] / self.cycle_length for name in self.source_order
         }
 
     def _cycle_sources(self, cycle: int) -> tuple[int, ...]:

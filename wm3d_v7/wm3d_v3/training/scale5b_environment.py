@@ -4,6 +4,7 @@ The code receipt binds source files.  This module separately binds the
 interpreter, CUDA-enabled PyTorch build, NCCL ABI, and Python distribution
 versions that were qualified with the FSDP2/DCP smoke test.
 """
+
 from __future__ import annotations
 
 import importlib.metadata
@@ -28,7 +29,7 @@ ENVIRONMENT_RECEIPT_SCHEMA = "wm3d_v7_native5b_environment_receipt_v1"
 
 
 class EnvironmentContractError(RuntimeError):
-    """Raised when a node differs from the qualified container runtime."""
+    """Raised when a node differs from the qualified Python runtime."""
 
 
 def _normalized_distribution_name(value: str) -> str:
@@ -97,7 +98,10 @@ def current_environment_report(contract: Mapping[str, Any]) -> dict[str, Any]:
     torch_cuda = str(torch.version.cuda)
     if torch_cuda != str(contract["torch_cuda"]):
         errors.append(f"torch CUDA {torch_cuda} != {contract['torch_cuda']}")
-    if not torch.distributed.is_available() or not torch.distributed.is_nccl_available():
+    if (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_nccl_available()
+    ):
         errors.append("PyTorch NCCL distributed backend is unavailable")
         nccl = (0, 0, 0)
     else:
@@ -204,9 +208,7 @@ def verify_environment_receipt(
             raise EnvironmentContractError(
                 "current environment failed:\n" + "\n".join(current["errors"])
             )
-        if current["fingerprint_sha256"] != frozen_report.get(
-            "fingerprint_sha256"
-        ):
+        if current["fingerprint_sha256"] != frozen_report.get("fingerprint_sha256"):
             raise EnvironmentContractError(
                 "current environment fingerprint differs from image receipt"
             )

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Encode one deterministic shard of the native WM3D-V7 5B dataset."""
+
 from __future__ import annotations
 
 import argparse
@@ -60,10 +61,7 @@ class Segment:
 
     @property
     def segment_id(self) -> str:
-        return (
-            f"{self.episode.episode_id}:"
-            f"{self.frame_start:09d}-{self.frame_stop:09d}"
-        )
+        return f"{self.episode.episode_id}:{self.frame_start:09d}-{self.frame_stop:09d}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -241,8 +239,7 @@ def _read_episode_actions(
         valid = np.isfinite(values)
         if not bool(valid.all()):
             raise ValueError(
-                f"non-finite factual action {spec.group_name} in "
-                f"{episode.episode_id}"
+                f"non-finite factual action {spec.group_name} in {episode.episode_id}"
             )
         groups[spec.group_name] = RawActionSeries(
             timestamps=timestamps,
@@ -305,7 +302,9 @@ def _auxiliary_normalizations(
 def _resize_views(value: torch.Tensor, size: int) -> torch.Tensor:
     frames, views, channels = value.shape[:3]
     resized = F.interpolate(
-        value.reshape(frames * views, channels, value.shape[-2], value.shape[-1]).float(),
+        value.reshape(
+            frames * views, channels, value.shape[-2], value.shape[-1]
+        ).float(),
         size=(size, size),
         mode="bilinear",
         align_corners=False,
@@ -360,9 +359,7 @@ def _encode_segment(
     encoded_parts: dict[str, list[torch.Tensor]] = {}
     for start in range(0, segment.frames, encoder_batch_frames):
         chunk = images[start : start + encoder_batch_frames].unsqueeze(0)
-        chunk_mask = frame_view_mask[
-            start : start + encoder_batch_frames
-        ].unsqueeze(0)
+        chunk_mask = frame_view_mask[start : start + encoder_batch_frames].unsqueeze(0)
         output = encoder(
             chunk.to(next(encoder.parameters()).device),
             view_mask=chunk_mask.to(next(encoder.parameters()).device),
@@ -454,15 +451,12 @@ def _verify_existing_part(
             or manifest.get("schema") != PART_SCHEMA
             or manifest.get("part_name") != expected_part_name
             or int(manifest.get("part_index", -1)) != expected_part_index
-            or int(manifest.get("worker_shard_id", -1))
-            != expected_shard_id
-            or int(manifest.get("worker_num_shards", -1))
-            != expected_num_shards
+            or int(manifest.get("worker_shard_id", -1)) != expected_shard_id
+            or int(manifest.get("worker_num_shards", -1)) != expected_num_shards
             or int(manifest.get("frames", 0)) <= 0
             or int(manifest.get("windows", 0)) <= 0
             or sha256_file(manifest_path) != commit.get("manifest_sha256")
-            or canonical_sha256(manifest)
-            != commit.get("manifest_content_sha256")
+            or canonical_sha256(manifest) != commit.get("manifest_content_sha256")
         ):
             return False
         for key, value in expected_lineage.items():
@@ -512,9 +506,7 @@ def _publish_part(
             expected_num_shards=args.num_shards,
             expected_lineage=lineage,
         ):
-            manifest = json.loads(
-                (final / "manifest.json").read_text(encoding="utf-8")
-            )
+            manifest = json.loads((final / "manifest.json").read_text(encoding="utf-8"))
             return {
                 "part": part_name,
                 "frames": int(manifest["frames"]),
@@ -621,12 +613,10 @@ def _publish_part(
         feature_buffers["rgb_offsets"] = [offsets]
         feature_buffers["rgb_lengths"] = [lengths]
         feature = {
-            name: torch.cat(values, dim=0)
-            for name, values in feature_buffers.items()
+            name: torch.cat(values, dim=0) for name, values in feature_buffers.items()
         }
         actions = {
-            name: torch.cat(values, dim=0)
-            for name, values in action_buffers.items()
+            name: torch.cat(values, dim=0) for name, values in action_buffers.items()
         }
         _atomic_safetensors(temporary / "features.safetensors", feature)
         _atomic_safetensors(temporary / "actions.safetensors", actions)
@@ -663,16 +653,12 @@ def _publish_part(
             "dataset_contract_sha256": lineage["dataset_contract_sha256"],
             "action_stats_sha256": lineage["action_stats_sha256"],
             "task_index_sha256": lineage["task_index_sha256"],
-            "encoder_asset_receipt_sha256": lineage[
-                "encoder_asset_receipt_sha256"
-            ],
+            "encoder_asset_receipt_sha256": lineage["encoder_asset_receipt_sha256"],
             "vggt_model": args.vggt_model,
             "vggt_revision": args.vggt_revision,
             "token_codec": "symmetric_int8_per_vector_fp16_scale_v1",
             "rgb_codec": f"jpeg_q{args.jpeg_quality}_independent_records_v1",
-            "auxiliary_codec": (
-                "type_onehot_plus_robust_values_and_validity_fp16_v1"
-            ),
+            "auxiliary_codec": ("type_onehot_plus_robust_values_and_validity_fp16_v1"),
             "frames": frame_cursor,
             "windows": len(index_rows),
             "segments": segment_records,

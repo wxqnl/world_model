@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Distributed robust action-statistics builder for the V7 5B corpus."""
+
 from __future__ import annotations
 
 import argparse
@@ -87,10 +88,7 @@ def _episode_sample_positions(
     if sample_budget <= 0:
         raise ValueError("sample budget must be positive")
     lengths = np.asarray(
-        [
-            episode.data_row_stop - episode.data_row_start
-            for episode in episodes
-        ],
+        [episode.data_row_stop - episode.data_row_start for episode in episodes],
         dtype=np.int64,
     )
     if lengths.size == 0 or bool((lengths <= 0).any()):
@@ -134,10 +132,7 @@ def _column_matrix(
 
 
 def command_partial(args: argparse.Namespace) -> None:
-    if (
-        not 0 <= args.shard_id < args.num_shards
-        or args.global_sample_budget <= 0
-    ):
+    if not 0 <= args.shard_id < args.num_shards or args.global_sample_budget <= 0:
         raise ValueError("invalid shard or sample budget")
     plan = resolve_regular_file(
         args.episode_plan.parent,
@@ -155,15 +150,12 @@ def command_partial(args: argparse.Namespace) -> None:
         key=lambda episode: (episode.source, episode.episode_id),
     )
     plan_sha = sha256_file(plan)
-    shard_sample_budget = math.ceil(
-        args.global_sample_budget / args.num_shards
-    )
+    shard_sample_budget = math.ceil(args.global_sample_budget / args.num_shards)
     positions_by_episode = _episode_sample_positions(
         selected,
         sample_budget=shard_sample_budget,
         seed_text=(
-            f"{plan_sha}:{args.shard_id}:{args.num_shards}:"
-            f"{args.global_sample_budget}"
+            f"{plan_sha}:{args.shard_id}:{args.num_shards}:{args.global_sample_budget}"
         ),
     )
     buffers: dict[str, list[np.ndarray]] = {}
@@ -236,10 +228,7 @@ def command_partial(args: argparse.Namespace) -> None:
     }
     arrays = {
         **values_by_key,
-        **{
-            f"{key}__valid": validity_by_key[key]
-            for key in sorted(values_by_key)
-        },
+        **{f"{key}__valid": validity_by_key[key] for key in sorted(values_by_key)},
     }
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -281,13 +270,14 @@ def command_partial(args: argparse.Namespace) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
-    print(json.dumps({**metadata, "output_sha256": sha256_file(output)}, sort_keys=True))
+    print(
+        json.dumps({**metadata, "output_sha256": sha256_file(output)}, sort_keys=True)
+    )
 
 
 def command_merge(args: argparse.Namespace) -> None:
     partials = sorted(
-        resolve_regular_file(path.parent, path.name)
-        for path in args.partials
+        resolve_regular_file(path.parent, path.name) for path in args.partials
     )
     metadata: list[dict[str, Any]] = []
     buffers: dict[str, list[np.ndarray]] = {}
@@ -317,15 +307,9 @@ def command_merge(args: argparse.Namespace) -> None:
                 valid_buffers.setdefault(key, []).append(valid)
     plan_hashes = {item["episode_plan_sha256"] for item in metadata}
     num_shards = {int(item["num_shards"]) for item in metadata}
-    global_budgets = {
-        int(item["global_sample_budget"]) for item in metadata
-    }
+    global_budgets = {int(item["global_sample_budget"]) for item in metadata}
     shard_ids = {int(item["shard_id"]) for item in metadata}
-    if (
-        len(plan_hashes) != 1
-        or len(num_shards) != 1
-        or len(global_budgets) != 1
-    ):
+    if len(plan_hashes) != 1 or len(num_shards) != 1 or len(global_budgets) != 1:
         raise ValueError("action-statistics partial lineage mismatch")
     expected_shards = next(iter(num_shards))
     if (
@@ -337,9 +321,7 @@ def command_merge(args: argparse.Namespace) -> None:
             f"action-statistics partials are incomplete: {sorted(shard_ids)}"
         )
     global_budget = next(iter(global_budgets))
-    maximum_total = (
-        math.ceil(global_budget / expected_shards) * expected_shards
-    )
+    maximum_total = math.ceil(global_budget / expected_shards) * expected_shards
     sampled_total = sum(int(item["sampled_rows"]) for item in metadata)
     if sampled_total > maximum_total:
         raise ValueError(

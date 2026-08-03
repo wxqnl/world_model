@@ -1,4 +1,5 @@
 """Shared configuration and code-lineage contracts for V7 native 5B."""
+
 from __future__ import annotations
 
 import json
@@ -30,12 +31,8 @@ def semantic_training_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         "schedule": config["schedule"],
         "loss": config["loss"],
         "code_receipt_sha256": config["run"]["code_receipt_sha256"],
-        "environment_contract_sha256": config["run"][
-            "environment_contract_sha256"
-        ],
-        "environment_receipt_sha256": config["run"][
-            "environment_receipt_sha256"
-        ],
+        "environment_contract_sha256": config["run"]["environment_contract_sha256"],
+        "environment_receipt_sha256": config["run"]["environment_receipt_sha256"],
         "train_semantics": {
             key: config["train"][key]
             for key in (
