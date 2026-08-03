@@ -310,7 +310,14 @@ def _resize_views(value: torch.Tensor, size: int) -> torch.Tensor:
         align_corners=False,
         antialias=True,
     )
-    return resized.reshape(frames, views, channels, size, size).div_(255.0)
+    # Antialiased interpolation can overshoot a constant uint8 image by one
+    # float32 ULP (for example 255 -> 255.00003).  Clamp after normalization
+    # so the encoder's strict [0, 1] contract remains exact.
+    return (
+        resized.reshape(frames, views, channels, size, size)
+        .div_(255.0)
+        .clamp_(0.0, 1.0)
+    )
 
 
 def _encode_segment(

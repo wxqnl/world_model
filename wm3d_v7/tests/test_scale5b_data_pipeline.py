@@ -121,6 +121,18 @@ def _contract() -> DatasetContract:
     )
 
 
+def test_encoder_resize_preserves_exact_unit_interval() -> None:
+    resize = runpy.run_path("scripts/scale5b/encode_shard.py")["_resize_views"]
+    white = torch.full(
+        (2, 3, 3, 480, 640),
+        255,
+        dtype=torch.uint8,
+    )
+    resized = resize(white, 384)
+    assert float(resized.min()) >= 0.0
+    assert float(resized.max()) <= 1.0
+
+
 def test_token_quantization_and_jpeg_pack_round_trip(tmp_path: Path) -> None:
     torch.manual_seed(2)
     value = torch.randn(5, 3, 7, 32)
