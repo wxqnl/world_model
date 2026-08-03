@@ -10,13 +10,13 @@ WM3D-V7
 
   ./run_v7.sh init [site.env]              # 生成站点配置
   ./run_v7.sh setup site.env               # 创建普通 Python venv 并安装依赖
-  ./run_v7.sh plan site.env                # 只打印将执行的完整流程
+  ./run_v7.sh plan site.env                # 打印将执行的完整流程
   ./run_v7.sh data site.env                # 下载、转换、cache、seal
   ./run_v7.sh train site.env               # 1k canary + eval，通过后提交 formal
   ./run_v7.sh eval site.env STEP_CHECKPOINT
   ./run_v7.sh all site.env                 # setup + data + train
 
-辅助命令：doctor、status。所有阶段都有不可变 receipt，可安全从已完成阶段继续。
+辅助命令：doctor、status。每个阶段都会生成 receipt，重跑时从已完成阶段继续。
 EOF
 }
 

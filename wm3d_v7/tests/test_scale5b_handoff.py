@@ -542,7 +542,7 @@ def test_planning_inventory_and_source_layouts_remain_aligned() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_root = repo_root / "configs" / "scale5b"
     inventory = yaml.safe_load(
-        (config_root / "dataset_inventory_5650h.template.yaml").read_text(
+        (config_root / "dataset_inventory_public6106h.template.yaml").read_text(
             encoding="utf-8"
         )
     )
@@ -552,12 +552,12 @@ def test_planning_inventory_and_source_layouts_remain_aligned() -> None:
     nominal_hours = sum(
         float(source["nominal_hours"]) for source in inventory["sources"]
     )
-    assert nominal_hours == pytest.approx(5_649.4)
+    assert nominal_hours == pytest.approx(6_106.4)
     assert nominal_hours == pytest.approx(
         float(inventory["notes"]["nominal_total_hours"])
     )
     layouts = json.loads(
-        (config_root / "source_layouts_5650h.template.json").read_text(encoding="utf-8")
+        (config_root / "source_layouts_public6106h.template.json").read_text(encoding="utf-8")
     )
     assert [layout["source"] for layout in layouts["layouts"]] == source_names
 
@@ -570,6 +570,9 @@ def test_data_pipeline_keeps_bootstrap_outside_formal_dataset_root() -> None:
     assert 'self.bootstrap = self.release / "dataset_bootstrap"' in pipeline
     assert 'contract = self.bootstrap / "dataset_contract.json"' in pipeline
     assert 'self.dataset / "bootstrap"' not in pipeline
+    assert "LEGACY_ROOT" not in pipeline
+    assert "LEGACY_MANIFEST_FULL" not in pipeline
+    assert "prepare_legacy_residual_manifest.py" not in pipeline
     assert "GLOBAL_SAMPLE_BUDGET" in pipeline
 
 

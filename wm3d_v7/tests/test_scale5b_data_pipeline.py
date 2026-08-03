@@ -463,66 +463,6 @@ def test_episode_input_validation_checks_parquet_width_and_video(
         validate_episode_inputs((invalid,))
 
 
-def test_legacy_residual_manifest_excludes_old_mg_by_provenance(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    module = runpy.run_path("scripts/scale5b/prepare_legacy_residual_manifest.py")
-    action_columns = (
-        ActionColumnSpec("arm", "action", (0, 1, 2, 3, 4, 5)),
-        ActionColumnSpec("gripper", "action", (6,), discrete=True),
-    )
-    rows = []
-    for index, provenance in enumerate(("droid", "robocasa365_mg")):
-        descriptor = EpisodeDescriptor(
-            source="legacy_v7_formal",
-            episode_id=f"legacy:{index}",
-            episode_index=index,
-            embodiment="single_arm_7d",
-            split="train",
-            task_text="pick",
-            raw_root=str(tmp_path),
-            data_relative_path=f"episode-{index}.parquet",
-            data_row_start=0,
-            data_row_stop=20,
-            timestamp_column="timestamp",
-            episode_column="episode_index",
-            source_fps=10.0,
-            duration_seconds=2.0,
-            views=(
-                ViewSegment("head", "head", f"head-{index}.mp4", 0.0, 2.0),
-                ViewSegment("left_hand", None, None, 0.0, 2.0),
-                ViewSegment("right_hand", None, None, 0.0, 2.0),
-            ),
-            action_columns=action_columns,
-            provenance_dataset=provenance,
-        )
-        rows.append(descriptor.as_dict())
-    source = tmp_path / "native5b_episode_manifest_full.jsonl"
-    source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    output = tmp_path / "native5b_episode_manifest.jsonl"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "prepare_legacy_residual_manifest.py",
-            "--input",
-            str(source),
-            "--output",
-            str(output),
-            "--exclude-provenance",
-            "robocasa365_mg",
-        ],
-    )
-    module["main"]()
-    result = json.loads(capsys.readouterr().out)
-    assert result["kept_episodes"] == 1
-    assert result["excluded"]["robocasa365_mg"]["episodes"] == 1
-    residual = json.loads(output.read_text(encoding="utf-8"))
-    assert residual["provenance_dataset"] == "droid"
-
-
 def test_action_statistics_global_budget_is_bounded_and_deterministic() -> None:
     module = runpy.run_path("scripts/scale5b/build_action_stats.py")
     allocate = module["_episode_sample_positions"]
@@ -1141,8 +1081,11 @@ def test_planning_templates_compile_and_bind_grouped_action_widths(
 ) -> None:
     module = runpy.run_path("scripts/scale5b/compile_dataset_contract.py")
     variable_names = (
-        "WM3D_V7_LEGACY_ROOT",
-        "ROBOCASA_FULL_ROOT",
+        "DROID_ROOT",
+        "BRIDGE_ROOT",
+        "ATOMIC_ROOT",
+        "COMPOSITE_ROOT",
+        "MG_ROOT",
         "AGIBOT_2026_IMITATION_ROOT",
         "AGIBOT_2026_RICH_ROOT",
         "AGIBOT_2026_REINFORCEMENT_ROOT",
@@ -1151,48 +1094,71 @@ def test_planning_templates_compile_and_bind_grouped_action_widths(
     for index, name in enumerate(variable_names):
         monkeypatch.setenv(name, str(tmp_path / f"source-{index}"))
     inventory = module["yaml"].safe_load(
-        Path("configs/scale5b/dataset_inventory_5650h.template.yaml").read_text(
+        Path("configs/scale5b/dataset_inventory_public6106h.template.yaml").read_text(
             encoding="utf-8"
         )
     )
     contract = DatasetContract.from_mapping(module["_expand"](inventory))
     assert len(contract.sha256) == 64
     assert contract.source_weights == {
-        "legacy_v7_formal": 10,
-        "robocasa_full": 15,
+        "droid": 14,
+        "bridge": 6,
+        "atomic": 4,
+        "composite": 8,
+        "mg": 8,
         "agibot_2026_imitation": 10,
         "agibot_2026_rich": 8,
         "agibot_2026_reinforcement": 12,
-        "agibot_beta": 45,
+        "agibot_beta": 30,
     }
     assert sum(source.nominal_hours for source in contract.sources) == pytest.approx(
-        5649.4
+        6106.4
     )
-    assert {source.adapter for source in contract.sources[2:]} == {"lerobot_collection"}
+    assert {source.adapter for source in contract.sources[:5]} == {"lerobot"}
+    assert {source.adapter for source in contract.sources[5:]} == {
+        "lerobot_collection"
+    }
 
     raw_layouts = json.loads(
-        Path("configs/scale5b/source_layouts_5650h.template.json").read_text(
+        Path("configs/scale5b/source_layouts_public6106h.template.json").read_text(
             encoding="utf-8"
         )
     )
     layouts = {item["source"]: item for item in raw_layouts["layouts"]}
     assert set(layouts) == set(contract.source_order)
-    assert layouts["legacy_v7_formal"]["forbidden_provenance_datasets"] == [
-        "robocasa365_mg"
-    ]
-    robocasa_width = sum(
-        len(item["indices"]) for item in layouts["robocasa_full"]["action_columns"]
-    )
-    agibot_width = sum(
+    assert {
+        item["column"] for item in layouts["droid"]["action_columns"]
+    } == {"action.original"}
+    assert sum(
+        len(item["indices"]) for item in layouts["bridge"]["action_columns"]
+    ) == 7
+    for source in ("atomic", "composite", "mg"):
+        assert sum(
+            len(item["indices"]) for item in layouts[source]["action_columns"]
+        ) == 12
+    assert sum(
         len(item["indices"]) for item in layouts["agibot_beta"]["action_columns"]
-    )
-    assert robocasa_width == 12
-    assert agibot_width == 22
+    ) == 22
 
     raw_lock = module["yaml"].safe_load(
         Path("configs/scale5b/raw_sources.lock.template.yaml").read_text(
             encoding="utf-8"
         )
+    )
+    assert tuple(raw_lock["sources"]) == (
+        "droid",
+        "bridge",
+        "atomic",
+        "composite",
+        "mg",
+        "agibot_world_2026_snapshot",
+        "agibot_beta_snapshot",
+        "agibot_alpha_converter_snapshot",
+    )
+    assert raw_lock["sources"]["droid"]["repo_id"] == "lerobot/droid_1.0.1"
+    assert (
+        raw_lock["sources"]["bridge"]["repo_id"]
+        == "ember-lab-berkeley/bridge_v2"
     )
     converter_source = raw_lock["sources"]["agibot_alpha_converter_snapshot"]
     assert converter_source["repo_id"] == "agibot-world/AgiBotWorld-Alpha"

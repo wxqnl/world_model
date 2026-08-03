@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-command, receipt-driven WM3D-V7 Native 5B cluster pipeline."""
+"""WM3D-V7 Native 5B 集群训练流水线。"""
 
 from __future__ import annotations
 
@@ -151,8 +151,6 @@ class Pipeline:
         self.runs = _absolute("RUNS_ROOT")
         self.logs = _absolute("LOG_ROOT")
         self.staging = _absolute("STAGING_ROOT")
-        self.legacy = _absolute("LEGACY_ROOT")
-        self.legacy_full = _absolute("LEGACY_MANIFEST_FULL")
         self.token_file = _absolute("HF_TOKEN_FILE")
         self.raw_lock = self.release / "raw_sources.lock.yaml"
         self.snapshots = self.raw / "snapshots"
@@ -298,7 +296,6 @@ class Pipeline:
                 raise PipelineError(f"缺少命令：{command}")
         if not self.dry_run:
             _regular(self.site, "site.env")
-            _regular(self.legacy_full, "LEGACY_MANIFEST_FULL")
             _safe_token(self.token_file)
             if _environment("ACCEPT_DATA_LICENSES") != YES:
                 raise PipelineError(
@@ -318,22 +315,38 @@ class Pipeline:
             "site": str(self.site),
             "world_size": self.world_size,
             "train_nodes": _integer("TRAIN_NODES"),
-            "data_plan_hours": 5649.4,
-            "architecture": "WM3D-V7 native3d, no Wan/Qwen/VLA",
+            "data_plan_hours": 6106.4,
+            "architecture": "WM3D-V7 native3d",
         }
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
 
     def lock(self) -> None:
         self.banner("冻结上游版本")
+        template_path = self.repo / "configs/scale5b/raw_sources.lock.template.yaml"
         if self.raw_lock.exists():
             value = yaml.safe_load(self.raw_lock.read_text(encoding="utf-8"))
+            template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
+            if tuple(value.get("sources", ())) != tuple(template["sources"]):
+                raise PipelineError("已有 raw lock 与当前公开数据清单不一致")
             for name, source in value["sources"].items():
                 if not re.fullmatch(r"[0-9a-f]{40}", str(source.get("revision", ""))):
                     raise PipelineError(f"已有 lock revision 非法：{name}")
+                expected = template["sources"][name]
+                for field in ("repo_id", "repo_type", "target_subdir"):
+                    if source.get(field) != expected.get(field):
+                        raise PipelineError(
+                            f"已有 raw lock 的 {name}.{field} 与模板不一致"
+                        )
             print(f"已完成：{self.raw_lock}")
             return
         overrides = {
-            "robocasa_full": _environment("ROBOCASA_REVISION", default="AUTO"),
+            "droid": _environment("DROID_REVISION", default="AUTO"),
+            "bridge": _environment("BRIDGE_REVISION", default="AUTO"),
+            "atomic": _environment("ROBOCASA_ATOMIC_REVISION", default="AUTO"),
+            "composite": _environment(
+                "ROBOCASA_COMPOSITE_REVISION", default="AUTO"
+            ),
+            "mg": _environment("ROBOCASA_MG_REVISION", default="AUTO"),
             "agibot_world_2026_snapshot": _environment(
                 "AGIBOT_2026_REVISION", default="AUTO"
             ),
@@ -348,7 +361,7 @@ class Pipeline:
             self.python,
             self.repo / "scripts/scale5b/resolve_source_lock.py",
             "--template",
-            self.repo / "configs/scale5b/raw_sources.lock.template.yaml",
+            template_path,
             "--output",
             self.raw_lock,
             "--token-file",
@@ -361,7 +374,7 @@ class Pipeline:
         self.command(command, env=self.secret_env())
 
     def download(self) -> None:
-        self.banner("下载四个不可变数据快照")
+        self.banner("下载公开数据快照")
         if not self.raw_lock.exists() and not self.dry_run:
             self.lock()
         self.command(
@@ -512,7 +525,11 @@ class Pipeline:
 
     def _schema_audits(self) -> None:
         inputs = {
-            "robocasa": (self.snapshots / "robocasa_full", False),
+            "droid": (self.snapshots / "droid", False),
+            "bridge": (self.snapshots / "bridge", False),
+            "robocasa_atomic": (self.snapshots / "atomic", False),
+            "robocasa_composite": (self.snapshots / "composite", False),
+            "robocasa_mg": (self.snapshots / "mg", False),
             "agibot2026_imitation": (
                 self.materialized / "agibot2026_imitation",
                 True,
@@ -578,32 +595,25 @@ class Pipeline:
         self._extract_collection("ReinforcementLearning", "agibot2026_reinforcement")
         self._prepare_beta()
         self._schema_audits()
-        residual = self.legacy / "native5b_episode_manifest.jsonl"
-        if not residual.exists():
-            self.python_command(
-                "scripts/scale5b/prepare_legacy_residual_manifest.py",
-                "--input",
-                self.legacy_full,
-                "--output",
-                residual,
-                "--exclude-provenance",
-                "robocasa365_mg",
-            )
         self._prepare_assets()
         contract = self.bootstrap / "dataset_contract.json"
         if not contract.exists():
             self.python_command(
                 "scripts/scale5b/compile_dataset_contract.py",
                 "--inventory",
-                self.repo / "configs/scale5b/dataset_inventory_5650h.template.yaml",
+                self.repo
+                / "configs/scale5b/dataset_inventory_public6106h.template.yaml",
                 "--output",
                 contract,
             )
         source_receipt = self.dataset / "receipts/source_scan.json"
         if not source_receipt.exists():
             environment = {
-                "WM3D_V7_LEGACY_ROOT": str(self.legacy),
-                "ROBOCASA_FULL_ROOT": str(self.snapshots / "robocasa_full"),
+                "DROID_ROOT": str(self.snapshots / "droid"),
+                "BRIDGE_ROOT": str(self.snapshots / "bridge"),
+                "ATOMIC_ROOT": str(self.snapshots / "atomic"),
+                "COMPOSITE_ROOT": str(self.snapshots / "composite"),
+                "MG_ROOT": str(self.snapshots / "mg"),
                 "AGIBOT_2026_IMITATION_ROOT": str(
                     self.materialized / "agibot2026_imitation"
                 ),
@@ -620,7 +630,8 @@ class Pipeline:
                     "--dataset-contract",
                     contract,
                     "--source-layouts",
-                    self.repo / "configs/scale5b/source_layouts_5650h.template.json",
+                    self.repo
+                    / "configs/scale5b/source_layouts_public6106h.template.json",
                     "--output-root",
                     self.dataset,
                 ],

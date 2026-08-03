@@ -1,191 +1,279 @@
 # WM3D-V7
 
-本分支只维护 **WM3D-V7 原生 3D 世界模型**的预训练代码。模型在线部分不依赖
-Wan、Qwen、VLA 或 V8；VGGT 和文本编码器只在离线 cache 阶段生成观测证据。
-训练、恢复和评测都只认带 `COMMITTED.json` 的编号 checkpoint。
+WM3D-V7 是原生 3D 世界模型。模型在显式时空 3D lattice 上联合预测未来 RGB、depth、
+point、camera 和 grouped action。仓库提供从公开数据下载、数据转换、离线 cache、
+分布式预训练到 checkpoint 评测的完整流程。
 
-仓库只有一个公开入口：`wm3d_v7/run_v7.sh`。下面的 5B/H200 配方是 V7 的一个
-大规模示例，不代表 V7 只能训练 5B。
+入口脚本是 `wm3d_v7/run_v7.sh`。默认配方为约 4.96B 参数、64 或 128 张 H200；
+模型规模、数据清单和训练步数都由配置文件定义。
 
-## 从一台新服务器开始
+## 从新集群开始
 
-### 1. 系统前置条件
+### 1. 集群条件
 
-- Linux x86_64，Python 3.10；
-- NVIDIA driver 能运行 CUDA 12.8 wheel，计算节点有 H200/NVLink；
-- Slurm 命令 `sbatch`、`srun`、`scontrol`；
+- Linux x86_64 与 Python 3.10；
+- 每节点 8 张 H200 SXM，节点内 NVLink；
+- Slurm：`sbatch`、`srun`、`scontrol`；
 - `git`、`curl`、`ffmpeg`；
-- 节点间共享存储与 400 Gb/s InfiniBand；
-- Hugging Face 账号已接受 AgiBot Alpha/Beta 的数据许可。
+- 所有节点可访问同一共享存储；
+- 训练节点间建议使用 400 Gb/s InfiniBand；
+- Hugging Face 账号已取得 AgiBot Alpha/Beta 的访问权限。
 
-不需要 Docker、Conda 或 micromamba。脚本会创建两个普通 venv：主训练环境和
-AgiBot 官方转换器环境，后者单独隔离是为了避免旧版 LeRobot 依赖污染训练环境。
+推荐准备 200 TB 可用空间，其中 80–100 TB 为训练期间的高速热层。64 张 H200
+可以运行该配方；128 张 H200 是正式推荐拓扑。
 
-如果集群访问官方 PyPI 很慢，可以只在安装命令前临时指定站点镜像；锁文件中的版本
-和 wheel SHA 校验仍然生效：
-
-```bash
-PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple ./run_v7.sh setup site.env
-```
-
-### 2. 克隆并生成站点配置
+### 2. 克隆代码
 
 ```bash
 git clone --branch v7 --single-branch --filter=blob:none \
   https://github.com/wxqnl/world_model.git
 cd world_model/wm3d_v7
+```
 
+### 3. 创建 Hugging Face token 文件
+
+先在 Hugging Face 网页接受 AgiBot Alpha/Beta 的许可。随后把 read token 写入一个
+权限为 0600 的文件：
+
+```bash
+install -d -m 700 /shared/secrets
+umask 077
+read -rsp "Hugging Face token: " HF_TOKEN
+printf '%s\n' "$HF_TOKEN" > /shared/secrets/huggingface_token
+unset HF_TOKEN
+chmod 600 /shared/secrets/huggingface_token
+```
+
+token 只从该文件读取，不会写入 source lock、Slurm 参数或训练日志。
+
+### 4. 生成站点配置并安装环境
+
+```bash
 ./run_v7.sh init site.env
 ```
 
-编辑 `site.env` 中标为“必填”的项目：
+编辑 `site.env`：
 
-- `WORK_ROOT`：共享高速存储根目录；
-- `LEGACY_ROOT`：现有 V7 formal 数据根目录；
-- `LEGACY_MANIFEST_FULL`：现有 V7 全量 episode manifest；
-- `HF_TOKEN_FILE`：只含一行 token 的普通文件，执行 `chmod 600`；
-- `SLURM_PARTITION` / `SLURM_ACCOUNT`；
-- 接受许可后将 `ACCEPT_DATA_LICENSES=YES`。
+```bash
+WORK_ROOT=/shared/wm3d_v7_native5b
+HF_TOKEN_FILE=/shared/secrets/huggingface_token
+SLURM_PARTITION=h200
+SLURM_ACCOUNT=your_account
+ACCEPT_DATA_LICENSES=YES
+```
 
-先检查站点参数，再运行全流程：
+`WORK_ROOT` 必须位于所有计算节点可见的共享存储。环境安装使用 Python 3.10 venv，
+依赖版本由 `environments/scale5b/requirements.lock` 固定：
 
 ```bash
 ./run_v7.sh setup site.env
-./run_v7.sh plan site.env       # 只打印完整命令，不下载、不提交任务
 ./run_v7.sh doctor site.env
-./run_v7.sh data site.env
-./run_v7.sh train site.env
 ```
 
-也可以一条命令执行以上过程：
+PyPI 访问较慢时，可以为安装命令指定镜像：
+
+```bash
+PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
+  ./run_v7.sh setup site.env
+```
+
+## 公开数据清单
+
+基础数据全部从公开仓库下载。当前 5B 配方包含以下数据：
+
+| source | Hugging Face 数据集 | 规划时长 | 下载后目录 |
+|---|---|---:|---|
+| DROID | [`lerobot/droid_1.0.1`](https://huggingface.co/datasets/lerobot/droid_1.0.1) | 约 350 h | `raw/snapshots/droid` |
+| Bridge V2 | [`ember-lab-berkeley/bridge_v2`](https://huggingface.co/datasets/ember-lab-berkeley/bridge_v2) | 约 100 h | `raw/snapshots/bridge` |
+| RoboCasa365 Atomic | [`robocasa365-pretrain-atomic`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-atomic) | 约 21 h | `raw/snapshots/atomic` |
+| RoboCasa365 Composite | [`robocasa365-pretrain-composite`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-composite) | 约 383 h | `raw/snapshots/composite` |
+| RoboCasa365 MG | [`robocasa365-pretrain-mg`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-mg) | 约 1,615 h | `raw/snapshots/mg` |
+| AgiBotWorld2026 真机数据 | [`agibot-world/AgiBotWorld2026`](https://huggingface.co/datasets/agibot-world/AgiBotWorld2026) | 约 661 h | `raw/snapshots/agibot_world_2026_snapshot` |
+| AgiBotWorld Beta | [`agibot-world/AgiBotWorld-Beta`](https://huggingface.co/datasets/agibot-world/AgiBotWorld-Beta) | 2,976.4 h | `raw/snapshots/agibot_beta_snapshot` |
+
+规划总量约 **6,106.4 小时**。AgiBotWorld2026 的 Imitation Learning、Rich
+Interaction 和 Reinforcement Learning 真机部分进入训练，Simulation 不在当前配方中。
+AgiBot Alpha 快照只提供 Beta 官方转换器。
+
+DROID、Bridge、Atomic、Composite、MG 延续 V7 五路数据定义。它们在总采样周期中
+占 40%，内部相对比例保持 35/15/10/20/20；AgiBot 数据占 60%。精确权重位于
+`configs/scale5b/dataset_inventory_public6106h.template.yaml`。
+
+### 下载、转换和 cache
+
+一条命令完成公开快照下载和全部数据处理：
+
+```bash
+./run_v7.sh data site.env
+```
+
+该命令执行：
+
+1. 查询每个 Hugging Face 仓库的 40 位 commit SHA；
+2. 写入 `WORK_ROOT/release/raw_sources.lock.yaml`；
+3. 断点下载八个不可变快照，其中一份包含官方转换器；
+4. 安全解包 AgiBotWorld2026，转换 AgiBot Beta；
+5. 审计每个 LeRobot source 的 RGB、action、时间戳和 episode schema；
+6. 生成统一 episode plan 与 embodiment-aware grouped action；
+7. 统计 action 分布，生成 task cache 和 VGGT 3D cache；
+8. 合并 shard，检查缺失、重复和覆盖率，发布 dataset seal。
+
+单独下载或续传某个 source 时，先生成 lock，再指定 source：
+
+```bash
+./run_v7.sh plan site.env
+source site.env
+
+"$PYTHON_BIN" scripts/scale5b/pipeline_native5b.py \
+  lock --site "$PWD/site.env"
+
+"$PYTHON_BIN" scripts/scale5b/download_raw_snapshots.py \
+  --lock "$RELEASE_ROOT/raw_sources.lock.yaml" \
+  --raw-root "$RAW_ROOT/snapshots" \
+  --source droid \
+  --resume
+```
+
+`--source` 可取 `droid`、`bridge`、`atomic`、`composite`、`mg`、
+`agibot_world_2026_snapshot`、`agibot_beta_snapshot` 或
+`agibot_alpha_converter_snapshot`。
+
+处理完成后的关键目录：
+
+```text
+WORK_ROOT/
+├── raw/
+│   ├── snapshots/       # 绑定 commit SHA 的公开原始快照
+│   └── materialized/    # AgiBot 解包和转换结果
+├── datasets/
+│   ├── v7_native5b_public6106h_v1/
+│   │   ├── control/     # dataset contract、episode plan、采样和 action 统计
+│   │   ├── shards/      # 训练 cache
+│   │   └── receipts/    # source scan、worker 和 dataset seal
+│   └── v7_native5b_encoder_assets_v1/
+├── release/             # source lock、代码与环境 receipt、物化配置
+├── runs/                # checkpoint
+└── logs/
+```
+
+正式训练以
+`WORK_ROOT/datasets/v7_native5b_public6106h_v1/receipts/dataset_seal.json`
+为数据入口。规划小时数用于容量估算；source scan 和 dataset seal 中的实测帧数与时长
+是正式统计。
+
+## Pipeline
+
+```mermaid
+flowchart LR
+  A["setup：Python 3.10 venv"] --> B["lock：冻结公开数据 revision"]
+  B --> C["download：断点下载"]
+  C --> D["prepare：转换、schema、episode plan"]
+  D --> E["cache：action、task、VGGT"]
+  E --> F["seal：完整性与去重"]
+  F --> G["1k canary"]
+  G --> H["RGB、depth、point、action eval"]
+  H --> I["formal training"]
+```
+
+查看完整命令而不提交任务：
+
+```bash
+./run_v7.sh plan site.env
+```
+
+从环境安装一路运行到正式训练：
 
 ```bash
 ./run_v7.sh all site.env
 ```
 
-`train` 会先等待 1,000-step 全拓扑 canary 和显式 RGB/depth/point/action eval
-通过，再异步提交正式训练，不会跳过 canary。查看状态：
+也可以分阶段执行：
 
 ```bash
+./run_v7.sh setup site.env
+./run_v7.sh data site.env
+./run_v7.sh train site.env
 ./run_v7.sh status site.env
 ```
 
-## 数据会下载和处理什么
+每个阶段发布 receipt。相同命令会验证已有结果并续传缺失 shard。训练恢复只选择带
+`COMMITTED.json` 的最高编号 checkpoint。
 
-`./run_v7.sh data site.env` 会依次完成版本冻结、断点下载、安全解包、AgiBot 转换、
-schema 审计、action 统计、任务文本 cache、VGGT cache、全量 merge 和 dataset seal。
-上游浮动分支只在首次运行时解析一次，之后全部绑定到 40 位 commit SHA。
+## 5B 配方
 
-| 数据 | 获取方式 | 规划大小 | 规划时长 |
-|---|---|---:|---:|
-| 现有 V7 residual | 从项目内部存储复制 | 依站点现状 | 约 397 h |
-| RoboCasa365 full MG | 脚本从 HF 下载 | 约 315 GB | 约 1,615 h |
-| AgiBotWorld2026 真机部分 | 脚本从 HF 下载 | 约 10.7 TB 有效载荷 | 约 661 h |
-| AgiBotWorld Beta | 脚本从 HF 下载并转换 | 约 48.1 TB | 2,976.4 h |
-| AgiBot Alpha 转换器 | 只下载固定转换脚本 | 很小 | 不计训练时长 |
+配置文件：
 
-规划总量约 **5,649.4 h**。小时数只用于采购；最终以 source scan 和 dataset seal
-中的实测帧数为准。AgiBotWorld2026 的 simulation 默认排除。旧 V7 中约 98 h 的
-RoboCasa 40k 子集会从 residual manifest 剔除，再用 full MG 替换，避免重复计数。
+- `configs/scale5b/wm3d_v7_native5b_h200.template.yaml`
+- `configs/scale5b/wm3d_v7_native5b_h200_canary1k.template.yaml`
+- `configs/examples/v7_native5b_h200.env`
 
-现有 V7 residual 是唯一不能由公开下载器重建的输入，因为其来源和许可由项目内部
-维护。新集群必须先复制 `LEGACY_ROOT` 与 `LEGACY_MANIFEST_FULL`；缺失时 pipeline
-会直接报错，不会悄悄缩小数据集。
+核心时空参数：
 
-推荐空间：至少 100 TB 当前可用；正式 5,000–8,000 h 方案准备 200 TB usable，
-其中 80–100 TB 为 NVMe 热层。原始下载、转换副本、cache、checkpoint 和失败临时目录
-都要计入容量。
-
-## Pipeline 的实际顺序
-
-```mermaid
-flowchart LR
-  A["setup：两个 Python 3.10 venv"] --> B["lock/download：冻结并下载数据"]
-  B --> C["prepare：转换、schema、episode plan"]
-  C --> D["cache：action/task/VGGT shards"]
-  D --> E["seal：完整性、去重、覆盖率"]
-  E --> F["1k canary"]
-  F --> G["RGB/depth/point/action eval"]
-  G --> H["formal training"]
-```
-
-每一阶段都写不可变 receipt。中断后重新运行相同命令，只会验证已完成阶段并补齐缺失
-shard；不会覆盖已有 shard。训练恢复只选择最高的完整编号 checkpoint，不读取
-`latest`。
-
-## 5B/H200 示例配置
-
-站点示例在 `wm3d_v7/configs/examples/v7_native5b_h200.env`，训练模板由入口脚本内部
-选择。推荐 16×8 H200，最低 8×8 H200；默认 BF16、FSDP2、逐层 activation
-checkpoint、分片 optimizer/checkpoint。
-
-| 参数 | 5B 示例 | 原因 |
+| 参数 | 值 | 设计目的 |
 |---|---:|---|
-| `T` | 24 | 5 Hz 下 4.8 秒上下文，覆盖更多接触前因 |
-| `P` | 144 | 每帧 12×12 原生空间格，改善小物体和边缘 |
-| `K` | 16 | 显式预测未来 3.2 秒，不局限 K=8 |
-| 外部 token `D` | 2048 | 与 VGGT/cache 接口一致，避免无信息的 I/O 膨胀 |
-| state hidden/layers | 2560 / 32 | 主要容量放在原生世界状态动力学 |
-| action hidden/layers | 2048 / 24 | action 是独立动力学主干，不是小型末端 head |
-| state↔action bridge | 10 层 | 世界状态与动作在深层反复交互 |
+| `T` | 24 | 5 Hz 下使用 4.8 秒历史 |
+| `P` | 144 | 每帧 12×12 原生空间格 |
+| `K` | 16 | 显式预测未来 3.2 秒 |
+| 外部 token `D` | 2048 | 对齐 VGGT/cache 接口 |
+| state hidden/layers | 2560 / 32 | 承载 RGB、depth、point、camera 的世界状态动力学 |
+| action hidden/layers | 2048 / 24 | 建模多 embodiment、可变维 grouped action |
+| state↔action bridge | 10 层 | 在深层交换世界状态与动作信息 |
 
-精确参数总数是 **4,956,589,929**：
+模型精确参数量为 **4,956,589,929**：
 
 | 模块 | 参数量 | 占比 |
 |---|---:|---:|
-| 原生 world state trunk | 3,250,831,360 | 65.5860% |
+| world state trunk | 3,250,831,360 | 65.5860% |
 | grouped-action trunk | 1,195,474,944 | 24.1189% |
-| 10 个 state↔action bridge | 424,719,360 | 8.5688% |
+| state↔action bridge | 424,719,360 | 8.5688% |
 | 接口、memory、位置与 query | 55,055,872 | 1.1108% |
 | 三视角 fuser | 16,783,360 | 0.3386% |
-| 显式 RGB head | 9,357,443 | 0.1888% |
+| RGB head | 9,357,443 | 0.1888% |
 | depth/point/camera/confidence head | 3,959,840 | 0.0799% |
-| 动作分布 head | 407,750 | 0.0082% |
+| action distribution head | 407,750 | 0.0082% |
 
-约 65.6% 参数给 state trunk，是为了让 RGB、depth、point 和 camera 共享同一个未来
-原生 3D state；约 24.1% 给 action trunk，使双臂、夹爪、底盘、腰和头部动作拥有真正
-的时序动力学。5B 示例不是视频生成器，也不是在 VLM 上接 action head。
-
-`(T+K)×P = 5,760` 个位置不会使用全局 dense attention：每层采用帧内空间 attention
-和同 patch 因果时间 attention，并通过低频 memory 承载 30–60 秒历史。这既保留
-显式时空 lattice，也避免 `5,760²` 的计算量。
+约 65.6% 参数用于 world state trunk，约 24.1% 用于 action trunk。RGB、depth、
+point 和 camera 共享未来原生 3D state，动作则由独立时序主干建模。长度
+`(T+K)×P = 5,760` 的 lattice 使用帧内空间 attention、同 patch 因果时间
+attention 和低频 memory。
 
 复核参数预算：
 
 ```bash
-cd world_model/wm3d_v7
 source site.env
 export PYTHONPATH="$PWD"
 "$PYTHON_BIN" scripts/scale5b/report_parameter_budget.py \
   --config configs/scale5b/wm3d_v7_native5b_h200.template.yaml
 ```
 
-## 如何判断训练是正确的
+## 训练与评测
 
-1. `data` 结束后必须存在 `DATASET_ROOT/receipts/dataset_seal.json`；
-2. canary 必须自然生成 `checkpoints/step_00001000/COMMITTED.json`；
-3. eval 的 `report.json` 中所有指标 finite，RGB/depth/point/action 监督覆盖率非零；
-4. `rgb_target_top_prediction_bottom.png` 上排是真值、下排是预测，用于发现黑图、常量图
-   和明显模糊；
-5. 只有以上检查通过，入口脚本才会提交正式训练。
+`./run_v7.sh train site.env` 先运行 1,000-step 全拓扑 canary。canary 完成后执行
+RGB、depth、point 和 action eval；门禁通过后提交正式训练。
 
-对任意完整 checkpoint 手工评测：
+对任意完整 checkpoint 运行评测：
 
 ```bash
 ./run_v7.sh eval site.env \
   /shared/wm3d_v7_native5b/runs/RUN/checkpoints/step_XXXXXXXX
 ```
 
-这里的 eval 是正确性门禁，不冒充最终 benchmark。模型优劣需要在固定验证集上比较
-RGB PSNR/边缘频谱、depth/point 误差、action NLL 与机器人闭环成功率。
+正确性检查包括：
 
-## 常见失败
+- checkpoint 目录包含 `COMMITTED.json`；
+- eval `report.json` 中所有指标 finite；
+- RGB、depth、point、action 的监督覆盖率非零；
+- `rgb_target_top_prediction_bottom.png` 上排为真值、下排为预测；
+- checkpoint 绑定同一份 dataset seal、代码 receipt、环境 receipt 和 run lineage。
 
-- `site.env 缺少 ...`：补全示例配置中的必填值；
+固定验证集可用于比较 RGB PSNR 与边缘频谱、depth/point 误差、action NLL。机器人
+闭环成功率由下游 benchmark 单独评估。
+
+## 常用排查
+
+- `site.env 缺少 ...`：补全站点配置中的必填值；
 - `HF_TOKEN_FILE 权限`：执行 `chmod 600 TOKEN_FILE`；
-- `revision 漂移`：不要手改已生成 lock，换新 `WORK_ROOT` 重新冻结；
-- `已有但没有 receipt`：保留现场，检查失败 shard 后重跑同一命令；
-- `No space` 或 preflight 失败：扩容后重跑，不降低安全门槛。
-
-内部脚本保留在 `scripts/scale5b/` 是因为它们实现当前 5B 示例；使用者不需要逐个调用。
-日常只使用 `run_v7.sh`、一个 `site.env` 和明确编号 checkpoint。
+- `revision 漂移`：检查 `release/raw_sources.lock.yaml` 与当前模板；
+- `已有目录但没有 receipt`：保留目录并用同一命令加 `--resume`；
+- `No space`：扩容共享存储后继续相同阶段；
+- Slurm 任务状态：`./run_v7.sh status site.env`。

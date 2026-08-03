@@ -5,13 +5,52 @@
       "schema": "wm3d_v7_native5b_source_layout_v1",
       "timestamp_column": "timestamp",
       "episode_column": "episode_index",
-      "source": "legacy_v7_formal",
-      "adapter": "normalized_manifest",
-      "embodiment": "single_arm_7d",
+      "source": "droid",
+      "adapter": "lerobot",
+      "embodiment": "droid_cartesian_7d",
       "view_keys": {
-        "head": "head",
-        "left_hand": "left_hand",
-        "right_hand": null
+        "head": "observation.images.exterior_1_left",
+        "left_hand": "observation.images.wrist_left",
+        "right_hand": "observation.images.exterior_2_left"
+      },
+      "action_columns": [
+        {
+          "group_name": "arm",
+          "column": "action.original",
+          "indices": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        {
+          "group_name": "gripper",
+          "column": "action.original",
+          "indices": [
+            6
+          ],
+          "discrete": true
+        }
+      ],
+      "auxiliary_columns": [],
+      "task_column": "task_index",
+      "default_task": "robot manipulation",
+      "provenance_dataset": "lerobot/droid_1.0.1"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "source": "bridge",
+      "adapter": "lerobot",
+      "embodiment": "bridge_widowx_7d",
+      "view_keys": {
+        "head": "observation.images.primary",
+        "left_hand": "observation.images.wrist",
+        "right_hand": "observation.images.side1"
       },
       "action_columns": [
         {
@@ -38,16 +77,139 @@
       "auxiliary_columns": [],
       "task_column": "task_index",
       "default_task": "robot manipulation",
-      "normalized_manifest_path": "native5b_episode_manifest.jsonl",
-      "forbidden_provenance_datasets": [
-        "robocasa365_mg"
-      ]
+      "provenance_dataset": "ember-lab-berkeley/bridge_v2"
     },
     {
       "schema": "wm3d_v7_native5b_source_layout_v1",
       "timestamp_column": "timestamp",
       "episode_column": "episode_index",
-      "source": "robocasa_full",
+      "source": "atomic",
+      "adapter": "lerobot",
+      "embodiment": "robocasa_panda_omron_12d",
+      "view_keys": {
+        "head": "observation.images.robot0_agentview_left",
+        "left_hand": "observation.images.robot0_eye_in_hand",
+        "right_hand": "observation.images.robot0_agentview_right"
+      },
+      "action_columns": [
+        {
+          "group_name": "base_motion",
+          "column": "action",
+          "indices": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "group_name": "control_mode",
+          "column": "action",
+          "indices": [
+            4
+          ],
+          "discrete": true
+        },
+        {
+          "group_name": "arm_translation",
+          "column": "action",
+          "indices": [
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "group_name": "arm_rotation",
+          "column": "action",
+          "indices": [
+            8,
+            9,
+            10
+          ]
+        },
+        {
+          "group_name": "gripper",
+          "column": "action",
+          "indices": [
+            11
+          ],
+          "discrete": true
+        }
+      ],
+      "auxiliary_columns": [],
+      "task_column": "task_index",
+      "default_task": "robot manipulation",
+      "provenance_dataset": "ember-lab-berkeley/robocasa365-pretrain-atomic"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "source": "composite",
+      "adapter": "lerobot",
+      "embodiment": "robocasa_panda_omron_12d",
+      "view_keys": {
+        "head": "observation.images.robot0_agentview_left",
+        "left_hand": "observation.images.robot0_eye_in_hand",
+        "right_hand": "observation.images.robot0_agentview_right"
+      },
+      "action_columns": [
+        {
+          "group_name": "base_motion",
+          "column": "action",
+          "indices": [
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "group_name": "control_mode",
+          "column": "action",
+          "indices": [
+            4
+          ],
+          "discrete": true
+        },
+        {
+          "group_name": "arm_translation",
+          "column": "action",
+          "indices": [
+            5,
+            6,
+            7
+          ]
+        },
+        {
+          "group_name": "arm_rotation",
+          "column": "action",
+          "indices": [
+            8,
+            9,
+            10
+          ]
+        },
+        {
+          "group_name": "gripper",
+          "column": "action",
+          "indices": [
+            11
+          ],
+          "discrete": true
+        }
+      ],
+      "auxiliary_columns": [],
+      "task_column": "task_index",
+      "default_task": "robot manipulation",
+      "provenance_dataset": "ember-lab-berkeley/robocasa365-pretrain-composite"
+    },
+    {
+      "schema": "wm3d_v7_native5b_source_layout_v1",
+      "timestamp_column": "timestamp",
+      "episode_column": "episode_index",
+      "source": "mg",
       "adapter": "lerobot",
       "embodiment": "robocasa_panda_omron_12d",
       "view_keys": {

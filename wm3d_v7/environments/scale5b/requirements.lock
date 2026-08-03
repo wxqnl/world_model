@@ -1,5 +1,5 @@
 # WM3D-V7 的 x86_64 / CPython 3.10 固定依赖。
-# run_v7.sh setup 会在普通 venv 中安装；无需 Docker 或 micromamba。
+# run_v7.sh setup 会在 Python 3.10 venv 中安装这些固定版本。
 absl-py==2.4.0
 accelerate==1.13.0
 annotated-doc==0.0.4
