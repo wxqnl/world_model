@@ -15,8 +15,10 @@ WM3D-V7
   ./run_v7.sh train site.env               # 1k canary + eval，通过后提交 formal
   ./run_v7.sh eval site.env STEP_CHECKPOINT
   ./run_v7.sh all site.env                 # setup + data + train
+  ./run_v7.sh smoke /abs/work-root         # 少量公开数据，2 卡真实 5B 全流程
 
 辅助命令：doctor、status。每个阶段都会生成 receipt，重跑时从已完成阶段继续。
+smoke 默认只使用当前机器 GPU0–1，不需要 site.env，不会提交 Slurm 任务。
 EOF
 }
 
@@ -37,6 +39,14 @@ if [[ "${action}" == "init" ]]; then
   echo "已生成 ${target}。填写标有“必填”的项目后运行："
   echo "  ./run_v7.sh all ${target}"
   exit 0
+fi
+
+if [[ "${action}" == "smoke" ]]; then
+  if [[ $# -ne 2 || "$2" != /* ]]; then
+    echo "用法：./run_v7.sh smoke /abs/work-root" >&2
+    exit 2
+  fi
+  exec "${ROOT}/scripts/scale5b/run_public_smoke.sh" "$2"
 fi
 
 if [[ $# -lt 2 ]]; then

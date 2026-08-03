@@ -98,7 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-config", type=Path, required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--run-lineage", required=True)
-    parser.add_argument("--world-size", type=int, choices=(64, 128), default=128)
+    parser.add_argument("--world-size", type=int, choices=(2, 64, 128), default=128)
+    parser.add_argument(
+        "--smoke-confirmation",
+        default="",
+        help="Required only for the isolated 2-GPU public smoke template.",
+    )
     parser.add_argument("--shard-degree", type=int, default=8)
     parser.add_argument("--global-batch-size", type=int, default=128)
     parser.add_argument("--micro-batch-size", type=int, default=1)
@@ -111,6 +116,12 @@ def main() -> None:
         raise ValueError("run-lineage must be an explicit lowercase SHA-256")
     if not RUN_NAME_RE.fullmatch(args.run_name):
         raise ValueError("run-name must be a canonical lowercase run identity")
+    if args.world_size == 2 and args.smoke_confirmation != (
+        "EXECUTE_V7_NATIVE5B_PUBLIC_SMOKE"
+    ):
+        raise ValueError("2-GPU topology requires the exact smoke confirmation")
+    if args.world_size != 2 and args.smoke_confirmation:
+        raise ValueError("smoke confirmation is forbidden for formal topology")
     if args.world_size % args.shard_degree:
         raise ValueError("world-size must be divisible by shard-degree")
     denominator = args.world_size * args.micro_batch_size
@@ -120,6 +131,13 @@ def main() -> None:
     _template_path, config = _load_regular_yaml(args.template)
     if config.get("schema") != TRAIN_CONFIG_SCHEMA:
         raise ValueError("training template schema mismatch")
+    if args.world_size == 2:
+        if "smoke" not in _template_path.name:
+            raise ValueError("2-GPU topology accepts only an explicit smoke template")
+        if int(config.get("train", {}).get("total_steps", 0)) > 2:
+            raise ValueError("small-topology smoke may run at most two optimizer steps")
+        if not bool(config.get("model", {}).get("activation_checkpointing")):
+            raise ValueError("small-topology smoke requires activation checkpointing")
     dataset_root = _real_directory(args.dataset_root, "dataset root")
     contract_relative = "control/dataset_contract.json"
     receipt_relative = "receipts/dataset_seal.json"

@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+if [[ $# -ne 1 || "$1" != /* ]]; then
+  echo "用法：$0 /abs/work-root" >&2
+  exit 2
+fi
+
+WORK_INPUT="$1"
+if [[ -L "${WORK_INPUT}" ]]; then
+  echo "work-root 不能是符号链接：${WORK_INPUT}" >&2
+  exit 2
+fi
+mkdir -p -- "${WORK_INPUT}"
+WORK_ROOT="$(realpath -e -- "${WORK_INPUT}")"
+if [[ ! -d "${WORK_ROOT}" || -L "${WORK_ROOT}" ]]; then
+  echo "work-root 必须是真实目录：${WORK_ROOT}" >&2
+  exit 2
+fi
+
+DEVICES="${WM3D_SMOKE_CUDA_DEVICES:-0,1}"
+EXPECTED_IP="${WM3D_SMOKE_EXPECTED_IP:-172.27.0.5}"
+if [[ "${DEVICES}" != "0,1" ]]; then
+  echo "本 smoke 固定使用 node42 GPU0–1，当前为 ${DEVICES}" >&2
+  exit 2
+fi
+WORLD_SIZE=2
+VGGT_SOURCE_COMMIT=a288dd0f14786c93483e45524328726ab7b1b4ce
+VGGT_REVISION=860abec7937da0a4c03c41d3c269c366e82abdf9
+TASK_REVISION=52e6cc877548ebd0de720a7fe86177f8a5593a673f40162aa9006a3877fa97c1
+
+export REPO_ROOT="${ROOT}"
+export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHON_BIN="${WORK_ROOT}/venv/bin/python"
+export TRAIN_ENV_RECEIPT="${WORK_ROOT}/venv/environment_receipt.json"
+export HF_HOME="${HF_HOME:-${WORK_ROOT}/hf_home}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${WORK_ROOT}/pip_cache}"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+mkdir -p -- "${HF_HOME}" "${PIP_CACHE_DIR}" "${WORK_ROOT}/logs" \
+  "${WORK_ROOT}/release" "${WORK_ROOT}/raw" "${WORK_ROOT}/build" \
+  "${WORK_ROOT}/receipts"
+
+echo "[1/10] 创建并核验固定 Python 环境"
+SYSTEM_PYTHON="${SYSTEM_PYTHON:-python3.10}" \
+  "${ROOT}/environments/scale5b/bootstrap_environment.sh"
+PY="${PYTHON_BIN}"
+TORCHRUN="${WORK_ROOT}/venv/bin/torchrun"
+
+echo "[2/10] 下载固定 revision 的 91 MB ALOHA 公开样本"
+"${PY}" "${ROOT}/scripts/scale5b/download_raw_snapshots.py" \
+  --lock "${ROOT}/configs/scale5b/raw_sources_smoke_aloha.lock.yaml" \
+  --raw-root "${WORK_ROOT}/raw" --source aloha_smoke --resume
+export ALOHA_SMOKE_ROOT="${WORK_ROOT}/raw/aloha_smoke"
+
+DATASET_ROOT="${WORK_ROOT}/dataset"
+CONTRACT_BUILD="${WORK_ROOT}/build/dataset_contract.json"
+if [[ ! -f "${DATASET_ROOT}/receipts/source_scan.json" ]]; then
+  echo "[3/10] 编译数据契约并扫描 train/val episode"
+  if [[ ! -f "${CONTRACT_BUILD}" ]]; then
+    "${PY}" "${ROOT}/scripts/scale5b/compile_dataset_contract.py" \
+      --inventory "${ROOT}/configs/scale5b/dataset_inventory_smoke_aloha.yaml" \
+      --output "${CONTRACT_BUILD}"
+  fi
+  "${PY}" "${ROOT}/scripts/scale5b/scan_sources.py" \
+    --dataset-contract "${CONTRACT_BUILD}" \
+    --source-layouts "${ROOT}/configs/scale5b/source_layouts_smoke_aloha.json" \
+    --output-root "${DATASET_ROOT}"
+fi
+
+if [[ ! -f "${DATASET_ROOT}/control/action_stats.json" ]]; then
+  echo "[4/10] 统计 grouped action"
+  PARTIAL="${WORK_ROOT}/build/action_stats_00000.npz"
+  if [[ ! -f "${PARTIAL}" ]]; then
+    "${PY}" "${ROOT}/scripts/scale5b/build_action_stats.py" partial \
+      --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
+      --output "${PARTIAL}" --shard-id 0 --num-shards 1 \
+      --global-sample-budget 25000
+  fi
+  "${PY}" "${ROOT}/scripts/scale5b/build_action_stats.py" merge \
+    --partials "${PARTIAL}" \
+    --output "${DATASET_ROOT}/control/action_stats.json"
+fi
+
+echo "[5/10] 准备固定 VGGT 资产和 smoke task bank"
+VGGT_SOURCE="${WORK_ROOT}/assets_source/vggt"
+if [[ ! -d "${VGGT_SOURCE}/.git" ]]; then
+  if [[ -e "${VGGT_SOURCE}" || -L "${VGGT_SOURCE}" ]]; then
+    echo "VGGT source 目录已存在但不是 Git checkout：${VGGT_SOURCE}" >&2
+    exit 2
+  fi
+  mkdir -p -- "$(dirname "${VGGT_SOURCE}")"
+  git clone --filter=blob:none https://github.com/facebookresearch/vggt.git "${VGGT_SOURCE}"
+  git -C "${VGGT_SOURCE}" checkout --detach "${VGGT_SOURCE_COMMIT}"
+fi
+if [[ "$(git -C "${VGGT_SOURCE}" rev-parse HEAD)" != "${VGGT_SOURCE_COMMIT}" ]]; then
+  echo "VGGT source commit 漂移" >&2
+  exit 2
+fi
+if [[ -n "$(git -C "${VGGT_SOURCE}" status --porcelain --untracked-files=no)" ]]; then
+  echo "VGGT source tracked files 不干净" >&2
+  exit 2
+fi
+
+if [[ -n "${VGGT_MODEL_SNAPSHOT:-}" ]]; then
+  VGGT_SNAPSHOT="$(realpath -e -- "${VGGT_MODEL_SNAPSHOT}")"
+else
+  VGGT_SNAPSHOT="$("${PY}" - <<PY
+from huggingface_hub import snapshot_download
+print(snapshot_download(
+    repo_id="facebook/VGGT-1B",
+    revision="${VGGT_REVISION}",
+    cache_dir="${HF_HOME}",
+))
+PY
+)"
+fi
+if [[ "$(basename "${VGGT_SNAPSHOT}")" != "${VGGT_REVISION}" ]]; then
+  echo "VGGT model snapshot revision 漂移：${VGGT_SNAPSHOT}" >&2
+  exit 2
+fi
+TASK_SNAPSHOT="${WORK_ROOT}/assets_source/task/${TASK_REVISION}"
+"${PY}" - "${TASK_SNAPSHOT}" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+root.mkdir(parents=True, exist_ok=True)
+path = root / "SMOKE_ONLY.txt"
+payload = "deterministic SHA-256 task vectors; not used by formal training\n"
+if path.exists() and path.read_text(encoding="utf-8") != payload:
+    raise SystemExit(f"task marker drift: {path}")
+if not path.exists():
+    path.write_text(payload, encoding="utf-8")
+PY
+ASSET_ROOT="${WORK_ROOT}/encoder_assets"
+if [[ ! -f "${ASSET_ROOT}/receipt.json" ]]; then
+  "${PY}" "${ROOT}/scripts/scale5b/prepare_encoder_assets.py" \
+    --vggt-source-root "${VGGT_SOURCE}" \
+    --vggt-source-commit "${VGGT_SOURCE_COMMIT}" \
+    --vggt-model facebook/VGGT-1B \
+    --vggt-snapshot "${VGGT_SNAPSHOT}" --vggt-revision "${VGGT_REVISION}" \
+    --task-model wm3d/smoke-hash-2048 \
+    --task-snapshot "${TASK_SNAPSHOT}" --task-revision "${TASK_REVISION}" \
+    --output-root "${ASSET_ROOT}"
+else
+  "${PY}" "${ROOT}/scripts/scale5b/verify_encoder_assets.py" \
+    --asset-root "${ASSET_ROOT}"
+fi
+if [[ ! -f "${DATASET_ROOT}/control/task_index.json" ]]; then
+  "${PY}" "${ROOT}/scripts/scale5b/build_task_bank_smoke.py" \
+    --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
+    --output-root "${DATASET_ROOT}" --asset-root "${ASSET_ROOT}" \
+    --confirmation EXECUTE_V7_PUBLIC_SMOKE_HASH_TASK_BANK
+fi
+
+resource_guard() {
+  "${PY}" "${ROOT}/scripts/scale5b/verify_smoke_resources.py" \
+    --devices "${DEVICES}" --work-root "${WORK_ROOT}" \
+    --expected-ip "${EXPECTED_IP}" --minimum-free-bytes 50000000000
+}
+
+if [[ ! -f "${DATASET_ROOT}/receipts/dataset_seal.json" ]]; then
+  echo "[6/10] GPU0–1 编码真实 RGB/action 并发布 VGGT cache"
+  resource_guard
+  pids=()
+  for shard in 0 1; do
+    gpu="${shard}"
+    log="${WORK_ROOT}/logs/encode_${shard}.log"
+    CUDA_VISIBLE_DEVICES="${gpu}" "${PY}" \
+      "${ROOT}/scripts/scale5b/encode_shard.py" \
+      --dataset-contract "${DATASET_ROOT}/control/dataset_contract.json" \
+      --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
+      --action-stats "${DATASET_ROOT}/control/action_stats.json" \
+      --task-index "${DATASET_ROOT}/control/task_index.json" \
+      --output-root "${DATASET_ROOT}" --asset-root "${ASSET_ROOT}" \
+      --shard-id "${shard}" --num-shards 2 --max-part-frames 128 \
+      --window-stride 8 --encoder-batch-frames 1 \
+      --vggt-revision "${VGGT_REVISION}" --device cuda \
+      >"${log}" 2>&1 &
+    pids+=("$!")
+  done
+  failed=0
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      failed=1
+    fi
+  done
+  if [[ "${failed}" -ne 0 ]]; then
+    echo "encoder shard 失败；证据保留在 ${WORK_ROOT}/logs" >&2
+    exit 1
+  fi
+  "${PY}" "${ROOT}/scripts/scale5b/merge_and_seal.py" \
+    --dataset-root "${DATASET_ROOT}" --num-encoder-shards 2
+fi
+"${PY}" "${ROOT}/scripts/scale5b/verify_dataset.py" \
+  --dataset-root "${DATASET_ROOT}" --mode deep --sample-windows-per-source 2
+
+echo "[7/10] 固化代码、环境和训练配置"
+CODE_RECEIPT="${WORK_ROOT}/receipts/code.json"
+if [[ ! -f "${CODE_RECEIPT}" ]]; then
+  "${PY}" "${ROOT}/scripts/scale5b/seal_code.py" \
+    --repo-root "${ROOT}" --output "${CODE_RECEIPT}"
+fi
+CONFIG="${WORK_ROOT}/release/train_smoke2.yaml"
+TRAIN_ROOT="${WORK_ROOT}/train"
+if [[ ! -f "${CONFIG}" ]]; then
+  RUN_LINEAGE="$("${PY}" - "${DATASET_ROOT}/receipts/dataset_seal.json" "${CODE_RECEIPT}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+value = b"wm3d_v7_public_smoke_v1"
+for name in sys.argv[1:]:
+    value += hashlib.sha256(Path(name).read_bytes()).digest()
+print(hashlib.sha256(value).hexdigest())
+PY
+)"
+  "${PY}" "${ROOT}/scripts/scale5b/materialize_config.py" \
+    --template "${ROOT}/configs/scale5b/wm3d_v7_native5b_smoke2.template.yaml" \
+    --dataset-root "${DATASET_ROOT}" --code-receipt "${CODE_RECEIPT}" \
+    --code-root "${ROOT}" \
+    --environment-contract "${ROOT}/environments/scale5b/environment_contract.json" \
+    --environment-receipt "${TRAIN_ENV_RECEIPT}" \
+    --output-root "${TRAIN_ROOT}" --output-config "${CONFIG}" \
+    --run-name wm3d_v7_native5b_public_aloha_smoke2 \
+    --run-lineage "${RUN_LINEAGE}" --world-size 2 --shard-degree 2 \
+    --global-batch-size 2 --micro-batch-size 1 \
+    --smoke-confirmation EXECUTE_V7_NATIVE5B_PUBLIC_SMOKE
+fi
+
+CHECKPOINT="${TRAIN_ROOT}/checkpoints/step_00000001"
+if [[ ! -f "${CHECKPOINT}/COMMITTED.json" ]]; then
+  echo "[8/10] GPU0–1 运行真实约 4.96B 模型的一步 FSDP2 训练"
+  resource_guard
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  CUDA_VISIBLE_DEVICES="${DEVICES}" "${TORCHRUN}" --standalone \
+    --nnodes=1 --nproc-per-node="${WORLD_SIZE}" \
+    -m wm3d_v3.training.train_native5b --config "${CONFIG}" \
+    2>&1 | tee "${WORK_ROOT}/logs/train.log"
+fi
+
+EVAL_ROOT="${WORK_ROOT}/eval"
+if [[ ! -f "${EVAL_ROOT}/report.json" ]]; then
+  echo "[9/10] 从显式 step_00000001 checkpoint 运行一步 eval"
+  resource_guard
+  CUDA_VISIBLE_DEVICES="${DEVICES}" "${TORCHRUN}" --standalone \
+    --nnodes=1 --nproc-per-node="${WORLD_SIZE}" \
+    -m wm3d_v3.training.eval_native5b --config "${CONFIG}" \
+    --checkpoint "${CHECKPOINT}" --output-root "${EVAL_ROOT}" --steps 1 \
+    2>&1 | tee "${WORK_ROOT}/logs/eval.log"
+fi
+
+echo "[10/10] 发布全流程证据报告"
+REPORT="${WORK_ROOT}/smoke_report.json"
+if [[ ! -f "${REPORT}" ]]; then
+  "${PY}" "${ROOT}/scripts/scale5b/report_public_smoke.py" \
+    --work-root "${WORK_ROOT}" --dataset-root "${DATASET_ROOT}" \
+    --train-config "${CONFIG}" --train-root "${TRAIN_ROOT}" \
+    --eval-root "${EVAL_ROOT}" \
+    --raw-receipt "${ALOHA_SMOKE_ROOT}/.wm3d_v7_download_receipt.json" \
+    --code-receipt "${CODE_RECEIPT}" \
+    --environment-receipt "${TRAIN_ENV_RECEIPT}" --output "${REPORT}"
+fi
+"${PY}" - "${REPORT}" <<'PY'
+import json
+import sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+if value.get("pass") is not True:
+    raise SystemExit("smoke report did not pass")
+print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+PY

@@ -175,6 +175,28 @@ flowchart LR
   H --> I["formal training"]
 ```
 
+### 小数据全流程验证
+
+在正式下载数十 TB 数据前，可以先在一台机器上验证完整软件链。下面的命令会创建独立
+Python 3.10 venv，下载固定 revision 的 ALOHA 公开数据（约 91 MB），生成真实 VGGT
+cache，再用 GPU0–1 对完整约 4.96B core 做一步 FSDP2 训练和一步 checkpoint eval：
+
+```bash
+./run_v7.sh smoke /shared/wm3d_v7_smoke
+```
+
+如果机器已有固定 revision 的 VGGT 模型快照，可以避免重复下载：
+
+```bash
+VGGT_MODEL_SNAPSHOT=/abs/hf-cache/models--facebook--VGGT-1B/snapshots/860abec7937da0a4c03c41d3c269c366e82abdf9 \
+  ./run_v7.sh smoke /shared/wm3d_v7_smoke
+```
+
+该入口固定检查本机地址、GPU0–1 空闲状态、ECC 和磁盘余量，不会抢占已有进程。最终
+证据在 `/shared/wm3d_v7_smoke/smoke_report.json`，同时包含原始数据 revision、dataset
+seal、精确参数量、step-1 checkpoint 哈希和 eval 指标。这是基础设施正确性验证，不是
+模型质量结论；正式训练仍使用 T24/P144/K16/D2048 和 64/128 张 H200 配方。
+
 查看完整命令而不提交任务：
 
 ```bash
