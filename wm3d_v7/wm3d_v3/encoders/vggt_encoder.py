@@ -37,6 +37,9 @@ def _ensure_local_vggt_on_path() -> Path:
                 f"preloaded VGGT module is outside the registered source tree: "
                 f"{name}={module_path}"
             ) from exc
+    # The source tree is part of the sealed asset bundle.  Importing it must
+    # never add __pycache__ files and invalidate the exact file-set receipt.
+    sys.dont_write_bytecode = True
     sys.path[:] = [entry for entry in sys.path if entry != str(root)]
     sys.path.insert(0, str(root))
     return root

@@ -37,6 +37,7 @@ if (( SLURM_ARRAY_TASK_ID < 0 || SLURM_ARRAY_TASK_ID >= NUM_SHARDS )); then
 fi
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/wm3d/bin/python}"
+export PYTHONDONTWRITEBYTECODE=1
 cd "${REPO_ROOT}"
 exec "${PYTHON_BIN}" scripts/scale5b/encode_shard.py \
   --dataset-contract "${DATASET_ROOT}/control/dataset_contract.json" \

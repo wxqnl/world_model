@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 
 import torch
 import yaml
@@ -99,6 +101,8 @@ def test_public_smoke_hash_embedding_and_shell_are_deterministic() -> None:
     assert first.shape == (2048,)
     assert torch.isfinite(first).all()
     assert torch.equal(first, second)
+    shell = (ROOT / "scripts" / "scale5b" / "run_public_smoke.sh").read_text()
+    assert "export PYTHONDONTWRITEBYTECODE=1" in shell
     assert not torch.equal(first, other)
     result = subprocess.run(
         ["bash", "-n", str(ROOT / "scripts" / "scale5b" / "run_public_smoke.sh")],
@@ -107,3 +111,40 @@ def test_public_smoke_hash_embedding_and_shell_are_deterministic() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_sealed_vggt_source_import_does_not_write_bytecode(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    package = source / "vggt"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "probe.py").write_text("VALUE = 7\n", encoding="utf-8")
+    program = "\n".join(
+        (
+            "import os",
+            "from pathlib import Path",
+            f"root = Path({str(source)!r})",
+            "os.environ['WM3D_VGGT_SOURCE_ROOT'] = str(root)",
+            (
+                "from wm3d_v3.encoders.vggt_encoder import "
+                "_ensure_local_vggt_on_path"
+            ),
+            "assert _ensure_local_vggt_on_path() == root",
+            "import vggt.probe",
+            "assert vggt.probe.VALUE == 7",
+            "assert not list(root.rglob('*.pyc'))",
+        )
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(ROOT)
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not list(source.rglob("*.pyc"))

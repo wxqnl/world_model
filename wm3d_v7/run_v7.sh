@@ -64,6 +64,7 @@ set -a
 source "${SITE_CONFIG}"
 set +a
 export SITE_CONFIG REPO_ROOT="${ROOT}"
+export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export PATH="$(dirname "${PYTHON_BIN}"):$(dirname "${CONVERTER_PYTHON_BIN}"):${PATH}"
 

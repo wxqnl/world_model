@@ -37,6 +37,7 @@ export TRAIN_ENV_RECEIPT="${WORK_ROOT}/venv/environment_receipt.json"
 export HF_HOME="${HF_HOME:-${WORK_ROOT}/hf_home}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${WORK_ROOT}/pip_cache}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export PYTHONDONTWRITEBYTECODE=1
 mkdir -p -- "${HF_HOME}" "${PIP_CACHE_DIR}" "${WORK_ROOT}/logs" \
   "${WORK_ROOT}/release" "${WORK_ROOT}/raw" "${WORK_ROOT}/build" \
   "${WORK_ROOT}/receipts"
@@ -132,7 +133,7 @@ if path.exists() and path.read_text(encoding="utf-8") != payload:
 if not path.exists():
     path.write_text(payload, encoding="utf-8")
 PY
-ASSET_ROOT="${WORK_ROOT}/encoder_assets"
+ASSET_ROOT="${WORK_ROOT}/encoder_assets_nopyc_v1"
 if [[ ! -f "${ASSET_ROOT}/receipt.json" ]]; then
   "${PY}" "${ROOT}/scripts/scale5b/prepare_encoder_assets.py" \
     --vggt-source-root "${VGGT_SOURCE}" \
