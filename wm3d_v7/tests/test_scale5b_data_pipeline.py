@@ -46,6 +46,7 @@ from wm3d_v3.data.scale5b_sources import (
     ViewSegment,
     deterministic_split,
     plan_shard,
+    scan_lerobot,
     scan_lerobot_collection,
     validate_episode_inputs,
 )
@@ -408,6 +409,116 @@ def test_lerobot_collection_namespaces_restarted_episode_indices(
     assert {Path(episode.raw_root) for episode in episodes} == {first, second}
     assert all(episode.episode_index == 0 for episode in episodes)
     assert all(episode.episode_id.startswith("agibot:") for episode in episodes)
+
+
+def test_lerobot_v3_global_rows_are_rebased_per_shared_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "lerobot"
+    (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
+    (root / "data" / "chunk-000").mkdir(parents=True)
+    (root / "videos" / "rgb" / "chunk-000").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "fps": 10.0,
+                "data_path": (
+                    "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+                ),
+                "video_path": (
+                    "videos/{video_key}/chunk-{chunk_index:03d}/"
+                    "file-{file_index:03d}.mp4"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    metadata = []
+    for episode_index, file_index, dataset_start, video_start in (
+        (0, 0, 0, 0.0),
+        (1, 0, 4, 0.4),
+        (2, 1, 8, 0.0),
+    ):
+        metadata.append(
+            {
+                "episode_index": episode_index,
+                "length": 4,
+                "data/chunk_index": 0,
+                "data/file_index": file_index,
+                "dataset_from_index": dataset_start,
+                "dataset_to_index": dataset_start + 4,
+                "videos/rgb/chunk_index": 0,
+                "videos/rgb/file_index": file_index,
+                "videos/rgb/from_timestamp": video_start,
+                "videos/rgb/to_timestamp": video_start + 0.4,
+                "tasks": ["move the arm"],
+            }
+        )
+    pq.write_table(
+        pa.Table.from_pylist(metadata),
+        root / "meta" / "episodes" / "chunk-000" / "file-000.parquet",
+    )
+    for file_index, episode_indices in ((0, (0, 1)), (1, (2,))):
+        timestamps: list[float] = []
+        episodes: list[int] = []
+        actions: list[list[float]] = []
+        for episode_index in episode_indices:
+            timestamps.extend([0.0, 0.1, 0.2, 0.3])
+            episodes.extend([episode_index] * 4)
+            actions.extend([[float(episode_index)] * 7] * 4)
+        pq.write_table(
+            pa.table(
+                {
+                    "timestamp": timestamps,
+                    "episode_index": episodes,
+                    "action": actions,
+                }
+            ),
+            root / "data" / "chunk-000" / f"file-{file_index:03d}.parquet",
+        )
+        (root / "videos" / "rgb" / "chunk-000" / f"file-{file_index:03d}.mp4").write_bytes(
+            b"metadata-only-video"
+        )
+    layout = SourceLayout.from_mapping(
+        {
+            "source": "aloha",
+            "adapter": "lerobot",
+            "embodiment": "bimanual",
+            "view_keys": {
+                "head": "rgb",
+                "left_hand": None,
+                "right_hand": None,
+            },
+            "action_columns": [
+                {
+                    "group_name": "arm",
+                    "column": "action",
+                    "indices": [0, 1, 2, 3, 4, 5],
+                },
+                {
+                    "group_name": "gripper",
+                    "column": "action",
+                    "indices": [6],
+                    "discrete": True,
+                },
+            ],
+        }
+    )
+    episodes = scan_lerobot(
+        root,
+        layout,
+        split_seed=7,
+        train_fraction=0.8,
+    )
+    assert [
+        (episode.data_relative_path, episode.data_row_start, episode.data_row_stop)
+        for episode in episodes
+    ] == [
+        ("data/chunk-000/file-000.parquet", 0, 4),
+        ("data/chunk-000/file-000.parquet", 4, 8),
+        ("data/chunk-000/file-001.parquet", 0, 4),
+    ]
+    assert validate_episode_inputs(episodes)["episodes"] == 3
 
 
 def test_episode_input_validation_checks_parquet_width_and_video(

@@ -436,6 +436,7 @@ def scan_lerobot(
     tasks = _task_lookup(root)
     descriptors: list[EpisodeDescriptor] = []
     seen: set[int] = set()
+    data_file_origins: dict[str, int] = {}
     for row in sorted(
         _metadata_rows(root), key=lambda item: int(item["episode_index"])
     ):
@@ -464,10 +465,33 @@ def scan_lerobot(
             ]
         )
         data_relative = _resolve_existing(root, candidates)
-        row_start = int(row.get("dataset_from_index", row.get("data/from_index", 0)))
-        row_stop = int(
-            row.get("dataset_to_index", row.get("data/to_index", row_start + length))
-        )
+        explicit_start = row.get("data/from_index")
+        explicit_stop = row.get("data/to_index")
+        if (explicit_start is None) != (explicit_stop is None):
+            raise ContractError(
+                f"episode {episode_index} has an incomplete file-local row interval"
+            )
+        if explicit_start is not None:
+            row_start = int(explicit_start)
+            row_stop = int(explicit_stop)
+        else:
+            dataset_start = int(row.get("dataset_from_index", 0))
+            dataset_stop = int(
+                row.get("dataset_to_index", dataset_start + length)
+            )
+            origin = data_file_origins.setdefault(data_relative, dataset_start)
+            if dataset_start < origin:
+                raise ContractError(
+                    f"episode {episode_index} precedes the first row of "
+                    f"{data_relative}"
+                )
+            row_start = dataset_start - origin
+            row_stop = dataset_stop - origin
+        if row_start < 0 or row_stop - row_start != length:
+            raise ContractError(
+                f"episode {episode_index} row interval [{row_start}, {row_stop}) "
+                f"does not match length {length}"
+            )
         start_seconds = float(row.get("video/from_timestamp", 0.0))
         stop_seconds = float(row.get("video/to_timestamp", length / fps))
         views: list[ViewSegment] = []
