@@ -79,6 +79,10 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
   ./wm3d.sh setup site.env
 ```
 
+集群无法直连 huggingface.co 时，在 site.env 中设置
+HF_ENDPOINT=https://hf-mirror.com。下载完成后仍会用 source lock 中的 40 位 commit SHA
+和本地 receipt 校验数据身份。
+
 ## 二、公开数据
 
 默认数据配置位于 `configs/data/public_6106h.yaml`，原始仓库与下载目录如下：
