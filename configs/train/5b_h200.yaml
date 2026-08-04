@@ -1,0 +1,131 @@
+schema: wm3d_v7_pretrain_config_v1
+
+# This file is deliberately not launchable.  materialize_config.py binds all
+# placeholders to one sealed dataset, code receipt, topology and run lineage.
+run:
+  name: __MATERIALIZE_REQUIRED__
+  run_lineage: __MATERIALIZE_REQUIRED__
+  output_root: __MATERIALIZE_REQUIRED__
+  code_receipt_path: __MATERIALIZE_REQUIRED__
+  code_receipt_sha256: __MATERIALIZE_REQUIRED__
+  environment_contract_path: __MATERIALIZE_REQUIRED__
+  environment_contract_sha256: __MATERIALIZE_REQUIRED__
+  environment_receipt_path: __MATERIALIZE_REQUIRED__
+  environment_receipt_sha256: __MATERIALIZE_REQUIRED__
+  training_contract_sha256: __MATERIALIZE_REQUIRED__
+
+model:
+  T: 24
+  P: 144
+  K: 16
+  token_dim: 2048
+  task_dim: 2048
+  num_views: 3
+  state_hidden: 2560
+  state_layers: 32
+  state_heads: 20
+  state_ff_mult: 2.5
+  action_hidden: 2048
+  action_layers: 24
+  action_heads: 16
+  action_ff_mult: 2.6666666666666665
+  bridge_layers_state: [2, 5, 8, 11, 14, 17, 20, 23, 26, 29]
+  bridge_heads: 16
+  view_hidden: 1024
+  view_heads: 8
+  view_ff_mult: 2.5
+  max_action_groups: 8
+  max_action_dim: 16
+  action_substeps: 6
+  max_group_id: 64
+  max_embodiments: 256
+  memory_dim: 2048
+  memory_every_state_layers: 4
+  max_aux_tokens: 8
+  aux_dim: 256
+  max_aux_type_id: 64
+  rgb_hidden: 512
+  rgb_size: 384
+  rgb_decode_indices: [3, 7, 11, 15]
+  geom_hidden: 768
+  dropout: 0.0
+  activation_checkpointing: true
+
+model_budget:
+  expected_parameters: 4956589929
+  minimum_parameters: 4956589929
+  maximum_parameters: 4956589929
+
+hardware:
+  accelerator_name_contains: H200
+  minimum_accelerator_memory_mib: 135000
+  gpus_per_node: 8
+  require_nvlink_clique: true
+  allowed_world_sizes: [64, 128]
+
+data:
+  root: __MATERIALIZE_REQUIRED__
+  contract: __MATERIALIZE_REQUIRED__
+  contract_sha256: __MATERIALIZE_REQUIRED__
+  seal_receipt: __MATERIALIZE_REQUIRED__
+  seal_receipt_sha256: __MATERIALIZE_REQUIRED__
+  source_order: []
+  source_weights: {}
+  memory_slots: 12
+  memory_stride_frames: 25
+  row_group_cache_size: 4
+  task_cache_size: 4096
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  minimum_free_bytes: 10000000000000
+
+distributed:
+  expected_world_size: 128
+  shard_degree: 8
+  minimum_shm_bytes: 64000000000
+  minimum_output_free_bytes: 10000000000000
+  minimum_ib_rate_gbps: 200.0
+  minimum_allreduce_gbps: 4.0
+
+optimizer:
+  peak_lr: 0.00012
+  min_lr: 0.00001
+  betas: [0.9, 0.95]
+  eps: 0.00000001
+  weight_decay: 0.1
+
+schedule:
+  warmup_steps: 2000
+  stable_fraction: 0.8
+
+train:
+  total_steps: 600000
+  global_batch_size: 128
+  micro_batch_size: 1
+  gradient_accumulation: 1
+  seed: 271828
+  validation_seed: 314159
+  gradient_clip: 1.0
+  log_every: 10
+  validation_steps: 100
+  validate_every: 5000
+  checkpoint_steps: [1000, 5000, 20000]
+  checkpoint_interval: 20000
+
+loss:
+  token_mse: 1.0
+  token_cosine: 0.1
+  rgb_charbonnier: 2.0
+  rgb_gradient: 0.5
+  rgb_laplacian: 0.2
+  depth_log: 1.5
+  depth_gradient: 0.25
+  point: 0.5
+  geometry_confidence: 0.1
+  camera_pose: 0.1
+  action_nll: 2.0
+  action_velocity: 0.3
+  action_contact: 0.4
+  action_log_scale_reg: 0.0001
+  epsilon: 0.000001

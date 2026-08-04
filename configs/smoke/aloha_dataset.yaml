@@ -1,0 +1,64 @@
+schema: wm3d_v7_dataset_v1
+name: wm3d_v7_public_aloha_smoke
+feature_fps: 5.0
+action_fps: 30.0
+T: 24
+P: 144
+K: 16
+token_dim: 2048
+task_dim: 2048
+num_views: 3
+max_action_groups: 8
+max_action_dim: 16
+action_substeps: 6
+max_group_id: 64
+max_embodiments: 256
+max_aux_tokens: 8
+aux_dim: 256
+max_aux_type_id: 64
+
+source_order: [aloha_smoke]
+sources:
+  - name: aloha_smoke
+    adapter: lerobot
+    raw_root: ${ALOHA_SMOKE_ROOT}
+    license_id: MIT
+    nominal_hours: 0.1388888889
+    weight: 100
+    embodiment_names: [aloha_bimanual_14d]
+    split_seed: 700
+    train_fraction: 0.8
+
+embodiments:
+  - name: aloha_bimanual_14d
+    embodiment_id: 10
+    views: [head, left_hand, right_hand]
+    action_groups:
+      - name: left_arm
+        group_id: 32
+        dimensions: [j0, j1, j2, j3, j4, j5]
+        rate_hz: 30.0
+        control_mode: joint_position
+      - name: left_gripper
+        group_id: 33
+        dimensions: [close]
+        rate_hz: 30.0
+        control_mode: discrete_gripper
+      - name: right_arm
+        group_id: 34
+        dimensions: [j0, j1, j2, j3, j4, j5]
+        rate_hz: 30.0
+        control_mode: joint_position
+      - name: right_gripper
+        group_id: 35
+        dimensions: [close]
+        rate_hz: 30.0
+        control_mode: discrete_gripper
+    auxiliary_modalities: []
+
+notes:
+  purpose: 只验证公开下载、数据契约、VGGT cache、真实 5B FSDP2、checkpoint 与 eval
+  quality_claim: false
+  formal_recipe_unchanged: true
+  upstream_repo: lerobot/aloha_sim_insertion_human
+  upstream_revision: cc571a3c661df81b566dbfde3d5c1e85fcdf7884
