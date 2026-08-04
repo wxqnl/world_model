@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish one immutable evidence report for the public V7 smoke."""
+"""Publish one immutable evidence report for the public WM3D smoke."""
 
 from __future__ import annotations
 

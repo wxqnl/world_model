@@ -2,7 +2,7 @@
 """Build a frozen 2048-D language-task bank for native WM3D.
 
 This is an offline conditioning encoder, not an online VLA path.  The formal
-default uses a pinned T5 encoder whose hidden size is exactly the V7 task
+default uses a pinned T5 encoder whose hidden size is exactly the WM3D task
 interface dimension.  The training graph contains only the native WM3D core.
 """
 

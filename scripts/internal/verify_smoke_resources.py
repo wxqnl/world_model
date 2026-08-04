@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed node/GPU/storage guard for the public V7 smoke."""
+"""Fail-closed node/GPU/storage guard for the public WM3D smoke."""
 
 from __future__ import annotations
 

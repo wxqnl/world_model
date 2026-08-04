@@ -18,7 +18,7 @@ aux_dim: 256
 max_aux_type_id: 64
 
 # 权重定义每 100 个样本的确定性采样周期。DROID/Bridge/Atomic/
-# Composite/MG 保持 V7 原五路 35/15/10/20/20 的相对比例，并占总周期 40%。
+# Composite/MG 保持当前五路 35/15/10/20/20 的相对比例，并占总周期 40%。
 source_order:
   - droid
   - bridge

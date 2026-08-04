@@ -36,7 +36,7 @@ if [[ -f "${RECEIPT}" && -x "${PYTHON_BIN}" ]]; then
   "${PYTHON_BIN}" "${REPO_ROOT}/scripts/internal/verify_environment.py" \
     --contract "${CONTRACT}" --receipt "${RECEIPT}" \
     --expected-sha256 "$(receipt_sha)"
-  echo "V7 环境已通过：${ENV_PREFIX}"
+  echo "WM3D 环境已通过：${ENV_PREFIX}"
   exit 0
 fi
 
@@ -56,4 +56,4 @@ if [[ -e "${RECEIPT}" || -L "${RECEIPT}" ]]; then
 fi
 "${PYTHON_BIN}" "${REPO_ROOT}/scripts/internal/verify_environment.py" \
   --contract "${CONTRACT}" --output "${RECEIPT}"
-echo "V7 环境安装完成：${ENV_PREFIX}"
+echo "WM3D 环境安装完成：${ENV_PREFIX}"
