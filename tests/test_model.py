@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -208,3 +211,26 @@ def test_dependency_guard_rejects_later_architecture(tmp_path: Path) -> None:
     bad.write_text("model_backend: qwen3-vl\n", encoding="utf-8")
     with pytest.raises(RuntimeContractError):
         assert_dependency_boundary([bad])
+
+
+def test_v7_lineage_audit_passes_for_formal_5b_config() -> None:
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(root / "scripts/tools/audit_v7_lineage.py"),
+            "--repo-root",
+            str(root),
+            "--config",
+            str(root / "configs/train/5b_h200.yaml"),
+        ],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["pass"]
+    assert payload["source_ref"] == "7241146891a61225a1c38947c57193967a9c11e9"
+    assert payload["parameters"]["total"] == 4_956_589_929
+    assert all(payload["owners"].values())

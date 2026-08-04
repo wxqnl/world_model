@@ -11,6 +11,25 @@ smoke 职责分类，目录说明见 `scripts/README.md`。
 当前发布分支为 `v7`。V7 是数据契约和 checkpoint 协议的版本号，不是项目名称。模型规模由
 YAML 配置决定；`configs/train/5b_h200.yaml` 是当前的大规模训练预设之一。
 
+## 代码接手导航
+
+仓库各职责目录都带中文 README：
+
+- [`configs/README.md`](configs/README.md)：站点、数据、smoke 与训练预设；
+- [`environments/README.md`](environments/README.md)：普通 Python venv 与环境 receipt；
+- [`scripts/README.md`](scripts/README.md)：一键流水线背后的脚本调用关系；
+- [`wm3d/README.md`](wm3d/README.md)：data、VGGT、model 与 training 运行时；
+- [`wm3d/models/README.md`](wm3d/models/README.md)：V7 native-3D 血统和 5B 架构所有权。
+
+安装环境后可直接核验当前正式 5B 配置是否仍与清理前 V7 anchor 一致：
+
+```bash
+./wm3d.sh audit site.env
+```
+
+该命令检查 Git anchor/blob、允许重命名后的逐字一致性、V7 配置继承段、后续架构依赖边界和
+精确参数预算；不是根据 README 文本作判断。
+
 ## 一、从新服务器开始
 
 ### 1. 集群条件

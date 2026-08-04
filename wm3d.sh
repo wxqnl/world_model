@@ -24,6 +24,7 @@ WM3D
   ./wm3d.sh status site.env                  查看数据与训练状态
   ./wm3d.sh all site.env                     setup + data + train
   ./wm3d.sh params site.env [TRAIN_YAML]     计算模型参数组成
+  ./wm3d.sh audit site.env [TRAIN_YAML]      核验 V7 血统与 native-3D 边界
 
   ./wm3d.sh smoke /abs/work-root             GPU0-1 公开小样本全流程
 
@@ -133,6 +134,20 @@ case "${action}" in
     config="$(realpath -e -- "${config}")"
     exec "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_parameters.py" \
       --config "${config}"
+    ;;
+  audit)
+    require_python
+    if [[ $# -gt 3 ]]; then
+      echo "用法：./wm3d.sh audit site.env [TRAIN_YAML]" >&2
+      exit 2
+    fi
+    config="${3:-${ROOT}/configs/train/5b_h200.yaml}"
+    if [[ "${config}" != /* ]]; then
+      config="${ROOT}/${config}"
+    fi
+    config="$(realpath -e -- "${config}")"
+    exec "${PYTHON_BIN}" "${ROOT}/scripts/tools/audit_v7_lineage.py" \
+      --repo-root "${ROOT}" --config "${config}"
     ;;
   all)
     setup

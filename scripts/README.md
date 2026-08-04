@@ -26,3 +26,15 @@ wm3d.sh
 
 正式运行不要绕过 `wm3d.sh` 直接拼接这些命令；统一入口负责加载 `site.env`、固定路径、
 验证 receipt，并保证恢复和封存语义一致。
+
+各目录的输入、输出和失败恢复方式：
+
+- [`data/README.md`](data/README.md)
+- [`assets/README.md`](assets/README.md)
+- [`cluster/README.md`](cluster/README.md)
+- [`slurm/README.md`](slurm/README.md)
+- [`smoke/README.md`](smoke/README.md)
+- [`tools/README.md`](tools/README.md)
+
+如果只是使用项目，从 `./wm3d.sh help` 开始即可；只有定位某一阶段或扩展新数据源时才需要
+进入这些实现目录。
