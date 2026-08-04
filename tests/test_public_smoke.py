@@ -104,6 +104,10 @@ def test_public_smoke_hash_embedding_and_shell_are_deterministic() -> None:
     assert torch.equal(first, second)
     shell = (ROOT / "scripts" / "run_public_smoke.sh").read_text()
     assert "export PYTHONDONTWRITEBYTECODE=1" in shell
+    assert (
+        'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"'
+        in shell
+    )
     assert not torch.equal(first, other)
     result = subprocess.run(
         ["bash", "-n", str(ROOT / "scripts" / "run_public_smoke.sh")],
