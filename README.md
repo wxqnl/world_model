@@ -218,19 +218,56 @@ VGGT_MODEL_SNAPSHOT=/abs/hf-cache/models--facebook--VGGT-1B/snapshots/860abec793
 ./wm3d.sh all site.env
 ```
 
-对完整编号 checkpoint 运行评测：
+### 训练正确性评测
+
+`train` 会先跑同构 canary，并且只有 canary checkpoint 的 eval 通过后才提交正式训练。正式
+训练期间可对任意带 `COMMITTED.json` 的完整编号 checkpoint 单独评测：
 
 ```bash
 ./wm3d.sh eval site.env \
   /shared/wm3d/runs/RUN/checkpoints/step_XXXXXXXX
 ```
 
-训练恢复只选择同时含 `COMMITTED.json` 的最高编号 checkpoint，不读取 `latest`。每个
-checkpoint 绑定 dataset seal、代码 receipt、环境 receipt、物化配置和 run lineage。
+评测会使用 checkpoint 所属 run 的物化配置和固定 validation sampler，在与训练相同的
+FSDP2/HSDP 拓扑上读取 validation split。输出位于：
 
-评测检查 RGB、depth、point、camera 和 action 指标是否 finite、监督覆盖率是否非零，并输出
-`rgb_target_top_prediction_bottom.png` 供直观检查。机器人闭环成功率由下游 benchmark 使用同一
-完整 checkpoint 单独评估。
+```text
+RELEASE_ROOT/eval/RUN_step_XXXXXXXX/
+├── report.json
+└── rgb_target_top_prediction_bottom.png
+```
+
+`report.json` 同时检查：
+
+| 范围 | 指标或门禁 |
+|---|---|
+| checkpoint | 编号、commit、run lineage、配置、代码、环境、dataset seal 全部绑定 |
+| 总体 | 所有 native loss 和直接指标均为有限数，监督值数量非零 |
+| RGB | MAE/MSE/RMSE、PSNR、预测方差，并输出 target/prediction 对照图 |
+| 3D | depth、point、geometry confidence 的 MAE/MSE/RMSE |
+| camera | 9D camera pose 的 MAE/MSE/RMSE |
+| action | grouped-action 的 MAE/MSE/RMSE、NLL/velocity loss |
+| contact | 概率误差、accuracy、contact loss |
+
+要判断后续 checkpoint 是否发生明显回退，应先用相同 `site.env`、validation 数据和
+`EVAL_STEPS` 分别生成两个报告，再运行：
+
+```bash
+./wm3d.sh compare-eval site.env \
+  /shared/wm3d/release/eval/RUN_step_00001000/report.json \
+  /shared/wm3d/release/eval/RUN_step_00005000/report.json \
+  /shared/wm3d/release/eval/compare_00001000_to_00005000.json
+```
+
+比较器要求 dataset seal、training contract、代码、参数量、run lineage、world size 和评测步数
+完全相同；默认不允许 lower-is-better 指标相对退化超过 20%、RGB PSNR 下降超过 1 dB、contact
+accuracy 下降超过 0.05。阈值用于拦截明显回退，不代表论文质量标准。
+
+eval PASS 的含义是训练链、checkpoint、监督覆盖和 native 输出工作正常；它不等于机器人闭环
+成功率，也不能单独证明模型优于其他版本。闭环 action 成功率仍需在具体机器人 benchmark 上
+使用同一完整 checkpoint 评测。
+
+训练恢复只选择同时含 `COMMITTED.json` 的最高编号 checkpoint，不读取 `latest`。
 
 ## 五、5B H200 训练预设
 

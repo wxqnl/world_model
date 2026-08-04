@@ -602,3 +602,36 @@ def test_canary_template_preserves_formal_model_data_and_loss_contract() -> None
     assert canary["train"]["checkpoint_interval"] == 0
     assert canary["schedule"]["warmup_steps"] < canary["train"]["total_steps"]
     assert formal["train"]["total_steps"] == 600_000
+
+
+def test_every_operational_script_is_documented_and_referenced() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    scripts = sorted(
+        path
+        for root in (repo_root / "scripts", repo_root / "environments")
+        for path in root.rglob("*")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix in {".py", ".sh"}
+    )
+    text_paths = [
+        path
+        for path in repo_root.rglob("*")
+        if path.is_file()
+        and ".git" not in path.parts
+        and "__pycache__" not in path.parts
+        and path.suffix in {".md", ".py", ".sh", ".yaml", ".json", ".example"}
+    ]
+    assert scripts
+    for script in scripts:
+        readme = script.parent / "README.md"
+        assert readme.is_file(), f"missing directory README for {script}"
+        assert script.name in readme.read_text(encoding="utf-8"), (
+            f"{script.name} is not documented in {readme}"
+        )
+        references = [
+            path
+            for path in text_paths
+            if path != script and script.name in path.read_text(encoding="utf-8")
+        ]
+        assert len(references) >= 2, f"orphan operational script: {script}"

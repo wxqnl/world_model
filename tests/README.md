@@ -5,7 +5,8 @@
 | `test_model.py` | 5B 参数冻结、native forward/backward、未来 action 无泄漏、sampler 恢复、V7 血统审计 |
 | `test_data_pipeline.py` | 数据契约、action/aux 对齐、codec、seal 与 dataset 读取 |
 | `test_download.py` | revision lock、断点下载、路径和内容校验 |
-| `test_handoff.py` | 环境/资产/code receipt、物化配置、checkpoint、NVLink/IB preflight |
+| `test_handoff.py` | 环境/资产/code receipt、物化配置、checkpoint、NVLink/IB preflight、孤儿脚本检查 |
+| `test_eval.py` | RGB/3D/camera/action/contact 指标契约与 checkpoint 报告回退比较 |
 | `test_public_smoke.py` | 公开 ALOHA smoke 的入口和报告契约 |
 
 运行：

@@ -22,3 +22,8 @@
 
 模板不能直接启动。`materialize_config.py` 会绑定 dataset/code/environment receipt、拓扑、batch
 和 run lineage。任何形状变化都必须重新运行参数审计、单测、smoke 和同构 canary。
+
+`./wm3d.sh eval` 不使用另一套 eval YAML，而是从 checkpoint 的 run root 找回这次训练已经
+物化并封存的配置；因此模型形状、validation seed、dataset seal 和 topology 都与 checkpoint
+一致。评测样本数由 `site.env` 的 `EVAL_STEPS` 控制。比较两个 checkpoint 时必须使用相同值，
+再运行 `./wm3d.sh compare-eval`。

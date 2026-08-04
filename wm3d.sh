@@ -21,6 +21,7 @@ WM3D
 
   ./wm3d.sh train site.env                   canary + eval + 正式训练
   ./wm3d.sh eval site.env STEP_CHECKPOINT    评测完整编号 checkpoint
+  ./wm3d.sh compare-eval site.env BASE CAND  对比两个 checkpoint 的 eval 报告
   ./wm3d.sh status site.env                  查看数据与训练状态
   ./wm3d.sh all site.env                     setup + data + train
   ./wm3d.sh params site.env [TRAIN_YAML]     计算模型参数组成
@@ -120,6 +121,23 @@ case "${action}" in
       exit 2
     fi
     pipeline eval --checkpoint "$3"
+    ;;
+  compare-eval)
+    require_python
+    if [[ $# -lt 4 || $# -gt 5 ]]; then
+      echo "用法：./wm3d.sh compare-eval site.env BASE_REPORT CANDIDATE_REPORT [OUTPUT_JSON]" >&2
+      exit 2
+    fi
+    baseline="$(realpath -e -- "$3")"
+    candidate="$(realpath -e -- "$4")"
+    command=(
+      "${PYTHON_BIN}" "${ROOT}/scripts/tools/compare_eval_reports.py"
+      --baseline "${baseline}" --candidate "${candidate}"
+    )
+    if [[ $# -eq 5 ]]; then
+      command+=(--output "$5")
+    fi
+    exec "${command[@]}"
     ;;
   params)
     require_python

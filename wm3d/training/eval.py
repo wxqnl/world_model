@@ -55,6 +55,15 @@ from wm3d.training.train import (
 
 
 EVAL_SCHEMA = "wm3d_v7_checkpoint_eval_v1"
+DIRECT_METRIC_PREFIXES = (
+    "rgb",
+    "depth",
+    "point",
+    "geometry_confidence",
+    "camera_pose",
+    "action",
+    "contact",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -241,30 +250,50 @@ def main() -> None:
 
                 rgb_indices = output["rgb_frame_indices"].long()
                 rgb_mask = batch["target_view_mask"].bool().index_select(1, rgb_indices)
-                for prefix, prediction, target, mask in (
-                    ("rgb", output["rgb"], batch["target_rgb"], rgb_mask),
-                    (
-                        "depth",
+                target_view_mask = batch["target_view_mask"].bool()
+                action_mask = batch["target_action_dim_mask"].bool() & batch[
+                    "action_group_mask"
+                ].bool()[:, None, :, None, None]
+                contact_mask = batch["target_contact_mask"].bool() & batch[
+                    "action_group_mask"
+                ].bool()[:, None, :, None]
+                direct_metrics = {
+                    "rgb": (output["rgb"], batch["target_rgb"], rgb_mask),
+                    "depth": (
                         output["depth"],
                         batch["target_depth"],
                         (batch["target_geometry_confidence"] > 0)
-                        & batch["target_view_mask"].bool().unsqueeze(-1),
+                        & target_view_mask.unsqueeze(-1),
                     ),
-                    (
-                        "point",
+                    "point": (
                         output["point"],
                         batch["target_point"],
                         (batch["target_geometry_confidence"] > 0)
-                        & batch["target_view_mask"].bool().unsqueeze(-1),
+                        & target_view_mask.unsqueeze(-1),
                     ),
-                    (
-                        "action",
+                    "geometry_confidence": (
+                        output["geometry_confidence"],
+                        batch["target_geometry_confidence"],
+                        target_view_mask.unsqueeze(-1),
+                    ),
+                    "camera_pose": (
+                        output["camera_pose"],
+                        batch["target_camera_pose"],
+                        target_view_mask,
+                    ),
+                    "action": (
                         output["action_mean"],
                         batch["target_action_values"],
-                        batch["target_action_dim_mask"].bool()
-                        & batch["action_group_mask"].bool()[:, None, :, None, None],
+                        action_mask,
                     ),
-                ):
+                    "contact": (
+                        output["contact_logit"].float().sigmoid(),
+                        batch["target_contact"],
+                        contact_mask,
+                    ),
+                }
+                for prefix in DIRECT_METRIC_PREFIXES:
+                    prediction, target, mask = direct_metrics[prefix]
                     absolute, squared, predicted, predicted_squared, count = (
                         _masked_stats(
                             prediction, target.to(dtype=prediction.dtype), mask
@@ -275,6 +304,11 @@ def main() -> None:
                     _sum(sums, f"{prefix}/prediction", predicted)
                     _sum(sums, f"{prefix}/prediction_squared", predicted_squared)
                     _sum(sums, f"{prefix}/count", count)
+                contact_correct = (
+                    (output["contact_logit"] >= 0)
+                    == (batch["target_contact"] >= 0.5)
+                ) & contact_mask
+                _sum(sums, "contact/correct", contact_correct.double().sum())
                 if context.is_rank0 and preview_payload is None:
                     preview_payload = (output, batch)
 
@@ -289,7 +323,7 @@ def main() -> None:
                     for name, value in sums.items()
                     if name.startswith("loss/")
                 }
-                for prefix in ("rgb", "depth", "point", "action"):
+                for prefix in DIRECT_METRIC_PREFIXES:
                     count = float(sums[f"{prefix}/count"].item())
                     if count <= 0:
                         raise ValueError(f"{prefix} supervision coverage is zero")
@@ -299,12 +333,17 @@ def main() -> None:
                     second = float(sums[f"{prefix}/prediction_squared"].item() / count)
                     metrics[f"{prefix}/mae"] = mae
                     metrics[f"{prefix}/mse"] = mse
+                    metrics[f"{prefix}/rmse"] = math.sqrt(mse)
                     metrics[f"{prefix}/prediction_std"] = math.sqrt(
                         max(0.0, second - mean * mean)
                     )
                     metrics[f"{prefix}/supervised_values"] = count
                 metrics["rgb/psnr"] = -10.0 * math.log10(
                     max(metrics["rgb/mse"], 1.0e-12)
+                )
+                metrics["contact/accuracy"] = float(
+                    sums["contact/correct"].item()
+                    / sums["contact/count"].item()
                 )
                 finite = all(math.isfinite(value) for value in metrics.values())
                 checks = {
@@ -313,7 +352,19 @@ def main() -> None:
                     "geometry_supervision_present": metrics["depth/supervised_values"]
                     > 0
                     and metrics["point/supervised_values"] > 0,
+                    "geometry_confidence_supervision_present": metrics[
+                        "geometry_confidence/supervised_values"
+                    ]
+                    > 0,
+                    "camera_pose_supervision_present": metrics[
+                        "camera_pose/supervised_values"
+                    ]
+                    > 0,
                     "action_supervision_present": metrics["action/supervised_values"]
+                    > 0,
+                    "contact_supervision_present": metrics[
+                        "contact/supervised_values"
+                    ]
                     > 0,
                     "rgb_prediction_not_constant": metrics["rgb/prediction_std"]
                     > 1.0e-4,
@@ -341,6 +392,22 @@ def main() -> None:
                     "eval_steps_per_rank": args.steps,
                     "metrics": metrics,
                     "checks": checks,
+                    "metric_contract": {
+                        "masked_global_aggregation": True,
+                        "lower_is_better": [
+                            "loss/total",
+                            "rgb/mse",
+                            "depth/mae",
+                            "point/mae",
+                            "geometry_confidence/mae",
+                            "camera_pose/mae",
+                            "action/mae",
+                        ],
+                        "higher_is_better": [
+                            "rgb/psnr",
+                            "contact/accuracy",
+                        ],
+                    },
                     "preview": {
                         "path": preview_path.name,
                         "sha256": sha256_file(preview_path),

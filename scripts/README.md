@@ -11,7 +11,7 @@
 | `cluster/` | 物化训练配置、代码 receipt、集群 preflight、节点启动 | `pipeline.py`、Slurm |
 | `slurm/` | action/cache 数组任务、训练和评测作业定义 | `pipeline.py` |
 | `smoke/` | 91 MB ALOHA 样本的双卡端到端验证与报告 | `wm3d.sh smoke` |
-| `tools/` | 模型参数组成报告 | `wm3d.sh params` |
+| `tools/` | V7 血统、参数组成和 eval 报告对比 | `wm3d.sh audit/params/compare-eval` |
 
 主要调用链：
 
@@ -21,7 +21,8 @@ wm3d.sh
 ├── train   → pipeline.py → cluster/ + slurm/
 ├── eval    → pipeline.py → cluster/ + slurm/
 ├── smoke   → smoke/run.sh → data/ + assets/ + cluster/ + smoke/
-└── params  → tools/report_parameters.py
+├── params/audit → tools/report_parameters.py + audit_v7_lineage.py
+└── compare-eval → tools/compare_eval_reports.py
 ```
 
 正式运行不要绕过 `wm3d.sh` 直接拼接这些命令；统一入口负责加载 `site.env`、固定路径、
