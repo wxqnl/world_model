@@ -14,7 +14,11 @@ import subprocess
 import uuid
 from typing import Iterable
 
-from wm3d.data.assets import ASSET_RECEIPT_SCHEMA
+from wm3d.data.assets import (
+    ASSET_RECEIPT_SCHEMA,
+    verify_vggt_source,
+    vggt_source_tree_sha256,
+)
 from wm3d.data.contracts import (
     atomic_write_json,
     canonical_sha256,
@@ -29,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--vggt-source-root", type=Path, required=True)
     parser.add_argument("--vggt-source-commit", required=True)
+    parser.add_argument("--vggt-source-archive-sha256", required=True)
+    parser.add_argument("--vggt-source-tree-sha256", required=True)
     parser.add_argument("--vggt-model", default="facebook/VGGT-1B")
     parser.add_argument("--vggt-snapshot", type=Path, required=True)
     parser.add_argument("--vggt-revision", required=True)
@@ -99,34 +105,65 @@ def _copy_vggt_source(
     source: Path,
     destination: Path,
     expected_commit: str,
-) -> int:
-    source = source.resolve(strict=True)
-    actual_commit = _command("git", "rev-parse", "HEAD", cwd=source)
-    if actual_commit != expected_commit:
-        raise ValueError(f"VGGT source commit {actual_commit} != {expected_commit}")
-    status = _command(
-        "git",
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
-        cwd=source,
-    )
-    if status:
-        raise ValueError("VGGT tracked source is dirty")
-    tracked = [
-        item
-        for item in _command("git", "ls-files", "-z", cwd=source).split("\0")
-        if item
-    ]
-    if not tracked:
-        raise ValueError("VGGT repository contains no tracked files")
-    for relative in tracked:
+    expected_archive_sha256: str,
+    expected_tree_sha256: str,
+) -> tuple[int, str]:
+    input_source = Path(source)
+    mode = os.lstat(input_source).st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise ValueError(f"VGGT source root is not a real directory: {input_source}")
+    source = input_source.resolve(strict=True)
+    if (source / ".git").is_dir():
+        actual_commit = _command("git", "rev-parse", "HEAD", cwd=source)
+        if actual_commit != expected_commit:
+            raise ValueError(
+                f"VGGT source commit {actual_commit} != {expected_commit}"
+            )
+        status = _command(
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            cwd=source,
+        )
+        if status:
+            raise ValueError("VGGT tracked source is dirty")
+        files = [
+            item
+            for item in _command("git", "ls-files", "-z", cwd=source).split("\0")
+            if item
+        ]
+        if not files:
+            raise ValueError("VGGT repository contains no tracked files")
+        evidence = {}
+        for relative in files:
+            path = source / relative
+            mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                raise ValueError(f"unsupported tracked VGGT entry: {relative}")
+            evidence[relative] = {
+                "size": int(os.lstat(path).st_size),
+                "sha256": sha256_file(path),
+            }
+        if vggt_source_tree_sha256(evidence) != expected_tree_sha256:
+            raise ValueError("VGGT Git checkout tree SHA mismatch")
+        provenance = "git_checkout"
+    else:
+        report = verify_vggt_source(
+            source,
+            expected_commit=expected_commit,
+            expected_archive_sha256=expected_archive_sha256,
+            expected_tree_sha256=expected_tree_sha256,
+        )
+        files = sorted(report["files"])
+        provenance = "github_codeload_archive"
+    for relative in files:
         path = source / relative
         mode = os.lstat(path).st_mode
         if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
             raise ValueError(f"unsupported tracked VGGT entry: {relative}")
         _copy_file(path, destination / relative)
-    return len(tracked)
+    return len(files), provenance
 
 
 def _evidence(root: Path) -> dict[str, dict[str, int | str]]:
@@ -163,6 +200,12 @@ def main() -> None:
     )
     if any(not REVISION_RE.fullmatch(value) for value in revisions):
         raise ValueError("asset revisions must be immutable 40-64 digit hex commits")
+    for name, value in (
+        ("VGGT source archive", args.vggt_source_archive_sha256),
+        ("VGGT source tree", args.vggt_source_tree_sha256),
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"{name} SHA must be 64 lowercase hex digits")
     vggt_snapshot = args.vggt_snapshot.resolve(strict=True)
     task_snapshot = args.task_snapshot.resolve(strict=True)
     if vggt_snapshot.name != args.vggt_revision:
@@ -180,10 +223,12 @@ def main() -> None:
         source_relative = Path("vggt/source")
         vggt_relative = Path("vggt/model") / args.vggt_revision
         task_relative = Path("task/model") / args.task_revision
-        source_files = _copy_vggt_source(
+        source_files, source_provenance = _copy_vggt_source(
             args.vggt_source_root,
             temporary / source_relative,
             args.vggt_source_commit,
+            args.vggt_source_archive_sha256,
+            args.vggt_source_tree_sha256,
         )
         vggt_files = _copy_snapshot(
             vggt_snapshot,
@@ -200,6 +245,9 @@ def main() -> None:
                 "vggt_source": {
                     "path": source_relative.as_posix(),
                     "commit": args.vggt_source_commit,
+                    "archive_sha256": args.vggt_source_archive_sha256,
+                    "tree_sha256": args.vggt_source_tree_sha256,
+                    "provenance": source_provenance,
                     "files": source_files,
                 },
                 "vggt_model": {

@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--vggt-source-commit", required=True)
+    parser.add_argument("--vggt-source-archive-sha256", required=True)
+    parser.add_argument("--vggt-source-tree-sha256", required=True)
     parser.add_argument("--vggt-model-revision", required=True)
     parser.add_argument("--task-model-revision", default="AUTO")
     return parser.parse_args()
@@ -43,36 +45,32 @@ def _token(path: Path) -> str:
     return value
 
 
-def _git_source(root: Path, commit: str) -> Path:
+def _vggt_source(
+    root: Path,
+    *,
+    commit: str,
+    archive_sha256: str,
+    tree_sha256: str,
+) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     target = root / f"vggt-{commit}"
-    if target.exists():
-        actual = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=target, text=True
-        ).strip()
-        if actual != commit:
-            raise ValueError(f"已有 VGGT source commit 漂移：{actual}")
-        return target.resolve(strict=True)
-    temporary = root / f".vggt-{commit}.incomplete"
-    if temporary.exists():
-        raise FileExistsError(f"存在未审失败目录：{temporary}")
     subprocess.run(
         [
-            "git",
-            "clone",
-            "--filter=blob:none",
-            "https://github.com/facebookresearch/vggt.git",
-            str(temporary),
+            sys.executable,
+            str(Path(__file__).with_name("materialize_vggt_source.py")),
+            "--output-root",
+            str(target),
+            "--archive-root",
+            str(root / "archives"),
+            "--commit",
+            commit,
+            "--archive-sha256",
+            archive_sha256,
+            "--tree-sha256",
+            tree_sha256,
         ],
         check=True,
     )
-    subprocess.run(["git", "checkout", "--detach", commit], cwd=temporary, check=True)
-    actual = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=temporary, text=True
-    ).strip()
-    if actual != commit:
-        raise ValueError("VGGT checkout 未落在指定 commit")
-    os.replace(temporary, target)
     return target.resolve(strict=True)
 
 
@@ -151,7 +149,12 @@ def main() -> None:
 
     staging = args.staging_root.resolve()
     staging.mkdir(parents=True, exist_ok=True)
-    source = _git_source(staging / "source", args.vggt_source_commit)
+    source = _vggt_source(
+        staging / "source",
+        commit=args.vggt_source_commit,
+        archive_sha256=args.vggt_source_archive_sha256,
+        tree_sha256=args.vggt_source_tree_sha256,
+    )
     models = staging / "models"
     vggt_snapshot = _snapshot(
         root=models,
@@ -173,6 +176,10 @@ def main() -> None:
             str(source),
             "--vggt-source-commit",
             args.vggt_source_commit,
+            "--vggt-source-archive-sha256",
+            args.vggt_source_archive_sha256,
+            "--vggt-source-tree-sha256",
+            args.vggt_source_tree_sha256,
             "--vggt-snapshot",
             str(vggt_snapshot),
             "--vggt-revision",

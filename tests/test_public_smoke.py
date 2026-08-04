@@ -103,7 +103,30 @@ def test_public_smoke_hash_embedding_and_shell_are_deterministic() -> None:
     assert torch.isfinite(first).all()
     assert torch.equal(first, second)
     shell = (ROOT / "scripts" / "smoke" / "run.sh").read_text()
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    smoke_readme = (ROOT / "scripts" / "smoke" / "README.md").read_text(
+        encoding="utf-8"
+    )
     assert "export PYTHONDONTWRITEBYTECODE=1" in shell
+    assert 'export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"' in shell
+    assert 'RUN_LOG="${WORK_ROOT}/logs/smoke.log"' in shell
+    assert 'RUN_STATUS="${WORK_ROOT}/smoke_status.json"' in shell
+    assert "trap publish_status EXIT" in shell
+    assert 'CURRENT_STAGE="download_aloha"' in shell
+    assert "scripts/assets/materialize_vggt_source.py" in shell
+    assert (
+        "VGGT_SOURCE_ARCHIVE_SHA256="
+        in shell
+    )
+    assert "VGGT_SOURCE_TREE_SHA256=" in shell
+    mirror_command = (
+        "HF_ENDPOINT=https://hf-mirror.com ./wm3d.sh smoke /abs/work-root"
+    )
+    assert mirror_command in smoke_readme
+    assert "HF_ENDPOINT=https://hf-mirror.com" in readme
+    assert "smoke_status.json" in readme
+    assert "http.version=HTTP/1.1" in readme
+    assert "不要用源码\ntarball 替代 Git checkout" in readme
     assert (
         'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"'
         in shell

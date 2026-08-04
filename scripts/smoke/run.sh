@@ -27,6 +27,8 @@ if [[ "${DEVICES}" != "0,1" ]]; then
 fi
 WORLD_SIZE=2
 VGGT_SOURCE_COMMIT=a288dd0f14786c93483e45524328726ab7b1b4ce
+VGGT_SOURCE_ARCHIVE_SHA256=df4e7de1184bcb28ad6b4a83ead828f34ba42fb18be03c034801ffeb3a058f91
+VGGT_SOURCE_TREE_SHA256=afc51bd052a538736830c33651f8f59f087629754298dd95d5d97a1a8bf99fa1
 VGGT_REVISION=860abec7937da0a4c03c41d3c269c366e82abdf9
 TASK_REVISION=52e6cc877548ebd0de720a7fe86177f8a5593a673f40162aa9006a3877fa97c1
 
@@ -42,20 +44,58 @@ mkdir -p -- "${HF_HOME}" "${PIP_CACHE_DIR}" "${WORK_ROOT}/logs" \
   "${WORK_ROOT}/release" "${WORK_ROOT}/raw" "${WORK_ROOT}/build" \
   "${WORK_ROOT}/receipts"
 
+RUN_LOG="${WORK_ROOT}/logs/smoke.log"
+RUN_STATUS="${WORK_ROOT}/smoke_status.json"
+ATTEMPT_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CURRENT_STAGE="environment"
+
+publish_status() {
+  rc=$?
+  trap - EXIT
+  set +e
+  state="failed"
+  if [[ "${rc}" -eq 0 ]]; then
+    state="passed"
+  fi
+  ended_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  status_tmp="${RUN_STATUS}.tmp.$$"
+  printf '%s\n' \
+    "{\"schema\":\"wm3d_v7_smoke_status_v1\",\"state\":\"${state}\",\"exit_code\":${rc},\"stage\":\"${CURRENT_STAGE}\",\"attempt_id\":\"${ATTEMPT_ID}\",\"started_at_utc\":\"${STARTED_AT_UTC}\",\"ended_at_utc\":\"${ended_at_utc}\",\"log\":\"logs/smoke.log\"}" \
+    >"${status_tmp}"
+  mv -f -- "${status_tmp}" "${RUN_STATUS}"
+  printf 'smoke %s：stage=%s exit=%s；日志=%s；状态=%s\n' \
+    "${state}" "${CURRENT_STAGE}" "${rc}" "${RUN_LOG}" "${RUN_STATUS}"
+  exit "${rc}"
+}
+
+trap publish_status EXIT
+exec > >(tee -a "${RUN_LOG}") 2>&1
+export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+printf '\n=== WM3D smoke attempt %s started %s ===\n' \
+  "${ATTEMPT_ID}" "${STARTED_AT_UTC}"
+echo "Hugging Face endpoint: ${HF_ENDPOINT}"
+
 echo "[1/10] 创建并核验固定 Python 环境"
 SYSTEM_PYTHON="${SYSTEM_PYTHON:-python3.10}" \
   "${ROOT}/environments/bootstrap_environment.sh"
 PY="${PYTHON_BIN}"
 TORCHRUN="${WORK_ROOT}/venv/bin/torchrun"
 
+CURRENT_STAGE="download_aloha"
 echo "[2/10] 下载固定 revision 的 91 MB ALOHA 公开样本"
-"${PY}" "${ROOT}/scripts/data/download_raw_snapshots.py" \
+if ! "${PY}" "${ROOT}/scripts/data/download_raw_snapshots.py" \
   --lock "${ROOT}/configs/smoke/aloha_sources.lock.yaml" \
-  --raw-root "${WORK_ROOT}/raw" --source aloha_smoke --resume
+  --raw-root "${WORK_ROOT}/raw" --source aloha_smoke --resume; then
+  echo "ALOHA 公开样本下载失败。若 huggingface.co 不可达，请原地重试：" >&2
+  echo "  HF_ENDPOINT=https://hf-mirror.com ./wm3d.sh smoke ${WORK_ROOT}" >&2
+  exit 1
+fi
 export ALOHA_SMOKE_ROOT="${WORK_ROOT}/raw/aloha_smoke"
 
 DATASET_ROOT="${WORK_ROOT}/dataset"
 CONTRACT_BUILD="${WORK_ROOT}/build/dataset_contract.json"
+CURRENT_STAGE="prepare_dataset"
 if [[ ! -f "${DATASET_ROOT}/receipts/source_scan.json" ]]; then
   echo "[3/10] 编译数据契约并扫描 train/val episode"
   if [[ ! -f "${CONTRACT_BUILD}" ]]; then
@@ -69,6 +109,7 @@ if [[ ! -f "${DATASET_ROOT}/receipts/source_scan.json" ]]; then
     --output-root "${DATASET_ROOT}"
 fi
 
+CURRENT_STAGE="action_statistics"
 if [[ ! -f "${DATASET_ROOT}/control/action_stats.json" ]]; then
   echo "[4/10] 统计 grouped action"
   PARTIAL="${WORK_ROOT}/build/action_stats_00000.npz"
@@ -83,25 +124,15 @@ if [[ ! -f "${DATASET_ROOT}/control/action_stats.json" ]]; then
     --output "${DATASET_ROOT}/control/action_stats.json"
 fi
 
+CURRENT_STAGE="encoder_assets"
 echo "[5/10] 准备固定 VGGT 资产和 smoke task bank"
 VGGT_SOURCE="${WORK_ROOT}/assets_source/vggt"
-if [[ ! -d "${VGGT_SOURCE}/.git" ]]; then
-  if [[ -e "${VGGT_SOURCE}" || -L "${VGGT_SOURCE}" ]]; then
-    echo "VGGT source 目录已存在但不是 Git checkout：${VGGT_SOURCE}" >&2
-    exit 2
-  fi
-  mkdir -p -- "$(dirname "${VGGT_SOURCE}")"
-  git clone --filter=blob:none https://github.com/facebookresearch/vggt.git "${VGGT_SOURCE}"
-  git -C "${VGGT_SOURCE}" checkout --detach "${VGGT_SOURCE_COMMIT}"
-fi
-if [[ "$(git -C "${VGGT_SOURCE}" rev-parse HEAD)" != "${VGGT_SOURCE_COMMIT}" ]]; then
-  echo "VGGT source commit 漂移" >&2
-  exit 2
-fi
-if [[ -n "$(git -C "${VGGT_SOURCE}" status --porcelain --untracked-files=no)" ]]; then
-  echo "VGGT source tracked files 不干净" >&2
-  exit 2
-fi
+"${PY}" "${ROOT}/scripts/assets/materialize_vggt_source.py" \
+  --output-root "${VGGT_SOURCE}" \
+  --archive-root "${WORK_ROOT}/assets_source/archives" \
+  --commit "${VGGT_SOURCE_COMMIT}" \
+  --archive-sha256 "${VGGT_SOURCE_ARCHIVE_SHA256}" \
+  --tree-sha256 "${VGGT_SOURCE_TREE_SHA256}"
 
 if [[ -n "${VGGT_MODEL_SNAPSHOT:-}" ]]; then
   VGGT_SNAPSHOT="$(realpath -e -- "${VGGT_MODEL_SNAPSHOT}")"
@@ -138,6 +169,8 @@ if [[ ! -f "${ASSET_ROOT}/receipt.json" ]]; then
   "${PY}" "${ROOT}/scripts/assets/seal_encoder_assets.py" \
     --vggt-source-root "${VGGT_SOURCE}" \
     --vggt-source-commit "${VGGT_SOURCE_COMMIT}" \
+    --vggt-source-archive-sha256 "${VGGT_SOURCE_ARCHIVE_SHA256}" \
+    --vggt-source-tree-sha256 "${VGGT_SOURCE_TREE_SHA256}" \
     --vggt-model facebook/VGGT-1B \
     --vggt-snapshot "${VGGT_SNAPSHOT}" --vggt-revision "${VGGT_REVISION}" \
     --task-model wm3d/smoke-hash-2048 \
@@ -161,6 +194,7 @@ resource_guard() {
     --expected-ip "${EXPECTED_IP}" --minimum-free-bytes 50000000000
 }
 
+CURRENT_STAGE="vggt_cache"
 if [[ ! -f "${DATASET_ROOT}/receipts/dataset_seal.json" ]]; then
   echo "[6/10] GPU0–1 编码真实 RGB/action 并发布 VGGT cache"
   resource_guard
@@ -197,6 +231,7 @@ fi
 "${PY}" "${ROOT}/scripts/data/verify_dataset.py" \
   --dataset-root "${DATASET_ROOT}" --mode deep --sample-windows-per-source 2
 
+CURRENT_STAGE="release_config"
 echo "[7/10] 固化代码、环境和训练配置"
 CODE_RECEIPT="${WORK_ROOT}/receipts/code.json"
 if [[ ! -f "${CODE_RECEIPT}" ]]; then
@@ -230,6 +265,7 @@ PY
 fi
 
 CHECKPOINT="${TRAIN_ROOT}/checkpoints/step_00000001"
+CURRENT_STAGE="train"
 if [[ ! -f "${CHECKPOINT}/COMMITTED.json" ]]; then
   echo "[8/10] GPU0–1 运行真实约 4.96B 模型的一步 FSDP2 训练"
   resource_guard
@@ -242,6 +278,7 @@ if [[ ! -f "${CHECKPOINT}/COMMITTED.json" ]]; then
 fi
 
 EVAL_ROOT="${WORK_ROOT}/eval"
+CURRENT_STAGE="eval"
 if [[ ! -f "${EVAL_ROOT}/report.json" ]]; then
   echo "[9/10] 从显式 step_00000001 checkpoint 运行一步 eval"
   resource_guard
@@ -252,6 +289,7 @@ if [[ ! -f "${EVAL_ROOT}/report.json" ]]; then
     2>&1 | tee "${WORK_ROOT}/logs/eval.log"
 fi
 
+CURRENT_STAGE="report"
 echo "[10/10] 发布全流程证据报告"
 REPORT="${WORK_ROOT}/smoke_report.json"
 if [[ ! -f "${REPORT}" ]]; then
@@ -271,3 +309,4 @@ if value.get("pass") is not True:
     raise SystemExit("smoke report did not pass")
 print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 PY
+CURRENT_STAGE="complete"

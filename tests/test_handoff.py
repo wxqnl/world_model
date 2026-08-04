@@ -7,12 +7,14 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 
 from packaging.utils import canonicalize_name
 import pytest
 import torch
 import yaml
 
+from scripts.assets.seal_encoder_assets import _copy_vggt_source
 from scripts.cluster.preflight_cluster import (
     _parse_ib_rate_gbps,
     _parse_nvlink_topology,
@@ -21,6 +23,9 @@ from scripts.cluster.seal_code import DEFAULT_PATTERNS
 from wm3d.data.assets import (
     ASSET_RECEIPT_SCHEMA,
     verify_asset_bundle,
+    verify_vggt_source,
+    vggt_source_evidence,
+    vggt_source_tree_sha256,
 )
 from wm3d.data.contracts import (
     ContractError,
@@ -154,6 +159,107 @@ def test_encoder_asset_receipt_detects_tamper(tmp_path: Path) -> None:
     target.write_bytes(b"tampered")
     with pytest.raises(ContractError, match="verification failed"):
         verify_asset_bundle(root, deep=True)
+
+
+def test_vggt_source_codeload_materialization_and_tamper_gate(
+    tmp_path: Path,
+) -> None:
+    commit = "a" * 40
+    expected = tmp_path / "expected"
+    (expected / "vggt/models").mkdir(parents=True)
+    (expected / "LICENSE.txt").write_text("license\n", encoding="utf-8")
+    (expected / "vggt/models/vggt.py").write_text(
+        "VALUE = 7\n",
+        encoding="utf-8",
+    )
+    files = vggt_source_evidence(expected)
+    tree_sha256 = vggt_source_tree_sha256(files)
+    archive_root = tmp_path / "archives"
+    archive_root.mkdir()
+    archive = archive_root / f"vggt-{commit}.tar.gz"
+    with tarfile.open(archive, mode="w:gz") as handle:
+        handle.add(expected, arcname=f"vggt-{commit}")
+    archive_sha256 = sha256_file(archive)
+    output = tmp_path / "source"
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts/assets/materialize_vggt_source.py"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--output-root",
+            str(output),
+            "--archive-root",
+            str(archive_root),
+            "--commit",
+            commit,
+            "--archive-sha256",
+            archive_sha256,
+            "--tree-sha256",
+            tree_sha256,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    cli_report = json.loads(result.stdout)
+    assert cli_report["status"] == "materialized"
+    assert cli_report["files"] == 2
+    assert cli_report["bytes"] == sum(
+        int(value["size"]) for value in files.values()
+    )
+    alias = tmp_path / "source-alias"
+    alias.symlink_to(output, target_is_directory=True)
+    with pytest.raises(ValueError, match="not a real directory"):
+        _copy_vggt_source(
+            alias,
+            tmp_path / "copy",
+            commit,
+            archive_sha256,
+            tree_sha256,
+        )
+    report = verify_vggt_source(
+        output,
+        expected_commit=commit,
+        expected_archive_sha256=archive_sha256,
+        expected_tree_sha256=tree_sha256,
+    )
+    assert report["pass"] is True
+    assert len(report["files"]) == 2
+    (output / "vggt/models/vggt.py").write_text(
+        "VALUE = 8\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ContractError, match="file evidence mismatch"):
+        verify_vggt_source(
+            output,
+            expected_commit=commit,
+            expected_archive_sha256=archive_sha256,
+            expected_tree_sha256=tree_sha256,
+        )
+
+
+def test_formal_pipeline_pins_vggt_archive_and_tree() -> None:
+    root = Path(__file__).resolve().parents[1]
+    site = (root / "configs/cluster/h200.env.example").read_text(
+        encoding="utf-8"
+    )
+    pipeline = (root / "scripts/pipeline.py").read_text(encoding="utf-8")
+    assert (
+        "VGGT_SOURCE_ARCHIVE_SHA256="
+        "df4e7de1184bcb28ad6b4a83ead828f34ba42fb18be03c034801ffeb3a058f91"
+        in site
+    )
+    assert (
+        "VGGT_SOURCE_TREE_SHA256="
+        "afc51bd052a538736830c33651f8f59f087629754298dd95d5d97a1a8bf99fa1"
+        in site
+    )
+    assert '"--vggt-source-archive-sha256"' in pipeline
+    assert '"--vggt-source-tree-sha256"' in pipeline
 
 
 def test_code_receipt_rejects_dirty_scope(tmp_path: Path) -> None:

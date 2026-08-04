@@ -53,6 +53,15 @@ git clone --branch v7 --single-branch \
 cd world_model
 ```
 
+如果所在网络的 GitHub HTTP/2 连接不稳定，使用完整历史的 HTTP/1.1 clone；不要用源码
+tarball 替代 Git checkout，因为 V7 血统审计和 code receipt 需要 Git 历史：
+
+```bash
+git -c http.version=HTTP/1.1 clone --branch v7 --single-branch \
+  https://github.com/wxqnl/world_model.git
+cd world_model
+```
+
 ### 3. 配置 Hugging Face 凭据
 
 先在 Hugging Face 页面接受 AgiBot Alpha/Beta 许可，再创建只读 token 文件：
@@ -102,9 +111,9 @@ PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple \
   ./wm3d.sh setup site.env
 ```
 
-集群无法直连 huggingface.co 时，在 site.env 中设置
-HF_ENDPOINT=https://hf-mirror.com。下载完成后仍会用 source lock 中的 40 位 commit SHA
-和本地 receipt 校验数据身份。
+集群无法直连 huggingface.co 时，正式数据流水线在 `site.env` 中设置
+`HF_ENDPOINT=https://hf-mirror.com`。下载完成后仍会用 source lock 中的 40 位 commit SHA
+和本地 receipt 校验数据身份。小样本 smoke 不读取 `site.env`，对应的镜像命令见第三节。
 
 ## 二、公开数据
 
@@ -184,11 +193,23 @@ WORK_ROOT/
 ```
 
 smoke 会下载固定 revision 的 ALOHA 小样本（约 91 MB），生成真实 VGGT cache，在
-GPU0–1 上执行一步 5B preset 的 FSDP2 训练、validation、原子 checkpoint 和 eval。它会先
-检查 GPU 空闲、ECC 和磁盘空间，不会占用已有计算进程。
+GPU0–1 上执行一步 5B preset 的 FSDP2 训练、validation、原子 checkpoint 和 eval。环境和
+数据准备可在 GPU 忙时完成；每个 GPU 阶段启动 worker 前都会重新检查 GPU 空闲、ECC 和
+磁盘空间，不会占用已有计算进程。
+
+smoke 直接继承标准 `HF_ENDPOINT`。无法直连 huggingface.co 时，从同一个 work-root 原地
+重试，已完成的环境和下载缓存会复用：
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com \
+  ./wm3d.sh smoke /shared/wm3d-smoke
+```
 
 成功标志是 `/shared/wm3d-smoke/smoke_report.json` 中 `pass=true`。报告包含原始数据
 revision、dataset seal、精确参数量、checkpoint 哈希以及 RGB/depth/point/action 指标。
+全过程会追加写入 `/shared/wm3d-smoke/logs/smoke.log`；最近一次尝试的阶段、退出码和日志
+位置会原子写入 `/shared/wm3d-smoke/smoke_status.json`。失败时先查看这两个文件，再用同一
+命令和 work-root 重试，不要删除半成品。
 
 如果已有固定 revision 的 VGGT 模型快照：
 
