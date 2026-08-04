@@ -8,7 +8,7 @@ import pytest
 def test_network_retry_recovers_and_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = runpy.run_path("scripts/internal/download_raw_snapshots.py")
+    module = runpy.run_path("scripts/data/download_raw_snapshots.py")
     calls = 0
     delays: list[float] = []
 
@@ -41,7 +41,7 @@ def test_network_retry_recovers_and_is_bounded(
 
 
 def test_network_retry_does_not_hide_programming_errors() -> None:
-    module = runpy.run_path("scripts/internal/download_raw_snapshots.py")
+    module = runpy.run_path("scripts/data/download_raw_snapshots.py")
 
     def invalid() -> None:
         raise ValueError("invalid source contract")

@@ -39,7 +39,7 @@ fi
 PYTHON_BIN="${PYTHON_BIN:-/opt/wm3d/bin/python}"
 export PYTHONDONTWRITEBYTECODE=1
 cd "${REPO_ROOT}"
-exec "${PYTHON_BIN}" scripts/internal/encode_shard.py \
+exec "${PYTHON_BIN}" scripts/data/cache_vggt_shard.py \
   --dataset-contract "${DATASET_ROOT}/control/dataset_contract.json" \
   --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
   --action-stats "${DATASET_ROOT}/control/action_stats.json" \

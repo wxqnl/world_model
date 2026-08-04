@@ -13,11 +13,11 @@ import pytest
 import torch
 import yaml
 
-from scripts.internal.preflight_cluster import (
+from scripts.cluster.preflight_cluster import (
     _parse_ib_rate_gbps,
     _parse_nvlink_topology,
 )
-from scripts.internal.seal_code import DEFAULT_PATTERNS
+from scripts.cluster.seal_code import DEFAULT_PATTERNS
 from wm3d.data.assets import (
     ASSET_RECEIPT_SCHEMA,
     verify_asset_bundle,
@@ -60,7 +60,14 @@ def test_code_seal_covers_native_encoder_dependency_closure() -> None:
         "wm3d/models/__init__.py",
         "wm3d/training/__init__.py",
     }
-    assert required.issubset(DEFAULT_PATTERNS)
+    root = Path(__file__).resolve().parents[1]
+    covered = {
+        path.relative_to(root).as_posix()
+        for pattern in DEFAULT_PATTERNS
+        for path in root.glob(pattern)
+        if path.is_file()
+    }
+    assert required.issubset(covered)
 
 
 def test_environment_receipt_binds_current_runtime(tmp_path: Path) -> None:
@@ -328,7 +335,7 @@ def test_materialize_config_verifies_full_seal_and_has_no_placeholders(
     output_config = tmp_path / "materialized.yaml"
     command = [
         sys.executable,
-        str(repo_root / "scripts" / "internal" / "materialize_config.py"),
+        str(repo_root / "scripts" / "cluster" / "materialize_config.py"),
         "--template",
         str(repo_root / "configs" / "train" / "5b_h200.yaml"),
         "--dataset-root",
@@ -475,7 +482,7 @@ def test_environment_setup_is_plain_and_beta_converter_is_lazy() -> None:
 def test_lerobot_converter_repair_is_exact_and_fail_closed() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     module = __import__(
-        "scripts.internal.prepare_lerobot_converter_build",
+        "environments.prepare_lerobot_converter_build",
         fromlist=["normalize_requirements"],
     )
     newline = bytes((10,))

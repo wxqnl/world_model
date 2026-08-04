@@ -23,7 +23,7 @@ done
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/wm3d/bin/python}"
 cd "${REPO_ROOT}"
-exec "${PYTHON_BIN}" scripts/internal/build_task_bank.py \
+exec "${PYTHON_BIN}" scripts/data/build_task_bank.py \
   --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
   --output-root "${DATASET_ROOT}" \
   --asset-root "${ENCODER_ASSET_ROOT}" \

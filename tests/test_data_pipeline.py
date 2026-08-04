@@ -122,7 +122,7 @@ def _contract() -> DatasetContract:
 
 
 def test_encoder_resize_preserves_exact_unit_interval() -> None:
-    resize = runpy.run_path("scripts/internal/encode_shard.py")["_resize_views"]
+    resize = runpy.run_path("scripts/data/cache_vggt_shard.py")["_resize_views"]
     white = torch.full(
         (2, 3, 3, 480, 640),
         255,
@@ -587,7 +587,7 @@ def test_episode_input_validation_checks_parquet_width_and_video(
 
 
 def test_action_statistics_global_budget_is_bounded_and_deterministic() -> None:
-    module = runpy.run_path("scripts/internal/build_action_stats.py")
+    module = runpy.run_path("scripts/data/build_action_stats.py")
     allocate = module["_episode_sample_positions"]
     episodes = [
         SimpleNamespace(
@@ -622,7 +622,7 @@ def test_action_statistics_global_budget_is_bounded_and_deterministic() -> None:
 
 
 def test_encoded_part_reentry_binds_complete_lineage(tmp_path: Path) -> None:
-    module = runpy.run_path("scripts/internal/encode_shard.py")
+    module = runpy.run_path("scripts/data/cache_vggt_shard.py")
     verify = module["_verify_existing_part"]
     part = tmp_path / "part-00003-000007"
     part.mkdir()
@@ -688,7 +688,7 @@ def test_encoded_part_reentry_binds_complete_lineage(tmp_path: Path) -> None:
         "expected_lineage": lineage,
     }
     assert verify(part, **arguments)
-    merge_module = runpy.run_path("scripts/internal/merge_and_seal.py")
+    merge_module = runpy.run_path("scripts/data/seal_dataset.py")
     merged = merge_module["_verify_part"](
         part,
         {**lineage, **encoder_identity},
@@ -703,7 +703,7 @@ def test_encoded_part_reentry_binds_complete_lineage(tmp_path: Path) -> None:
 def test_merge_binds_worker_summaries_and_rejects_payload_aliases(
     tmp_path: Path,
 ) -> None:
-    module = runpy.run_path("scripts/internal/merge_and_seal.py")
+    module = runpy.run_path("scripts/data/seal_dataset.py")
     load_receipts = module["_load_worker_receipts"]
     committed_names = module["_committed_part_names"]
     receipt_root = tmp_path / "dataset"
@@ -754,7 +754,7 @@ def test_raw_source_lock_is_immutable_and_gated_dry_run_needs_no_secret(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = runpy.run_path("scripts/internal/download_raw_snapshots.py")
+    module = runpy.run_path("scripts/data/download_raw_snapshots.py")
     lock = {
         "schema": "wm3d_v7_raw_sources_lock_v1",
         "sources": {
@@ -844,7 +844,7 @@ def test_raw_source_lock_is_immutable_and_gated_dry_run_needs_no_secret(
 
 
 def test_archive_extractor_rejects_path_escape_and_special_names() -> None:
-    module = runpy.run_path("scripts/internal/safe_extract_lerobot_collection.py")
+    module = runpy.run_path("scripts/data/safe_extract_lerobot_collection.py")
     member_relative = module["_member_relative"]
     assert member_relative("task/meta/info.json") == Path("task/meta/info.json")
     for unsafe in ("", "/absolute/file", "../escape", "task/../../escape"):
@@ -857,7 +857,7 @@ def test_archive_collection_finalize_binds_download_and_exact_archive_set(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    module = runpy.run_path("scripts/internal/safe_extract_lerobot_collection.py")
+    module = runpy.run_path("scripts/data/safe_extract_lerobot_collection.py")
     snapshot = tmp_path / "snapshot"
     archive_root = snapshot / "ImitationLearning"
     archive_root.mkdir(parents=True)
@@ -940,7 +940,7 @@ def test_agibot_beta_materialization_is_exact_and_reentrant(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = runpy.run_path("scripts/internal/safe_materialize_agibot_beta.py")
+    module = runpy.run_path("scripts/data/safe_materialize_agibot_beta.py")
     snapshot = tmp_path / "agibot_beta_snapshot"
     (snapshot / "task_info").mkdir(parents=True)
     (snapshot / "observations" / "327").mkdir(parents=True)
@@ -1002,7 +1002,7 @@ def test_agibot_beta_materialization_is_exact_and_reentrant(
 
     output_parent = tmp_path / "materialized"
     output_parent.mkdir()
-    task_list_module = runpy.run_path("scripts/internal/list_agibot_beta_tasks.py")
+    task_list_module = runpy.run_path("scripts/data/list_agibot_beta_tasks.py")
     task_list_path = output_parent / "task_ids.txt"
     monkeypatch.setattr(
         sys,
@@ -1040,7 +1040,7 @@ def test_agibot_beta_materialization_is_exact_and_reentrant(
     assert finalized["complete"] is True
     assert finalized["archives"] == 3
     assert finalized["episodes"] == 2
-    converter_module = runpy.run_path("scripts/internal/convert_agibot_beta_task.py")
+    converter_module = runpy.run_path("scripts/data/convert_agibot_beta_task.py")
     receipt_path, receipt = converter_module["_materialization_receipt"](output)
     assert receipt_path.name == ".wm3d_v7_beta_materialization_receipt.json"
     assert (
@@ -1084,7 +1084,7 @@ def test_agibot_beta_materialization_is_exact_and_reentrant(
     assert frozen_receipt_path == converter_download_receipt
     assert frozen_receipt["revision"] == converter_revision
     environment_module = runpy.run_path(
-        "scripts/internal/verify_agibot_converter_environment.py"
+        "environments/verify_agibot_converter_environment.py"
     )
     environment_root = tmp_path / "agibot_converter_environment"
     environment_root.mkdir()
@@ -1202,7 +1202,7 @@ def test_planning_templates_compile_and_bind_grouped_action_widths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = runpy.run_path("scripts/internal/compile_dataset_contract.py")
+    module = runpy.run_path("scripts/data/compile_dataset_contract.py")
     variable_names = (
         "DROID_ROOT",
         "BRIDGE_ROOT",

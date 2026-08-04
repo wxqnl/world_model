@@ -378,7 +378,7 @@ class Pipeline:
         }
         command: list[str | Path] = [
             self.python,
-            self.repo / "scripts/internal/resolve_source_lock.py",
+            self.repo / "scripts/data/resolve_source_lock.py",
             "--template",
             template_path,
             "--output",
@@ -399,7 +399,7 @@ class Pipeline:
         self.command(
             [
                 self.python,
-                self.repo / "scripts/internal/download_raw_snapshots.py",
+                self.repo / "scripts/data/download_raw_snapshots.py",
                 "--lock",
                 self.raw_lock,
                 "--raw-root",
@@ -421,7 +421,7 @@ class Pipeline:
         shell_command = (
             f"cd {shlex.quote(str(self.repo))} && "
             f"{shlex.quote(str(self.python))} "
-            "scripts/internal/safe_extract_lerobot_collection.py "
+            "scripts/data/safe_extract_lerobot_collection.py "
             f"--archive-root {shlex.quote(str(archive_root))} "
             f"--output-root {shlex.quote(str(output))} "
             f"--num-shards {shards} "
@@ -429,7 +429,7 @@ class Pipeline:
         )
         self.sbatch_wrap(shell_command, wait=True, array=array)
         self.python_command(
-            "scripts/internal/safe_extract_lerobot_collection.py",
+            "scripts/data/safe_extract_lerobot_collection.py",
             "--archive-root",
             archive_root,
             "--output-root",
@@ -459,7 +459,7 @@ class Pipeline:
         )
         if not task_list.exists():
             self.python_command(
-                "scripts/internal/list_agibot_beta_tasks.py",
+                "scripts/data/list_agibot_beta_tasks.py",
                 "--raw-root",
                 snapshot,
                 "--output",
@@ -468,7 +468,7 @@ class Pipeline:
         raw_receipt = raw / ".wm3d_v7_beta_materialization_receipt.json"
         if not raw_receipt.exists():
             self.python_command(
-                "scripts/internal/safe_materialize_agibot_beta.py",
+                "scripts/data/safe_materialize_agibot_beta.py",
                 "prepare",
                 "--snapshot-root",
                 snapshot,
@@ -480,14 +480,14 @@ class Pipeline:
             shell_command = (
                 f"cd {shlex.quote(str(self.repo))} && "
                 f"{shlex.quote(str(self.python))} "
-                "scripts/internal/safe_materialize_agibot_beta.py extract "
+                "scripts/data/safe_materialize_agibot_beta.py extract "
                 f"--snapshot-root {shlex.quote(str(snapshot))} "
                 f"--output-root {shlex.quote(str(raw))} --num-shards {shards} "
                 '--shard-id "${SLURM_ARRAY_TASK_ID}"'
             )
             self.sbatch_wrap(shell_command, wait=True, array=array)
             self.python_command(
-                "scripts/internal/safe_materialize_agibot_beta.py",
+                "scripts/data/safe_materialize_agibot_beta.py",
                 "finalize",
                 "--snapshot-root",
                 snapshot,
@@ -515,7 +515,7 @@ class Pipeline:
         shell_command = (
             f"cd {shlex.quote(str(self.repo))} && "
             f"{shlex.quote(str(self.converter_python))} "
-            "scripts/internal/convert_agibot_beta_task.py "
+            "scripts/data/convert_agibot_beta_task.py "
             f"--raw-root {shlex.quote(str(raw))} "
             f"--output-root {shlex.quote(str(converted))} "
             f"--vendor-converter {shlex.quote(str(converter))} "
@@ -528,7 +528,7 @@ class Pipeline:
         self.command(
             [
                 self.converter_python,
-                self.repo / "scripts/internal/convert_agibot_beta_task.py",
+                self.repo / "scripts/data/convert_agibot_beta_task.py",
                 "--raw-root",
                 raw,
                 "--output-root",
@@ -569,7 +569,7 @@ class Pipeline:
                 continue
             command: list[str | Path] = [
                 self.python,
-                self.repo / "scripts/internal/inspect_lerobot_schema.py",
+                self.repo / "scripts/data/inspect_lerobot_schema.py",
                 "--root",
                 root,
                 "--output",
@@ -584,7 +584,7 @@ class Pipeline:
     def _prepare_assets(self) -> None:
         if (self.assets / "receipt.json").exists():
             self.python_command(
-                "scripts/internal/verify_encoder_assets.py",
+                "scripts/assets/verify_encoder_assets.py",
                 "--asset-root",
                 self.assets,
                 "--deep",
@@ -593,7 +593,7 @@ class Pipeline:
         self.command(
             [
                 self.python,
-                self.repo / "scripts/internal/download_encoder_assets.py",
+                self.repo / "scripts/assets/download_encoder_assets.py",
                 "--staging-root",
                 self.staging / "encoder_assets",
                 "--output-root",
@@ -621,7 +621,7 @@ class Pipeline:
         contract = self.bootstrap / "dataset_contract.json"
         if not contract.exists():
             self.python_command(
-                "scripts/internal/compile_dataset_contract.py",
+                "scripts/data/compile_dataset_contract.py",
                 "--inventory",
                 self.repo / "configs/data/public_6106h.yaml",
                 "--output",
@@ -647,7 +647,7 @@ class Pipeline:
             self.command(
                 [
                     self.python,
-                    self.repo / "scripts/internal/scan_sources.py",
+                    self.repo / "scripts/data/scan_sources.py",
                     "--dataset-contract",
                     contract,
                     "--source-layouts",
@@ -680,7 +680,7 @@ class Pipeline:
             ]
             if missing:
                 self.sbatch_script(
-                    "scripts/internal/sbatch_action_stats_array.sh",
+                    "scripts/slurm/sbatch_action_stats_array.sh",
                     exports={
                         "REPO_ROOT": self.repo,
                         "DATASET_ROOT": self.dataset,
@@ -703,7 +703,7 @@ class Pipeline:
             self.command(
                 [
                     self.python,
-                    self.repo / "scripts/internal/build_action_stats.py",
+                    self.repo / "scripts/data/build_action_stats.py",
                     "merge",
                     "--partials",
                     *partials,
@@ -717,7 +717,7 @@ class Pipeline:
         task_index = self.dataset / "control/task_index.json"
         if not task_index.exists():
             self.sbatch_script(
-                "scripts/internal/sbatch_task_bank.sh",
+                "scripts/slurm/sbatch_task_bank.sh",
                 exports={
                     "REPO_ROOT": self.repo,
                     "DATASET_ROOT": self.dataset,
@@ -736,7 +736,7 @@ class Pipeline:
         ]
         if missing:
             self.sbatch_script(
-                "scripts/internal/sbatch_encode_array.sh",
+                "scripts/slurm/sbatch_encode_array.sh",
                 exports={
                     "REPO_ROOT": self.repo,
                     "DATASET_ROOT": self.dataset,
@@ -752,7 +752,7 @@ class Pipeline:
         seal = self.dataset / "receipts/dataset_seal.json"
         if not seal.exists():
             self.python_command(
-                "scripts/internal/merge_and_seal.py",
+                "scripts/data/seal_dataset.py",
                 "--dataset-root",
                 self.dataset,
                 "--num-encoder-shards",
@@ -761,7 +761,7 @@ class Pipeline:
                 "1000000",
             )
         self.python_command(
-            "scripts/internal/verify_dataset.py",
+            "scripts/data/verify_dataset.py",
             "--dataset-root",
             self.dataset,
             "--mode",
@@ -770,7 +770,7 @@ class Pipeline:
             "4",
         )
         self.python_command(
-            "scripts/internal/verify_dataset.py",
+            "scripts/data/verify_dataset.py",
             "--dataset-root",
             self.dataset,
             "--mode",
@@ -791,7 +791,7 @@ class Pipeline:
         output = self.release / "code_receipt.json"
         if not output.exists():
             self.python_command(
-                "scripts/internal/seal_code.py",
+                "scripts/cluster/seal_code.py",
                 "--repo-root",
                 self.repo,
                 "--output",
@@ -837,7 +837,7 @@ class Pipeline:
             return config, output
         template = self._template(canary=canary)
         self.python_command(
-            "scripts/internal/materialize_config.py",
+            "scripts/cluster/materialize_config.py",
             "--template",
             template,
             "--dataset-root",
@@ -898,7 +898,7 @@ class Pipeline:
         if resume is not None:
             exports["RESUME_CHECKPOINT"] = resume
         return self.sbatch_script(
-            "scripts/internal/sbatch_train.sh",
+            "scripts/slurm/sbatch_train.sh",
             exports=exports,
             wait=wait,
             nodes=_integer("TRAIN_NODES"),
@@ -938,7 +938,7 @@ class Pipeline:
             return report
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.sbatch_script(
-            "scripts/internal/sbatch_eval.sh",
+            "scripts/slurm/sbatch_eval.sh",
             exports={
                 "CONFIG": config,
                 "CHECKPOINT": checkpoint,

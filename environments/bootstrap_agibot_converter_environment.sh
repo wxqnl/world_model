@@ -22,7 +22,7 @@ ARCHIVE="${CACHE}/lerobot-${REVISION}.tar.gz"
 SOURCE_ROOT="${CACHE}/lerobot-${REVISION}"
 BUILD_ROOT="${CACHE}/lerobot-${REVISION}-wm3d-build"
 POETRY_ENV="${ENV_ROOT}/poetry-1.8.5"
-PREPARE_SCRIPT="${REPO_ROOT}/scripts/internal/prepare_lerobot_converter_build.py"
+PREPARE_SCRIPT="${REPO_ROOT}/environments/prepare_lerobot_converter_build.py"
 
 command -v "${SYSTEM_PYTHON}" >/dev/null || {
   echo "找不到 ${SYSTEM_PYTHON}" >&2
@@ -82,7 +82,7 @@ fi
 
 if [[ -f "${RECEIPT}" && -x "${CONVERTER_PYTHON_BIN}" ]]; then
   "${CONVERTER_PYTHON_BIN}" \
-    "${REPO_ROOT}/scripts/internal/verify_agibot_converter_environment.py" \
+    "${REPO_ROOT}/environments/verify_agibot_converter_environment.py" \
     --contract "${CONTRACT}" --revision-file "${REVISION_FILE}" \
     --receipt "${RECEIPT}"
   echo "AgiBot 转换环境已通过：${ENV_PREFIX}"
@@ -160,7 +160,7 @@ if [[ -e "${RECEIPT}" || -L "${RECEIPT}" ]]; then
   exit 2
 fi
 "${CONVERTER_PYTHON_BIN}" \
-  "${REPO_ROOT}/scripts/internal/verify_agibot_converter_environment.py" \
+  "${REPO_ROOT}/environments/verify_agibot_converter_environment.py" \
   --contract "${CONTRACT}" --revision-file "${REVISION_FILE}" \
   --output "${RECEIPT}"
 echo "AgiBot 转换环境安装完成：${ENV_PREFIX}"

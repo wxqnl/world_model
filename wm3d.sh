@@ -57,7 +57,7 @@ if [[ "${action}" == "smoke" ]]; then
     echo "用法：./wm3d.sh smoke /abs/work-root" >&2
     exit 2
   fi
-  exec "${ROOT}/scripts/run_public_smoke.sh" "$2"
+  exec "${ROOT}/scripts/smoke/run.sh" "$2"
 fi
 
 if [[ $# -lt 2 ]]; then
@@ -131,7 +131,7 @@ case "${action}" in
       config="${ROOT}/${config}"
     fi
     config="$(realpath -e -- "${config}")"
-    exec "${PYTHON_BIN}" "${ROOT}/scripts/internal/report_parameter_budget.py" \
+    exec "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_parameters.py" \
       --config "${config}"
     ;;
   all)

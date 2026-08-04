@@ -10,10 +10,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-from scripts.internal.verify_agibot_converter_environment import (
+from environments.verify_agibot_converter_environment import (
     RECEIPT_SCHEMA as CONVERTER_ENVIRONMENT_RECEIPT_SCHEMA,
 )
-from scripts.internal.verify_agibot_converter_environment import validate_receipt
+from environments.verify_agibot_converter_environment import validate_receipt
 from wm3d.data.contracts import (
     atomic_write_json,
     canonical_sha256,

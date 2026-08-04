@@ -41,7 +41,7 @@ if [[ -e "${OUTPUT}" ]]; then
 fi
 
 cd "${REPO_ROOT}"
-exec "${PYTHON_BIN}" scripts/internal/build_action_stats.py partial \
+exec "${PYTHON_BIN}" scripts/data/build_action_stats.py partial \
   --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
   --output "${OUTPUT}" \
   --shard-id "${SLURM_ARRAY_TASK_ID}" \

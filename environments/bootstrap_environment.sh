@@ -33,7 +33,7 @@ PY
 }
 
 if [[ -f "${RECEIPT}" && -x "${PYTHON_BIN}" ]]; then
-  "${PYTHON_BIN}" "${REPO_ROOT}/scripts/internal/verify_environment.py" \
+  "${PYTHON_BIN}" "${REPO_ROOT}/environments/verify_environment.py" \
     --contract "${CONTRACT}" --receipt "${RECEIPT}" \
     --expected-sha256 "$(receipt_sha)"
   echo "WM3D 环境已通过：${ENV_PREFIX}"
@@ -54,6 +54,6 @@ if [[ -e "${RECEIPT}" || -L "${RECEIPT}" ]]; then
   echo "环境 receipt 已存在但未通过，拒绝覆盖：${RECEIPT}" >&2
   exit 2
 fi
-"${PYTHON_BIN}" "${REPO_ROOT}/scripts/internal/verify_environment.py" \
+"${PYTHON_BIN}" "${REPO_ROOT}/environments/verify_environment.py" \
   --contract "${CONTRACT}" --output "${RECEIPT}"
 echo "WM3D 环境安装完成：${ENV_PREFIX}"

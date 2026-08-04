@@ -98,7 +98,7 @@ echo "[$(date --iso-8601=seconds)] WM3D distributed preflight run=${RDZV_ID}"
 "${TORCHRUN_BIN}" \
   "${COMMON_ARGS[@]}" \
   --master-port="${MASTER_PORT}" \
-  scripts/internal/preflight_cluster.py \
+  scripts/cluster/preflight_cluster.py \
   --config "${CONFIG}" \
   --report "${PREFLIGHT_REPORT}"
 

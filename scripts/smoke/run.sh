@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 if [[ $# -ne 1 || "$1" != /* ]]; then
   echo "用法：$0 /abs/work-root" >&2
   exit 2
@@ -49,7 +49,7 @@ PY="${PYTHON_BIN}"
 TORCHRUN="${WORK_ROOT}/venv/bin/torchrun"
 
 echo "[2/10] 下载固定 revision 的 91 MB ALOHA 公开样本"
-"${PY}" "${ROOT}/scripts/internal/download_raw_snapshots.py" \
+"${PY}" "${ROOT}/scripts/data/download_raw_snapshots.py" \
   --lock "${ROOT}/configs/smoke/aloha_sources.lock.yaml" \
   --raw-root "${WORK_ROOT}/raw" --source aloha_smoke --resume
 export ALOHA_SMOKE_ROOT="${WORK_ROOT}/raw/aloha_smoke"
@@ -59,11 +59,11 @@ CONTRACT_BUILD="${WORK_ROOT}/build/dataset_contract.json"
 if [[ ! -f "${DATASET_ROOT}/receipts/source_scan.json" ]]; then
   echo "[3/10] 编译数据契约并扫描 train/val episode"
   if [[ ! -f "${CONTRACT_BUILD}" ]]; then
-    "${PY}" "${ROOT}/scripts/internal/compile_dataset_contract.py" \
+    "${PY}" "${ROOT}/scripts/data/compile_dataset_contract.py" \
       --inventory "${ROOT}/configs/smoke/aloha_dataset.yaml" \
       --output "${CONTRACT_BUILD}"
   fi
-  "${PY}" "${ROOT}/scripts/internal/scan_sources.py" \
+  "${PY}" "${ROOT}/scripts/data/scan_sources.py" \
     --dataset-contract "${CONTRACT_BUILD}" \
     --source-layouts "${ROOT}/configs/smoke/aloha_layouts.json" \
     --output-root "${DATASET_ROOT}"
@@ -73,12 +73,12 @@ if [[ ! -f "${DATASET_ROOT}/control/action_stats.json" ]]; then
   echo "[4/10] 统计 grouped action"
   PARTIAL="${WORK_ROOT}/build/action_stats_00000.npz"
   if [[ ! -f "${PARTIAL}" ]]; then
-    "${PY}" "${ROOT}/scripts/internal/build_action_stats.py" partial \
+    "${PY}" "${ROOT}/scripts/data/build_action_stats.py" partial \
       --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
       --output "${PARTIAL}" --shard-id 0 --num-shards 1 \
       --global-sample-budget 25000
   fi
-  "${PY}" "${ROOT}/scripts/internal/build_action_stats.py" merge \
+  "${PY}" "${ROOT}/scripts/data/build_action_stats.py" merge \
     --partials "${PARTIAL}" \
     --output "${DATASET_ROOT}/control/action_stats.json"
 fi
@@ -135,7 +135,7 @@ if not path.exists():
 PY
 ASSET_ROOT="${WORK_ROOT}/encoder_assets_nopyc_v1"
 if [[ ! -f "${ASSET_ROOT}/receipt.json" ]]; then
-  "${PY}" "${ROOT}/scripts/internal/seal_encoder_assets.py" \
+  "${PY}" "${ROOT}/scripts/assets/seal_encoder_assets.py" \
     --vggt-source-root "${VGGT_SOURCE}" \
     --vggt-source-commit "${VGGT_SOURCE_COMMIT}" \
     --vggt-model facebook/VGGT-1B \
@@ -144,11 +144,11 @@ if [[ ! -f "${ASSET_ROOT}/receipt.json" ]]; then
     --task-snapshot "${TASK_SNAPSHOT}" --task-revision "${TASK_REVISION}" \
     --output-root "${ASSET_ROOT}"
 else
-  "${PY}" "${ROOT}/scripts/internal/verify_encoder_assets.py" \
+  "${PY}" "${ROOT}/scripts/assets/verify_encoder_assets.py" \
     --asset-root "${ASSET_ROOT}"
 fi
 if [[ ! -f "${DATASET_ROOT}/control/task_index.json" ]]; then
-  "${PY}" "${ROOT}/scripts/internal/build_task_bank.py" \
+  "${PY}" "${ROOT}/scripts/data/build_task_bank.py" \
     --backend smoke-hash \
     --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
     --output-root "${DATASET_ROOT}" --asset-root "${ASSET_ROOT}" \
@@ -156,7 +156,7 @@ if [[ ! -f "${DATASET_ROOT}/control/task_index.json" ]]; then
 fi
 
 resource_guard() {
-  "${PY}" "${ROOT}/scripts/internal/verify_smoke_resources.py" \
+  "${PY}" "${ROOT}/scripts/smoke/verify_resources.py" \
     --devices "${DEVICES}" --work-root "${WORK_ROOT}" \
     --expected-ip "${EXPECTED_IP}" --minimum-free-bytes 50000000000
 }
@@ -169,7 +169,7 @@ if [[ ! -f "${DATASET_ROOT}/receipts/dataset_seal.json" ]]; then
     gpu="${shard}"
     log="${WORK_ROOT}/logs/encode_${shard}.log"
     CUDA_VISIBLE_DEVICES="${gpu}" "${PY}" \
-      "${ROOT}/scripts/internal/encode_shard.py" \
+      "${ROOT}/scripts/data/cache_vggt_shard.py" \
       --dataset-contract "${DATASET_ROOT}/control/dataset_contract.json" \
       --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
       --action-stats "${DATASET_ROOT}/control/action_stats.json" \
@@ -191,16 +191,16 @@ if [[ ! -f "${DATASET_ROOT}/receipts/dataset_seal.json" ]]; then
     echo "encoder shard 失败；证据保留在 ${WORK_ROOT}/logs" >&2
     exit 1
   fi
-  "${PY}" "${ROOT}/scripts/internal/merge_and_seal.py" \
+  "${PY}" "${ROOT}/scripts/data/seal_dataset.py" \
     --dataset-root "${DATASET_ROOT}" --num-encoder-shards 2
 fi
-"${PY}" "${ROOT}/scripts/internal/verify_dataset.py" \
+"${PY}" "${ROOT}/scripts/data/verify_dataset.py" \
   --dataset-root "${DATASET_ROOT}" --mode deep --sample-windows-per-source 2
 
 echo "[7/10] 固化代码、环境和训练配置"
 CODE_RECEIPT="${WORK_ROOT}/receipts/code.json"
 if [[ ! -f "${CODE_RECEIPT}" ]]; then
-  "${PY}" "${ROOT}/scripts/internal/seal_code.py" \
+  "${PY}" "${ROOT}/scripts/cluster/seal_code.py" \
     --repo-root "${ROOT}" --output "${CODE_RECEIPT}"
 fi
 CONFIG="${WORK_ROOT}/release/train_smoke2.yaml"
@@ -216,7 +216,7 @@ for name in sys.argv[1:]:
 print(hashlib.sha256(value).hexdigest())
 PY
 )"
-  "${PY}" "${ROOT}/scripts/internal/materialize_config.py" \
+  "${PY}" "${ROOT}/scripts/cluster/materialize_config.py" \
     --template "${ROOT}/configs/train/5b_smoke.yaml" \
     --dataset-root "${DATASET_ROOT}" --code-receipt "${CODE_RECEIPT}" \
     --code-root "${ROOT}" \
@@ -255,7 +255,7 @@ fi
 echo "[10/10] 发布全流程证据报告"
 REPORT="${WORK_ROOT}/smoke_report.json"
 if [[ ! -f "${REPORT}" ]]; then
-  "${PY}" "${ROOT}/scripts/internal/report_public_smoke.py" \
+  "${PY}" "${ROOT}/scripts/smoke/report.py" \
     --work-root "${WORK_ROOT}" --dataset-root "${DATASET_ROOT}" \
     --train-config "${CONFIG}" --train-root "${TRAIN_ROOT}" \
     --eval-root "${EVAL_ROOT}" \

@@ -38,5 +38,5 @@ srun --export=ALL --kill-on-bad-exit=1 --label bash -lc '
   ulimit -n 1048576
   export NODE_RANK="${SLURM_NODEID}"
   export NODE_LOG="${EVAL_LOG_ROOT}/node_$(printf "%03d" "${SLURM_NODEID}").log"
-  exec "${REPO_ROOT}/scripts/internal/launch_eval_node.sh"
+  exec "${REPO_ROOT}/scripts/cluster/launch_eval_node.sh"
 '

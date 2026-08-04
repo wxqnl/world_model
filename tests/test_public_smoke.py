@@ -9,7 +9,7 @@ import sys
 import torch
 import yaml
 
-from scripts.internal.build_task_bank import deterministic_embedding
+from scripts.data.build_task_bank import deterministic_embedding
 from wm3d.data.contracts import DatasetContract
 from wm3d.data.sources import (
     SourceLayout,
@@ -102,15 +102,15 @@ def test_public_smoke_hash_embedding_and_shell_are_deterministic() -> None:
     assert first.shape == (2048,)
     assert torch.isfinite(first).all()
     assert torch.equal(first, second)
-    shell = (ROOT / "scripts" / "run_public_smoke.sh").read_text()
+    shell = (ROOT / "scripts" / "smoke" / "run.sh").read_text()
     assert "export PYTHONDONTWRITEBYTECODE=1" in shell
     assert (
-        'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"'
+        'ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"'
         in shell
     )
     assert not torch.equal(first, other)
     result = subprocess.run(
-        ["bash", "-n", str(ROOT / "scripts" / "run_public_smoke.sh")],
+        ["bash", "-n", str(ROOT / "scripts" / "smoke" / "run.sh")],
         check=False,
         capture_output=True,
         text=True,

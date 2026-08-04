@@ -5,7 +5,8 @@ WM3D 是在显式时空 3D lattice 上联合学习世界状态与机器人动作
 时序主干建模，再通过双向 bridge 交换信息。
 
 仓库提供从公开数据下载、数据转换、VGGT 特征缓存、分布式预训练、精确恢复到 checkpoint
-评测的完整流程。日常操作统一通过 `./wm3d.sh`；`scripts/internal/` 中的程序由入口按阶段调用。
+评测的完整流程。日常操作统一通过 `./wm3d.sh`；实现脚本按数据、资产、集群、Slurm 和
+smoke 职责分类，目录说明见 `scripts/README.md`。
 
 当前发布分支为 `v7`。V7 是数据契约和 checkpoint 协议的版本号，不是项目名称。模型规模由
 YAML 配置决定；`configs/train/5b_h200.yaml` 是当前的大规模训练预设之一。
@@ -274,9 +275,13 @@ configs/
 └── train/            # 不同规模的训练预设
 environments/         # Python 3.10 venv 与固定依赖
 scripts/
-├── pipeline.py       # 流程编排
-├── run_public_smoke.sh
-└── internal/         # 各阶段的可测试实现
+├── pipeline.py       # 下载、处理、缓存、训练与评测编排
+├── data/             # 数据下载、转换、统计、缓存与封存
+├── assets/           # VGGT 等离线编码资产
+├── cluster/          # 配置物化、代码封存、启动前检查
+├── slurm/            # Slurm 作业入口
+├── smoke/            # 公开小样本全流程验证
+└── tools/            # 参数统计等独立工具
 tests/                # 数据、模型、恢复、发布与 smoke 契约测试
 wm3d.sh               # 用户入口
 ```
