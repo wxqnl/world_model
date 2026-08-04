@@ -95,12 +95,6 @@ class ExactSourceSchedule:
         self.expanded_source_ids = tuple(expanded)
         self.cycle_length = len(expanded)
 
-    @property
-    def fractions(self) -> dict[str, float]:
-        return {
-            name: self.weights[name] / self.cycle_length for name in self.source_order
-        }
-
     def _cycle_sources(self, cycle: int) -> tuple[int, ...]:
         order = _cycle_permutation(self.cycle_length, self.seed, cycle)
         return tuple(self.expanded_source_ids[index] for index in order)
@@ -212,19 +206,6 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         return self.num_optimizer_steps * self.gradient_accumulation
-
-    def describe_step(self, optimizer_step: int) -> dict[str, int | str]:
-        address = self.schedule.address(optimizer_step)
-        start, stop = self.source_spans[address.source_name]
-        return {
-            "optimizer_step": address.optimizer_step,
-            "source_name": address.source_name,
-            "source_occurrence": address.source_occurrence,
-            "source_length": stop - start,
-            "global_batch": self.global_batch,
-            "cycle": address.cycle,
-            "cycle_position": address.cycle_position,
-        }
 
     def __iter__(self) -> Iterator[list[int]]:
         for step in range(

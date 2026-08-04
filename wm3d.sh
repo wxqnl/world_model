@@ -82,7 +82,6 @@ export PATH="$(dirname "${PYTHON_BIN}"):$(dirname "${CONVERTER_PYTHON_BIN}"):${P
 
 setup() {
   "${ROOT}/environments/bootstrap_environment.sh"
-  "${ROOT}/environments/bootstrap_agibot_converter_environment.sh"
 }
 
 require_python() {

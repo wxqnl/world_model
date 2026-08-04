@@ -9,7 +9,7 @@ import sys
 import torch
 import yaml
 
-from scripts.internal.build_task_bank_smoke import deterministic_embedding
+from scripts.internal.build_task_bank import deterministic_embedding
 from wm3d.data.contracts import DatasetContract
 from wm3d.data.sources import (
     SourceLayout,

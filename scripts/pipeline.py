@@ -141,9 +141,7 @@ class Pipeline:
         self.dry_run = bool(args.dry_run or os.environ.get("PIPELINE_DRY_RUN") == "1")
         self.repo = _absolute("REPO_ROOT", must_exist=True)
         self.python = _absolute("PYTHON_BIN", must_exist=not self.dry_run)
-        self.converter_python = _absolute(
-            "CONVERTER_PYTHON_BIN", must_exist=not self.dry_run
-        )
+        self.converter_python = _absolute("CONVERTER_PYTHON_BIN")
         self.raw = _absolute("RAW_ROOT")
         self.release = _absolute("RELEASE_ROOT")
         self.dataset = _absolute("DATASET_ROOT")
@@ -305,7 +303,9 @@ class Pipeline:
         for template in (self._template(canary=True), self._template(canary=False)):
             value = yaml.safe_load(template.read_text(encoding="utf-8"))
             hardware = value.get("hardware", {})
-            allowed = tuple(int(item) for item in hardware.get("allowed_world_sizes", ()))
+            allowed = tuple(
+                int(item) for item in hardware.get("allowed_world_sizes", ())
+            )
             if int(hardware.get("gpus_per_node", 0)) != gpus_per_node:
                 raise PipelineError(f"站点 GPU/节点数与配置不一致：{template}")
             if self.world_size not in allowed:
@@ -364,9 +364,7 @@ class Pipeline:
             "droid": _environment("DROID_REVISION", default="AUTO"),
             "bridge": _environment("BRIDGE_REVISION", default="AUTO"),
             "atomic": _environment("ROBOCASA_ATOMIC_REVISION", default="AUTO"),
-            "composite": _environment(
-                "ROBOCASA_COMPOSITE_REVISION", default="AUTO"
-            ),
+            "composite": _environment("ROBOCASA_COMPOSITE_REVISION", default="AUTO"),
             "mg": _environment("ROBOCASA_MG_REVISION", default="AUTO"),
             "agibot_world_2026_snapshot": _environment(
                 "AGIBOT_2026_REVISION", default="AUTO"
@@ -498,6 +496,9 @@ class Pipeline:
             )
         if converted_receipt.exists():
             return
+        self.command(
+            [self.repo / "environments/bootstrap_agibot_converter_environment.sh"]
+        )
         if self.dry_run:
             task_count = 1000
         else:
@@ -592,7 +593,7 @@ class Pipeline:
         self.command(
             [
                 self.python,
-                self.repo / "scripts/internal/prepare_encoder_bundle.py",
+                self.repo / "scripts/internal/download_encoder_assets.py",
                 "--staging-root",
                 self.staging / "encoder_assets",
                 "--output-root",
@@ -622,8 +623,7 @@ class Pipeline:
             self.python_command(
                 "scripts/internal/compile_dataset_contract.py",
                 "--inventory",
-                self.repo
-                / "configs/data/public_6106h.yaml",
+                self.repo / "configs/data/public_6106h.yaml",
                 "--output",
                 contract,
             )
@@ -651,8 +651,7 @@ class Pipeline:
                     "--dataset-contract",
                     contract,
                     "--source-layouts",
-                    self.repo
-                    / "configs/data/public_6106h_layouts.json",
+                    self.repo / "configs/data/public_6106h_layouts.json",
                     "--output-root",
                     self.dataset,
                 ],

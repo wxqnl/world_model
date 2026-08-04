@@ -72,6 +72,9 @@ ACCEPT_DATA_LICENSES=YES
 ./wm3d.sh doctor site.env
 ```
 
+`setup` 只安装训练与数据处理共用的主环境。运行 `prepare` 时，流水线会按需创建
+独立的 AgiBot Beta 转换环境；转换器依赖不会污染训练环境，也不需要手工配置。
+
 PyPI 访问较慢时可临时指定镜像：
 
 ```bash
@@ -114,7 +117,7 @@ Interaction 和 Reinforcement Learning 的真机部分；Simulation 不计入该
 
 1. 解析每个公开仓库的 40 位 commit SHA，生成不可变 source lock；
 2. 断点下载固定 revision 的原始快照；
-3. 安全解包 AgiBotWorld2026，并用固定版本的官方工具转换 AgiBot Beta；
+3. 安全解包 AgiBotWorld2026；到该阶段才自动安装固定版本的官方工具并转换 AgiBot Beta；
 4. 审计 RGB、action、时间戳、episode 和 embodiment schema；
 5. 生成统一 episode plan、grouped action 与可变维度 mask；
 6. 统计 action 分布，生成 task bank 和 VGGT 3D cache；

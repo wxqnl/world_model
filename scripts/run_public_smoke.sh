@@ -135,7 +135,7 @@ if not path.exists():
 PY
 ASSET_ROOT="${WORK_ROOT}/encoder_assets_nopyc_v1"
 if [[ ! -f "${ASSET_ROOT}/receipt.json" ]]; then
-  "${PY}" "${ROOT}/scripts/internal/prepare_encoder_assets.py" \
+  "${PY}" "${ROOT}/scripts/internal/seal_encoder_assets.py" \
     --vggt-source-root "${VGGT_SOURCE}" \
     --vggt-source-commit "${VGGT_SOURCE_COMMIT}" \
     --vggt-model facebook/VGGT-1B \
@@ -148,7 +148,8 @@ else
     --asset-root "${ASSET_ROOT}"
 fi
 if [[ ! -f "${DATASET_ROOT}/control/task_index.json" ]]; then
-  "${PY}" "${ROOT}/scripts/internal/build_task_bank_smoke.py" \
+  "${PY}" "${ROOT}/scripts/internal/build_task_bank.py" \
+    --backend smoke-hash \
     --episode-plan "${DATASET_ROOT}/control/episode_plan.jsonl" \
     --output-root "${DATASET_ROOT}" --asset-root "${ASSET_ROOT}" \
     --confirmation EXECUTE_V7_PUBLIC_SMOKE_HASH_TASK_BANK

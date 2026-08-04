@@ -458,14 +458,18 @@ def test_preflight_parses_infiniband_rate_fail_closed() -> None:
         _parse_ib_rate_gbps("0 Gb/sec")
 
 
-def test_environment_setup_uses_plain_venv_and_no_container() -> None:
+def test_environment_setup_is_plain_and_beta_converter_is_lazy() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     setup_script = (repo_root / "environments" / "bootstrap_environment.sh").read_text(
         encoding="utf-8"
     )
+    entry = (repo_root / "wm3d.sh").read_text(encoding="utf-8")
+    pipeline = (repo_root / "scripts" / "pipeline.py").read_text(encoding="utf-8")
     assert '-m venv "${ENV_PREFIX}"' in setup_script
     assert "docker" not in setup_script.lower()
     assert "micromamba" not in setup_script.lower()
+    assert "bootstrap_agibot_converter_environment.sh" not in entry
+    assert "bootstrap_agibot_converter_environment.sh" in pipeline
 
 
 def test_lerobot_converter_repair_is_exact_and_fail_closed() -> None:
@@ -504,9 +508,7 @@ def test_lerobot_converter_repair_is_exact_and_fail_closed() -> None:
 
     contract = json.loads(
         (
-            repo_root
-            / "environments"
-            / "agibot_converter_environment_contract.json"
+            repo_root / "environments" / "agibot_converter_environment_contract.json"
         ).read_text(encoding="utf-8")
     )
     assert contract["packages"]["av"] == "13.1.0"
@@ -541,9 +543,7 @@ def test_planning_inventory_and_source_layouts_remain_aligned() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_root = repo_root / "configs" / "data"
     inventory = yaml.safe_load(
-        (config_root / "public_6106h.yaml").read_text(
-            encoding="utf-8"
-        )
+        (config_root / "public_6106h.yaml").read_text(encoding="utf-8")
     )
     source_names = [source["name"] for source in inventory["sources"]]
     assert inventory["source_order"] == source_names
@@ -563,9 +563,7 @@ def test_planning_inventory_and_source_layouts_remain_aligned() -> None:
 
 def test_data_pipeline_keeps_bootstrap_outside_formal_dataset_root() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    pipeline = (repo_root / "scripts" / "pipeline.py").read_text(
-        encoding="utf-8"
-    )
+    pipeline = (repo_root / "scripts" / "pipeline.py").read_text(encoding="utf-8")
     assert 'self.bootstrap = self.release / "dataset_bootstrap"' in pipeline
     assert 'contract = self.bootstrap / "dataset_contract.json"' in pipeline
     assert 'self.dataset / "bootstrap"' not in pipeline
@@ -578,17 +576,19 @@ def test_data_pipeline_keeps_bootstrap_outside_formal_dataset_root() -> None:
 def test_canary_template_preserves_formal_model_data_and_loss_contract() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     config_root = repo_root / "configs" / "train"
-    formal = yaml.safe_load(
-        (config_root / "5b_h200.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
+    formal = yaml.safe_load((config_root / "5b_h200.yaml").read_text(encoding="utf-8"))
     canary = yaml.safe_load(
-        (config_root / "5b_h200_canary.yaml").read_text(
-            encoding="utf-8"
-        )
+        (config_root / "5b_h200_canary.yaml").read_text(encoding="utf-8")
     )
-    for section in ("model", "model_budget", "hardware", "data", "distributed", "optimizer", "loss"):
+    for section in (
+        "model",
+        "model_budget",
+        "hardware",
+        "data",
+        "distributed",
+        "optimizer",
+        "loss",
+    ):
         assert canary[section] == formal[section]
     assert canary["train"]["total_steps"] == 1000
     assert max(canary["train"]["checkpoint_steps"]) == 1000

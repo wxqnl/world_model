@@ -168,7 +168,7 @@ def main() -> None:
     subprocess.run(
         [
             sys.executable,
-            str(Path(__file__).with_name("prepare_encoder_assets.py")),
+            str(Path(__file__).with_name("seal_encoder_assets.py")),
             "--vggt-source-root",
             str(source),
             "--vggt-source-commit",

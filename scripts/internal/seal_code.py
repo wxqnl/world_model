@@ -43,7 +43,6 @@ DEFAULT_PATTERNS = (
     "configs/train/*",
     "environments/*",
     "tests/test_*.py",
-    "tests/fsdp2_smoke.py",
     "wm3d.sh",
 )
 

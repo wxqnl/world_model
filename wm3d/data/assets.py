@@ -1,4 +1,4 @@
-"""Portable, immutable offline-encoder assets for WM3D WM3D."""
+"""Portable, immutable offline-encoder assets for WM3D."""
 
 from __future__ import annotations
 

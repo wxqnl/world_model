@@ -180,21 +180,6 @@ class _SafeTensorShard:
                     output[name] = handle.get_slice(name)[start:stop]
         return output
 
-    def optional(
-        self,
-        relative: str,
-        names: Sequence[str],
-        bounds: tuple[int, int],
-    ) -> dict[str, torch.Tensor]:
-        path = self.path(relative)
-        output: dict[str, torch.Tensor] = {}
-        with safe_open(path, framework="pt", device="cpu") as handle:
-            keys = set(handle.keys())
-            for name in names:
-                if name in keys:
-                    output[name] = handle.get_slice(name)[bounds[0] : bounds[1]]
-        return output
-
     def read_quantized(
         self,
         relative: str,
