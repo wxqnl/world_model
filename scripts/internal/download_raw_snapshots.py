@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Mapping
+import sys
+import time
+from typing import Any, Mapping, TypeVar
 
 from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+import httpx
 import yaml
 
 from wm3d.data.contracts import (
@@ -26,6 +31,7 @@ from wm3d.data.contracts import (
 LOCK_SCHEMA = "wm3d_v7_raw_sources_lock_v1"
 RECEIPT_SCHEMA = "wm3d_v7_raw_download_receipt_v1"
 REVISION_RE = re.compile(r"[0-9a-f]{40}")
+T = TypeVar("T")
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,8 +49,58 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="允许 huggingface_hub 续传无最终 receipt 的已有目录。",
     )
+    parser.add_argument(
+        "--network-attempts",
+        type=int,
+        default=8,
+        help="瞬时网络错误的最大尝试次数；固定 revision 下载可安全续传。",
+    )
+    parser.add_argument(
+        "--network-backoff-seconds",
+        type=float,
+        default=2.0,
+        help="网络重试的初始退避秒数，之后指数增长并封顶 30 秒。",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
+
+
+def _retryable_hub_error(error: BaseException) -> bool:
+    if isinstance(error, (httpx.TransportError, LocalEntryNotFoundError)):
+        return True
+    if isinstance(error, HfHubHTTPError):
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+        return status is None or status in {408, 425, 429} or status >= 500
+    return False
+
+
+def _retry_network(
+    operation: Callable[[], T],
+    *,
+    label: str,
+    attempts: int,
+    initial_delay: float,
+) -> T:
+    if attempts < 1:
+        raise ValueError("network attempts 必须 >= 1")
+    if initial_delay < 0:
+        raise ValueError("network backoff 必须 >= 0")
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except Exception as error:
+            if not _retryable_hub_error(error) or attempt == attempts:
+                raise
+            delay = min(initial_delay * (2 ** (attempt - 1)), 30.0)
+            print(
+                f"{label}: 网络请求失败 ({type(error).__name__})，"
+                f"{delay:g} 秒后进行第 {attempt + 1}/{attempts} 次尝试",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def _load_lock(path: Path) -> dict[str, Any]:
@@ -183,23 +239,33 @@ def main() -> None:
             continue
 
         api = HfApi(token=token)
-        resolved = api.repo_info(
-            repo_id=str(source["repo_id"]),
-            repo_type="dataset",
-            revision=str(source["revision"]),
-        ).sha
+        resolved = _retry_network(
+            lambda: api.repo_info(
+                repo_id=str(source["repo_id"]),
+                repo_type="dataset",
+                revision=str(source["revision"]),
+            ).sha,
+            label=f"{name} revision",
+            attempts=args.network_attempts,
+            initial_delay=args.network_backoff_seconds,
+        )
         if resolved != source["revision"]:
             raise ValueError(
                 f"{name}: 远端解析 SHA {resolved} 与 lock {source['revision']} 不一致"
             )
-        snapshot_download(
-            repo_id=str(source["repo_id"]),
-            repo_type="dataset",
-            revision=str(source["revision"]),
-            local_dir=target,
-            token=token,
-            allow_patterns=source.get("allow_patterns") or None,
-            ignore_patterns=source.get("ignore_patterns") or None,
+        _retry_network(
+            lambda: snapshot_download(
+                repo_id=str(source["repo_id"]),
+                repo_type="dataset",
+                revision=str(source["revision"]),
+                local_dir=target,
+                token=token,
+                allow_patterns=source.get("allow_patterns") or None,
+                ignore_patterns=source.get("ignore_patterns") or None,
+            ),
+            label=f"{name} snapshot",
+            attempts=args.network_attempts,
+            initial_delay=args.network_backoff_seconds,
         )
         files, total_bytes, payload_sha256 = _payload_inventory(
             target,
