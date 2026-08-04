@@ -1,5 +1,7 @@
 # 模型：V7 native-3D 血统与 5B 预设
 
+逐模块代码、张量形状、防泄漏路径和设计取舍见 [`CODING.md`](CODING.md)。
+
 ## 可核验血统
 
 当前 `wm3d.py` 不是从 V8、Qwen 或 Wan 改写而来。它来自本分支清理前的 V7 native 5B

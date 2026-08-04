@@ -1,5 +1,7 @@
 # 数据运行时
 
+动作对齐、cache codec、WindowDataset 与精确 sampler 的代码说明见 [`CODING.md`](CODING.md)。
+
 | 文件 | 职责 |
 |---|---|
 | `contracts.py` | dataset、embodiment、seal、哈希和安全路径契约 |

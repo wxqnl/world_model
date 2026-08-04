@@ -1,5 +1,8 @@
 # Python 包
 
+按一次样本的真实调用顺序阅读代码，见 [`CODING.md`](CODING.md)。四个子目录的实现细节分别写在各自的
+`CODING.md` 中。
+
 `wm3d` 是正式训练会封存进 code receipt 的运行时包：
 
 ```text

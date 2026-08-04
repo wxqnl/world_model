@@ -1,5 +1,7 @@
 # 训练运行时
 
+Loss、FSDP2、训练循环、原子 checkpoint 与 eval 的代码说明见 [`CODING.md`](CODING.md)。
+
 | 文件 | 职责 |
 |---|---|
 | `config.py` | 加载物化 YAML，核验 schema、receipt 和 training contract SHA |
