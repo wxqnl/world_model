@@ -6,6 +6,57 @@ task embedding、grouped action 和可选传感器 token。
 本文按 `WM3D.forward()` 的执行顺序说明代码。示例形状来自 `configs/train/5b_h200.yaml`：T24、P144、
 K16、三视角、state hidden 2560、action hidden 2048。
 
+## 先看完整模型
+
+一次 forward 中，观测、世界状态和动作按下面的路径流动：
+
+```text
+三视角 context token [B,T,V,P,2048]
+  └─ MultiViewTokenFuser ───────────────────────► context state [B,T,P,2560]
+                                                   + K 个 learned future state query
+task embedding ───────────────────────────────────► state / action 两条主干
+context-only aux / low-frequency memory ─────────► state trunk
+future factual action ───────────────────────────► 只条件化 future state
+
+context grouped action + K 个 learned action query
+  └─ GroupedActionTokenizer ─────────────────────► action latent [B,T+K,G,2048]
+
+        32 层 FactorizedStateBlock              24 层 ActionBlock
+                  │                                      │
+                  └──── 10 个 StateActionBridge ─────────┘
+                         分层双向交换信息
+                  │                                      │
+                  ▼                                      ▼
+     token / RGB / depth / point / camera       grouped action distribution
+```
+
+模型由以下部分组成：
+
+| 部分 | 使用的表示 | 主要职责 |
+|---|---|---|
+| 多视角入口 | 冻结 VGGT cache，三视角 2048D patch token | 在同一空间位置上融合可用视角，生成 state trunk 的 context |
+| state trunk | `[B,T+K,P,2560]` | 建模时间与空间动力学，持有未来世界状态 |
+| action trunk | `[B,T+K,G,2048]` | 建模 embodiment-aware grouped action，输出连续动作分布与 contact |
+| state-action bridge | state patch summary 与 action group latent | 在指定深度双向交换世界与动作信息，同时执行防泄漏 mask |
+| 条件输入 | task、context-only aux、低频 memory、future factual action | 给两条主干提供任务、传感器、长时信息和动作条件 |
+| 显式输出头 | future state / future action latent | 直接预测 VGGT token、RGB、depth、point、camera、confidence 和动作 |
+
+所有权按输出划分：state trunk 负责未来世界，action trunk 负责策略动作。VGGT 只提供离线观测表示和
+几何监督；在线模型中没有 VGGT、语言模型、VLA action head 或视频生成器。真实未来动作只进入 future state，
+不会写入 context，也不会作为 action trunk 的答案输入。
+
+`WM3D.forward()` 依次执行六步：
+
+1. `MultiViewTokenFuser` 把三视角 context cache 融合成单一 patch lattice；
+2. 在 context 后拼接 K 个未来 state query，并加入时间、空间、task 与合法的条件输入；
+3. `GroupedActionTokenizer` 把历史动作编码成 group latent，并为未来动作放置 learned query；
+4. state/action block 按层交错执行，十个 bridge 在固定深度交换信息；
+5. 取最后 K 帧 latent，分别送入世界、几何、RGB 和动作输出头；
+6. training loss 对显式 target 计算监督，梯度回到两条主干与 bridge。
+
+当前 5B 配置约 49.57 亿参数，其中 state trunk 约占 65.6%，action trunk 约占 24.1%，bridge 约占
+8.6%。`WM3D` 类本身不绑定 5B；其他规模通过同一组配置字段改变深度和宽度。
+
 ## 1. 配置与基础层
 
 `WM3DConfig.validate()` 在构造模型前检查几项结构约束：

@@ -3,6 +3,43 @@
 本目录把来源不同的机器人 episode 变成同一种训练样本。核心任务包括：定义可哈希契约、对齐异构动作和
 传感器、压缩并随机读取 cache、组成 T24/K16 窗口，以及让多机采样可以由 optimizer step 精确重建。
 
+## 数据 pipeline 全貌
+
+从公开源数据到 `WM3D.forward()` 的 batch，完整路径如下：
+
+```text
+公开数据源 + immutable source lock
+  └─ sources.py：扫描 episode，生成统一 episode plan
+      ├─ action.py：动作统计、时间对齐、group/mask、aux token
+      ├─ encoders：VGGT 视觉/几何 cache 与 task embedding bank
+      └─ codec.py：token int8、RGB JPEG pack、逐帧 shard
+                    │
+                    ▼
+       window parquet/index + dataset seal/receipt
+                    │
+                    ▼
+       WindowDataset 按地址读取 T24 context + K16 future
+                    │
+                    ▼
+       StepAddressedBatchSampler 决定 source/rank/sample
+                    │
+                    ▼
+       model batch：context 条件 + future world/action target
+```
+
+| 阶段 | 主要代码 | 输入与输出 |
+|---|---|---|
+| 契约与来源 | `contracts.py`、`sources.py` | source lock → 统一 episode plan、稳定 ID 与 shape contract |
+| 动作与传感器 | `action.py` | 原始控制流 → grouped action、dim/group mask、aux token |
+| 离线表示 | `encoders`、task bank | RGB/文本 → 冻结 VGGT cache 与 task embedding |
+| 封存与随机读 | `codec.py` | 逐帧数组/RGB → frame shard、JPEG pack、SHA receipt |
+| 窗口组装 | `dataset.py` | window address → T/K 模型输入和显式监督 target |
+| 分布式取样 | `sampler.py` | optimizer step + rank → 可重建的 source mix 与样本地址 |
+
+样本在 Dataset 边界分成两类字段。context 侧包含三视角 token、历史 grouped action、task、aux 和可选低频
+memory；future 侧包含 token、RGB、depth、point、camera 与动作 target。训练时不重新扫描原始数据，也不根据
+文件内容猜测 shape。source lock、contract、index、cache 与 seal 的 SHA 必须完全一致，Dataset 才会返回样本。
+
 ## 1. 文件与调用顺序
 
 | 文件 | 入口职责 |

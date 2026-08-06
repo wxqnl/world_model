@@ -3,6 +3,36 @@
 本目录负责把物化配置、sealed dataset、WM3D 和分布式运行时绑定成可恢复训练。这里不定义模型结构，也不
 修改数据；任何 code/data/environment receipt 不一致都会在创建正式 optimizer step 前失败。
 
+## 训练系统全貌
+
+训练层把已经固定的模型与数据契约接入分布式优化、checkpoint 和评测：
+
+```text
+基础 YAML + code/env/data/topology receipt
+  └─ materialize_config.py ─► 单次 run 的物化配置与 lineage
+      └─ preflight ─────────► shape、SHA、硬件、磁盘、batch、checkpoint 计划
+          └─ WindowDataset + StepAddressedBatchSampler
+              └─ WM3D + compute_native_loss
+                  └─ bottom-up FSDP2/HSDP + AdamW + WSD schedule
+                      ├─ train / validation metrics
+                      └─ atomic DCP checkpoint + manifest + COMPLETE
+                                      │
+                                      ▼
+                         显式 checkpoint eval / compare
+```
+
+| 部分 | 代码入口 | 职责 |
+|---|---|---|
+| 配置与准入 | `materialize_config.py`、preflight helpers | 固定本次 run 的代码、环境、数据、拓扑和 lineage |
+| 分布式运行时 | `runtime.py`、`fsdp.py` | 初始化 NCCL mesh，bottom-up 包装模型并约束设备拓扑 |
+| 优化目标 | `losses.py` | 汇总 token、RGB、depth、point、camera 和 grouped action loss |
+| 训练循环 | `train.py` | accumulation、optimizer、scheduler、validation 与硬停 |
+| 持久化 | `checkpoint.py` | 原子写入分片模型、optimizer、sampler、RNG 和 manifest |
+| 结果检查 | `eval.py`、`compare_eval.py` | 对指定编号 checkpoint 做绝对检查与相邻里程碑对比 |
+
+训练层负责优化与可恢复性，并沿用 Dataset 字段和 `WM3D.forward()` 的所有权边界。正式运行只接受物化配置和
+显式编号 checkpoint；代码拒绝 `latest`、隐式单卡回退、缺 receipt 的数据和不完整 checkpoint。
+
 ## 1. 一次正式启动的顺序
 
 `train.py::main()` 的主要阶段如下：

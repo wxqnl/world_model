@@ -3,6 +3,36 @@
 本目录负责把公开 RGB 视频转换成 WM3D 训练需要的冻结视觉与几何表示。正式预训练不加载 VGGT；这里的
 输出会先写入 sealed cache，再由 `wm3d.data` 读取。
 
+## 编码 pipeline 全貌
+
+编码阶段位于数据准备与正式训练之间。它只读取当前观测，不做未来预测：
+
+```text
+公开 episode 的 RGB + 稳定 view mask
+  └─ 去除整批都缺失的相机槽位
+      └─ 将 T 折入 batch：[B,T,V,3,H,W] → [B*T,V,3,H,W]
+          └─ 固定源码、revision 与权重的冻结 VGGT
+              ├─ aggregator patch token ─► 12×12 pooling ─► 固定三视角槽位
+              ├─ depth head ─────────────► depth + confidence
+              ├─ point head ─────────────► point + confidence
+              └─ camera head ────────────► pose / intrinsics
+                         │
+                         ▼
+             immutable frame cache + asset receipt
+```
+
+| 部分 | 代码入口 | 产物 |
+|---|---|---|
+| 资产固定 | `VGGTEncoder.__init__()` | 源码路径、revision、权重文件集和 SHA receipt |
+| 多视角编码 | `VGGTEncoder.forward()` | VGGT aggregator token 与原始几何 head 输出 |
+| 形状整理 | `VGGTFeatureEncoder.forward()` | `[B,T,3,144,2048]` 的固定视角 token 槽位 |
+| 显式几何 | `_canonicalize_*()` | depth、point、camera、intrinsics 和 confidence |
+| cache 打包 | `VGGTCacheFeatures` | `wm3d.data.codec` 可以封存的逐帧字段 |
+
+本目录统一观测坐标和表示接口。在线 WM3D 负责时间动力学；编码时，各时间帧独立通过 VGGT。缺失视角由 mask
+表示，不会伪造为黑图。depth、point 和 camera 是冻结模型产生的 pseudo-label，其质量边界会随 asset receipt
+一起进入数据契约。正式训练只读 cache，因此视觉 encoder 不占用训练显存，也不接收 world-model loss 的梯度。
+
 ## 1. 组件边界
 
 | 文件 | 真实职责 |
