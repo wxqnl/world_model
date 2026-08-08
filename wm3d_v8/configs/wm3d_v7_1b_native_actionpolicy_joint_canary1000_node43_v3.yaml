@@ -1,0 +1,70 @@
+_base_: wm3d_v7_1b_native_actionpolicy_joint_canary500_node43_v2.yaml
+
+# Final launch gate for the repaired V7 1B objective.  This remains a fresh
+# initialization: it is evidence for the objective, never a warm start for the
+# formal run.
+contract:
+  schema: wm3d_v7_1b_native_actionpolicy_joint_canary_v3
+  profile: canary_non_inheritable
+  purpose: validate_direct_pose_delta_gripper_and_pose_flow_with_native_3d
+  serving_action_owner: direct_pose_plus_delta_composed_gripper
+  auxiliary_action_owner: pose_only_flow_matching
+
+model:
+  # The deterministic base head is the only serving pose owner.  The flow
+  # decoder is trained on the six pose coordinates only and never replaces it.
+  policy_enable_flow_head: true
+  policy_flow_use_as_policy: false
+  policy_flow_layers: 2
+  policy_flow_hidden: 1024
+  policy_flow_action_dim: 6
+  policy_flow_default_steps: 8
+  policy_flow_noise_scale: 1.0
+  policy_flow_zero_init_output: true
+
+train:
+  run_lineage: wm3d_v7_1b_native_actionpolicy_joint_canary1000_node43_20260807_v3
+  max_steps: 1000
+  warmup_steps: 100
+  ckpt_every_steps: 250
+  keep_last_checkpoints: 5
+  checkpoint_milestone_steps: [20, 100, 250, 500, 1000]
+  log_every: 10
+  grad_probe_every: 20
+
+  # Direct pose remains executable.  Flow is a separate pose-distribution
+  # auxiliary, with no gripper coordinate and no serving-time ownership.
+  direct_policy_head: base
+  direct_policy_weight: 1.0
+  enforce_separate_direct_flow_heads: false
+  policy_flow_weight: 0.25
+  policy_flow_action_dim: 6
+  policy_flow_pose_weight: 1.0
+  policy_flow_grip_weight: 0.0
+  policy_flow_first_weight: 0.50
+  policy_flow_noise_scale: 1.0
+  policy_flow_t_eps: 1.0e-4
+
+  # The action-free future read by the policy is explicitly grounded in the
+  # demonstrated native token future.  The native z_a head remains active.
+  native_action_no_teacher_weight: 0.15
+  native_future_no_teacher_weight: 0.20
+  native_future_no_teacher_weight_start_step: 0
+  native_future_no_teacher_weight_ramp_steps: 100
+  native_future_no_teacher_cosine_weight: 0.10
+
+  lr: 1.0e-5
+  lr_multipliers:
+    action_policy: 3.0
+
+lr_schedule:
+  type: wsd
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 100
+  stable_frac: 0.80
+  decay_frac: 0.20
+
+out:
+  root: /data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/results/wm3d_v7_1b_native_actionpolicy_joint_canary1000_node43_v3
+  require_empty_checkpoint_dir: true

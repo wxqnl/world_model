@@ -1,0 +1,131 @@
+{
+  "balanced_quality_metrics": {
+    "depth_relative_l1": {
+      "step1000": 0.1324906157620717,
+      "step20": 0.1780878912191838
+    },
+    "native_no_teacher/rotation_gain_vs_zero": {
+      "step1000": -0.24568881317973137,
+      "step20": -0.536132187768817
+    },
+    "native_no_teacher/translation_gain_vs_zero": {
+      "step1000": -0.02424311265349388,
+      "step20": 0.016696780920028687
+    },
+    "objective/L_point": {
+      "step1000": 0.048986863967729735,
+      "step20": 0.2351544422097504
+    },
+    "rgb_l1": {
+      "step1000": 0.040689864620799196,
+      "step20": 0.11082112703006715
+    },
+    "serving_grip_balanced_accuracy": {
+      "step1000": 0.70625,
+      "step20": 0.846875
+    },
+    "serving_grip_negative_recall": {
+      "step1000": 0.726457399103139,
+      "step20": 0.8116591928251121
+    },
+    "serving_grip_positive_recall": {
+      "step1000": 0.592814371257485,
+      "step20": 0.7485029940119761
+    },
+    "serving_grip_transition_recall": {
+      "step1000": 0.7559523809523809,
+      "step20": 0.017857142857142856
+    },
+    "serving_pose_norm_l1": {
+      "step1000": 0.6736030247993767,
+      "step20": 0.6941748479148373
+    },
+    "serving_rotation_mae_deg": {
+      "step1000": 1.730854556336999,
+      "step20": 1.7170837147394196
+    },
+    "serving_translation_mae_mm": {
+      "step1000": 11.862371872365475,
+      "step20": 12.63779077399522
+    }
+  },
+  "canary_config": {
+    "leaf_sha256": "863692918a1f426e77168c04684aa86cc2ce609b24153320883406dad6be044e",
+    "path": "/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/configs/wm3d_v7_1b_native_actionpolicy_joint_canary1000_node43_v3.yaml",
+    "resolved_sha256": "50655a0ea860aa2fb4a2c73ce6f42a615284c0c38a6406ac1775d416b5e84634"
+  },
+  "checkpoint": {
+    "model_state_entries": 1003,
+    "optimizer_state_entries": 998,
+    "path": "/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/results/wm3d_v7_1b_native_actionpolicy_joint_canary1000_node43_v3/ckpt/step_00001000.pt",
+    "run_lineage": "6414477dc2854d2dedc82437fa3ad5dc7e3d9384e0d22ba18ab7d17b6f093d67",
+    "sampler_state_present": true,
+    "scheduler_present": true,
+    "sha256": "6ca2130083b8acd9acc8e149bc2792f29c7c8c003bbd49320afc1f3b9170cd86",
+    "size_bytes": 17022170364,
+    "step": 1000,
+    "zip_complete": true
+  },
+  "decision": "PASS_FORMAL_REPRETRAIN",
+  "errors": [],
+  "evidence": {
+    "early_quality": {
+      "path": "/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/audits/actionrepair_1b_20260807/canary1000_v3_step20_quality.json",
+      "sha256": "bdd73180b82bf71373c471d456864d6a928f2764bd44c798cb9796b8adc224a0"
+    },
+    "final_quality": {
+      "path": "/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/audits/actionrepair_1b_20260807/canary1000_v3_step1000_quality.json",
+      "sha256": "e3dc85303600b6f0643ac6ce655441d16bd5a4ab114620632dc3cd3ac3e0a317"
+    },
+    "train_log": {
+      "path": "/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/logs/actionrepair_1b_20260807/joint_canary1000_node43_v3.log",
+      "sha256": "2cd067400a60eb77332ea3efdff34dddc98537994d28d21a91064d550d7e0caf"
+    }
+  },
+  "formal_config_draft": {
+    "leaf_sha256": "8a8324e0db029296bb8a3ce58863bf87349ebf7a02794d04407a505772808cdc",
+    "path": "/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/configs/wm3d_v7_1b_native_actionpolicy_joint_formal100k_3node24_v3.yaml",
+    "resolved_sha256": "05c9d8fb228e2247f4e02e9eda484b6d86d6d4ce27682736da77b58dfdce02b5"
+  },
+  "formal_config_schema": "wm3d_v7_1b_native_actionpolicy_joint_formal_v3",
+  "interpretation": "objective_wiring_gate_not_downstream_libero_score",
+  "passed": true,
+  "schema": "wm3d_v7_1b_native_actionpolicy_joint_canary_gate_v3",
+  "training_telemetry": {
+    "depth": {
+      "head_median": 0.1499,
+      "tail_median": 0.0978
+    },
+    "direct_pose": {
+      "head_median": 0.474,
+      "tail_median": 0.48749999999999993
+    },
+    "first_step": 0,
+    "last_step": 990,
+    "native_action": {
+      "head_median": 1.86225,
+      "tail_median": 2.2383499999999996
+    },
+    "native_future": {
+      "head_median": 3.06775,
+      "tail_median": 0.5803
+    },
+    "policy_flow_pose": {
+      "head_median": 1.3759000000000001,
+      "tail_median": 1.2097
+    },
+    "rgb_L1": {
+      "head_median": 0.07594999999999999,
+      "tail_median": 0.024050000000000002
+    },
+    "source_mix": {
+      "oxe_bridge_action": 0.1504,
+      "oxe_droid_action": 0.3491,
+      "oxe_fraction": 0.4995,
+      "robocasa_atomic": 0.1009,
+      "robocasa_composite": 0.2008,
+      "robocasa_mg": 0.1988
+    },
+    "source_mix_step": 990
+  }
+}

@@ -1,0 +1,16 @@
+# PyTorch wheel must match the cluster CUDA driver. The sealed run used:
+# torch==2.7.1+cu128
+# torchvision==0.22.1+cu128
+numpy==1.26.4
+PyYAML==6.0.3
+safetensors==0.8.0rc1
+transformers==5.9.0
+huggingface-hub==1.16.4
+einops==0.8.2
+scipy==1.15.3
+scikit-learn==1.7.2
+h5py==3.16.0
+imageio==2.37.3
+opencv-python-headless==4.11.0.86
+pytest==9.0.3
+ruff==0.15.14

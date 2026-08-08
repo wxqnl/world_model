@@ -1,0 +1,70 @@
+_base_: wm3d_v7_1b_native_actionpolicy_joint_canary500_node43_v1.yaml
+
+# V2 repairs the two remaining V1 failures without changing the native WM3D
+# architecture or its 1B initialization:
+#   1. the action-free core future is anchored to demonstrated native-3D tokens;
+#   2. gripper execution is owned by causal hold/open/close events composed from
+#      the preceding observed gripper state.
+contract:
+  schema: wm3d_v7_1b_native_actionpolicy_joint_canary_v2
+  profile: canary_non_inheritable
+  purpose: validate_anchored_native_future_and_event_owned_gripper_pretraining
+  serving_action_owner: direct_pose_plus_delta_composed_gripper
+
+model:
+  policy_enable_grip_delta_head: true
+  policy_grip_delta_hidden: 256
+  policy_grip_delta_zero_init: true
+  policy_grip_delta_use_composed_action_cond: true
+  policy_grip_delta_soft_compose_action_cond: true
+  policy_grip_delta_straight_through_action_cond: true
+  policy_grip_owner: delta_composed
+
+train:
+  run_lineage: wm3d_v7_1b_native_actionpolicy_joint_canary500_node43_20260807_v2
+
+  # Keep the direct pose head as the only pose owner. Flow remains disabled.
+  direct_policy_grip_owner: delta_composed
+
+  # The legacy absolute state logit is not a serving owner in V2.
+  direct_policy_grip_weight: 0.0
+  direct_policy_first_grip_weight: 0.0
+  direct_policy_grip_natural_bce_weight: 0.0
+  direct_policy_first_grip_natural_bce_weight: 0.0
+
+  # Six-partition macro CE supplies rare boundary/in-clip transitions; the
+  # lower-weight natural CE preserves the real hold/open/close prior.
+  direct_policy_grip_delta_ce_weight: 1.0
+  direct_policy_grip_delta_ce_weight_start_step: 0
+  direct_policy_grip_delta_ce_weight_ramp_steps: 100
+  direct_policy_grip_delta_natural_ce_weight: 0.25
+  direct_policy_grip_delta_natural_ce_weight_start_step: 0
+  direct_policy_grip_delta_natural_ce_weight_ramp_steps: 100
+  direct_policy_grip_delta_hold_weight: 0.5
+  direct_policy_grip_delta_up_weight: 1.0
+  direct_policy_grip_delta_down_weight: 1.0
+  direct_policy_grip_delta_boundary_hold_weight: 0.5
+  direct_policy_grip_delta_boundary_up_partition_weight: 1.0
+  direct_policy_grip_delta_boundary_down_partition_weight: 1.0
+  direct_policy_grip_delta_inclip_hold_weight: 0.5
+  direct_policy_grip_delta_inclip_up_weight: 1.0
+  direct_policy_grip_delta_inclip_down_weight: 1.0
+
+  # A differentiable composed-state auxiliary prevents locally correct event
+  # classes from drifting over the full K=8 executable chunk.
+  direct_policy_grip_delta_state_bce_weight: 0.25
+  direct_policy_grip_delta_state_bce_weight_start_step: 0
+  direct_policy_grip_delta_state_bce_weight_ramp_steps: 100
+  direct_policy_grip_delta_state_pos_weight: 1.0
+  direct_policy_grip_delta_state_neg_weight: 1.0
+
+  # Anchor the exact action-free core_pred consumed by the policy. This is a
+  # native-token target, not latent-3D replacement and not teacher-action input.
+  native_future_no_teacher_weight: 0.10
+  native_future_no_teacher_weight_start_step: 0
+  native_future_no_teacher_weight_ramp_steps: 100
+  native_future_no_teacher_cosine_weight: 0.10
+
+out:
+  root: /data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/results/wm3d_v7_1b_native_actionpolicy_joint_canary500_node43_v2
+  require_empty_checkpoint_dir: true

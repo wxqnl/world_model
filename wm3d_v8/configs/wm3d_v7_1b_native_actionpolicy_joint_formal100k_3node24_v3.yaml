@@ -1,0 +1,69 @@
+_base_: wm3d_v7_1b_native_actionpolicy_joint_formal_data_runtime_v3.yaml
+
+# Full V7 1B re-pretraining.  The formal run starts from random world weights
+# and a frozen pinned codec; it never resumes the diagnostic canary.
+contract:
+  schema: wm3d_v7_1b_native_actionpolicy_joint_formal_v3
+  profile: formal
+  purpose: full_native_3d_world_and_transferable_action_pretraining
+  preflight_required: true
+  preflight_script: scripts/preflight_wm3d_v7_1b_actionpolicy_joint.py
+  canary_required: true
+  canary_config: configs/wm3d_v7_1b_native_actionpolicy_joint_canary1000_node43_v3.yaml
+  # Filled with the immutable 1K gate receipt and its SHA256 only after the
+  # canary has naturally stopped and passed.  A formal full preflight rejects
+  # either placeholder, so this file cannot authorize training prematurely.
+  canary_gate_receipt: /data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/audits/actionrepair_1b_20260807/canary1000_v3_formal_gate.json
+  canary_gate_receipt_sha256: 81003750526ff8b581a52fa9584fe44ced1b9b6912a36aebac0fd219adc15501
+  auto_promote: false
+  flow_policy_enabled: true
+  flow_serving_enabled: false
+  native_3d_outputs_required: [rgb, depth, point, pose]
+  future_observation_inputs_forbidden: true
+  serving_action_owner: direct_pose_plus_delta_composed_gripper
+  auxiliary_action_owner: pose_only_flow_matching
+
+train:
+  run_lineage: wm3d_v7_1b_native_actionpolicy_joint_formal100k_3node24_20260807_v3
+  fresh_initialization_required: true
+  fresh_init_required: true
+  forbid_warm_start: true
+  stage_transition: null
+  resume_checkpoint: null
+  pretrained_world_checkpoint: null
+  model_initialization: random_world_weights_with_frozen_pinned_codec
+
+  num_nodes: 3
+  gpus_per_node: 8
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 2
+  effective_global_batch: 96
+  max_steps: 100000
+  main_promotion_step: 100000
+  planned_review_stop_step: 100000
+  extension_cap_steps: 100000
+  warmup_steps: 2000
+  ckpt_every_steps: 5000
+  keep_last_checkpoints: 6
+  checkpoint_milestone_steps: [1000, 5000, 10000, 25000, 50000, 80000, 100000]
+  log_every: 20
+  grad_probe_every: 100
+  max_val_batches: 64
+  abort_on_nonfinite: true
+
+  milestone_reviews:
+    fail_closed: false
+    pause_on_missing_or_failed_review: false
+    required_review_steps: []
+
+lr_schedule:
+  type: wsd
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+  stable_frac: 0.78
+  decay_frac: 0.20
+
+out:
+  root: /data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/results/wm3d_v7_1b_native_actionpolicy_joint_formal100k_3node24_v3
+  require_empty_checkpoint_dir: true

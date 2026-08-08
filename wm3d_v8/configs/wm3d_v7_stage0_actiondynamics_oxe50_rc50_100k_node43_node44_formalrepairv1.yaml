@@ -1,0 +1,362 @@
+_base_: wm3d_v7_1b_native_common.yaml
+
+# Corrected WM3D-v7 S0 contract.  Both OXE canonical-action adapters and their
+# train-only statistics are audited and pinned below.  Formal launch remains
+# blocked until the save/resume canary passes and node43/node44 expose identical
+# formal OXE pools/ordered identities under the full preflight.
+contract:
+  schema: wm3d_v7_stage0_action_dynamics_contract_v1
+  profile: main
+  preflight_required: true
+  preflight_script: scripts/preflight_wm3d_v7_stage0_actiondynamics.py
+  canary_required: true
+  canary_config: configs/wm3d_v7_stage0_actiondynamics_oxe50_rc50_canary200_node43_node44.yaml
+  canary_gate_script: scripts/gate_wm3d_v7_stage0_actiondynamics_canary.py
+  auto_promote: false
+  canonical_action:
+    version: wm3d_v7_base_delta_axisangle_gripclose_v1
+    layout: [dx_m, dy_m, dz_m, drot_x_rad, drot_y_rad, drot_z_rad, gripper_close_signed]
+    source_frame: base
+    translation_unit: meter
+    rotation_representation: axis_angle
+    gripper_semantics: signed_close_positive_continuous
+
+model:
+  enable_pixel: true
+  enable_context_pixel: true
+  context_pixel_hidden: 1024
+  context_pixel_action_dim: 7
+  context_pixel_task_dim: 2048
+  context_pixel_residual_scale: 0.75
+  context_pixel_use_action: true
+  context_pixel_use_task: true
+  context_pixel_predict_motion: true
+  context_pixel_motion_blend_gain: 0.5
+  token_codec_checkpoint_sha256: a8b0103e936fdb97658a5325400a996452d9896685e9a5af1618ba38ada34470
+  token_codec_frozen: true
+  state:
+    action_cond_dim: 7
+  action:
+    action_cond_dim: 7
+
+data:
+  dataset_type: v7_mixed
+  T: 16
+  k: 8
+  stride: 2
+  seed: 1707
+  view_dropout: 0.10
+  require_task_emb: true
+  require_action_stats: true
+  require_rgb_sidecar: true
+  node_sharded_window_cache: false
+
+  compact_index: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_full_v1/index.jsonl
+  compact_index_sha256: 228810a379431fc2f3a4678f452cee687b64e1bc19a3b021e07bfefd46f1c938
+  action_stats: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_full_v1/action_stats_train.npz
+  action_stats_sha256: 3fc7906d149e444e985742bcc9a632ec6a8e874ec4f7fcf95ae0102dd7491bb0
+  rgb_sidecar_indices:
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_atomic_rgb_anchor_v1/index.jsonl
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_composite_rgb_anchor_v1/index.jsonl
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_mg_rgb_anchor_v1/index.jsonl
+  rgb_sidecar_sha256:
+    /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_atomic_rgb_anchor_v1/index.jsonl: b61bf9d1151acad7029194ed2329736a15d00d7dc2b8432b46ecf1bf1d55cfba
+    /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_composite_rgb_anchor_v1/index.jsonl: 8a068206e3d34bb1d4f7c2e2c9a700a9903e56f589cf87298fdcdda087b2dfcd
+    /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_mg_rgb_anchor_v1/index.jsonl: 701b65b30af14311dc0b7bee890d7c7d7e8f2a5206c42b9269b9e5e0e401f873
+  robocasa_partitions: [atomic, composite, mg]
+
+  # These are separate loaders and separate normalization statistics.  A
+  # pooled six-domain OXE loader or pooled stats file is forbidden.
+  oxe_sources:
+    - source_name: oxe_droid_action
+      include_datasets: [droid]
+      manifest: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/droid/source_manifest.jsonl
+      manifest_sha256: c8abc8ffc6d0da2e60760254bbfcb50a4dcf3eaa26b06f6482fc853ca8432a95
+      trusted_manifest_fast_init: true
+      trusted_manifest_sha256: c8abc8ffc6d0da2e60760254bbfcb50a4dcf3eaa26b06f6482fc853ca8432a95
+      allowed_action_kinds: [cartesian_target_interval_delta+rpy+gripper]
+      allowed_fps: [5]
+      cache_root: /data/Minko/datasets/cache/wm3d_v6_stage1_droid_interval_full
+      droid_provenance_index: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/evidence/droid_interval/index.json
+      droid_provenance_index_sha256: b1eab6ae52e315bbb7d611573f808ccf9865795193ff1c89961e9d54217a43a7
+      action_adapter:
+        version: wm3d_v7_base_delta_axisangle_gripclose_v1
+        source_representation: delta_xyz_wrapped_rpy_gripper
+        rotation_conversion: wrapped_rpy_interval_delta_to_so3_to_axisangle
+        translation_unit: meter
+        source_frame: base
+        gripper_semantics: signed_close_positive_continuous
+      canonical_action_cache_manifest: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/droid/index.jsonl
+      canonical_action_cache_manifest_sha256: a05e19799a4316f9ee423c26827bfcde038993ffe9e167ecca1101f7ba62a412
+      canonical_action_cache_root: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/droid
+      canonical_action_enabled: true
+      canonical_action_sources: [droid]
+      canonical_action_stats_by_source:
+        droid: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/droid/action_stats_train.npz
+      canonical_action_stats_sha256_by_source:
+        droid: d19b470010047ab9e80c16b8ba9237f1aa5e6fb4d8c22710889867632202af32
+      action_audit_gate: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/droid/action_audit_gate.json
+      action_audit_gate_sha256: 877b46d15316ed165407c2d6171db48416ac4ce75de79439a12c8afddf309fb7
+      action_contract_evidence_path: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/evidence/v6_formal/action_frame_contract.json
+      action_contract_evidence_sha256: bea17c1215ecedc22934e78532322cd36244389d86a9dfc4aeb527d0cab1ee9c
+      default_action_frame_offset: -1
+      require_action_contract: false
+      require_canonical_action_contract: true
+      split: {mode: episode, val_frac: 0.03, seed: 909}
+      require_train_val_disjoint: true
+      require_task_emb: true
+      load_rgb: true
+      load_geom: true
+      load_state_tgt: true
+      load_geom_extra: true
+      require_geom_extra: true
+      window_geom_subdir: vggt_window_geom_p64_T16_k8_s4_hw64_full_v1
+      use_window_tokens: true
+      window_geom_shard_index: /data/Minko/datasets/cache/wm3d_v7_formal_oxe_window_repair_20260717_v1/index.tsv
+      window_geom_shard_root: /data/Minko/datasets/cache/wm3d_v7_formal_oxe_window_repair_20260717_v1
+      trust_window_geom_cache: true
+      allow_pseudo_progress_targets: false
+      T: 16
+      k: 8
+      stride: 4
+
+    - source_name: oxe_bridge_action
+      include_datasets: [bridge]
+      manifest: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/bridge/source_manifest.jsonl
+      manifest_sha256: 8be14e8797ee73cf54d036944ab351bd83f703bf4eb0be1979d996cad3fe059e
+      trusted_manifest_fast_init: true
+      trusted_manifest_sha256: 8be14e8797ee73cf54d036944ab351bd83f703bf4eb0be1979d996cad3fe059e
+      allowed_action_kinds: [delta_xyz+rpy+gripper]
+      allowed_fps: [5]
+      cache_root: /data/Minko/datasets/cache/wm3d_v6_stage1_droid_interval_full
+      action_adapter:
+        version: wm3d_v7_base_delta_axisangle_gripclose_v1
+        source_representation: delta_xyz_rotation_delta_gripper
+        rotation_conversion: fixed_extrinsic_xyz_rz_ry_rx_to_axisangle
+        translation_unit: meter
+        source_frame: base
+        gripper_semantics: signed_close_positive_continuous
+      canonical_action_cache_manifest: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/bridge/index.jsonl
+      canonical_action_cache_manifest_sha256: 4968915fe1a727460041afe9e146af64eac54807aac092a9fe11c2a245eb749c
+      canonical_action_cache_root: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/bridge
+      canonical_action_enabled: true
+      canonical_action_sources: [bridge]
+      canonical_action_stats_by_source:
+        bridge: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/bridge/action_stats_train.npz
+      canonical_action_stats_sha256_by_source:
+        bridge: 0b96402a464d9708ba654c48057b5f49f90acdb297a277fbbd10a422ca33d711
+      action_audit_gate: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/bridge/action_audit_gate.json
+      action_audit_gate_sha256: de3a7d6b5f2765e055076c91aba2440d95f3005d227097a26a013953a761ddba
+      action_contract_evidence_path: /data/Minko/world_model/wm3d_v7/manifests/oxe_action_canonical_v1/evidence/v6_formal/action_frame_contract.json
+      action_contract_evidence_sha256: bea17c1215ecedc22934e78532322cd36244389d86a9dfc4aeb527d0cab1ee9c
+      default_action_frame_offset: -2
+      require_action_contract: false
+      require_canonical_action_contract: true
+      split: {mode: episode, val_frac: 0.03, seed: 909}
+      require_train_val_disjoint: true
+      require_task_emb: true
+      load_rgb: true
+      load_geom: true
+      load_state_tgt: true
+      load_geom_extra: true
+      require_geom_extra: true
+      window_geom_subdir: vggt_window_geom_p64_T16_k8_s4_hw64_full_v1
+      use_window_tokens: true
+      window_geom_shard_index: /data/Minko/datasets/cache/wm3d_v7_formal_oxe_window_repair_20260717_v1/index.tsv
+      window_geom_shard_root: /data/Minko/datasets/cache/wm3d_v7_formal_oxe_window_repair_20260717_v1
+      trust_window_geom_cache: true
+      allow_pseudo_progress_targets: false
+      T: 16
+      k: 8
+      stride: 4
+
+train:
+  # New S0: no V6 checkpoint, no optimizer inheritance, no implicit resume.
+  fresh_initialization_required: true
+  fresh_init_required: true
+  forbid_warm_start: true
+  forbid_cross_run_resume: true
+  allow_exact_same_run_resume: true
+  forbid_resume: false
+  strict_v6_native_warm_start: false
+  stage_transition: null
+  resume_checkpoint: null
+  model_initialization: random_world_weights_with_frozen_pinned_codec
+  pretrained_world_checkpoint: null
+  run_lineage: wm3d_v7_s0_actiondyn_main_formalrepair_20260717_v1
+  resume_contract:
+    mode: exact_same_run_only
+    require_same_run_lineage: true
+    require_resume_compatible_config_digest: true
+    require_same_output_root: true
+    restore_model: true
+    restore_optimizer: true
+    restore_scheduler: true
+    restore_global_step: true
+    restore_sampler_cycle: true
+    restore_rng: false
+    rng_mode: step_addressed_reconstruction
+    verify_rng_contract: true
+    require_step_named_checkpoint: true
+    reject_latest_pt: true
+    min_checkpoint_bytes: 15000000000
+
+  num_nodes: 2
+  gpus_per_node: 8
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 2
+  effective_global_batch: 64
+  precision: bf16
+  num_workers: 4
+  prefetch_factor: 2
+  ddp_broadcast_buffers: false
+  grad_clip: 1.0
+  # Keep the scheduler horizon immutable at 100k. The launcher pauses at 80k
+  # with the non-semantic --stop_after_step flag for manual review, then exact
+  # resumes this same run/config to 100k if approved.
+  max_steps: 100000
+  main_promotion_step: 80000
+  planned_review_stop_step: 80000
+  extension_cap_steps: 100000
+  extension_requires_manual_decision: true
+  ckpt_every_steps: 5000
+  keep_last_checkpoints: 6
+  warmup_steps: 2000
+  max_val_batches: 32
+  abort_on_nonfinite: true
+  enable_pixel_loss: true
+
+  # Every factual source conditions the native dynamics on the real action
+  # from optimizer step 0.  OXE must never take the old zero-action/
+  # representation-only path.
+  oxe_representation_only: false
+  factual_action_conditioning:
+    enabled: true
+    start_step: 0
+    detach_action_condition: false
+    require_valid_action_contract: true
+    require_finite_action: true
+    allow_zero_hold_action: true
+    required_sources:
+      - oxe_droid_action
+      - oxe_bridge_action
+      - robocasa_atomic
+      - robocasa_composite
+      - robocasa_mg
+  action_aux_sources:
+    - oxe_droid_action
+    - oxe_bridge_action
+    - robocasa_atomic
+    - robocasa_composite
+    - robocasa_mg
+  factual_action_sources:
+    - oxe_droid_action
+    - oxe_bridge_action
+    - robocasa_atomic
+    - robocasa_composite
+    - robocasa_mg
+  audited_action_sources:
+    - oxe_droid_action
+    - oxe_bridge_action
+    - robocasa_atomic
+    - robocasa_composite
+    - robocasa_mg
+  representation_only_sources: []
+  # This value is consumed directly by
+  # train.normalize_action_grip_contract and therefore must stay on its
+  # executable enum.  The canonical caches retain continuous close-positive
+  # values in [-1, 1]; BCE-facing targets are mapped exactly by (g + 1) / 2.
+  action_grip_contract: signed_close
+  action_grip_semantics:
+    canonical_input: signed_close_positive_continuous
+    close01_supervision: exact_affine_g_plus_1_over_2
+  factual_main_action_loss_weight: 0.0
+
+  # Sparse state/task -> action bridge.  Its supervised loss is intentionally
+  # outside the factual main loss.action path.
+  native_action_no_teacher_weight: 0.05
+  native_action_no_teacher_pose_space: normalized
+  native_action_no_teacher_grip_positive_weight: 1.0
+  native_action_no_teacher_start_step: 5000
+  native_action_no_teacher_ramp_steps: 5000
+  native_action_no_teacher_every: 4
+
+  # Counterfactual loss must touch the native state/action dynamics, not only
+  # the context-pixel renderer.  One shuffled factual action is the negative.
+  native_core_action_cf_enabled: true
+  native_core_action_cf_rank_weight: 1.0
+  native_core_action_cf_separation_weight: 0.25
+  native_core_action_cf_start_step: 10000
+  native_core_action_cf_ramp_steps: 5000
+  native_core_action_cf_every: 8
+  native_core_action_cf_batch_size: 1
+  native_core_action_cf_variants: [shuffled]
+  native_core_action_cf_margin: 0.003
+  native_core_action_cf_separation_margin: 0.006
+  context_pixel_action_rank_weight: 0.0
+  context_pixel_action_separation_weight: 0.0
+
+  # Fail-closed early reviews prevent another day-long invalid run.  CF has
+  # zero weight exactly at 10K, so its full-weight review is correctly at 15K.
+  checkpoint_milestone_steps: [5000, 10000, 15000]
+  milestone_reviews:
+    fail_closed: true
+    pause_on_missing_or_failed_review: true
+    required_review_steps:
+      - step: 5000
+        gates: [factual_action_all_sources, factual_action_grad_projection, finite_rgb_depth_point]
+      - step: 10000
+        gates: [native_no_teacher_active_finite, native_no_teacher_grad, native_cf_pre_activation_baseline]
+      - step: 15000
+        gates: [native_core_cf_full_weight_finite, native_core_cf_acc_gap, native_core_cf_state_action_projection_grad, native_core_cf_native_state_dynamics_grad]
+
+  mixed_batch_sampler:
+    enabled: true
+    seed: 1707
+    expected_oxe_fraction: 0.50
+    expected_robocasa_fraction: 0.50
+    cycle_optimizer_steps: 100
+    shuffle_cycle: true
+    synchronized_across_ranks: true
+    accumulation_group_same_source: true
+    num_batches_per_epoch: 50000
+    val_num_batches_per_epoch: 100
+    source_cycle_counts_exact:
+      oxe_droid_action: 35
+      oxe_bridge_action: 15
+      robocasa_atomic: 10
+      robocasa_composite: 20
+      robocasa_mg: 20
+    forbidden_sources:
+      - fractal20220817_data
+      - taco_play
+      - jaco_play
+      - kuka
+
+loss:
+  # No direct teacher-forced action head in the factual main objective.  Action
+  # relevance is learned through factual dynamics plus the two sparse bridges.
+  action: 0.0
+  rgb_l1: 1.2
+  rgb_lpips: 0.55
+  rgb_motion_l1: 1.0
+  rgb_edge: 0.08
+  rgb_motion_bce: 0.03
+  rgb_motion_dice: 0.03
+  rgb_motion_pos_weight: 2.0
+  rgb_motion_threshold: 0.03
+  rgb_motion_gain: 3.0
+
+optimizer:
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+lr_schedule:
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+
+out:
+  root: /data/Minko/world_model/wm3d_v7/results/wm3d_v7_stage0_actiondynamics_oxe50_rc50_100k_node43_node44_formalrepairv1
+  require_empty_checkpoint_dir: true

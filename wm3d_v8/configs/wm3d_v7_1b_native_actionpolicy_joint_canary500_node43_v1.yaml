@@ -1,0 +1,169 @@
+_base_: wm3d_v7_stage0_actiondynamics_oxe50_rc50_100k_node43_node44_formalrepairv1.yaml
+
+# Non-inheritable diagnostic run for repairing the original V7 1B pretraining
+# objective.  The native WM3D RGB/depth/point losses remain active.  A causal
+# policy reads an action-free WM3D core prediction and may backpropagate into
+# that core; it is not a detached VLA side head.
+contract:
+  schema: wm3d_v7_1b_native_actionpolicy_joint_canary_v1
+  profile: canary_non_inheritable
+  purpose: validate_joint_native_world_and_transferable_action_pretraining
+  preflight_required: false
+  canary_required: false
+  native_3d_outputs_required: [rgb, depth, point, pose]
+  future_observation_inputs_forbidden: true
+  serving_action_owner: direct_base_policy
+  flow_policy_enabled: false
+
+model:
+  enable_action_policy: true
+  policy_hidden: 1024
+  policy_layers: 6
+  policy_heads: 16
+  policy_chunk_layers: 2
+  policy_horizon: 8
+  policy_task_dim: 2048
+  policy_max_context: 16
+  policy_dropout: 0.05
+  policy_use_task: true
+  policy_patch_pool: last_patches
+  policy_max_spatial_tokens: 64
+  policy_use_context_rgb: false
+  policy_context_source: core_pred
+  policy_core_action_cond: none
+  policy_lowdim_dim: 0
+  policy_object_state_dim: 0
+  policy_plan_state_dim: 0
+  policy_action_history_len: 4
+  policy_action_history_dim: 7
+  policy_action_history_as_token: true
+  policy_use_progress: false
+  policy_enable_local_residual: false
+  policy_enable_waypoint_head: false
+  policy_enable_prior: false
+  policy_action_add_trunk: false
+  policy_zero_init_output: false
+  policy_enable_grip_delta_head: false
+  policy_enable_flow_head: false
+  policy_flow_use_as_policy: false
+
+data:
+  policy_action_history_len: 4
+  policy_action_history_dim: 7
+
+train:
+  seed: 1707
+  run_lineage: wm3d_v7_1b_native_actionpolicy_joint_canary500_node43_20260806_v1
+  joint_native_action_pretraining: true
+  num_nodes: 1
+  gpus_per_node: 8
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 4
+  effective_global_batch: 64
+  max_steps: 500
+  warmup_steps: 50
+  ckpt_every_steps: 100
+  keep_last_checkpoints: 6
+  checkpoint_milestone_steps: [20, 100, 250, 500]
+  max_val_batches: 32
+  log_every: 10
+  grad_probe_every: 20
+  direct_policy_only: false
+  future_value_only: false
+  trainable_prefixes: []
+  freeze_prefixes: []
+  lr: 1.0e-5
+  lr_multipliers:
+    action_policy: 3.0
+
+  # The serving policy observes only causal inputs: past native state/task,
+  # an action-free WM3D prediction, and four preceding canonical actions.
+  direct_policy_context_source: core_pred
+  direct_policy_core_action_cond: none
+  direct_policy_core_eval: false
+  direct_policy_required_horizon: 8
+  direct_policy_require_action_prev_grip: true
+  direct_policy_weight: 1.0
+  direct_policy_head: base
+  direct_policy_report_metrics: true
+  enforce_separate_direct_flow_heads: false
+  policy_flow_weight: 0.0
+
+  direct_policy_pose_weight: 1.0
+  direct_policy_first_pose_weight: 2.0
+  direct_policy_delta_weight: 0.25
+  direct_policy_worst_step_pose_weight: 0.25
+  direct_policy_cumulative_pose_weight: 0.10
+  direct_policy_endpoint_pose_weight: 0.10
+  direct_policy_direction_weight: 0.05
+
+  # One absolute gripper head owns all six causal event partitions.  The
+  # partition-macro term preserves rare transition recall; the natural-micro
+  # BCE preserves the deployment prior and therefore the fixed 0.5 threshold.
+  direct_policy_grip_partition_contract: true
+  direct_policy_grip_owner: absolute
+  direct_policy_grip_weight: 0.5
+  direct_policy_first_grip_weight: 0.5
+  direct_policy_grip_natural_bce_weight: 1.0
+  direct_policy_first_grip_natural_bce_weight: 0.5
+  direct_policy_grip_class_balance: false
+  direct_policy_grip_focal_gamma: 0.0
+  direct_policy_grip_delta_state_bce_weight: 0.0
+  direct_policy_grip_transition_weight: 0.0
+  direct_policy_grip_boundary_weight: 0.0
+  direct_policy_grip_transition_bce_weight: 0.0
+  direct_policy_grip_transition_up_bce_weight: 0.0
+  direct_policy_grip_transition_down_bce_weight: 0.0
+  direct_policy_grip_transition_margin_weight: 0.0
+  direct_policy_grip_transition_delta_bce_weight: 0.0
+  direct_policy_grip_transition_delta_up_bce_weight: 0.0
+  direct_policy_grip_transition_delta_down_bce_weight: 0.0
+  direct_policy_grip_nontransition_delta_weight: 0.0
+  direct_policy_grip_event_logit_margin_weight: 0.0
+  direct_policy_grip_boundary_logit_margin_weight: 0.0
+  direct_policy_grip_rate_mse_weight: 0.0
+  direct_policy_grip_boundary_bce_weight: 0.0
+  direct_policy_grip_boundary_up_bce_weight: 0.0
+  direct_policy_grip_boundary_down_bce_weight: 0.0
+  direct_policy_grip_boundary_rate_mse_weight: 0.0
+  direct_policy_grip_delta_ce_weight: 0.0
+
+  # Train the native z_a/action projection on every optimizer step rather than
+  # introducing it sparsely after step 5K as in the original Stage0 run.
+  native_action_no_teacher_weight: 0.20
+  native_action_no_teacher_start_step: 0
+  native_action_no_teacher_ramp_steps: 0
+  native_action_no_teacher_every: 1
+
+  condition_dropout:
+    enabled: false
+    text_only_p: 0.0
+    text_context_p: 0.0
+    text_action_p: 0.0
+    action_p: 0.0
+    context_p: 0.0
+
+  milestone_reviews:
+    fail_closed: false
+    pause_on_missing_or_failed_review: false
+    required_review_steps: []
+
+optimizer:
+  type: adamw
+  betas: [0.9, 0.95]
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  weight_decay: 0.02
+  grad_clip: 1.0
+
+lr_schedule:
+  type: wsd
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 50
+  stable_frac: 0.7
+  decay_frac: 0.3
+
+out:
+  root: /data/Minko/world_model/wm3d_v7_actionrepair1b_20260806/results/wm3d_v7_1b_native_actionpolicy_joint_canary500_node43_v1
+  require_empty_checkpoint_dir: true
