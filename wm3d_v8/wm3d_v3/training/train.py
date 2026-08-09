@@ -110,6 +110,8 @@ _DIRECT_POLICY_OXE_OVERRIDE_KEYS = frozenset(
         "load_geom_extra",
         "require_geom_extra",
         "use_window_tokens",
+        "causal_dual_view_required",
+        "causal_dual_view_representation",
         "load_policy_state",
         "require_policy_state",
         "strict_policy_state_prescan",
@@ -1390,6 +1392,12 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
                         window_geom_shard_roots=tuple(Path(p) if p is not None else None for p in shard_roots)
                         if shard_roots else None,
                         use_window_tokens=bool(data_cfg.get("use_window_tokens", False)),
+                        causal_dual_view_required=bool(
+                            data_cfg.get("causal_dual_view_required", False)
+                        ),
+                        causal_dual_view_representation=data_cfg.get(
+                            "causal_dual_view_representation"
+                        ),
                         max_windows_per_episode=int(data_cfg.get("max_windows_per_episode", 0) or 0),
                         trust_window_geom_cache=bool(data_cfg.get("trust_window_geom_cache", False)),
                         trusted_manifest_fast_init=bool(
