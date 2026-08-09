@@ -9,6 +9,7 @@ import torch
 
 from scripts.cache_robocasa365_v7_compact import (
     WorkItem,
+    _filter_records_by_rgb_sidecar,
     _encode_causal_clip,
     _write_causal_item,
 )
@@ -203,6 +204,41 @@ def test_robocasa_writer_emits_loader_ready_causal_archive(
     assert row["context_future_leakage"] is False
     assert row["v7_source"] == "atomic"
     assert len(row["artifact_sha256"]) == 64
+
+
+def test_robocasa_causal_selection_intersects_rgb_sidecar(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "rgb_index.jsonl"
+    sidecar.write_text(
+        '{"schema":"wm3d_v7_rgb_sidecar_v1","clip_hash":"keep",'
+        '"split":"train"}\n'
+        '{"schema":"wm3d_v7_rgb_sidecar_v1","clip_hash":"other",'
+        '"split":"val"}\n'
+    )
+    records = [
+        SimpleNamespace(clip_hash="keep", split="train"),
+        SimpleNamespace(clip_hash="drop", split="train"),
+        SimpleNamespace(clip_hash="other", split="train"),
+    ]
+
+    filtered, digest = _filter_records_by_rgb_sidecar(records, sidecar)
+
+    assert [record.clip_hash for record in filtered] == ["keep"]
+    assert len(digest) == 64
+
+
+def test_robocasa_causal_selection_rejects_bad_rgb_sidecar(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "rgb_index.jsonl"
+    sidecar.write_text(
+        '{"schema":"wrong","clip_hash":"keep","split":"train"}\n'
+    )
+    records = [SimpleNamespace(clip_hash="keep", split="train")]
+
+    with pytest.raises(ValueError, match="RGB sidecar schema"):
+        _filter_records_by_rgb_sidecar(records, sidecar)
 
 
 

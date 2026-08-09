@@ -106,6 +106,53 @@ def _episode_index(record: V7ClipRecord) -> int:
         raise ValueError(f"cannot parse episode index: {record.native_episode_id}") from exc
 
 
+def _filter_records_by_rgb_sidecar(
+    records: list[V7ClipRecord],
+    rgb_sidecar_index: Path,
+) -> tuple[list[V7ClipRecord], str]:
+    """Keep only split-aligned clips with immutable RGB supervision."""
+
+    rgb_sidecar_index = Path(rgb_sidecar_index)
+    available: dict[str, str] = {}
+    for line_number, line in enumerate(
+        rgb_sidecar_index.read_text().splitlines(), 1
+    ):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: invalid JSON: {exc}"
+            ) from exc
+        if row.get("schema") != "wm3d_v7_rgb_sidecar_v1":
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: invalid RGB sidecar schema"
+            )
+        clip_hash = str(row.get("clip_hash") or "")
+        split = str(row.get("split") or "")
+        if not clip_hash or split not in {"train", "val", "test"}:
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: invalid RGB identity"
+            )
+        previous = available.get(clip_hash)
+        if previous is not None and previous != split:
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: conflicting split for "
+                f"{clip_hash}"
+            )
+        available[clip_hash] = split
+    if not available:
+        raise ValueError(f"empty RGB sidecar index: {rgb_sidecar_index}")
+    filtered = [
+        record for record in records
+        if available.get(record.clip_hash) == record.split
+    ]
+    if not filtered:
+        raise ValueError("manifest has no split-aligned RGB sidecar clips")
+    return filtered, _sha256_file(rgb_sidecar_index)
+
+
 def _select_records(records: list[V7ClipRecord], max_clips: int) -> list[V7ClipRecord]:
     records = [record for record in records if record.action_valid]
     if max_clips <= 0 or max_clips >= len(records):
@@ -890,6 +937,7 @@ def main() -> None:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--max-clips", type=int, default=0)
     parser.add_argument("--batch-frames", type=int, default=32)
+    parser.add_argument("--rgb-sidecar-index", type=Path)
     parser.add_argument(
         "--causal-dual-view",
         action="store_true",
@@ -922,6 +970,10 @@ def main() -> None:
         raise SystemExit(
             "--causal-dual-view requires an explicit --v7-source partition"
         )
+    if args.causal_dual_view and args.rgb_sidecar_index is None:
+        raise SystemExit(
+            "--causal-dual-view requires --rgb-sidecar-index for RGB supervision"
+        )
 
     downstream = json.loads(args.codec_downstream_report.read_text())
     if not bool(downstream.get("formal_cache_allowed")):
@@ -930,9 +982,13 @@ def main() -> None:
         raise SystemExit(
             "token codec was not fit on the immutable V7 train split; refusing formal cache"
         )
-    all_records = _select_records(
-        list(read_v7_manifest(args.manifest)), int(args.max_clips)
-    )
+    manifest_records = list(read_v7_manifest(args.manifest))
+    rgb_sidecar_sha256 = None
+    if args.causal_dual_view:
+        manifest_records, rgb_sidecar_sha256 = _filter_records_by_rgb_sidecar(
+            manifest_records, args.rgb_sidecar_index
+        )
+    all_records = _select_records(manifest_records, int(args.max_clips))
     if not all_records:
         raise SystemExit("manifest selection contains no action-valid clips")
     selection_sha256 = _selection_sha256(all_records)
@@ -979,6 +1035,7 @@ def main() -> None:
     }
     if args.causal_dual_view:
         config_identity["v7_source"] = str(args.v7_source)
+        config_identity["rgb_sidecar_index_sha256"] = rgb_sidecar_sha256
     config_sha256 = hashlib.sha256(
         json.dumps(config_identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -1133,6 +1190,12 @@ def main() -> None:
         "index_sha256": index_sha256,
         "config_sha256": config_sha256,
         "global_selected_clips": len(all_records),
+        "rgb_sidecar_index": (
+            str(args.rgb_sidecar_index.resolve())
+            if args.causal_dual_view else None
+        ),
+        "rgb_sidecar_index_sha256": rgb_sidecar_sha256,
+        "rgb_sidecar_coverage_passed": bool(args.causal_dual_view),
         "action_audit": str(args.action_audit.resolve()),
         "action_audit_sha256": action_audit_sha256,
         "factual_action_audit_passed": True,

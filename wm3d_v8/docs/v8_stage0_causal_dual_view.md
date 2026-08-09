@@ -83,6 +83,7 @@ python scripts/cache_robocasa365_v7_compact.py \
   --root <robocasa_partition_root> \
   --manifest <audited_factual_manifest.jsonl> \
   --action-audit <factual_action_audit.json> \
+  --rgb-sidecar-index <partition_rgb_sidecar_index.jsonl> \
   --codec <pca384_int8_strict_v2.pt> \
   --codec-downstream-report <codec_downstream_report.json> \
   --output-root <new_v8_partition_cache_root> \
