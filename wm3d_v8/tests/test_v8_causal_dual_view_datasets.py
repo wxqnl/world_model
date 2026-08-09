@@ -122,9 +122,10 @@ def test_oxe_loader_keeps_observed_context_separate_from_future_targets(
     sample = dataset[0]
 
     assert sample["s_in"].shape == (3, 4, 6)
-    assert sample["s_tgt"].shape == (2, 4, 6)
+    assert "s_tgt" not in sample
+    assert sample["s_tgt_codec"].shape == (2, 4, 6)
     assert sample["s_in"][:, 0, 0].tolist() == [1.0, 2.0, 3.0]
-    assert sample["s_tgt"][:, 0, 0].tolist() == [10.0, 15.0]
+    assert sample["s_tgt_codec"][:, 0, 0].tolist() == [10.0, 15.0]
     assert sample["depth_tgt"].shape == (2, 8, 8)
     assert sample["point_tgt"].shape == (2, 8, 8, 3)
     assert sample["pose_geom_tgt"].shape == (2, 9)

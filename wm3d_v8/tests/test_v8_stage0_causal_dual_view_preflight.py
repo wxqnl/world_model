@@ -337,6 +337,7 @@ class _ProbeDataset:
             raise IndexError(index)
         return {
             "s_in": np.zeros((1,), dtype=np.float32),
+            "s_tgt": np.zeros((8, 64, 384), dtype=np.float32),
             "action_tgt": np.zeros((8, 7), dtype=np.float32),
             "action_tgt_norm": np.zeros((8, 6), dtype=np.float32),
             "c": np.zeros((2048,), dtype=np.float32),
@@ -351,6 +352,34 @@ class _ProbeMix:
     def __init__(self, lengths: dict[str, int]) -> None:
         self.source_names = list(MIX)
         self.datasets = [_ProbeDataset(lengths[name]) for name in self.source_names]
+
+
+def test_full_dataset_probe_rejects_legacy_unmarked_codec_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lengths = {source: 16 for source in MIX}
+    monkeypatch.setattr(
+        preflight_module,
+        "build_datasets",
+        lambda _config: (_ProbeMix(lengths), _ProbeMix(lengths)),
+    )
+    checks = _Checks("full")
+
+    _validate_dataset_probe_v8(
+        checks,
+        {
+            "train": {
+                "batch_size_per_gpu": 2,
+                "gpus_per_node": 8,
+                "num_nodes": 1,
+            }
+        },
+    )
+
+    assert any(
+        "dataset_probe.oxe_droid_action.s_tgt_codec is missing" in error
+        for error in checks.errors
+    )
 
 
 def test_full_dataset_probe_requires_each_source_to_fill_global_batch(

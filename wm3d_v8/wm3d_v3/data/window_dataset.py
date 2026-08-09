@@ -1618,7 +1618,10 @@ class OXEWindowDataset(Dataset):
                 }
             )
         if self.cfg.load_state_tgt:
-            sample["s_tgt"] = torch.from_numpy(pooled_w[T:]).float()
+            target_key = (
+                "s_tgt_codec" if self.cfg.causal_dual_view_required else "s_tgt"
+            )
+            sample[target_key] = torch.from_numpy(pooled_w[T:]).float()
         if depth_w is not None:
             sample["depth_in"] = torch.from_numpy(depth_w[:T]).float()
         if depth_tgt_w is not None:

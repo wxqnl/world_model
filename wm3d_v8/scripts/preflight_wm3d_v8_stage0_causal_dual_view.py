@@ -813,6 +813,7 @@ def _validate_dataset_probe_v8(
             )
     required = {
         "s_in": None,
+        "s_tgt_codec": (8, 64, 384),
         "action_tgt": (8, 7),
         "action_tgt_norm": (8, 6),
         "c": (2048,),
