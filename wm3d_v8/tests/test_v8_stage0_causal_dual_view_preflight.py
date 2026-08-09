@@ -7,11 +7,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import scripts.preflight_wm3d_v8_stage0_causal_dual_view as preflight_module
 from scripts.seal_wm3d_v8_stage0_causal_dual_view_canary import (
     _merge_robocasa_indices,
     _runtime_overlay,
 )
 from scripts.preflight_wm3d_v8_stage0_causal_dual_view import (
+    _Checks,
+    _validate_dataset_probe_v8,
     CausalDualViewPreflightError,
     load_config,
     validate_preflight,
@@ -289,3 +292,71 @@ def test_full_preflight_rejects_legacy_cache(tmp_path: Path) -> None:
             verify_training_assets=False, verify_local_resources=False,
         )
     assert any("schema" in error for error in info.value.report["errors"])
+
+
+class _ProbeDataset:
+    def __init__(self, length: int) -> None:
+        self.length = length
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
+        if index < 0 or index >= self.length:
+            raise IndexError(index)
+        return {
+            "s_in": np.zeros((1,), dtype=np.float32),
+            "action_tgt": np.zeros((8, 7), dtype=np.float32),
+            "action_tgt_norm": np.zeros((8, 6), dtype=np.float32),
+            "c": np.zeros((2048,), dtype=np.float32),
+            "rgb_tgt": np.zeros((1,), dtype=np.float32),
+            "depth_tgt": np.zeros((1,), dtype=np.float32),
+            "point_tgt": np.zeros((1,), dtype=np.float32),
+            "pose_geom_tgt": np.zeros((1,), dtype=np.float32),
+        }
+
+
+class _ProbeMix:
+    def __init__(self, lengths: dict[str, int]) -> None:
+        self.source_names = list(MIX)
+        self.datasets = [_ProbeDataset(lengths[name]) for name in self.source_names]
+
+
+def test_full_dataset_probe_requires_each_source_to_fill_global_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    train_lengths = {source: 16 for source in MIX}
+    validation_lengths = {source: 16 for source in MIX}
+    train_lengths["oxe_droid_action"] = 15
+    validation_lengths["oxe_bridge_action"] = 15
+    monkeypatch.setattr(
+        preflight_module,
+        "build_datasets",
+        lambda _config: (_ProbeMix(train_lengths), _ProbeMix(validation_lengths)),
+    )
+    checks = _Checks("full")
+
+    report = _validate_dataset_probe_v8(
+        checks,
+        {
+            "train": {
+                "batch_size_per_gpu": 2,
+                "gpus_per_node": 8,
+                "num_nodes": 1,
+            }
+        },
+    )
+
+    assert report["global_batch"] == 16
+    assert report["train_source_lengths"]["oxe_droid_action"] == 15
+    assert report["validation_source_lengths"]["oxe_bridge_action"] == 15
+    assert any(
+        "dataset_probe.oxe_droid_action train has 15 samples; "
+        "requires global batch 16" in error
+        for error in checks.errors
+    )
+    assert any(
+        "dataset_probe.oxe_bridge_action validation has 15 samples; "
+        "requires global batch 16" in error
+        for error in checks.errors
+    )

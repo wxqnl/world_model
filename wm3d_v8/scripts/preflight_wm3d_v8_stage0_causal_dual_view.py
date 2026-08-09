@@ -704,20 +704,57 @@ def _validate_dataset_probe_v8(
 
     if checks.mode != "full":
         return {}
-    report: dict[str, Any] = {"source_lengths": {}, "samples": {}}
+    train_cfg = config.get("train") or {}
     try:
-        _train, validation = build_datasets(config)
-        if not hasattr(validation, "source_names") or not hasattr(
-            validation, "datasets"
-        ):
-            raise RuntimeError("expected formal V8 mixed validation dataset")
-        sources = {
+        global_batch = (
+            int(train_cfg["batch_size_per_gpu"])
+            * int(train_cfg["gpus_per_node"])
+            * int(train_cfg["num_nodes"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        checks.errors.append(f"dataset_probe global batch is invalid: {exc}")
+        return {
+            "global_batch": None,
+            "train_source_lengths": {},
+            "validation_source_lengths": {},
+            "source_lengths": {},
+            "samples": {},
+        }
+    checks.expect(global_batch > 0, "dataset_probe global batch must be positive")
+    report: dict[str, Any] = {
+        "global_batch": global_batch,
+        "train_source_lengths": {},
+        "validation_source_lengths": {},
+        "source_lengths": {},
+        "samples": {},
+    }
+    try:
+        train, validation = build_datasets(config)
+        for split_name, mixed in (("train", train), ("validation", validation)):
+            if not hasattr(mixed, "source_names") or not hasattr(
+                mixed, "datasets"
+            ):
+                raise RuntimeError(
+                    f"expected formal V8 mixed {split_name} dataset"
+                )
+        train_sources = {
+            str(name): dataset
+            for name, dataset in zip(
+                train.source_names, train.datasets, strict=True
+            )
+        }
+        validation_sources = {
             str(name): dataset
             for name, dataset in zip(
                 validation.source_names, validation.datasets, strict=True
             )
         }
-        lengths = {name: len(dataset) for name, dataset in sources.items()}
+        train_lengths = {
+            name: len(dataset) for name, dataset in train_sources.items()
+        }
+        validation_lengths = {
+            name: len(dataset) for name, dataset in validation_sources.items()
+        }
     except Exception as exc:
         checks.errors.append(
             "formal dataset construction failed: "
@@ -725,10 +762,33 @@ def _validate_dataset_probe_v8(
         )
         return report
 
-    report["source_lengths"] = {
-        str(name): int(length) for name, length in lengths.items()
+    report["train_source_lengths"] = {
+        str(name): int(length) for name, length in train_lengths.items()
     }
-    checks.equal(set(sources), set(EXPECTED_SOURCES), "dataset_probe.source_names")
+    report["validation_source_lengths"] = {
+        str(name): int(length) for name, length in validation_lengths.items()
+    }
+    # Keep the legacy alias for existing report consumers.
+    report["source_lengths"] = dict(report["validation_source_lengths"])
+    checks.equal(
+        set(train_sources), set(EXPECTED_SOURCES),
+        "dataset_probe.train.source_names",
+    )
+    checks.equal(
+        set(validation_sources), set(EXPECTED_SOURCES),
+        "dataset_probe.validation.source_names",
+    )
+    for split_name, lengths in (
+        ("train", train_lengths),
+        ("validation", validation_lengths),
+    ):
+        for name in EXPECTED_SOURCES:
+            length = int(lengths.get(name, 0) or 0)
+            checks.expect(
+                length >= global_batch,
+                f"dataset_probe.{name} {split_name} has {length} samples; "
+                f"requires global batch {global_batch}",
+            )
     required = {
         "s_in": None,
         "action_tgt": (8, 7),
@@ -740,8 +800,8 @@ def _validate_dataset_probe_v8(
         "pose_geom_tgt": None,
     }
     for name in EXPECTED_SOURCES:
-        dataset = sources.get(name)
-        length = int(lengths.get(name, 0) or 0)
+        dataset = validation_sources.get(name)
+        length = int(validation_lengths.get(name, 0) or 0)
         checks.expect(length > 0, f"dataset_probe.{name} is empty")
         if dataset is None or length <= 0:
             continue
