@@ -4710,9 +4710,15 @@ def validate_stage_transition_preflight(cfg: dict, args: argparse.Namespace) -> 
     return load_mode
 
 
-def validate_empty_checkpoint_dir_preflight(cfg: dict) -> None:
+def validate_empty_checkpoint_dir_preflight(
+    cfg: dict,
+    *,
+    resume_checkpoint: Path | None = None,
+) -> None:
     """Keep a fresh stage lineage from silently reusing an old output run."""
 
+    if resume_checkpoint is not None:
+        return
     out_cfg = cfg.get("out") or {}
     if not bool(out_cfg.get("require_empty_checkpoint_dir", False)):
         return
@@ -8323,7 +8329,10 @@ def main():
             raise ValueError(
                 "forbid_resume=true permits only an explicitly enabled same-run exact resume"
             )
-    validate_empty_checkpoint_dir_preflight(cfg)
+    validate_empty_checkpoint_dir_preflight(
+        cfg,
+        resume_checkpoint=args.resume,
+    )
     stage_transition_mode = validate_stage_transition_preflight(cfg, args)
     future_value_stage = validate_future_value_stage_preflight(cfg, args)
     action_pretraining_stage = validate_action_pretraining_preflight(cfg)

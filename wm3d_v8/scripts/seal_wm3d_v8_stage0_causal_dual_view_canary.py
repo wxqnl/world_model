@@ -180,18 +180,29 @@ def _runtime_overlay(
     oxe_paths: dict[str, list[Path]],
     combined_robocasa_index: Path,
     max_steps: int | None = None,
+    initial_stop_step: int | None = None,
     out_root: Path | None = None,
     run_lineage: str | None = None,
 ) -> dict[str, Any]:
-    bounded_values = (max_steps, out_root, run_lineage)
+    bounded_values = (
+        max_steps, initial_stop_step, out_root, run_lineage
+    )
     if any(value is not None for value in bounded_values) and not all(
         value is not None for value in bounded_values
     ):
         raise ValueError(
-            "bounded runtime overlay requires max_steps, out_root and run_lineage"
+            "bounded runtime overlay requires max_steps, initial_stop_step, "
+            "out_root and run_lineage"
         )
     if max_steps is not None and int(max_steps) <= 0:
         raise ValueError("max_steps must be positive")
+    if initial_stop_step is not None and (
+        int(initial_stop_step) <= 0
+        or int(initial_stop_step) >= int(max_steps)
+    ):
+        raise ValueError(
+            "initial_stop_step must be positive and below max_steps"
+        )
     if run_lineage is not None and not str(run_lineage).strip():
         raise ValueError("run_lineage must be non-empty")
     combined = combined_robocasa_index.resolve()
@@ -225,16 +236,19 @@ def _runtime_overlay(
     }
     if max_steps is not None:
         stop = int(max_steps)
+        initial_stop = int(initial_stop_step)
+        milestones = [initial_stop, stop]
         overlay["train"] = {
             "run_lineage": str(run_lineage),
             "max_steps": stop,
+            "canary_initial_stop_step": initial_stop,
             "main_promotion_step": stop,
             "planned_review_stop_step": stop,
             "extension_cap_steps": stop,
             "warmup_steps": min(10, stop),
-            "ckpt_every_steps": stop,
-            "checkpoint_milestone_steps": [stop],
-            "milestone_reviews": {"required_review_steps": [stop]},
+            "ckpt_every_steps": initial_stop,
+            "checkpoint_milestone_steps": milestones,
+            "milestone_reviews": {"required_review_steps": milestones},
         }
         overlay["out"] = {
             "root": str(Path(out_root).resolve()),
@@ -257,6 +271,7 @@ def main() -> None:
     parser.add_argument("--runtime-config", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--initial-stop-step", type=int)
     parser.add_argument("--out-root", type=Path)
     parser.add_argument("--run-lineage")
     parser.add_argument("--skip-training-assets", action="store_true")
@@ -284,6 +299,7 @@ def main() -> None:
         oxe_paths=oxe_paths,
         combined_robocasa_index=args.combined_robocasa_index,
         max_steps=args.max_steps,
+        initial_stop_step=args.initial_stop_step,
         out_root=args.out_root,
         run_lineage=args.run_lineage,
     )

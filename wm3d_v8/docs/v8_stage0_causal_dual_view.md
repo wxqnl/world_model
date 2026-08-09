@@ -102,14 +102,20 @@ python scripts/cache_robocasa365_v7_compact.py \
 ## Seal 和 full preflight
 
 seal_wm3d_v8_stage0_causal_dual_view_canary.py 合并三个 RoboCasa index，
-写入只引用新缓存的 runtime config，并运行 full preflight。短 canary 还需
-显式传入：
+写入只引用新缓存的 runtime config，并运行 full preflight。两阶段 canary
+必须把完整优化器/LR 计划和首次 invocation 硬停分开声明：
 
 ~~~text
---max-steps 20
+--max-steps 100
+--initial-stop-step 20
 --out-root <fresh_result_root>
 --run-lineage <fresh_lineage>
 ~~~
+
+`max_steps=100` 决定 optimizer 和 LR scheduler 的完整计划；
+`initial_stop_step=20` 只让第一次进程在 step20 保存并退出。禁止把
+`max_steps` 改成 20 后再尝试续到 100，因为那会改变 scheduler 和
+resume-compatible config digest，不属于 exact resume。
 
 seal 报告只有同时满足以下条件才可交给 launcher：
 
@@ -127,20 +133,41 @@ WM3D_V8_CANARY_SEAL_SHA256=<seal_report_sha256> \
   scripts/launch_wm3d_v8_stage0_causal_dual_view_canary.sh check
 ~~~
 
-check 会重新核对 runtime config、resolved config、seal SHA、输出目录、
-GPU/ECC、磁盘和 full preflight。通过后把 check 改为 launch。
+`check` 会重新核对 runtime config、resolved config、seal SHA、空输出目录、
+GPU/ECC、磁盘和 full preflight。通过后把 `check` 改为 `launch`，首次进程
+从 fresh initialization 运行到 step20 并自然退出。
+
+step20 checkpoint 完整审查并记录 SHA256 后，使用同一个 runtime config、
+同一个 output root 和同一个 run lineage 继续：
+
+~~~bash
+WM3D_V8_CANARY_SEAL_SHA256=<seal_report_sha256> \
+WM3D_V8_CANARY_RESUME_SHA256=<step_00000020_sha256> \
+  scripts/launch_wm3d_v8_stage0_causal_dual_view_canary.sh resume-check
+
+WM3D_V8_CANARY_SEAL_SHA256=<seal_report_sha256> \
+WM3D_V8_CANARY_RESUME_SHA256=<step_00000020_sha256> \
+  scripts/launch_wm3d_v8_stage0_causal_dual_view_canary.sh resume
+~~~
+
+resume 模式必须严格恢复 model、optimizer、scheduler、sampler 和 RNG；
+不得使用 `latest.pt`，不得重置 optimizer，也不得换 output root 或 lineage。
 
 ## Canary 验收
 
-20-step canary 必须自然硬停，并满足：
+0→20 和 exact-resume 20→100 两段都必须自然硬停，并满足：
 
 - 五源 step 持续前进，loss 和梯度为有限值；
+- 完整 100-step source cycle 的计数精确为 35/15/10/20/20；
 - direct action、flow auxiliary、native no-teacher action 和 future anchor
   都参与训练；
 - RGB、depth、point、pose loss 为有限值；
 - 没有 OOM、CUDA、NCCL、Traceback、I/O 或数据错误；
 - step_00000020.pt 稳定、ZIP 可读，并含 model、optimizer、scheduler、
   sampler 和 RNG 状态。
+- exact-resume telemetry 精确绑定 step20 SHA、lineage、config digest、
+  optimizer/scheduler/sampler/RNG 恢复状态和下一 source；
+- step_00000100.pt 稳定、ZIP 可读并与 step20 保持同一 lineage。
 
 Canary 通过后仍保持暂停。正式长训需要完整缓存和单独的 authority review。
 任何任务都只从完整编号 checkpoint 恢复，不使用 latest。

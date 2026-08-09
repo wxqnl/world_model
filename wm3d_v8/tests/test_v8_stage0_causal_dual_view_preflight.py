@@ -19,6 +19,9 @@ from scripts.preflight_wm3d_v8_stage0_causal_dual_view import (
     load_config,
     validate_preflight,
 )
+from wm3d_v3.training.train import (
+    validate_empty_checkpoint_dir_preflight,
+)
 from wm3d_v3.data.v8_causal_dual_view import (
     CAUSAL_DUAL_VIEW_REPRESENTATION as REPRESENTATION,
     CAUSAL_DUAL_VIEW_SCHEMA as SCHEMA,
@@ -202,8 +205,10 @@ def test_merge_robocasa_indices_binds_partition_identity(tmp_path: Path) -> None
     assert replay_rows == merged
 
 
-def test_runtime_overlay_can_bound_a_fresh_training_smoke(tmp_path: Path) -> None:
-    """Catches a smoke launcher accidentally inheriting the 100-step run/output."""
+def test_runtime_overlay_preserves_exact_resume_training_schedule(
+    tmp_path: Path,
+) -> None:
+    """The first hard stop must not shorten the optimizer/LR schedule."""
 
     base = tmp_path / "base.yaml"
     base.write_text("{}\n")
@@ -223,15 +228,18 @@ def test_runtime_overlay_can_bound_a_fresh_training_smoke(tmp_path: Path) -> Non
         base_config=base,
         oxe_paths=oxe_paths,
         combined_robocasa_index=robocasa,
-        max_steps=20,
+        max_steps=100,
+        initial_stop_step=20,
         out_root=out_root,
-        run_lineage="wm3d_v8_stage0_causal_dual_view_smoke20_test",
+        run_lineage="wm3d_v8_stage0_causal_dual_view_canary100_test",
     )
 
-    assert overlay["train"]["max_steps"] == 20
-    assert overlay["train"]["planned_review_stop_step"] == 20
-    assert overlay["train"]["checkpoint_milestone_steps"] == [20]
-    assert overlay["train"]["run_lineage"].endswith("smoke20_test")
+    assert overlay["train"]["max_steps"] == 100
+    assert overlay["train"]["canary_initial_stop_step"] == 20
+    assert overlay["train"]["planned_review_stop_step"] == 100
+    assert overlay["train"]["ckpt_every_steps"] == 20
+    assert overlay["train"]["checkpoint_milestone_steps"] == [20, 100]
+    assert overlay["train"]["run_lineage"].endswith("canary100_test")
     assert overlay["out"] == {
         "root": str(out_root.resolve()),
         "require_empty_checkpoint_dir": True,
@@ -422,16 +430,27 @@ def test_full_dataset_probe_requires_each_source_to_fill_global_batch(
     )
 
 
-def test_canary_launcher_defaults_to_fresh_v8_outputs() -> None:
+def test_canary_launcher_supports_fresh_then_exact_resume_v9() -> None:
     launcher = (
         ROOT / "scripts" /
         "launch_wm3d_v8_stage0_causal_dual_view_canary.sh"
     ).read_text()
 
-    assert "runtime_config_smoke20_v8.yaml" in launcher
-    assert "seal_report_smoke20_v8.json" in launcher
-    assert "results/training_canary20_v8" in launcher
-    assert "logs/training_canary20_v8" in launcher
+    assert "runtime_config_canary100_v9.yaml" in launcher
+    assert "seal_report_canary100_v9.json" in launcher
+    assert "results/training_canary100_v9" in launcher
+    assert "logs/training_canary100_v9" in launcher
+    assert '"resume-check"' in launcher
+    assert '"resume"' in launcher
+    assert 'int(train.get("max_steps", -1)) != 100' in launcher
+    assert 'int(train.get("canary_initial_stop_step", -1)) != 20' in launcher
+    assert "--stop_after_step 20" in launcher
+    assert "--stop_after_step 100" in launcher
+    assert "--strict_resume" in launcher
+    assert "WM3D_V8_CANARY_RESUME_SHA256" in launcher
+    assert "step_00000020.pt" in launcher
+    assert "train_rank0_fresh_0_to_20.log" in launcher
+    assert "train_rank0_resume_20_to_100.log" in launcher
     assert "training_canary20_v1" not in launcher
     assert "training_canary20_v2" not in launcher
     assert "training_canary20_v3" not in launcher
@@ -439,6 +458,32 @@ def test_canary_launcher_defaults_to_fresh_v8_outputs() -> None:
     assert "training_canary20_v5" not in launcher
     assert "training_canary20_v6" not in launcher
     assert "training_canary20_v7" not in launcher
+    assert "training_canary20_v8" not in launcher
+
+
+def test_fresh_checkpoint_guard_allows_explicit_exact_resume(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "run"
+    checkpoint = root / "ckpt" / "step_00000020.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"numbered checkpoint")
+    cfg = {
+        "out": {
+            "root": str(root),
+            "ckpt_dir": "ckpt",
+            "require_empty_checkpoint_dir": True,
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="checkpoint directory is not empty"):
+        validate_empty_checkpoint_dir_preflight(
+            cfg, resume_checkpoint=None
+        )
+
+    validate_empty_checkpoint_dir_preflight(
+        cfg, resume_checkpoint=checkpoint
+    )
 
 
 def test_runtime_dependency_gate_requires_lpips_for_pixel_training(
