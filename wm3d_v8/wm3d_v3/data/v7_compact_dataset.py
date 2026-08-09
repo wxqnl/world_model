@@ -8,6 +8,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from .v8_causal_dual_view import (
+    CAUSAL_DUAL_VIEW_REPRESENTATION,
+    CAUSAL_DUAL_VIEW_SCHEMA,
+    validate_causal_dual_view_archive,
+)
 
 
 @dataclass
@@ -27,6 +32,8 @@ class V7CompactDatasetConfig:
     action_only: bool = False
     policy_action_history_len: int = 0
     policy_action_history_dim: int = 7
+    causal_dual_view_required: bool = False
+    causal_dual_view_representation: str | None = None
 
 
 @dataclass
@@ -53,6 +60,14 @@ class V7CompactWindowDataset(Dataset):
             raise ValueError("policy_action_history_len must be non-negative")
         if cfg.policy_action_history_dim != 7:
             raise ValueError("canonical V7 policy action history must be 7D")
+        if cfg.causal_dual_view_required:
+            if (
+                cfg.causal_dual_view_representation
+                != CAUSAL_DUAL_VIEW_REPRESENTATION
+            ):
+                raise ValueError("causal compact mode needs the exact V8 representation")
+            if cfg.action_only:
+                raise ValueError("causal compact mode requires native 3D targets")
         rows: list[dict] = []
         with Path(cfg.index_path).open(encoding="utf-8") as handle:
             for line in handle:
@@ -117,6 +132,59 @@ class V7CompactWindowDataset(Dataset):
         self.index: list[tuple[int, int]] = []
         required = cfg.T + cfg.k
         for record_index, row in enumerate(rows):
+            if cfg.causal_dual_view_required:
+                if row.get("paired_views") is not True:
+                    raise ValueError(
+                        f"causal RoboCasa cache requires paired views: "
+                        f"{row.get('clip_hash')}"
+                    )
+                if row.get("schema") != CAUSAL_DUAL_VIEW_SCHEMA:
+                    raise ValueError(f"unexpected causal dual-view schema: {row.get('clip_hash')}")
+                if row.get("representation") != CAUSAL_DUAL_VIEW_REPRESENTATION:
+                    raise ValueError(f"unexpected causal compact representation: {row.get('clip_hash')}")
+                if row.get("context_future_leakage") is not False:
+                    raise ValueError(f"context_future_leakage must be false: {row.get('clip_hash')}")
+                if row.get("target_usage") != "supervision_only":
+                    raise ValueError(f"target_usage must be supervision_only: {row.get('clip_hash')}")
+                if row.get("geometry_coordinate_frame") != "first_observed_camera":
+                    raise ValueError(f"unexpected geometry gauge: {row.get('clip_hash')}")
+                with np.load(row["path"], allow_pickle=False) as archive:
+                    summary = validate_causal_dual_view_archive(
+                        archive,
+                        T=cfg.T,
+                        k=cfg.k,
+                        paired_views=bool(row.get("paired_views", False)),
+                    )
+                    if not summary["compact"]:
+                        raise ValueError("RoboCasa causal cache must have a W dimension")
+                    for key, expected in (
+                        ("clip_hash", row["clip_hash"]),
+                        ("split", row["split"]),
+                        ("source", row["source"]),
+                        ("action_adapter_version", row["action_adapter_version"]),
+                        ("action_audit_sha256", row["action_audit_sha256"]),
+                    ):
+                        if str(np.asarray(archive[key]).item()) != str(expected):
+                            raise ValueError(f"compact cache identity mismatch for {key}: {row['clip_hash']}")
+                    archive_starts = np.asarray(archive["window_starts"], dtype=np.int64)
+                row_starts = np.asarray(row.get("window_starts"), dtype=np.int64)
+                if row_starts.ndim != 1 or not np.array_equal(row_starts, archive_starts):
+                    raise ValueError(f"compact window_starts identity mismatch: {row['clip_hash']}")
+                if len(row_starts) == 0 or np.any(np.diff(row_starts) <= 0):
+                    raise ValueError(f"compact window_starts must be sorted unique: {row['clip_hash']}")
+                if any(
+                    start < 0 or start + required > int(row["model_frames"])
+                    for start in row_starts.tolist()
+                ):
+                    raise ValueError(f"compact window start outside clip: {row['clip_hash']}")
+                row["_causal_window_lookup"] = {
+                    int(start): window_index
+                    for window_index, start in enumerate(row_starts.tolist())
+                }
+                self.index.extend(
+                    (record_index, int(start)) for start in row_starts.tolist()
+                )
+                continue
             segments = row.get("geometry_segments")
             if not segments:
                 raise ValueError(f"formal cache has no VGGT gauge segments: {row.get('clip_hash')}")
@@ -125,9 +193,6 @@ class V7CompactWindowDataset(Dataset):
                 if not (0 <= segment_start < segment_stop <= int(row["model_frames"])):
                     raise ValueError(f"invalid geometry segment: {row.get('clip_hash')}")
                 if cfg.action_only:
-                    # Direct policy training needs only a geometrically valid
-                    # context plus a contiguous action chunk.  Future geometry
-                    # targets remain tied to S0's shorter K=8 gauge segments.
                     last_start = min(
                         segment_stop - cfg.T,
                         int(row["model_frames"]) - cfg.T - cfg.k + 1,
@@ -136,9 +201,7 @@ class V7CompactWindowDataset(Dataset):
                         self.index.extend(
                             (record_index, start)
                             for start in range(
-                                segment_start,
-                                last_start + 1,
-                                cfg.stride,
+                                segment_start, last_start + 1, cfg.stride
                             )
                         )
                 else:
@@ -179,7 +242,11 @@ class V7CompactWindowDataset(Dataset):
         row = self.records[record_index]
         T, k = self.cfg.T, self.cfg.k
         with np.load(row["path"], allow_pickle=False) as archive:
-            if str(archive["schema"].item()) != "wm3d_v7_compact_geom_v3":
+            if self.cfg.causal_dual_view_required:
+                validate_causal_dual_view_archive(
+                    archive, T=T, k=k, paired_views=True
+                )
+            elif str(archive["schema"].item()) != "wm3d_v7_compact_geom_v3":
                 raise ValueError(f"unexpected compact cache schema: {row['path']}")
             for key, expected in (
                 ("clip_hash", row["clip_hash"]),
@@ -190,9 +257,7 @@ class V7CompactWindowDataset(Dataset):
             ):
                 if str(archive[key].item()) != str(expected):
                     raise ValueError(f"compact cache identity mismatch for {key}: {row['clip_hash']}")
-            anchor = self._latent(archive, "anchor")
             paired_views = bool(row.get("paired_views", False))
-            wrist = self._latent(archive, "wrist") if paired_views else np.zeros_like(anchor)
             actions = np.asarray(archive["actions"], dtype=np.float32)
             action_valid_mask = np.asarray(archive["action_valid_mask"], dtype=np.bool_)
             task_text = (
@@ -201,31 +266,56 @@ class V7CompactWindowDataset(Dataset):
                 else ""
             )
             task = np.asarray(archive["task_emb"], dtype=np.float32)
-            geometry_segment_id = np.asarray(archive["geometry_segment_id"], dtype=np.int16)
-            if not self.cfg.action_only:
-                depth = np.asarray(archive["depth_patch"], dtype=np.float32)
-                depth_conf = np.asarray(archive["depth_conf_patch"], dtype=np.float32)
-                points = np.asarray(archive["point_patch"], dtype=np.float32)
-                point_conf = np.asarray(archive["point_conf_patch"], dtype=np.float32)
-                pose = np.asarray(archive["pose_enc"], dtype=np.float32)
+            if self.cfg.causal_dual_view_required:
+                window_index = row["_causal_window_lookup"].get(int(start))
+                if window_index is None:
+                    raise ValueError(f"compact cache omits indexed start {start}")
+                anchor = np.asarray(archive["context_codes"][window_index], dtype=np.int8).astype(np.float32)
+                anchor *= np.asarray(archive["context_scale"][window_index], dtype=np.float32)
+                wrist = np.asarray(archive["wrist_context_codes"][window_index], dtype=np.int8).astype(np.float32)
+                wrist *= np.asarray(archive["wrist_context_scale"][window_index], dtype=np.float32)
+                future = np.asarray(archive["future_codes"][window_index], dtype=np.int8).astype(np.float32)
+                future *= np.asarray(archive["future_scale"][window_index], dtype=np.float32)
+                depth = np.asarray(archive["future_depth_patch"][window_index], dtype=np.float32)
+                depth_conf = np.asarray(archive["future_depth_conf_patch"][window_index], dtype=np.float32)
+                points = np.asarray(archive["future_point_patch"][window_index], dtype=np.float32)
+                point_conf = np.asarray(archive["future_point_conf_patch"][window_index], dtype=np.float32)
+                pose = np.asarray(archive["future_pose_enc"][window_index], dtype=np.float32)
+                geometry_segment_id = None
+            else:
+                anchor = self._latent(archive, "anchor")
+                wrist = self._latent(archive, "wrist") if paired_views else np.zeros_like(anchor)
+                geometry_segment_id = np.asarray(archive["geometry_segment_id"], dtype=np.int16)
+                if not self.cfg.action_only:
+                    depth = np.asarray(archive["depth_patch"], dtype=np.float32)
+                    depth_conf = np.asarray(archive["depth_conf_patch"], dtype=np.float32)
+                    points = np.asarray(archive["point_patch"], dtype=np.float32)
+                    point_conf = np.asarray(archive["point_conf_patch"], dtype=np.float32)
+                    pose = np.asarray(archive["pose_enc"], dtype=np.float32)
         if self.cfg.require_task_emb and (task.shape != (2048,) or not np.any(task)):
             raise RuntimeError(f"missing real task embedding: {row['clip_hash']}")
         context_end = start + T
         future_end = context_end + k
         action_start = context_end - 1
         action_end = action_start + k
-        if min(len(anchor), len(wrist)) < context_end or len(actions) < action_end:
+        context_short = (
+            min(len(anchor), len(wrist)) < T
+            if self.cfg.causal_dual_view_required
+            else min(len(anchor), len(wrist)) < context_end
+        )
+        if context_short or len(actions) < action_end:
             raise RuntimeError(f"short compact cache record: {row['clip_hash']}")
         if (
             len(action_valid_mask) < action_end
             or not action_valid_mask[action_start:action_end].all()
         ):
             raise RuntimeError(f"invalid action interval: {row['clip_hash']}")
-        geometry_end = context_end if self.cfg.action_only else future_end
-        if len(geometry_segment_id) < geometry_end:
-            raise RuntimeError(f"short geometry segment record: {row['clip_hash']}")
-        if len(np.unique(geometry_segment_id[start:geometry_end])) != 1:
-            raise RuntimeError(f"window crossed a VGGT geometry gauge boundary: {row['clip_hash']}")
+        if not self.cfg.causal_dual_view_required:
+            geometry_end = context_end if self.cfg.action_only else future_end
+            if len(geometry_segment_id) < geometry_end:
+                raise RuntimeError(f"short geometry segment record: {row['clip_hash']}")
+            if len(np.unique(geometry_segment_id[start:geometry_end])) != 1:
+                raise RuntimeError(f"window crossed a VGGT geometry gauge boundary: {row['clip_hash']}")
         # The action at model index t drives the transition from frame t to t+1.
         action_window = actions[action_start : action_start + k]
         previous_grip = actions[action_start - 1 : action_start, 6]
@@ -254,8 +344,16 @@ class V7CompactWindowDataset(Dataset):
         if wrist_dropped:
             view_mask[:, 1] = False
         sample = {
-            "s_in": torch.from_numpy(anchor[start : start + T].copy()),
-            "s_wrist": torch.from_numpy(wrist[start : start + T].copy()),
+            "s_in": torch.from_numpy(
+                anchor.copy()
+                if self.cfg.causal_dual_view_required
+                else anchor[start : start + T].copy()
+            ),
+            "s_wrist": torch.from_numpy(
+                wrist.copy()
+                if self.cfg.causal_dual_view_required
+                else wrist[start : start + T].copy()
+            ),
             "view_mask": torch.from_numpy(view_mask),
             "action_tgt": torch.from_numpy(action_window.copy()),
             "action_tgt_norm": torch.from_numpy(
@@ -280,31 +378,28 @@ class V7CompactWindowDataset(Dataset):
         if action_history is not None:
             sample["action_history"] = torch.from_numpy(action_history)
         if not self.cfg.action_only:
-            if min(
-                len(anchor), len(depth), len(depth_conf), len(points),
-                len(point_conf), len(pose),
-            ) < future_end:
-                raise RuntimeError(f"short compact target record: {row['clip_hash']}")
+            if self.cfg.causal_dual_view_required:
+                target_arrays = (future, depth, depth_conf, points, point_conf, pose)
+                if min(len(value) for value in target_arrays) < k:
+                    raise RuntimeError(f"short causal compact target: {row['clip_hash']}")
+                target_slice = slice(0, k)
+                state_target = future
+            else:
+                if min(
+                    len(anchor), len(depth), len(depth_conf), len(points),
+                    len(point_conf), len(pose),
+                ) < future_end:
+                    raise RuntimeError(f"short compact target record: {row['clip_hash']}")
+                target_slice = slice(context_end, future_end)
+                state_target = anchor
             sample.update(
                 {
-                    "s_tgt_codec": torch.from_numpy(
-                        anchor[context_end:future_end].copy()
-                    ),
-                    "depth_tgt": torch.from_numpy(
-                        depth[context_end:future_end].copy()
-                    ),
-                    "depth_conf_tgt": torch.from_numpy(
-                        depth_conf[context_end:future_end].copy()
-                    ),
-                    "point_tgt": torch.from_numpy(
-                        points[context_end:future_end].copy()
-                    ),
-                    "point_conf_tgt": torch.from_numpy(
-                        point_conf[context_end:future_end].copy()
-                    ),
-                    "pose_geom_tgt": torch.from_numpy(
-                        pose[context_end:future_end].copy()
-                    ),
+                    "s_tgt_codec": torch.from_numpy(state_target[target_slice].copy()),
+                    "depth_tgt": torch.from_numpy(depth[target_slice].copy()),
+                    "depth_conf_tgt": torch.from_numpy(depth_conf[target_slice].copy()),
+                    "point_tgt": torch.from_numpy(points[target_slice].copy()),
+                    "point_conf_tgt": torch.from_numpy(point_conf[target_slice].copy()),
+                    "pose_geom_tgt": torch.from_numpy(pose[target_slice].copy()),
                 }
             )
         rgb_row = self.rgb_records.get(row["clip_hash"])

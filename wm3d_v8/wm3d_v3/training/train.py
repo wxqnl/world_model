@@ -3282,6 +3282,12 @@ def build_datasets(cfg: dict, overfit_ids=None):
             ),
             "require_rgb_sidecar": bool(data_cfg.get("require_rgb_sidecar", False)),
             "action_only": bool(data_cfg.get("direct_policy_action_only", False)),
+            "causal_dual_view_required": bool(
+                data_cfg.get("compact_causal_dual_view_required", False)
+            ),
+            "causal_dual_view_representation": data_cfg.get(
+                "compact_causal_dual_view_representation"
+            ),
             "policy_action_history_len": int(
                 data_cfg.get(
                     "policy_action_history_len",
@@ -3471,6 +3477,12 @@ def build_datasets(cfg: dict, overfit_ids=None):
             ),
             "require_rgb_sidecar": bool(data_cfg.get("require_rgb_sidecar", False)),
             "action_only": bool(data_cfg.get("direct_policy_action_only", False)),
+            "causal_dual_view_required": bool(
+                data_cfg.get("compact_causal_dual_view_required", False)
+            ),
+            "causal_dual_view_representation": data_cfg.get(
+                "compact_causal_dual_view_representation"
+            ),
             "policy_action_history_len": int(
                 data_cfg.get(
                     "policy_action_history_len",
