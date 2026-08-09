@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from wm3d_v3.data.manifest import OXEClipRecord, read_manifest
+from wm3d_v3.data.splits import episode_split
 from wm3d_v3.data.v8_causal_dual_view import (
     CAUSAL_DUAL_VIEW_REPRESENTATION,
     CAUSAL_DUAL_VIEW_SCHEMA,
@@ -330,6 +331,28 @@ def _shard_path(path: Path, shard_id: int, num_shards: int) -> Path:
     )
 
 
+def _records_for_split(
+    records: list[OXEClipRecord],
+    *,
+    split: str,
+    val_frac: float,
+    seed: int,
+) -> list[OXEClipRecord]:
+    """Apply the exact episode split used by the mixed-source trainer."""
+
+    if split not in {"train", "val"}:
+        raise ValueError(f"unsupported OXE training split: {split!r}")
+    partition = episode_split(
+        records,
+        val_frac=float(val_frac),
+        seed=int(seed),
+    )
+    selected_ids = (
+        partition.train_clip_ids if split == "train" else partition.val_clip_ids
+    )
+    return [record for record in records if record.clip_id in selected_ids]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -339,7 +362,9 @@ def main() -> None:
     parser.add_argument("--codec", type=Path, required=True)
     parser.add_argument("--codec-downstream-report", type=Path, required=True)
     parser.add_argument("--source", required=True)
-    parser.add_argument("--split", choices=("train", "val", "test"), required=True)
+    parser.add_argument("--split", choices=("train", "val"), required=True)
+    parser.add_argument("--val-frac", type=float, default=0.03)
+    parser.add_argument("--split-seed", type=int, default=909)
     parser.add_argument("--rgb-subdir", default="rgb_256")
     parser.add_argument("--action-subdir", default="actions")
     parser.add_argument("--task-subdir", default="qwen_taskemb")
@@ -362,7 +387,13 @@ def main() -> None:
 
     manifest_sha = _sha256_file(args.manifest)
     codec_sha = _sha256_file(args.codec)
-    records = sorted(read_manifest(args.manifest), key=lambda row: row.clip_id)
+    all_records = sorted(
+        read_manifest(args.manifest), key=lambda row: row.clip_id
+    )
+    records = _records_for_split(
+        all_records, split=args.split,
+        val_frac=args.val_frac, seed=args.split_seed,
+    )
     candidates: list[tuple[OXEClipRecord, int]] = []
     for record in records:
         for start in range(
@@ -393,6 +424,9 @@ def main() -> None:
         "codec_sha256": codec_sha,
         "source": args.source,
         "split": args.split,
+        "split_mode": "episode",
+        "val_frac": args.val_frac,
+        "split_seed": args.split_seed,
         "T": args.T,
         "k": args.k,
         "stride": args.stride,

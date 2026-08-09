@@ -15,6 +15,7 @@ from scripts.cache_robocasa365_v7_compact import (
 from scripts.cache_wm3d_v8_stage0_causal_dual_view_oxe import (
     _encode_record_windows,
     _index_row,
+    _records_for_split,
     _publish_archive,
     _validate_index_selection,
     _window_path,
@@ -258,6 +259,36 @@ def test_oxe_builder_publishes_exact_selection_without_clobber(
             _window_path(tmp_path, record.clip_id, 0),
             conflicting,
         )
+
+
+def test_oxe_producer_uses_training_episode_split_exactly() -> None:
+    records = [
+        OXEClipRecord(
+            clip_id=f"bridge/episode_{index:03d}",
+            dataset="bridge",
+            tar_path="/sealed/bridge.tar",
+            pickle_member=f"episode_{index:03d}.pkl",
+            n_frames=32,
+            fps=5,
+            robot="widowx",
+            task_text="move the block",
+        )
+        for index in range(20)
+    ]
+    train = _records_for_split(
+        records, split="train", val_frac=0.20, seed=909
+    )
+    val = _records_for_split(
+        records, split="val", val_frac=0.20, seed=909
+    )
+
+    assert len(train) == 16 and len(val) == 4
+    assert {record.clip_id for record in train}.isdisjoint(
+        record.clip_id for record in val
+    )
+    assert {record.clip_id for record in train + val} == {
+        record.clip_id for record in records
+    }
 
 
 @pytest.mark.parametrize(
