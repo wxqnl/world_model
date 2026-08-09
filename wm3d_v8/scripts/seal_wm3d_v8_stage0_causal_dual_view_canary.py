@@ -139,6 +139,41 @@ def _merge_robocasa_indices(
     return _publish_text_no_clobber(output.resolve(), text), merged
 
 
+def _oxe_window_binding(
+    oxe_paths: dict[str, list[Path]],
+) -> dict[str, Any]:
+    expected = {"oxe_droid_action", "oxe_bridge_action"}
+    if set(oxe_paths) != expected:
+        raise ValueError("OXE indices must contain DROID and Bridge exactly")
+    directories: set[Path] = set()
+    for source in sorted(expected):
+        paths = [Path(path).resolve() for path in oxe_paths[source]]
+        if not paths:
+            raise ValueError(f"{source} has no causal index")
+        for index_path in paths:
+            for row in _read_jsonl(index_path):
+                raw_path = str(row.get("path") or "")
+                if not raw_path:
+                    raise ValueError(f"{index_path}: OXE row is missing path")
+                artifact = Path(raw_path).resolve()
+                if artifact.suffix != ".npz":
+                    raise ValueError(f"{index_path}: OXE path must be an NPZ")
+                directories.add(artifact.parent)
+    if len(directories) != 1:
+        raise ValueError(
+            "OXE causal indices must use one shared window directory"
+        )
+    window_dir = directories.pop()
+    if window_dir == window_dir.parent or not window_dir.name:
+        raise ValueError("OXE shared window directory has no usable basename")
+    return {
+        "window_geom_cache_root": str(window_dir.parent),
+        "window_geom_subdir": window_dir.name,
+        "window_geom_shard_index": None,
+        "window_geom_shard_root": None,
+    }
+
+
 def _runtime_overlay(
     *,
     base_config: Path,
@@ -161,6 +196,7 @@ def _runtime_overlay(
         raise ValueError("run_lineage must be non-empty")
     combined = combined_robocasa_index.resolve()
     combined_sha = _sha256_file(combined)
+    oxe_loader_binding = _oxe_window_binding(oxe_paths)
     indices: dict[str, Any] = {}
     for source in ("oxe_droid_action", "oxe_bridge_action"):
         paths = [path.resolve() for path in oxe_paths[source]]
@@ -184,6 +220,7 @@ def _runtime_overlay(
             "compact_index": str(combined),
             "compact_index_sha256": combined_sha,
             "causal_dual_view_indices": indices,
+            "direct_policy_oxe_overrides": oxe_loader_binding,
         },
     }
     if max_steps is not None:

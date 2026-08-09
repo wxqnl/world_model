@@ -207,10 +207,13 @@ def test_runtime_overlay_can_bound_a_fresh_training_smoke(tmp_path: Path) -> Non
 
     base = tmp_path / "base.yaml"
     base.write_text("{}\n")
+    windows = tmp_path / "causal_windows"
     oxe_paths = {}
     for source in ("oxe_droid_action", "oxe_bridge_action"):
         path = tmp_path / f"{source}.jsonl"
-        path.write_text("{}\n")
+        path.write_text(json.dumps({
+            "path": str(windows / f"{source}__start_000000.npz"),
+        }) + "\n")
         oxe_paths[source] = [path]
     robocasa = tmp_path / "robocasa.jsonl"
     robocasa.write_text("{}\n")
@@ -233,6 +236,34 @@ def test_runtime_overlay_can_bound_a_fresh_training_smoke(tmp_path: Path) -> Non
         "root": str(out_root.resolve()),
         "require_empty_checkpoint_dir": True,
     }
+    assert overlay["data"]["direct_policy_oxe_overrides"] == {
+        "window_geom_cache_root": str(tmp_path.resolve()),
+        "window_geom_subdir": "causal_windows",
+        "window_geom_shard_index": None,
+        "window_geom_shard_root": None,
+    }
+
+
+def test_runtime_overlay_rejects_split_oxe_window_directories(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text("{}\n")
+    oxe_paths = {}
+    for source in ("oxe_droid_action", "oxe_bridge_action"):
+        path = tmp_path / f"{source}.jsonl"
+        artifact = tmp_path / source / "episode__start_000000.npz"
+        path.write_text(json.dumps({"path": str(artifact)}) + "\n")
+        oxe_paths[source] = [path]
+    robocasa = tmp_path / "robocasa.jsonl"
+    robocasa.write_text("{}\n")
+
+    with pytest.raises(ValueError, match="one shared window directory"):
+        _runtime_overlay(
+            base_config=base,
+            oxe_paths=oxe_paths,
+            combined_robocasa_index=robocasa,
+        )
 
 
 def _config(tmp_path: Path, legacy_source=None):
