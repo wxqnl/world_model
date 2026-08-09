@@ -12,5 +12,6 @@ scikit-learn==1.7.2
 h5py==3.16.0
 imageio==2.37.3
 opencv-python-headless==4.11.0.86
+lpips==0.1.4
 pytest==9.0.3
 ruff==0.15.14

@@ -408,3 +408,27 @@ def test_canary_launcher_defaults_to_fresh_v6_outputs() -> None:
     assert "training_canary20_v3" not in launcher
     assert "training_canary20_v4" not in launcher
     assert "training_canary20_v5" not in launcher
+
+
+def test_runtime_dependency_gate_requires_lpips_for_pixel_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        preflight_module.importlib.util,
+        "find_spec",
+        lambda name: None if name == "lpips" else object(),
+    )
+    checks = _Checks("full")
+
+    report = preflight_module._validate_runtime_dependencies(
+        checks,
+        {
+            "model": {"enable_pixel": True},
+            "loss": {"rgb_lpips": 0.55},
+        },
+    )
+
+    assert report == {"lpips": False}
+    assert checks.errors == [
+        "runtime dependency lpips is required when loss.rgb_lpips > 0"
+    ]

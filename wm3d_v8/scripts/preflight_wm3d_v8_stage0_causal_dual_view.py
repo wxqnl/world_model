@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import sys
@@ -85,6 +86,27 @@ def _json_sha256(payload: Any) -> str:
         payload, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_runtime_dependencies(
+    checks: _Checks, config: dict[str, Any]
+) -> dict[str, bool]:
+    model = config.get("model") or {}
+    loss = config.get("loss") or {}
+    try:
+        rgb_lpips = float(loss.get("rgb_lpips", 0.0))
+    except (TypeError, ValueError):
+        rgb_lpips = 0.0
+    required = bool(model.get("enable_pixel")) and rgb_lpips > 0.0
+    report: dict[str, bool] = {}
+    if required:
+        available = importlib.util.find_spec("lpips") is not None
+        report["lpips"] = available
+        checks.expect(
+            available,
+            "runtime dependency lpips is required when loss.rgb_lpips > 0",
+        )
+    return report
 
 
 def _np_scalar(archive: Any, name: str) -> Any:
@@ -866,6 +888,7 @@ def validate_preflight(
         raise ValueError(f"unsupported mode: {mode}")
     checks = _Checks(mode)
     sources = _validate_contract_and_objective(checks, config)
+    runtime_dependencies = _validate_runtime_dependencies(checks, config)
     asset_report = (
         _validate_training_assets(checks, config, sources)
         if verify_training_assets
@@ -894,6 +917,7 @@ def validate_preflight(
         "run_lineage": (config.get("train") or {}).get("run_lineage"),
         "source_coverage": coverage,
         "cache_contract_hashes": contract_hashes,
+        "runtime_dependencies": runtime_dependencies,
         "action_objective": {
             "direct_policy_weight": 1.0,
             "policy_flow_weight": 0.25,
