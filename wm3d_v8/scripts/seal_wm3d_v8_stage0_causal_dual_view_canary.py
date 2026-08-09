@@ -144,7 +144,21 @@ def _runtime_overlay(
     base_config: Path,
     oxe_paths: dict[str, list[Path]],
     combined_robocasa_index: Path,
+    max_steps: int | None = None,
+    out_root: Path | None = None,
+    run_lineage: str | None = None,
 ) -> dict[str, Any]:
+    bounded_values = (max_steps, out_root, run_lineage)
+    if any(value is not None for value in bounded_values) and not all(
+        value is not None for value in bounded_values
+    ):
+        raise ValueError(
+            "bounded runtime overlay requires max_steps, out_root and run_lineage"
+        )
+    if max_steps is not None and int(max_steps) <= 0:
+        raise ValueError("max_steps must be positive")
+    if run_lineage is not None and not str(run_lineage).strip():
+        raise ValueError("run_lineage must be non-empty")
     combined = combined_robocasa_index.resolve()
     combined_sha = _sha256_file(combined)
     indices: dict[str, Any] = {}
@@ -164,7 +178,7 @@ def _runtime_overlay(
             "partition": partition,
             "paired_views": True,
         }
-    return {
+    overlay: dict[str, Any] = {
         "_base_": str(base_config.resolve()),
         "data": {
             "compact_index": str(combined),
@@ -172,6 +186,24 @@ def _runtime_overlay(
             "causal_dual_view_indices": indices,
         },
     }
+    if max_steps is not None:
+        stop = int(max_steps)
+        overlay["train"] = {
+            "run_lineage": str(run_lineage),
+            "max_steps": stop,
+            "main_promotion_step": stop,
+            "planned_review_stop_step": stop,
+            "extension_cap_steps": stop,
+            "warmup_steps": min(10, stop),
+            "ckpt_every_steps": stop,
+            "checkpoint_milestone_steps": [stop],
+            "milestone_reviews": {"required_review_steps": [stop]},
+        }
+        overlay["out"] = {
+            "root": str(Path(out_root).resolve()),
+            "require_empty_checkpoint_dir": True,
+        }
+    return overlay
 
 
 def main() -> None:
@@ -187,6 +219,9 @@ def main() -> None:
     parser.add_argument("--combined-robocasa-index", type=Path, required=True)
     parser.add_argument("--runtime-config", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--out-root", type=Path)
+    parser.add_argument("--run-lineage")
     parser.add_argument("--skip-training-assets", action="store_true")
     parser.add_argument("--skip-local-resources", action="store_true")
     args = parser.parse_args()
@@ -211,6 +246,9 @@ def main() -> None:
         base_config=args.base_config,
         oxe_paths=oxe_paths,
         combined_robocasa_index=args.combined_robocasa_index,
+        max_steps=args.max_steps,
+        out_root=args.out_root,
+        run_lineage=args.run_lineage,
     )
     runtime_text = yaml.safe_dump(overlay, sort_keys=False)
     runtime_sha = _publish_text_no_clobber(args.runtime_config, runtime_text)

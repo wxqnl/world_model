@@ -7,7 +7,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scripts.seal_wm3d_v8_stage0_causal_dual_view_canary import _merge_robocasa_indices
+from scripts.seal_wm3d_v8_stage0_causal_dual_view_canary import (
+    _merge_robocasa_indices,
+    _runtime_overlay,
+)
 from scripts.preflight_wm3d_v8_stage0_causal_dual_view import (
     CausalDualViewPreflightError,
     load_config,
@@ -194,6 +197,39 @@ def test_merge_robocasa_indices_binds_partition_identity(tmp_path: Path) -> None
     replay_digest, replay_rows = _merge_robocasa_indices(inputs, output)
     assert replay_digest == digest
     assert replay_rows == merged
+
+
+def test_runtime_overlay_can_bound_a_fresh_training_smoke(tmp_path: Path) -> None:
+    """Catches a smoke launcher accidentally inheriting the 100-step run/output."""
+
+    base = tmp_path / "base.yaml"
+    base.write_text("{}\n")
+    oxe_paths = {}
+    for source in ("oxe_droid_action", "oxe_bridge_action"):
+        path = tmp_path / f"{source}.jsonl"
+        path.write_text("{}\n")
+        oxe_paths[source] = [path]
+    robocasa = tmp_path / "robocasa.jsonl"
+    robocasa.write_text("{}\n")
+    out_root = tmp_path / "results"
+
+    overlay = _runtime_overlay(
+        base_config=base,
+        oxe_paths=oxe_paths,
+        combined_robocasa_index=robocasa,
+        max_steps=20,
+        out_root=out_root,
+        run_lineage="wm3d_v8_stage0_causal_dual_view_smoke20_test",
+    )
+
+    assert overlay["train"]["max_steps"] == 20
+    assert overlay["train"]["planned_review_stop_step"] == 20
+    assert overlay["train"]["checkpoint_milestone_steps"] == [20]
+    assert overlay["train"]["run_lineage"].endswith("smoke20_test")
+    assert overlay["out"] == {
+        "root": str(out_root.resolve()),
+        "require_empty_checkpoint_dir": True,
+    }
 
 
 def _config(tmp_path: Path, legacy_source=None):
