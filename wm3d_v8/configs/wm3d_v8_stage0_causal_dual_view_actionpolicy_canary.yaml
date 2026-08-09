@@ -1,0 +1,131 @@
+_base_: wm3d_v7_1b_native_actionpolicy_joint_canary1000_node43_v3.yaml
+
+# Fresh V8 Stage0 canary for the causal dual-view native-3D contract.
+contract:
+  schema: wm3d_v8_stage0_causal_dual_view_actionpolicy_canary_v1
+  profile: canary_non_inheritable
+  purpose: validate_causal_observed_context_native3d_and_joint_action_pretraining
+  preflight_required: true
+  preflight_script: scripts/preflight_wm3d_v8_stage0_causal_dual_view.py
+  canary_required: false
+  auto_promote: false
+  causal_dual_view_schema: wm3d_v8_stage0_causal_dual_view_v1
+  causal_dual_view_representation: wm3d_v8_vggt_observed_context_target_split_v1
+  context_future_leakage: false
+  target_usage: supervision_only
+  geometry_coordinate_frame: first_observed_camera
+  future_observation_inputs_forbidden: true
+  native_3d_outputs_required: [rgb, depth, point, pose]
+
+data:
+  compact_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/robocasa/index.jsonl
+  compact_index_sha256: PENDING_CANARY_ROBOCASA_INDEX_SHA256
+  action_stats_source_index_sha256: 228810a379431fc2f3a4678f452cee687b64e1bc19a3b021e07bfefd46f1c938
+  compact_causal_dual_view_required: true
+  compact_causal_dual_view_representation: wm3d_v8_vggt_observed_context_target_split_v1
+
+  # These keys are loader-only overrides. Canonical action manifests, audit
+  # gates, action adapters and source identities remain inherited and pinned.
+  direct_policy_oxe_overrides:
+    cache_root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/cache/oxe
+    window_geom_subdir: causal_dual_view_windows
+    window_geom_shard_index: null
+    window_geom_shard_root: null
+    trust_window_geom_cache: true
+    max_windows_per_episode: 1
+    causal_dual_view_required: true
+    causal_dual_view_representation: wm3d_v8_vggt_observed_context_target_split_v1
+    load_rgb: true
+    load_geom: true
+    load_state_tgt: true
+    load_geom_extra: true
+    require_geom_extra: true
+    use_window_tokens: true
+
+  causal_dual_view_indices:
+    oxe_droid_action:
+      kind: oxe
+      paths:
+        - /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/oxe_droid_action.jsonl
+      sha256: [PENDING_CANARY_OXE_DROID_INDEX_SHA256]
+      paired_views: false
+    oxe_bridge_action:
+      kind: oxe
+      paths:
+        - /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/oxe_bridge_action.jsonl
+      sha256: [PENDING_CANARY_OXE_BRIDGE_INDEX_SHA256]
+      paired_views: false
+    robocasa_atomic:
+      kind: compact
+      paths:
+        - /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/robocasa/index.jsonl
+      sha256: [PENDING_CANARY_ROBOCASA_INDEX_SHA256]
+      partition: atomic
+      paired_views: true
+    robocasa_composite:
+      kind: compact
+      paths:
+        - /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/robocasa/index.jsonl
+      sha256: [PENDING_CANARY_ROBOCASA_INDEX_SHA256]
+      partition: composite
+      paired_views: true
+    robocasa_mg:
+      kind: compact
+      paths:
+        - /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/robocasa/index.jsonl
+      sha256: [PENDING_CANARY_ROBOCASA_INDEX_SHA256]
+      partition: mg
+      paired_views: true
+
+train:
+  run_lineage: wm3d_v8_stage0_causal_dual_view_actionpolicy_canary_20260809_v1
+  fresh_initialization_required: true
+  fresh_init_required: true
+  forbid_warm_start: true
+  forbid_cross_run_resume: true
+  stage_transition: null
+  resume_checkpoint: null
+  pretrained_world_checkpoint: null
+  model_initialization: random_world_weights_with_frozen_pinned_codec
+
+  num_nodes: 1
+  gpus_per_node: 8
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 4
+  effective_global_batch: 64
+  max_steps: 100
+  main_promotion_step: 100
+  planned_review_stop_step: 100
+  extension_cap_steps: 100
+  warmup_steps: 10
+  ckpt_every_steps: 20
+  keep_last_checkpoints: 6
+  checkpoint_milestone_steps: [20, 100]
+  log_every: 1
+  grad_probe_every: 5
+
+  joint_native_action_pretraining: true
+  direct_policy_weight: 1.0
+  policy_flow_weight: 0.25
+  native_action_no_teacher_weight: 0.15
+  native_action_no_teacher_start_step: 0
+  native_action_no_teacher_every: 1
+  native_future_no_teacher_weight: 0.20
+  native_future_no_teacher_weight_start_step: 0
+
+  milestone_reviews:
+    fail_closed: true
+    pause_on_missing_or_failed_review: true
+    required_review_steps: [20, 100]
+
+lr_schedule:
+  type: wsd
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 10
+  stable_frac: 0.70
+  decay_frac: 0.20
+
+out:
+  root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/results/canary_v1
+  require_empty_checkpoint_dir: true
