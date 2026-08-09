@@ -110,6 +110,52 @@ def _future_geometry(
 
 
 @torch.inference_mode()
+def encode_observed_context(
+    images: torch.Tensor,
+    *,
+    encoder: torch.nn.Module,
+    codec: Any,
+    T: int,
+) -> dict[str, np.ndarray]:
+    """Encode exactly T observed frames for an input-only camera view."""
+
+    if T <= 0:
+        raise ValueError("T must be positive")
+    if not isinstance(images, torch.Tensor) or images.ndim != 4:
+        raise ValueError("images must be a [T,3,H,W] tensor")
+    if images.shape[0] != T or images.shape[1] != 3:
+        raise ValueError(f"expected images [{T},3,H,W], got {tuple(images.shape)}")
+    if not torch.isfinite(images.float()).all():
+        raise ValueError("images contain non-finite values")
+
+    flag_names = ("return_depth", "return_depth_conf", "return_geom_extra")
+    previous = {
+        name: getattr(encoder, name)
+        for name in flag_names
+        if hasattr(encoder, name)
+    }
+    try:
+        for name in flag_names:
+            if hasattr(encoder, name):
+                setattr(encoder, name, False)
+        output = encoder(images.unsqueeze(0))
+    finally:
+        for name, value in previous.items():
+            setattr(encoder, name, value)
+
+    tokens = _one_batch(output, "pooled")
+    if tokens.shape[0] != T:
+        raise ValueError(
+            f"observed VGGT forward returned {tokens.shape[0]} frames, expected {T}"
+        )
+    codes, scale = _quantize(tokens, codec=codec)
+    return {
+        "context_codes": codes,
+        "context_scale": scale,
+    }
+
+
+@torch.inference_mode()
 def encode_causal_dual_view(
     images: torch.Tensor,
     *,
