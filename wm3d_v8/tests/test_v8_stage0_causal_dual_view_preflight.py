@@ -422,22 +422,23 @@ def test_full_dataset_probe_requires_each_source_to_fill_global_batch(
     )
 
 
-def test_canary_launcher_defaults_to_fresh_v7_outputs() -> None:
+def test_canary_launcher_defaults_to_fresh_v8_outputs() -> None:
     launcher = (
         ROOT / "scripts" /
         "launch_wm3d_v8_stage0_causal_dual_view_canary.sh"
     ).read_text()
 
-    assert "runtime_config_smoke20_v7.yaml" in launcher
-    assert "seal_report_smoke20_v7.json" in launcher
-    assert "results/training_canary20_v7" in launcher
-    assert "logs/training_canary20_v7" in launcher
+    assert "runtime_config_smoke20_v8.yaml" in launcher
+    assert "seal_report_smoke20_v8.json" in launcher
+    assert "results/training_canary20_v8" in launcher
+    assert "logs/training_canary20_v8" in launcher
     assert "training_canary20_v1" not in launcher
     assert "training_canary20_v2" not in launcher
     assert "training_canary20_v3" not in launcher
     assert "training_canary20_v4" not in launcher
     assert "training_canary20_v5" not in launcher
     assert "training_canary20_v6" not in launcher
+    assert "training_canary20_v7" not in launcher
 
 
 def test_runtime_dependency_gate_requires_lpips_for_pixel_training(
