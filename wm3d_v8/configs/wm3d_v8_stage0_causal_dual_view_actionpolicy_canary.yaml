@@ -27,7 +27,7 @@ data:
   # These keys are loader-only overrides. Canonical action manifests, audit
   # gates, action adapters and source identities remain inherited and pinned.
   direct_policy_oxe_overrides:
-    cache_root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/cache/oxe
+    window_geom_cache_root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/cache/oxe
     window_geom_subdir: causal_dual_view_windows
     window_geom_shard_index: null
     window_geom_shard_root: null

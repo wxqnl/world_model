@@ -187,6 +187,7 @@ def test_robocasa_writer_emits_loader_ready_causal_archive(
         config_sha256="d" * 64,
         codec_sha256="e" * 64,
         codec_downstream_report_sha256="f" * 64,
+        v7_source="atomic",
     )
 
     with np.load(row["path"], allow_pickle=False) as archive:
@@ -200,6 +201,7 @@ def test_robocasa_writer_emits_loader_ready_causal_archive(
     assert summary["windows"] == 1
     assert row["schema"] == "wm3d_v8_stage0_causal_dual_view_v1"
     assert row["context_future_leakage"] is False
+    assert row["v7_source"] == "atomic"
     assert len(row["artifact_sha256"]) == 64
 
 
@@ -245,6 +247,7 @@ def test_oxe_builder_publishes_exact_selection_without_clobber(
     _validate_index_selection(expected, rows)
     assert all(Path(row["path"]).is_file() for row in rows)
     assert all(len(row["artifact_sha256"]) == 64 for row in rows)
+    assert all(row["paired_views"] is False for row in rows)
 
     same_sha = _publish_archive(
         _window_path(tmp_path, record.clip_id, 0),

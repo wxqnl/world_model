@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.preflight_wm3d_v7_1b_actionpolicy_joint import (  # noqa: E402
-    _validate_dataset_probe,
     _validate_local_resources,
 )
 from scripts.preflight_wm3d_v7_stage0_actiondynamics import (  # noqa: E402
@@ -46,7 +46,10 @@ from wm3d_v3.data.v8_causal_dual_view import (  # noqa: E402
     TARGET_USAGE,
     validate_causal_dual_view_archive,
 )
-from wm3d_v3.training.train import apply_direct_policy_oxe_overrides  # noqa: E402
+from wm3d_v3.training.train import (  # noqa: E402
+    apply_direct_policy_oxe_overrides,
+    build_datasets,
+)
 
 
 REPORT_SCHEMA = "wm3d_v8_stage0_causal_dual_view_preflight_report_v1"
@@ -312,6 +315,10 @@ def _validate_contract_and_objective(
         checks.equal(source.get("window_geom_shard_index"), None, f"{name}.shard_index")
         checks.equal(source.get("window_geom_shard_root"), None, f"{name}.shard_root")
         checks.expect(bool(source.get("cache_root")), f"{name}.cache_root is missing")
+        checks.expect(
+            bool(source.get("window_geom_cache_root")),
+            f"{name}.window_geom_cache_root is missing",
+        )
         checks.expect(bool(source.get("window_geom_subdir")), f"{name}.window_geom_subdir is missing")
     return sources
 
@@ -417,6 +424,18 @@ def _validate_training_assets(
         if checks.mode == "full":
             root = Path(str(source.get("cache_root") or ""))
             checks.expect(root.is_dir(), f"{name}.cache_root is missing: {root}")
+            window_root = Path(
+                str(source.get("window_geom_cache_root") or "")
+            )
+            checks.expect(
+                window_root.is_dir(),
+                f"{name}.window_geom_cache_root is missing: {window_root}",
+            )
+            window_subdir = str(source.get("window_geom_subdir") or "")
+            checks.expect(
+                (window_root / window_subdir).is_dir(),
+                f"{name}.window geometry directory is missing: {window_root / window_subdir}",
+            )
             checks.expect(manifest is not None, f"{name}.manifest is unavailable")
 
     gate_report = None
@@ -678,6 +697,104 @@ def _validate_causal_indices(
     return coverage, contract_hashes
 
 
+def _validate_dataset_probe_v8(
+    checks: _Checks, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Construct all five sources without importing the optional eval package."""
+
+    if checks.mode != "full":
+        return {}
+    report: dict[str, Any] = {"source_lengths": {}, "samples": {}}
+    try:
+        _train, validation = build_datasets(config)
+        if not hasattr(validation, "source_names") or not hasattr(
+            validation, "datasets"
+        ):
+            raise RuntimeError("expected formal V8 mixed validation dataset")
+        sources = {
+            str(name): dataset
+            for name, dataset in zip(
+                validation.source_names, validation.datasets, strict=True
+            )
+        }
+        lengths = {name: len(dataset) for name, dataset in sources.items()}
+    except Exception as exc:
+        checks.errors.append(
+            "formal dataset construction failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return report
+
+    report["source_lengths"] = {
+        str(name): int(length) for name, length in lengths.items()
+    }
+    checks.equal(set(sources), set(EXPECTED_SOURCES), "dataset_probe.source_names")
+    required = {
+        "s_in": None,
+        "action_tgt": (8, 7),
+        "action_tgt_norm": (8, 6),
+        "c": (2048,),
+        "rgb_tgt": None,
+        "depth_tgt": None,
+        "point_tgt": None,
+        "pose_geom_tgt": None,
+    }
+    for name in EXPECTED_SOURCES:
+        dataset = sources.get(name)
+        length = int(lengths.get(name, 0) or 0)
+        checks.expect(length > 0, f"dataset_probe.{name} is empty")
+        if dataset is None or length <= 0:
+            continue
+        try:
+            sample = dataset[0]
+        except Exception as exc:
+            checks.errors.append(
+                f"dataset_probe.{name}[0] failed: {type(exc).__name__}: {exc}"
+            )
+            continue
+        checks.expect(
+            isinstance(sample, dict),
+            f"dataset_probe.{name}[0] is not a mapping",
+        )
+        if not isinstance(sample, dict):
+            continue
+        sample_report: dict[str, Any] = {"keys": sorted(sample)}
+        tensors: dict[str, Any] = {}
+        for key, expected_shape in required.items():
+            value = sample.get(key)
+            checks.expect(
+                value is not None, f"dataset_probe.{name}.{key} is missing"
+            )
+            if value is None:
+                continue
+            try:
+                tensor = torch.as_tensor(value)
+            except (TypeError, ValueError) as exc:
+                checks.errors.append(
+                    f"dataset_probe.{name}.{key} is not tensor-like: {exc}"
+                )
+                continue
+            shape = tuple(int(dim) for dim in tensor.shape)
+            tensors[key] = {"shape": list(shape), "dtype": str(tensor.dtype)}
+            if expected_shape is not None:
+                checks.equal(
+                    shape,
+                    expected_shape,
+                    f"dataset_probe.{name}.{key}.shape",
+                )
+            checks.expect(
+                tensor.numel() > 0, f"dataset_probe.{name}.{key} is empty"
+            )
+            if tensor.is_floating_point():
+                checks.expect(
+                    bool(torch.isfinite(tensor).all().item()),
+                    f"dataset_probe.{name}.{key} contains nonfinite values",
+                )
+        sample_report["tensors"] = tensors
+        report["samples"][name] = sample_report
+    return report
+
+
 def validate_preflight(
     config: dict[str, Any],
     mode: str = "full",
@@ -696,7 +813,7 @@ def validate_preflight(
     )
     coverage, contract_hashes = _validate_causal_indices(checks, config)
     dataset_probe = (
-        _validate_dataset_probe(checks, config)
+        _validate_dataset_probe_v8(checks, config)
         if verify_training_assets
         else {}
     )

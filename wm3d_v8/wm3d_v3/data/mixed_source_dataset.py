@@ -117,11 +117,14 @@ def partition_v7_compact_dataset(
     buckets: dict[str, list[int]] = {name: [] for name in requested}
     for sample_index, (record_index, _start) in enumerate(dataset.index):
         record = dataset.records[int(record_index)]
-        value = (
-            record.get(record_field)
-            if isinstance(record, dict)
-            else getattr(record, record_field)
-        )
+        if isinstance(record, dict):
+            value = record.get(record_field)
+            if value is None and record_field == "dataset":
+                value = record.get("v7_source", record.get("source"))
+        else:
+            value = getattr(record, record_field, None)
+            if value is None and record_field == "dataset":
+                value = getattr(record, "v7_source", getattr(record, "source", None))
         value = str(value)
         if value in buckets:
             buckets[value].append(sample_index)

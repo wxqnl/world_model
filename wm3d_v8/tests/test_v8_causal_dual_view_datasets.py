@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -41,13 +42,15 @@ def _causal_metadata(*, leakage: bool = False) -> dict[str, np.ndarray]:
 def _write_oxe_fixture(
     root: Path,
     *,
+    window_root: Path | None = None,
     leakage: bool = False,
     schema: str = SCHEMA,
 ) -> OXEClipRecord:
     clip_id = "toy/episode"
     safe_id = "toy__episode"
     (root / "actions").mkdir(parents=True)
-    (root / "causal_windows").mkdir(parents=True)
+    causal_root = window_root or root
+    (causal_root / "causal_windows").mkdir(parents=True)
     actions = np.zeros((5, 7), dtype=np.float32)
     actions[:, 0] = np.arange(5, dtype=np.float32)
     np.save(root / "actions" / f"{safe_id}.npy", actions)
@@ -74,7 +77,7 @@ def _write_oxe_fixture(
         }
     )
     np.savez_compressed(
-        root / "causal_windows" / f"{safe_id}__start_000000.npz",
+        causal_root / "causal_windows" / f"{safe_id}__start_000000.npz",
         **payload,
     )
     return OXEClipRecord(
@@ -128,6 +131,41 @@ def test_oxe_loader_keeps_observed_context_separate_from_future_targets(
     assert sample["action_tgt"][:, 0].tolist() == [3.0, 4.0]
 
 
+def test_oxe_loader_reads_causal_windows_from_an_independent_cache_root(
+    tmp_path: Path,
+) -> None:
+    """Catches replacing the base RGB/action cache root with the V8 window root."""
+
+    base_root = tmp_path / "base"
+    window_root = tmp_path / "v8_windows"
+    record = _write_oxe_fixture(base_root, window_root=window_root)
+    config = _oxe_config(base_root)
+    config.window_geom_cache_root = window_root
+
+    sample = OXEWindowDataset([record], config)[0]
+
+    assert sample["s_in"].shape == (3, 4, 6)
+    assert sample["action_tgt"][:, 0].tolist() == [3.0, 4.0]
+
+
+def test_oxe_loader_skips_manifest_records_not_selected_by_sparse_causal_cache(
+    tmp_path: Path,
+) -> None:
+    """Catches treating an intentionally sparse canary cache as corrupt data."""
+
+    record = _write_oxe_fixture(tmp_path)
+    missing = replace(record, clip_id="toy/missing")
+    np.save(
+        tmp_path / "actions" / "toy__missing.npy",
+        np.zeros((5, 7), dtype=np.float32),
+    )
+
+    dataset = OXEWindowDataset([record, missing], _oxe_config(tmp_path))
+
+    assert len(dataset) == 1
+    assert dataset[0]["clip_id"] == "toy/episode"
+
+
 @pytest.mark.parametrize(
     ("leakage", "schema", "message"),
     [
@@ -157,6 +195,7 @@ def test_window_config_threads_causal_dual_view_contract(tmp_path: Path) -> None
             "k": 2,
             "stride": 1,
             "cache_root": str(tmp_path),
+            "window_geom_cache_root": str(tmp_path / "v8_windows"),
             "use_window_tokens": True,
             "causal_dual_view_required": True,
             "causal_dual_view_representation": REPRESENTATION,
@@ -165,6 +204,7 @@ def test_window_config_threads_causal_dual_view_contract(tmp_path: Path) -> None
 
     assert config.causal_dual_view_required is True
     assert config.causal_dual_view_representation == REPRESENTATION
+    assert config.window_geom_cache_root == tmp_path / "v8_windows"
 
 
 def test_direct_policy_override_allows_only_causal_loader_keys() -> None:
@@ -174,6 +214,7 @@ def test_direct_policy_override_allows_only_causal_loader_keys() -> None:
         {"manifest": "source.jsonl"},
         {
             "direct_policy_oxe_overrides": {
+                "window_geom_cache_root": "/v8/windows",
                 "causal_dual_view_required": True,
                 "causal_dual_view_representation": REPRESENTATION,
             }
@@ -182,6 +223,7 @@ def test_direct_policy_override_allows_only_causal_loader_keys() -> None:
 
     assert result["causal_dual_view_required"] is True
     assert result["causal_dual_view_representation"] == REPRESENTATION
+    assert result["window_geom_cache_root"] == "/v8/windows"
 
 
 def _write_compact_fixture(

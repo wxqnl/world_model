@@ -116,7 +116,7 @@ def _publish_archive(path: Path, payload: dict[str, Any]) -> str:
 def _resize_frames(frames: np.ndarray, size: int = 224) -> torch.Tensor:
     if frames.ndim != 4 or frames.shape[-1] != 3 or frames.dtype != np.uint8:
         raise ValueError("RGB cache must be uint8 [N,H,W,3]")
-    tensor = torch.from_numpy(np.asarray(frames)).permute(0, 3, 1, 2).float()
+    tensor = torch.from_numpy(np.array(frames, copy=True)).permute(0, 3, 1, 2).float()
     tensor.div_(255.0)
     if tensor.shape[-2:] != (size, size):
         tensor = F.interpolate(
@@ -254,6 +254,7 @@ def _index_row(
         "target_usage": "supervision_only",
         "geometry_coordinate_frame": "first_observed_camera",
         **identity,
+        "paired_views": False,
         "P": int(summary["token_count"]),
         "token_D": 2048,
         "latent_dim": int(summary["latent_dim"]),

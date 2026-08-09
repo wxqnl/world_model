@@ -627,7 +627,10 @@ def _write_causal_item(
     config_sha256: str,
     codec_sha256: str,
     codec_downstream_report_sha256: str,
+    v7_source: str,
 ) -> dict[str, Any]:
+    if v7_source not in {"atomic", "composite", "mg"}:
+        raise ValueError(f"unsupported RoboCasa V7 source: {v7_source!r}")
     required = (
         item.anchor_codes,
         item.anchor_scale,
@@ -657,6 +660,7 @@ def _write_causal_item(
         "clip_hash": np.asarray(item.record.clip_hash),
         "split": np.asarray(item.record.split),
         "source": np.asarray(item.record.source),
+        "v7_source": np.asarray(v7_source),
         "native_episode_id": np.asarray(item.record.native_episode_id),
         "native_start_frame": np.asarray(
             item.record.native_start_frame, dtype=np.int64
@@ -731,6 +735,7 @@ def _write_causal_item(
         "clip_hash": item.record.clip_hash,
         "split": item.record.split,
         "source": item.record.source,
+        "v7_source": v7_source,
         "task_class": item.record.task_class,
         "path": str(destination.resolve()),
         "artifact_sha256": artifact_sha256,
@@ -891,6 +896,11 @@ def main() -> None:
         help="write the V8 observed-context/target-only schema",
     )
     parser.add_argument(
+        "--v7-source",
+        choices=("atomic", "composite", "mg"),
+        help="RoboCasa partition identity required by causal dual-view caches",
+    )
+    parser.add_argument(
         "--proof-allow-legacy-action-audit",
         action="store_true",
         help="proof-only compatibility; formal caches require explicit factual_action_audit",
@@ -908,6 +918,10 @@ def main() -> None:
         raise SystemExit("num-shards must be >=1")
     if not 0 <= args.shard_id < args.num_shards:
         raise SystemExit("shard-id must satisfy 0 <= shard-id < num-shards")
+    if args.causal_dual_view and args.v7_source is None:
+        raise SystemExit(
+            "--causal-dual-view requires an explicit --v7-source partition"
+        )
 
     downstream = json.loads(args.codec_downstream_report.read_text())
     if not bool(downstream.get("formal_cache_allowed")):
@@ -963,6 +977,8 @@ def main() -> None:
         "window_stride": WINDOW_STRIDE,
         "vggt_revision": VGGT_MODEL_REVISION,
     }
+    if args.causal_dual_view:
+        config_identity["v7_source"] = str(args.v7_source)
     config_sha256 = hashlib.sha256(
         json.dumps(config_identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -1047,6 +1063,7 @@ def main() -> None:
                     codec_downstream_report_sha256=(
                         codec_downstream_report_sha256
                     ),
+                    v7_source=str(args.v7_source),
                 )
             else:
                 row = _write_item(
@@ -1101,6 +1118,7 @@ def main() -> None:
             if args.causal_dual_view
             else None
         ),
+        "v7_source": str(args.v7_source) if args.causal_dual_view else None,
         "clips": len(index_rows),
         "windows": sum(int(row["windows"]) for row in index_rows),
         "splits": {split: sum(row["split"] == split for row in index_rows) for split in ("train", "val", "test")},

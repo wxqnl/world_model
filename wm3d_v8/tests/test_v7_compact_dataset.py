@@ -4,14 +4,39 @@ import json
 
 import numpy as np
 import torch
+from torch.utils.data import Dataset
 
 from wm3d_v3.data.action_condition import make_action_condition
+from wm3d_v3.data.mixed_source_dataset import partition_v7_compact_dataset
 from wm3d_v3.data.v7_compact_dataset import (
     V7CompactDatasetConfig,
     V7CompactWindowDataset,
     V7SameRootBranchDataset,
     V7SameRootBranchDatasetConfig,
 )
+
+
+def test_compact_partition_uses_v7_source_when_dataset_is_absent() -> None:
+    class CompactRecords(Dataset):
+        records = [
+            {"v7_source": "atomic", "source": "robocasa365"},
+            {"v7_source": "composite", "source": "robocasa365"},
+            {"v7_source": "mg", "source": "robocasa365"},
+        ]
+        index = [(0, 0), (1, 0), (2, 0)]
+
+        def __len__(self) -> int:
+            return len(self.index)
+
+        def __getitem__(self, index: int) -> int:
+            return index
+
+    partitions = partition_v7_compact_dataset(
+        CompactRecords(), ("atomic", "composite", "mg")
+    )
+    assert {name: list(part.indices) for name, part in partitions.items()} == {
+        "atomic": [0], "composite": [1], "mg": [2]
+    }
 
 
 def _write_clip(path, split: str, frames: int = 26) -> None:

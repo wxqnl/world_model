@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from scripts.seal_wm3d_v8_stage0_causal_dual_view_canary import _merge_robocasa_indices
 from scripts.preflight_wm3d_v8_stage0_causal_dual_view import (
     CausalDualViewPreflightError,
     load_config,
@@ -83,6 +84,11 @@ def test_resolved_configs_lock_causal_action_policy_contract(
     assert data["compact_causal_dual_view_representation"] == REPRESENTATION
     assert set(data["causal_dual_view_indices"]) == set(MIX)
     override = data["direct_policy_oxe_overrides"]
+    assert "cache_root" not in override
+    assert override["window_geom_cache_root"] == (
+        "/data/Minko/world_model/"
+        "wm3d_v8_stage0_causal_dual_view_20260809/cache/oxe"
+    )
     assert override["causal_dual_view_required"] is True
     assert override["causal_dual_view_representation"] == REPRESENTATION
     assert override["use_window_tokens"] is True
@@ -160,6 +166,34 @@ def _artifact(root, source, split, compact, legacy=False):
 def _index(path, rows):
     path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
     return _sha(path)
+
+
+def test_merge_robocasa_indices_binds_partition_identity(tmp_path: Path) -> None:
+    inputs = {}
+    for partition in ("atomic", "composite", "mg"):
+        rows = []
+        for split in ("train", "val"):
+            row = _artifact(tmp_path, partition, split, True)
+            row["source"] = "robocasa365"
+            rows.append(row)
+        path = tmp_path / f"{partition}.jsonl"
+        _index(path, rows)
+        inputs[partition] = path
+
+    output = tmp_path / "combined.jsonl"
+    digest, merged = _merge_robocasa_indices(inputs, output)
+    assert digest == _sha(output)
+    assert len(merged) == 6
+    assert {row["v7_source"] for row in merged} == {
+        "atomic", "composite", "mg"
+    }
+    assert {row["source"] for row in merged} == {"robocasa365"}
+    assert all(row["schema"] == SCHEMA for row in merged)
+    assert all(row["representation"] == REPRESENTATION for row in merged)
+
+    replay_digest, replay_rows = _merge_robocasa_indices(inputs, output)
+    assert replay_digest == digest
+    assert replay_rows == merged
 
 
 def _config(tmp_path: Path, legacy_source=None):

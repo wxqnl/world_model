@@ -101,6 +101,7 @@ class WindowConfig:
     load_geom_extra: bool = False
     require_geom_extra: bool = False
     window_geom_subdir: str = "vggt_window_geom_p64"
+    window_geom_cache_root: Path | None = None
     window_geom_shard_index: Path | None = None
     window_geom_shard_root: Path | None = None
     window_geom_shard_indices: tuple[Path, ...] | None = None
@@ -611,6 +612,10 @@ class OXEWindowDataset(Dataset):
         scan_started = time.monotonic()
         self.cfg = cfg or WindowConfig()
         self.cfg.cache_root = Path(self.cfg.cache_root)
+        if self.cfg.window_geom_cache_root is not None:
+            self.cfg.window_geom_cache_root = Path(
+                self.cfg.window_geom_cache_root
+            )
         if self.cfg.causal_dual_view_required:
             if (
                 self.cfg.causal_dual_view_representation
@@ -1132,7 +1137,12 @@ class OXEWindowDataset(Dataset):
                 if self.cfg.max_windows_per_episode and len(starts) > int(self.cfg.max_windows_per_episode):
                     starts = starts[: int(self.cfg.max_windows_per_episode)]
                 for start in starts:
-                    path = _window_geom_path(self.cfg.cache_root, self.cfg.window_geom_subdir, cid, start)
+                    path = _window_geom_path(
+                        self.cfg.window_geom_cache_root or self.cfg.cache_root,
+                        self.cfg.window_geom_subdir,
+                        cid,
+                        start,
+                    )
                     name = _window_geom_name(cid, start)
                     if self.cfg.causal_dual_view_required:
                         causal_archive = None
@@ -1179,6 +1189,8 @@ class OXEWindowDataset(Dataset):
                             ):
                                 valid_starts.append(start)
                 if not valid_starts:
+                    if self.cfg.causal_dual_view_required:
+                        continue
                     if self._window_shards is not None and self.cfg.trust_window_geom_cache:
                         # Node-sharded tar caches may share or symlink a broader
                         # base cache than the local window shard owns.
@@ -1351,7 +1363,12 @@ class OXEWindowDataset(Dataset):
         cid = _safe(rec.clip_id)
         T, k = self.cfg.T, self.cfg.k
         window_geom = None
-        window_geom_path = _window_geom_path(self.cfg.cache_root, self.cfg.window_geom_subdir, cid, start)
+        window_geom_path = _window_geom_path(
+            self.cfg.window_geom_cache_root or self.cfg.cache_root,
+            self.cfg.window_geom_subdir,
+            cid,
+            start,
+        )
         if self.cfg.load_geom_extra or self.cfg.require_geom_extra or self.cfg.use_window_tokens:
             if window_geom_path.exists():
                 window_geom = np.load(window_geom_path)

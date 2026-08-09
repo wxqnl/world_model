@@ -112,6 +112,7 @@ _DIRECT_POLICY_OXE_OVERRIDE_KEYS = frozenset(
         "use_window_tokens",
         "cache_root",
         "window_geom_subdir",
+        "window_geom_cache_root",
         "trust_window_geom_cache",
         "max_windows_per_episode",
         "causal_dual_view_required",
@@ -1387,6 +1388,8 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
                         load_geom_extra=bool(data_cfg.get("load_geom_extra", False)),
                         require_geom_extra=bool(data_cfg.get("require_geom_extra", False)),
                         window_geom_subdir=data_cfg.get("window_geom_subdir", "vggt_window_geom_p64"),
+                        window_geom_cache_root=Path(data_cfg["window_geom_cache_root"])
+                        if data_cfg.get("window_geom_cache_root") else None,
                         window_geom_shard_index=Path(data_cfg["window_geom_shard_index"])
                         if data_cfg.get("window_geom_shard_index") else None,
                         window_geom_shard_root=Path(data_cfg["window_geom_shard_root"])
