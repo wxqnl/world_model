@@ -9,12 +9,12 @@ fi
 
 PROJECT=/data/Minko/wm3d_v8_release_worktree/wm3d_v8
 RUNTIME_ROOT=/data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809
-CFG=${WM3D_V8_CANARY_CFG:-${RUNTIME_ROOT}/manifests/canary/runtime_config_smoke20_v4.yaml}
-SEAL=${WM3D_V8_CANARY_SEAL:-${RUNTIME_ROOT}/manifests/canary/seal_report_smoke20_v4.json}
-OUT=${RUNTIME_ROOT}/results/training_canary20_v4
-LOG_DIR=${RUNTIME_ROOT}/logs/training_canary20_v4
+CFG=${WM3D_V8_CANARY_CFG:-${RUNTIME_ROOT}/manifests/canary/runtime_config_smoke20_v5.yaml}
+SEAL=${WM3D_V8_CANARY_SEAL:-${RUNTIME_ROOT}/manifests/canary/seal_report_smoke20_v5.json}
+OUT=${RUNTIME_ROOT}/results/training_canary20_v5
+LOG_DIR=${RUNTIME_ROOT}/logs/training_canary20_v5
 LOG=${LOG_DIR}/train_rank0.log
-PREFLIGHT_LOG=${LOG_DIR}/preflight_full_v4.json
+PREFLIGHT_LOG=${LOG_DIR}/preflight_full_v5.json
 PID_FILE=${LOG_DIR}/launcher_rank0.pid
 PY=/root/miniconda3/envs/starvla/bin/python
 
@@ -69,7 +69,7 @@ if not bool(train.get("fresh_initialization_required")):
     raise SystemExit("bounded canary requires fresh initialization")
 if Path(str(out.get("root") or "")).resolve() != Path(
     "/data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/"
-    "results/training_canary20_v4"
+    "results/training_canary20_v5"
 ):
     raise SystemExit("bounded canary output root mismatch")
 PY
