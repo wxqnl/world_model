@@ -18,6 +18,7 @@ from scripts.cache_wm3d_v8_stage0_causal_dual_view_oxe import (
     _index_row,
     _records_for_split,
     _publish_archive,
+    _select_window_candidates,
     _validate_index_selection,
     _window_path,
 )
@@ -328,6 +329,35 @@ def test_oxe_producer_uses_training_episode_split_exactly() -> None:
     assert {record.clip_id for record in train + val} == {
         record.clip_id for record in records
     }
+
+
+def test_oxe_bounded_selection_can_require_distinct_clips() -> None:
+    records = [
+        OXEClipRecord(
+            clip_id=f"bridge/episode_{index:03d}",
+            dataset="bridge",
+            tar_path="/sealed/bridge.tar",
+            pickle_member=f"episode_{index:03d}.pkl",
+            n_frames=40,
+            fps=5,
+            robot="widowx",
+            task_text="move the block",
+        )
+        for index in range(20)
+    ]
+
+    selected = _select_window_candidates(
+        records,
+        T=16,
+        k=8,
+        stride=4,
+        max_windows=16,
+        max_windows_per_clip=1,
+    )
+
+    assert len(selected) == 16
+    assert len({record.clip_id for record, _ in selected}) == 16
+    assert {start for _, start in selected} == {0}
 
 
 @pytest.mark.parametrize(

@@ -354,6 +354,37 @@ def _records_for_split(
     return [record for record in records if record.clip_id in selected_ids]
 
 
+def _select_window_candidates(
+    records: list[OXEClipRecord],
+    *,
+    T: int,
+    k: int,
+    stride: int,
+    max_windows: int = 0,
+    max_windows_per_clip: int = 0,
+) -> list[tuple[OXEClipRecord, int]]:
+    """Select deterministic windows with an optional per-clip cap."""
+
+    if T <= 0 or k <= 0 or stride <= 0:
+        raise ValueError("T, k, and stride must be positive")
+    if max_windows < 0 or max_windows_per_clip < 0:
+        raise ValueError("window limits must be non-negative")
+
+    candidates: list[tuple[OXEClipRecord, int]] = []
+    for record in records:
+        starts = list(range(
+            0,
+            int(record.n_frames) - int(T) - int(k) + 1,
+            int(stride),
+        ))
+        if max_windows_per_clip > 0:
+            starts = starts[: int(max_windows_per_clip)]
+        candidates.extend((record, start) for start in starts)
+    if max_windows > 0:
+        candidates = candidates[: int(max_windows)]
+    return candidates
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -375,6 +406,7 @@ def main() -> None:
     parser.add_argument("--shard-id", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--max-windows", type=int, default=0)
+    parser.add_argument("--max-windows-per-clip", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
@@ -395,16 +427,14 @@ def main() -> None:
         all_records, split=args.split,
         val_frac=args.val_frac, seed=args.split_seed,
     )
-    candidates: list[tuple[OXEClipRecord, int]] = []
-    for record in records:
-        for start in range(
-            0,
-            int(record.n_frames) - int(args.T) - int(args.k) + 1,
-            int(args.stride),
-        ):
-            candidates.append((record, start))
-    if args.max_windows > 0:
-        candidates = candidates[: int(args.max_windows)]
+    candidates = _select_window_candidates(
+        records,
+        T=args.T,
+        k=args.k,
+        stride=args.stride,
+        max_windows=args.max_windows,
+        max_windows_per_clip=args.max_windows_per_clip,
+    )
     if not candidates:
         raise SystemExit("selection contains no OXE windows")
     selection_identity = [
@@ -431,6 +461,8 @@ def main() -> None:
         "T": args.T,
         "k": args.k,
         "stride": args.stride,
+        "max_windows": args.max_windows,
+        "max_windows_per_clip": args.max_windows_per_clip,
         "rgb_subdir": args.rgb_subdir,
         "action_subdir": args.action_subdir,
         "task_subdir": args.task_subdir,
@@ -534,6 +566,8 @@ def main() -> None:
         "num_shards": args.num_shards,
         "selected_global": len(candidates),
         "selected_shard": len(assigned),
+        "max_windows": args.max_windows,
+        "max_windows_per_clip": args.max_windows_per_clip,
         "encoded": len(rows),
         "manifest_sha256": manifest_sha,
         "selection_sha256": selection_sha,

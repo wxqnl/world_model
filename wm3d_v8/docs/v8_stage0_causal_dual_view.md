@@ -50,6 +50,10 @@ preflight 会读取五源 dataset，并在样本不足、张量缺失、shape �
 
 以下命令需要分别对 DROID/Bridge 和 train/val 执行。正式数据应使用分片
 参数覆盖全部窗口；--max-windows 只用于短 canary。
+短 canary 还必须设置 `--max-windows-per-clip 1`，使每个 index 至少
+包含 16 个不同 clip；这与训练侧 `max_windows_per_episode: 1` 保持
+一致，不会把同一 episode 的多个窗口误当成一个可填满 global batch
+的独立样本。
 
 ~~~bash
 export WM3D_VGGT_SOURCE_ROOT=/root/wm3d_v8_runtime/vggt_a288dd0f_v1
