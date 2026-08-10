@@ -223,6 +223,9 @@ def capture_rng_contract(base_seed: int, rank: int) -> dict:
         "numpy_state": np.random.get_state(),
         "torch_cpu_state": torch.get_rng_state().cpu(),
     }
+    if torch.cuda.is_available():
+        result["torch_cuda_state"] = torch.cuda.get_rng_state().cpu()
+    return result
 
 
 def module_state_sha256(module: torch.nn.Module | None) -> str | None:
@@ -238,9 +241,6 @@ def module_state_sha256(module: torch.nn.Module | None) -> str | None:
         digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
         digest.update(value.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
-    if torch.cuda.is_available():
-        result["torch_cuda_state"] = torch.cuda.get_rng_state().cpu()
-    return result
 
 
 def build_exact_resume_startup_event(

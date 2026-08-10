@@ -20,6 +20,7 @@ from scripts.preflight_wm3d_v8_stage0_causal_dual_view import (
     validate_preflight,
 )
 from wm3d_v3.training.train import (
+    capture_rng_contract,
     validate_empty_checkpoint_dir_preflight,
 )
 from wm3d_v3.data.v8_causal_dual_view import (
@@ -484,6 +485,21 @@ def test_fresh_checkpoint_guard_allows_explicit_exact_resume(
     validate_empty_checkpoint_dir_preflight(
         cfg, resume_checkpoint=checkpoint
     )
+
+
+def test_checkpoint_rng_contract_is_not_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(preflight_module.torch.cuda, "is_available", lambda: False)
+
+    contract = capture_rng_contract(base_seed=1707, rank=0)
+
+    assert contract["schema"] == "wm3d_v7_step_addressed_rng_v1"
+    assert contract["base_seed"] == 1707
+    assert contract["rank"] == 0
+    assert contract["rank_stride"] == 100_003
+    assert contract["step_offset"] == 10_000_019
+    assert contract["torch_cpu_state"].numel() > 0
 
 
 def test_runtime_dependency_gate_requires_lpips_for_pixel_training(
