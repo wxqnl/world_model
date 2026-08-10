@@ -168,6 +168,21 @@ resume 模式必须严格恢复 model、optimizer、scheduler、sampler 和 RNG�
 - exact-resume telemetry 精确绑定 step20 SHA、lineage、config digest、
   optimizer/scheduler/sampler/RNG 恢复状态和下一 source；
 - step_00000100.pt 稳定、ZIP 可读并与 step20 保持同一 lineage。
+用审查器把上述证据固化为 no-clobber、可哈希的报告：
+
+~~~bash
+python scripts/review_wm3d_v8_stage0_causal_dual_view_canary.py \
+  --runtime-config <runtime_config.yaml> \
+  --seal-report <seal_report.json> \
+  --fresh-log <train_rank0_fresh_0_to_20.log> \
+  --resume-log <train_rank0_resume_20_to_100.log> \
+  --telemetry <canary_telemetry.jsonl> \
+  --step20-checkpoint <step_00000020.pt> \
+  --step100-checkpoint <step_00000100.pt> \
+  --out <new_review_report.json>
+~~~
+
+只有输出 PASS_STAGE0_CAUSAL_DUAL_VIEW_CANARY 且 errors=[] 才算通过。
 
 Canary 通过后仍保持暂停。正式长训需要完整缓存和单独的 authority review。
 任何任务都只从完整编号 checkpoint 恢复，不使用 latest。
