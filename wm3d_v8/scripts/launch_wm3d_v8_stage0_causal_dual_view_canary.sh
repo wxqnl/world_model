@@ -10,10 +10,10 @@ fi
 
 PROJECT=/data/Minko/wm3d_v8_release_worktree/wm3d_v8
 RUNTIME_ROOT=/data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809
-CFG=${WM3D_V8_CANARY_CFG:-${RUNTIME_ROOT}/manifests/canary/runtime_config_canary100_v9.yaml}
-SEAL=${WM3D_V8_CANARY_SEAL:-${RUNTIME_ROOT}/manifests/canary/seal_report_canary100_v9.json}
-OUT=${RUNTIME_ROOT}/results/training_canary100_v9
-LOG_DIR=${RUNTIME_ROOT}/logs/training_canary100_v9
+CFG=${WM3D_V8_CANARY_CFG:-${RUNTIME_ROOT}/manifests/canary/runtime_config_canary100_v10.yaml}
+SEAL=${WM3D_V8_CANARY_SEAL:-${RUNTIME_ROOT}/manifests/canary/seal_report_canary100_v10.json}
+OUT=${RUNTIME_ROOT}/results/training_canary100_v10
+LOG_DIR=${RUNTIME_ROOT}/logs/training_canary100_v10
 RESUME_CKPT=${OUT}/ckpt/step_00000020.pt
 PY=/root/miniconda3/envs/starvla/bin/python
 
@@ -88,7 +88,7 @@ if list(train.get("checkpoint_milestone_steps") or []) != [20, 100]:
     raise SystemExit("canary checkpoints must bind steps 20 and 100")
 if Path(str(out.get("root") or "")).resolve() != Path(
     "/data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/"
-    "results/training_canary100_v9"
+    "results/training_canary100_v10"
 ):
     raise SystemExit("canary output root mismatch")
 PY

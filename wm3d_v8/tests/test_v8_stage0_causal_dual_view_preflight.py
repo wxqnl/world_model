@@ -431,16 +431,17 @@ def test_full_dataset_probe_requires_each_source_to_fill_global_batch(
     )
 
 
-def test_canary_launcher_supports_fresh_then_exact_resume_v9() -> None:
+def test_canary_launcher_supports_fresh_then_exact_resume_v10() -> None:
     launcher = (
         ROOT / "scripts" /
         "launch_wm3d_v8_stage0_causal_dual_view_canary.sh"
     ).read_text()
 
-    assert "runtime_config_canary100_v9.yaml" in launcher
-    assert "seal_report_canary100_v9.json" in launcher
-    assert "results/training_canary100_v9" in launcher
-    assert "logs/training_canary100_v9" in launcher
+    assert "runtime_config_canary100_v10.yaml" in launcher
+    assert "seal_report_canary100_v10.json" in launcher
+    assert "results/training_canary100_v10" in launcher
+    assert "logs/training_canary100_v10" in launcher
+    assert "training_canary100_v9" not in launcher
     assert '"resume-check"' in launcher
     assert '"resume"' in launcher
     assert 'int(train.get("max_steps", -1)) != 100' in launcher
