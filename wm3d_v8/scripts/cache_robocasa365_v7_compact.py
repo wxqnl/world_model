@@ -38,6 +38,12 @@ from wm3d_v3.data.v7_contracts import (
     V7ClipRecord,
     read_v7_manifest,
 )
+from wm3d_v3.data.v8_causal_dual_view import (
+    causal_dual_view_metadata,
+    encode_causal_dual_view,
+    encode_observed_context,
+    validate_causal_dual_view_archive,
+)
 from wm3d_v3.encoders.qwen_vl_encoder import QwenVLEmbed
 from wm3d_v3.encoders.vggt_encoder import VGGTEncoder
 from wm3d_v3.models.token_codec import PCATokenCodec, TokenCodecConfig
@@ -65,6 +71,9 @@ class WorkItem:
     dones: np.ndarray
     anchor_codes: np.ndarray | None = None
     anchor_scale: np.ndarray | None = None
+    future_codes: np.ndarray | None = None
+    future_scale: np.ndarray | None = None
+    window_starts: np.ndarray | None = None
     wrist_codes: np.ndarray | None = None
     wrist_scale: np.ndarray | None = None
     depth_patch: np.ndarray | None = None
@@ -95,6 +104,53 @@ def _episode_index(record: V7ClipRecord) -> int:
         return int(record.native_episode_id.rsplit("_", 1)[1])
     except (IndexError, ValueError) as exc:
         raise ValueError(f"cannot parse episode index: {record.native_episode_id}") from exc
+
+
+def _filter_records_by_rgb_sidecar(
+    records: list[V7ClipRecord],
+    rgb_sidecar_index: Path,
+) -> tuple[list[V7ClipRecord], str]:
+    """Keep only split-aligned clips with immutable RGB supervision."""
+
+    rgb_sidecar_index = Path(rgb_sidecar_index)
+    available: dict[str, str] = {}
+    for line_number, line in enumerate(
+        rgb_sidecar_index.read_text().splitlines(), 1
+    ):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: invalid JSON: {exc}"
+            ) from exc
+        if row.get("schema") != "wm3d_v7_rgb_sidecar_v1":
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: invalid RGB sidecar schema"
+            )
+        clip_hash = str(row.get("clip_hash") or "")
+        split = str(row.get("split") or "")
+        if not clip_hash or split not in {"train", "val", "test"}:
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: invalid RGB identity"
+            )
+        previous = available.get(clip_hash)
+        if previous is not None and previous != split:
+            raise ValueError(
+                f"{rgb_sidecar_index}:{line_number}: conflicting split for "
+                f"{clip_hash}"
+            )
+        available[clip_hash] = split
+    if not available:
+        raise ValueError(f"empty RGB sidecar index: {rgb_sidecar_index}")
+    filtered = [
+        record for record in records
+        if available.get(record.clip_hash) == record.split
+    ]
+    if not filtered:
+        raise ValueError("manifest has no split-aligned RGB sidecar clips")
+    return filtered, _sha256_file(rgb_sidecar_index)
 
 
 def _select_records(records: list[V7ClipRecord], max_clips: int) -> list[V7ClipRecord]:
@@ -191,6 +247,32 @@ def _atomic_write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
     os.replace(temporary, path)
+
+def _publish_text_no_clobber(path: Path, text: str) -> str:
+    encoded = text.encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_bytes() != encoded:
+            raise FileExistsError(f"existing report is non-identical: {path}")
+        return _sha256_file(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_bytes() != encoded:
+                raise FileExistsError(
+                    f"existing report is non-identical: {path}"
+                )
+        return _sha256_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 
 
 def _sha256_file(path: Path, chunk_bytes: int = 8 << 20) -> str:
@@ -356,6 +438,79 @@ def _encode_clip(
     return result
 
 
+@torch.inference_mode()
+def _encode_causal_clip(
+    frames: list[np.ndarray],
+    *,
+    encoder: VGGTEncoder,
+    codec: PCATokenCodec,
+    T: int,
+    k: int,
+    stride: int,
+    keep_geometry: bool,
+) -> dict[str, np.ndarray]:
+    """Encode exact windows from one decoded clip using independent forwards."""
+
+    if T <= 0 or k <= 0 or stride <= 0:
+        raise ValueError("T, k, and stride must be positive")
+    required = T + k
+    starts = np.arange(0, len(frames) - required + 1, stride, dtype=np.int64)
+    if len(starts) == 0:
+        raise ValueError(
+            f"causal clip has {len(frames)} frames; requires at least {required}"
+        )
+    images = _resize_frames(np.stack(frames))
+    windows: list[dict[str, np.ndarray]] = []
+    for start in starts.tolist():
+        window = images[start : start + required]
+        if keep_geometry:
+            encoded = encode_causal_dual_view(
+                window,
+                encoder=encoder,
+                codec=codec,
+                T=T,
+                k=k,
+            )
+        else:
+            encoded = encode_observed_context(
+                window[:T],
+                encoder=encoder,
+                codec=codec,
+                T=T,
+            )
+        windows.append(encoded)
+
+    result = {
+        **causal_dual_view_metadata(T=T, k=k),
+        "window_starts": starts,
+        "context_codes": np.stack(
+            [window["context_codes"] for window in windows], axis=0
+        ),
+        "context_scale": np.stack(
+            [window["context_scale"] for window in windows], axis=0
+        ),
+    }
+    if keep_geometry:
+        for key in (
+            "future_codes",
+            "future_scale",
+            "future_depth_patch",
+            "future_depth_conf_patch",
+            "future_point_patch",
+            "future_point_conf_patch",
+            "future_pose_enc",
+        ):
+            result[key] = np.stack([window[key] for window in windows], axis=0)
+        validate_causal_dual_view_archive(
+            result,
+            T=T,
+            k=k,
+            paired_views=False,
+        )
+    return result
+
+
+
 def _encode_video_group(
     video_path: Path,
     group: list[WorkItem],
@@ -365,6 +520,7 @@ def _encode_video_group(
     codec: PCATokenCodec,
     batch_frames: int,
     keep_geometry: bool,
+    causal_dual_view: bool,
 ) -> None:
     wanted: dict[int, list[int]] = {}
     for item_index, item in enumerate(group):
@@ -385,26 +541,67 @@ def _encode_video_group(
                 for owner in owners:
                     buffers[owner].append(rgb)
                     if len(buffers[owner]) == len(group[owner].model_frame_indices):
-                        output = _encode_clip(
-                            buffers.pop(owner),
-                            encoder=encoder,
-                            codec=codec,
-                            batch_frames=batch_frames,
-                            keep_geometry=keep_geometry,
-                        )
+                        decoded = buffers.pop(owner)
+                        if causal_dual_view:
+                            output = _encode_causal_clip(
+                                decoded,
+                                encoder=encoder,
+                                codec=codec,
+                                T=CONTEXT_FRAMES,
+                                k=FUTURE_FRAMES,
+                                stride=WINDOW_STRIDE,
+                                keep_geometry=keep_geometry,
+                            )
+                        else:
+                            output = _encode_clip(
+                                decoded,
+                                encoder=encoder,
+                                codec=codec,
+                                batch_frames=batch_frames,
+                                keep_geometry=keep_geometry,
+                            )
                         item = group[owner]
                         if keep_geometry:
-                            item.anchor_codes = output["codes"]
-                            item.anchor_scale = output["scale"]
-                            item.depth_patch = output["depth_patch"]
-                            item.depth_conf_patch = output["depth_conf_patch"]
-                            item.point_patch = output["point_patch"]
-                            item.point_conf_patch = output["point_conf_patch"]
-                            item.pose_enc = output["pose_enc"]
-                            item.geometry_segment_id = output["geometry_segment_id"]
+                            if causal_dual_view:
+                                item.anchor_codes = output["context_codes"]
+                                item.anchor_scale = output["context_scale"]
+                                item.future_codes = output["future_codes"]
+                                item.future_scale = output["future_scale"]
+                                item.depth_patch = output["future_depth_patch"]
+                                item.depth_conf_patch = output[
+                                    "future_depth_conf_patch"
+                                ]
+                                item.point_patch = output["future_point_patch"]
+                                item.point_conf_patch = output[
+                                    "future_point_conf_patch"
+                                ]
+                                item.pose_enc = output["future_pose_enc"]
+                                item.window_starts = output["window_starts"]
+                            else:
+                                item.anchor_codes = output["codes"]
+                                item.anchor_scale = output["scale"]
+                                item.depth_patch = output["depth_patch"]
+                                item.depth_conf_patch = output["depth_conf_patch"]
+                                item.point_patch = output["point_patch"]
+                                item.point_conf_patch = output["point_conf_patch"]
+                                item.pose_enc = output["pose_enc"]
+                                item.geometry_segment_id = output[
+                                    "geometry_segment_id"
+                                ]
                         else:
-                            item.wrist_codes = output["codes"]
-                            item.wrist_scale = output["scale"]
+                            if causal_dual_view:
+                                if not np.array_equal(
+                                    item.window_starts,
+                                    output["window_starts"],
+                                ):
+                                    raise RuntimeError(
+                                        "anchor/wrist causal window identity mismatch"
+                                    )
+                                item.wrist_codes = output["context_codes"]
+                                item.wrist_scale = output["context_scale"]
+                            else:
+                                item.wrist_codes = output["codes"]
+                                item.wrist_scale = output["scale"]
                         completed.add(owner)
             if frame_number >= maximum:
                 break
@@ -419,6 +616,206 @@ def _atomic_savez(path: Path, **payload: Any) -> None:
     with temporary.open("wb") as handle:
         np.savez_compressed(handle, **payload)
     os.replace(temporary, path)
+def _payload_matches(path: Path, payload: dict[str, Any]) -> bool:
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            if set(archive.files) != set(payload):
+                return False
+            return all(
+                np.array_equal(np.asarray(archive[key]), np.asarray(value))
+                for key, value in payload.items()
+            )
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def _publish_causal_archive(path: Path, payload: dict[str, Any]) -> str:
+    """Publish without clobber; an existing archive must be array-identical."""
+
+    validate_causal_dual_view_archive(
+        payload,
+        T=CONTEXT_FRAMES,
+        k=FUTURE_FRAMES,
+        paired_views=True,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if not _payload_matches(path, payload):
+            raise FileExistsError(f"existing causal archive is non-identical: {path}")
+        return _sha256_file(path)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("xb") as handle:
+            np.savez_compressed(handle, **payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if not _payload_matches(path, payload):
+                raise FileExistsError(
+                    f"existing causal archive is non-identical: {path}"
+                )
+        if not _payload_matches(path, payload):
+            raise RuntimeError(f"causal archive replay validation failed: {path}")
+        return _sha256_file(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_causal_item(
+    item: WorkItem,
+    output_root: Path,
+    task_embedding: np.ndarray,
+    *,
+    action_audit_sha256: str,
+    manifest_sha256: str,
+    selection_sha256: str,
+    config_sha256: str,
+    codec_sha256: str,
+    codec_downstream_report_sha256: str,
+    v7_source: str,
+) -> dict[str, Any]:
+    if v7_source not in {"atomic", "composite", "mg"}:
+        raise ValueError(f"unsupported RoboCasa V7 source: {v7_source!r}")
+    required = (
+        item.anchor_codes,
+        item.anchor_scale,
+        item.wrist_codes,
+        item.wrist_scale,
+        item.future_codes,
+        item.future_scale,
+        item.depth_patch,
+        item.depth_conf_patch,
+        item.point_patch,
+        item.point_conf_patch,
+        item.pose_enc,
+        item.window_starts,
+    )
+    if any(value is None for value in required):
+        raise RuntimeError(
+            f"incomplete causal compact payload for {item.record.clip_hash}"
+        )
+    payload = {
+        **causal_dual_view_metadata(
+            T=CONTEXT_FRAMES,
+            k=FUTURE_FRAMES,
+        ),
+        "producer_schema": np.asarray(
+            "wm3d_v8_stage0_causal_dual_view_robocasa_producer_v1"
+        ),
+        "clip_hash": np.asarray(item.record.clip_hash),
+        "split": np.asarray(item.record.split),
+        "source": np.asarray(item.record.source),
+        "v7_source": np.asarray(v7_source),
+        "native_episode_id": np.asarray(item.record.native_episode_id),
+        "native_start_frame": np.asarray(
+            item.record.native_start_frame, dtype=np.int64
+        ),
+        "native_end_frame": np.asarray(
+            item.record.native_end_frame, dtype=np.int64
+        ),
+        "native_fps": np.asarray(item.record.native_fps, dtype=np.float32),
+        "embodiment_id": np.asarray(item.record.embodiment_id),
+        "action_adapter_version": np.asarray(
+            item.record.action.adapter_version
+        ),
+        "action_audit_sha256": np.asarray(action_audit_sha256),
+        "manifest_sha256": np.asarray(manifest_sha256),
+        "selection_sha256": np.asarray(selection_sha256),
+        "config_sha256": np.asarray(config_sha256),
+        "codec_sha256": np.asarray(codec_sha256),
+        "codec_downstream_report_sha256": np.asarray(
+            codec_downstream_report_sha256
+        ),
+        "source_control_hz": np.asarray(
+            item.record.action.control_hz, dtype=np.float32
+        ),
+        "model_control_hz": np.asarray(MODEL_HZ, dtype=np.float32),
+        "raw_action_kind": np.asarray(item.record.action.raw_kind),
+        "raw_action_key": np.asarray(item.record.action.action_key),
+        "raw_actions": item.raw_actions.astype(np.float32),
+        "native_frame_indices": item.native_frame_indices.astype(np.int64),
+        "model_timestamps": item.model_timestamps.astype(np.float64),
+        "action_valid_mask": item.action_valid_mask.astype(np.bool_),
+        "task_text": np.asarray(item.record.task_text),
+        "task_emb": np.asarray(task_embedding, dtype=np.float16),
+        "token_count": np.asarray(
+            item.anchor_codes.shape[-2], dtype=np.int64
+        ),
+        "token_dim": np.asarray(2048, dtype=np.int64),
+        "latent_dim": np.asarray(
+            item.anchor_codes.shape[-1], dtype=np.int64
+        ),
+        "window_starts": item.window_starts,
+        "context_codes": item.anchor_codes,
+        "context_scale": item.anchor_scale,
+        "wrist_context_codes": item.wrist_codes,
+        "wrist_context_scale": item.wrist_scale,
+        "future_codes": item.future_codes,
+        "future_scale": item.future_scale,
+        "future_depth_patch": item.depth_patch,
+        "future_depth_conf_patch": item.depth_conf_patch,
+        "future_point_patch": item.point_patch,
+        "future_point_conf_patch": item.point_conf_patch,
+        "future_pose_enc": item.pose_enc,
+        "actions": item.actions.astype(np.float32),
+        "rewards": item.rewards.astype(np.float32),
+        "dones": item.dones.astype(np.bool_),
+    }
+    validate_causal_dual_view_archive(
+        payload,
+        T=CONTEXT_FRAMES,
+        k=FUTURE_FRAMES,
+        paired_views=True,
+    )
+    destination = (
+        output_root / item.record.split / f"{item.record.clip_hash}.npz"
+    )
+    artifact_sha256 = _publish_causal_archive(destination, payload)
+    return {
+        "schema": str(np.asarray(payload["schema"]).item()),
+        "representation": str(np.asarray(payload["representation"]).item()),
+        "context_future_leakage": False,
+        "target_usage": "supervision_only",
+        "geometry_coordinate_frame": "first_observed_camera",
+        "clip_hash": item.record.clip_hash,
+        "split": item.record.split,
+        "source": item.record.source,
+        "v7_source": v7_source,
+        "task_class": item.record.task_class,
+        "path": str(destination.resolve()),
+        "artifact_sha256": artifact_sha256,
+        "model_frames": int(len(item.actions)),
+        "T": CONTEXT_FRAMES,
+        "k": FUTURE_FRAMES,
+        "P": int(item.anchor_codes.shape[-2]),
+        "token_D": 2048,
+        "latent_dim": int(item.anchor_codes.shape[-1]),
+        "windows": int(len(item.window_starts)),
+        "window_starts": item.window_starts.astype(np.int64).tolist(),
+        "paired_views": True,
+        "action_valid": True,
+        "action_adapter_version": item.record.action.adapter_version,
+        "action_audit_sha256": action_audit_sha256,
+        "manifest_sha256": manifest_sha256,
+        "selection_sha256": selection_sha256,
+        "config_sha256": config_sha256,
+        "codec_sha256": codec_sha256,
+        "codec_downstream_report_sha256": codec_downstream_report_sha256,
+        "factual_action_audit_passed": True,
+        "counterfactual_replay_passed": False,
+        "pseudo_outcomes": False,
+        "geometry_teacher": {
+            "name": "VGGT",
+            "revision": VGGT_MODEL_REVISION,
+            "pseudo_teacher": True,
+            "confidence_stored": True,
+        },
+    }
+
+
+
 
 
 def _geometry_segments(segment_id: np.ndarray) -> list[list[int]]:
@@ -540,6 +937,17 @@ def main() -> None:
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--max-clips", type=int, default=0)
     parser.add_argument("--batch-frames", type=int, default=32)
+    parser.add_argument("--rgb-sidecar-index", type=Path)
+    parser.add_argument(
+        "--causal-dual-view",
+        action="store_true",
+        help="write the V8 observed-context/target-only schema",
+    )
+    parser.add_argument(
+        "--v7-source",
+        choices=("atomic", "composite", "mg"),
+        help="RoboCasa partition identity required by causal dual-view caches",
+    )
     parser.add_argument(
         "--proof-allow-legacy-action-audit",
         action="store_true",
@@ -558,6 +966,14 @@ def main() -> None:
         raise SystemExit("num-shards must be >=1")
     if not 0 <= args.shard_id < args.num_shards:
         raise SystemExit("shard-id must satisfy 0 <= shard-id < num-shards")
+    if args.causal_dual_view and args.v7_source is None:
+        raise SystemExit(
+            "--causal-dual-view requires an explicit --v7-source partition"
+        )
+    if args.causal_dual_view and args.rgb_sidecar_index is None:
+        raise SystemExit(
+            "--causal-dual-view requires --rgb-sidecar-index for RGB supervision"
+        )
 
     downstream = json.loads(args.codec_downstream_report.read_text())
     if not bool(downstream.get("formal_cache_allowed")):
@@ -566,9 +982,13 @@ def main() -> None:
         raise SystemExit(
             "token codec was not fit on the immutable V7 train split; refusing formal cache"
         )
-    all_records = _select_records(
-        list(read_v7_manifest(args.manifest)), int(args.max_clips)
-    )
+    manifest_records = list(read_v7_manifest(args.manifest))
+    rgb_sidecar_sha256 = None
+    if args.causal_dual_view:
+        manifest_records, rgb_sidecar_sha256 = _filter_records_by_rgb_sidecar(
+            manifest_records, args.rgb_sidecar_index
+        )
+    all_records = _select_records(manifest_records, int(args.max_clips))
     if not all_records:
         raise SystemExit("manifest selection contains no action-valid clips")
     selection_sha256 = _selection_sha256(all_records)
@@ -587,7 +1007,7 @@ def main() -> None:
     index_path = _shard_index_path(
         args.index, int(args.shard_id), int(args.num_shards)
     )
-    if int(args.batch_frames) < CONTEXT_FRAMES + FUTURE_FRAMES:
+    if not args.causal_dual_view and int(args.batch_frames) < CONTEXT_FRAMES + FUTURE_FRAMES:
         raise SystemExit(
             f"batch-frames must be >= {CONTEXT_FRAMES + FUTURE_FRAMES} so every "
             "training window stays inside one VGGT world-coordinate gauge"
@@ -596,6 +1016,29 @@ def main() -> None:
     manifest_sha256 = _sha256_file(args.manifest)
     codec_sha256 = _sha256_file(args.codec)
     codec_downstream_report_sha256 = _sha256_file(args.codec_downstream_report)
+    config_identity = {
+        "schema": (
+            "wm3d_v8_stage0_causal_dual_view_robocasa_producer_v1"
+            if args.causal_dual_view
+            else SCHEMA_VERSION
+        ),
+        "root": str(args.root.resolve()),
+        "manifest_sha256": manifest_sha256,
+        "selection_sha256": selection_sha256,
+        "codec_sha256": codec_sha256,
+        "codec_downstream_report_sha256": codec_downstream_report_sha256,
+        "action_audit_sha256": action_audit_sha256,
+        "context_frames": CONTEXT_FRAMES,
+        "future_frames": FUTURE_FRAMES,
+        "window_stride": WINDOW_STRIDE,
+        "vggt_revision": VGGT_MODEL_REVISION,
+    }
+    if args.causal_dual_view:
+        config_identity["v7_source"] = str(args.v7_source)
+        config_identity["rgb_sidecar_index_sha256"] = rgb_sidecar_sha256
+    config_sha256 = hashlib.sha256(
+        json.dumps(config_identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     adapter = _load_adapter(
         args.action_audit,
         allow_legacy_proof_audit=bool(args.proof_allow_legacy_action_audit),
@@ -651,6 +1094,7 @@ def main() -> None:
             codec=codec,
             batch_frames=int(args.batch_frames),
             keep_geometry=True,
+            causal_dual_view=bool(args.causal_dual_view),
         )
         _encode_video_group(
             wrist_path,
@@ -660,18 +1104,37 @@ def main() -> None:
             codec=codec,
             batch_frames=int(args.batch_frames),
             keep_geometry=False,
+            causal_dual_view=bool(args.causal_dual_view),
         )
         for item in group:
-            index_rows.append(
-                _write_item(
+            if args.causal_dual_view:
+                row = _write_causal_item(
+                    item,
+                    args.output_root,
+                    task_cache[item.record.task_text],
+                    action_audit_sha256=action_audit_sha256,
+                    manifest_sha256=manifest_sha256,
+                    selection_sha256=selection_sha256,
+                    config_sha256=config_sha256,
+                    codec_sha256=codec_sha256,
+                    codec_downstream_report_sha256=(
+                        codec_downstream_report_sha256
+                    ),
+                    v7_source=str(args.v7_source),
+                )
+            else:
+                row = _write_item(
                     item,
                     args.output_root,
                     task_cache[item.record.task_text],
                     action_audit_sha256=action_audit_sha256,
                 )
-            )
+            index_rows.append(row)
             item.anchor_codes = None
             item.anchor_scale = None
+            item.future_codes = None
+            item.future_scale = None
+            item.window_starts = None
             item.wrist_codes = None
             item.wrist_scale = None
             item.depth_patch = None
@@ -680,15 +1143,39 @@ def main() -> None:
             item.point_conf_patch = None
             item.pose_enc = None
             item.geometry_segment_id = None
-        _atomic_write_jsonl(partial_index_path, index_rows)
+        if not args.causal_dual_view:
+            _atomic_write_jsonl(partial_index_path, index_rows)
 
     del encoder
     torch.cuda.empty_cache()
     gc.collect()
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(partial_index_path, index_path)
+    if args.causal_dual_view:
+        index_text = "".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in sorted(
+                index_rows,
+                key=lambda value: (value["split"], value["clip_hash"]),
+            )
+        )
+        index_sha256 = _publish_text_no_clobber(index_path, index_text)
+    else:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(partial_index_path, index_path)
+        index_sha256 = _sha256_file(index_path)
     report = {
-        "schema": SCHEMA_VERSION,
+        "schema": (
+            "wm3d_v8_stage0_causal_dual_view_robocasa_producer_v1"
+            if args.causal_dual_view
+            else SCHEMA_VERSION
+        ),
+        "pass": True,
+        "causal_dual_view": bool(args.causal_dual_view),
+        "representation": (
+            "wm3d_v8_vggt_observed_context_target_split_v1"
+            if args.causal_dual_view
+            else None
+        ),
+        "v7_source": str(args.v7_source) if args.causal_dual_view else None,
         "clips": len(index_rows),
         "windows": sum(int(row["windows"]) for row in index_rows),
         "splits": {split: sum(row["split"] == split for row in index_rows) for split in ("train", "val", "test")},
@@ -700,7 +1187,15 @@ def main() -> None:
         "codec_sha256": codec_sha256,
         "codec_downstream_report_sha256": codec_downstream_report_sha256,
         "selection_sha256": selection_sha256,
+        "index_sha256": index_sha256,
+        "config_sha256": config_sha256,
         "global_selected_clips": len(all_records),
+        "rgb_sidecar_index": (
+            str(args.rgb_sidecar_index.resolve())
+            if args.causal_dual_view else None
+        ),
+        "rgb_sidecar_index_sha256": rgb_sidecar_sha256,
+        "rgb_sidecar_coverage_passed": bool(args.causal_dual_view),
         "action_audit": str(args.action_audit.resolve()),
         "action_audit_sha256": action_audit_sha256,
         "factual_action_audit_passed": True,
@@ -710,7 +1205,7 @@ def main() -> None:
             "revision": VGGT_MODEL_REVISION,
             "pseudo_teacher": True,
         },
-        "geometry_segment_frames": int(args.batch_frames),
+        "geometry_segment_frames": None if args.causal_dual_view else int(args.batch_frames),
         "sharding": {
             "algorithm": "whole_video_pair_lpt_v1",
             "shard_id": int(args.shard_id),
@@ -722,7 +1217,11 @@ def main() -> None:
         },
     }
     report_path = index_path.with_suffix(".report.json")
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    report_text = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.causal_dual_view:
+        _publish_text_no_clobber(report_path, report_text)
+    else:
+        report_path.write_text(report_text)
     print(json.dumps(report, sort_keys=True))
 
 

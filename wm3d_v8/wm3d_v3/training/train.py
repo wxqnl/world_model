@@ -110,6 +110,13 @@ _DIRECT_POLICY_OXE_OVERRIDE_KEYS = frozenset(
         "load_geom_extra",
         "require_geom_extra",
         "use_window_tokens",
+        "cache_root",
+        "window_geom_subdir",
+        "window_geom_cache_root",
+        "trust_window_geom_cache",
+        "max_windows_per_episode",
+        "causal_dual_view_required",
+        "causal_dual_view_representation",
         "load_policy_state",
         "require_policy_state",
         "strict_policy_state_prescan",
@@ -216,6 +223,9 @@ def capture_rng_contract(base_seed: int, rank: int) -> dict:
         "numpy_state": np.random.get_state(),
         "torch_cpu_state": torch.get_rng_state().cpu(),
     }
+    if torch.cuda.is_available():
+        result["torch_cuda_state"] = torch.cuda.get_rng_state().cpu()
+    return result
 
 
 def module_state_sha256(module: torch.nn.Module | None) -> str | None:
@@ -231,9 +241,6 @@ def module_state_sha256(module: torch.nn.Module | None) -> str | None:
         digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
         digest.update(value.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
-    if torch.cuda.is_available():
-        result["torch_cuda_state"] = torch.cuda.get_rng_state().cpu()
-    return result
 
 
 def build_exact_resume_startup_event(
@@ -1381,6 +1388,8 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
                         load_geom_extra=bool(data_cfg.get("load_geom_extra", False)),
                         require_geom_extra=bool(data_cfg.get("require_geom_extra", False)),
                         window_geom_subdir=data_cfg.get("window_geom_subdir", "vggt_window_geom_p64"),
+                        window_geom_cache_root=Path(data_cfg["window_geom_cache_root"])
+                        if data_cfg.get("window_geom_cache_root") else None,
                         window_geom_shard_index=Path(data_cfg["window_geom_shard_index"])
                         if data_cfg.get("window_geom_shard_index") else None,
                         window_geom_shard_root=Path(data_cfg["window_geom_shard_root"])
@@ -1390,6 +1399,12 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
                         window_geom_shard_roots=tuple(Path(p) if p is not None else None for p in shard_roots)
                         if shard_roots else None,
                         use_window_tokens=bool(data_cfg.get("use_window_tokens", False)),
+                        causal_dual_view_required=bool(
+                            data_cfg.get("causal_dual_view_required", False)
+                        ),
+                        causal_dual_view_representation=data_cfg.get(
+                            "causal_dual_view_representation"
+                        ),
                         max_windows_per_episode=int(data_cfg.get("max_windows_per_episode", 0) or 0),
                         trust_window_geom_cache=bool(data_cfg.get("trust_window_geom_cache", False)),
                         trusted_manifest_fast_init=bool(
@@ -3274,6 +3289,12 @@ def build_datasets(cfg: dict, overfit_ids=None):
             ),
             "require_rgb_sidecar": bool(data_cfg.get("require_rgb_sidecar", False)),
             "action_only": bool(data_cfg.get("direct_policy_action_only", False)),
+            "causal_dual_view_required": bool(
+                data_cfg.get("compact_causal_dual_view_required", False)
+            ),
+            "causal_dual_view_representation": data_cfg.get(
+                "compact_causal_dual_view_representation"
+            ),
             "policy_action_history_len": int(
                 data_cfg.get(
                     "policy_action_history_len",
@@ -3463,6 +3484,12 @@ def build_datasets(cfg: dict, overfit_ids=None):
             ),
             "require_rgb_sidecar": bool(data_cfg.get("require_rgb_sidecar", False)),
             "action_only": bool(data_cfg.get("direct_policy_action_only", False)),
+            "causal_dual_view_required": bool(
+                data_cfg.get("compact_causal_dual_view_required", False)
+            ),
+            "causal_dual_view_representation": data_cfg.get(
+                "compact_causal_dual_view_representation"
+            ),
             "policy_action_history_len": int(
                 data_cfg.get(
                     "policy_action_history_len",
@@ -4683,9 +4710,15 @@ def validate_stage_transition_preflight(cfg: dict, args: argparse.Namespace) -> 
     return load_mode
 
 
-def validate_empty_checkpoint_dir_preflight(cfg: dict) -> None:
+def validate_empty_checkpoint_dir_preflight(
+    cfg: dict,
+    *,
+    resume_checkpoint: Path | None = None,
+) -> None:
     """Keep a fresh stage lineage from silently reusing an old output run."""
 
+    if resume_checkpoint is not None:
+        return
     out_cfg = cfg.get("out") or {}
     if not bool(out_cfg.get("require_empty_checkpoint_dir", False)):
         return
@@ -8296,7 +8329,10 @@ def main():
             raise ValueError(
                 "forbid_resume=true permits only an explicitly enabled same-run exact resume"
             )
-    validate_empty_checkpoint_dir_preflight(cfg)
+    validate_empty_checkpoint_dir_preflight(
+        cfg,
+        resume_checkpoint=args.resume,
+    )
     stage_transition_mode = validate_stage_transition_preflight(cfg, args)
     future_value_stage = validate_future_value_stage_preflight(cfg, args)
     action_pretraining_stage = validate_action_pretraining_preflight(cfg)

@@ -27,7 +27,8 @@ case "${1:-}" in
       scripts/launch_wm3d_v7_1b_actionpolicy_joint_canary1000_node43_v3.sh \
       scripts/launch_wm3d_v7_1b_actionpolicy_joint_formal100k_node_v3.sh \
       scripts/start_wm3d_v7_1b_actionpolicy_joint_formal100k_3node24_v3.sh \
-      scripts/launch_wm3d_v7_stage1_planner.sh
+      scripts/launch_wm3d_v7_stage1_planner.sh \
+      scripts/launch_wm3d_v8_stage0_causal_dual_view_canary.sh
     "${PYTHON_BIN}" -m pytest -q \
       tests/test_v7_action_loss_contract.py \
       tests/test_v7_native_action_loss.py \
@@ -37,7 +38,12 @@ case "${1:-}" in
       tests/test_v7_compact_sharding.py \
       tests/test_v7_data_contracts.py \
       tests/test_v7_stage1_planner.py \
-      tests/test_v7_stage1_planner_contract.py
+      tests/test_v7_stage1_planner_contract.py \
+      tests/test_v8_causal_dual_view.py \
+      tests/test_v8_causal_dual_view_cache_builders.py \
+      tests/test_v8_causal_dual_view_datasets.py \
+      tests/test_v8_stage0_causal_dual_view_preflight.py \
+      tests/test_v8_stage0_causal_dual_view_review.py
     ;;
   stage0-static)
     "${PYTHON_BIN}" scripts/preflight_wm3d_v7_1b_actionpolicy_joint.py \

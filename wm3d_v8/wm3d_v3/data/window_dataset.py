@@ -52,6 +52,10 @@ from wm3d_v3.stage1.action_contract import (
     resolve_action_window,
     validate_manifest_contract_coverage,
 )
+from .v8_causal_dual_view import (
+    CAUSAL_DUAL_VIEW_REPRESENTATION,
+    validate_causal_dual_view_archive,
+)
 
 
 def _rss_mib() -> float:
@@ -97,11 +101,14 @@ class WindowConfig:
     load_geom_extra: bool = False
     require_geom_extra: bool = False
     window_geom_subdir: str = "vggt_window_geom_p64"
+    window_geom_cache_root: Path | None = None
     window_geom_shard_index: Path | None = None
     window_geom_shard_root: Path | None = None
     window_geom_shard_indices: tuple[Path, ...] | None = None
     window_geom_shard_roots: tuple[Path | None, ...] | None = None
     use_window_tokens: bool = False
+    causal_dual_view_required: bool = False
+    causal_dual_view_representation: str | None = None
     max_windows_per_episode: int = 0
     trust_window_geom_cache: bool = False
     # Skip repeated remote cache-header scans only when the input manifest is
@@ -144,6 +151,28 @@ def _window_geom_path(cache_root: Path, subdir: str, cid: str, start: int) -> Pa
 
 def _window_geom_name(cid: str, start: int) -> str:
     return f"{cid}__start_{int(start):06d}.npz"
+
+
+def _validate_causal_window_identity(
+    archive,
+    *,
+    clip_id: str,
+    start: int,
+    T: int,
+    k: int,
+) -> dict[str, int | bool]:
+    summary = validate_causal_dual_view_archive(
+        archive, T=T, k=k, paired_views=False
+    )
+    if summary["compact"]:
+        raise ValueError("OXE causal dual-view cache must be one window per archive")
+    cached_clip = str(np.asarray(archive["clip_id"]).item())
+    cached_start = int(np.asarray(archive["start"]).item())
+    if cached_clip != clip_id:
+        raise ValueError(f"causal dual-view clip identity mismatch: {cached_clip!r} != {clip_id!r}")
+    if cached_start != int(start):
+        raise ValueError(f"causal dual-view start identity mismatch: {cached_start} != {int(start)}")
+    return summary
 
 
 
@@ -583,6 +612,22 @@ class OXEWindowDataset(Dataset):
         scan_started = time.monotonic()
         self.cfg = cfg or WindowConfig()
         self.cfg.cache_root = Path(self.cfg.cache_root)
+        if self.cfg.window_geom_cache_root is not None:
+            self.cfg.window_geom_cache_root = Path(
+                self.cfg.window_geom_cache_root
+            )
+        if self.cfg.causal_dual_view_required:
+            if (
+                self.cfg.causal_dual_view_representation
+                != CAUSAL_DUAL_VIEW_REPRESENTATION
+            ):
+                raise ValueError("causal_dual_view_required needs the exact V8 representation")
+            if not self.cfg.use_window_tokens:
+                raise ValueError("causal_dual_view_required needs use_window_tokens=true")
+            if not self.cfg.load_state_tgt:
+                raise ValueError("causal_dual_view_required needs load_state_tgt=true")
+            if not self.cfg.require_geom_extra:
+                raise ValueError("causal_dual_view_required needs require_geom_extra=true")
         _dataset_startup_log(
             "begin",
             scan_started,
@@ -1092,8 +1137,36 @@ class OXEWindowDataset(Dataset):
                 if self.cfg.max_windows_per_episode and len(starts) > int(self.cfg.max_windows_per_episode):
                     starts = starts[: int(self.cfg.max_windows_per_episode)]
                 for start in starts:
-                    path = _window_geom_path(self.cfg.cache_root, self.cfg.window_geom_subdir, cid, start)
+                    path = _window_geom_path(
+                        self.cfg.window_geom_cache_root or self.cfg.cache_root,
+                        self.cfg.window_geom_subdir,
+                        cid,
+                        start,
+                    )
                     name = _window_geom_name(cid, start)
+                    if self.cfg.causal_dual_view_required:
+                        causal_archive = None
+                        if path.exists():
+                            causal_archive = np.load(path, allow_pickle=False)
+                        elif (
+                            self._window_shards is not None
+                            and self._window_shards.has(name)
+                        ):
+                            causal_archive = self._window_shards.open_npz(name)
+                        if causal_archive is None:
+                            continue
+                        try:
+                            _validate_causal_window_identity(
+                                causal_archive,
+                                clip_id=r.clip_id,
+                                start=start,
+                                T=self.cfg.T,
+                                k=self.cfg.k,
+                            )
+                        finally:
+                            causal_archive.close()
+                        valid_starts.append(start)
+                        continue
                     if self.cfg.trust_window_geom_cache:
                         if path.exists() or (self._window_shards is not None and self._window_shards.has(name)):
                             valid_starts.append(start)
@@ -1116,6 +1189,8 @@ class OXEWindowDataset(Dataset):
                             ):
                                 valid_starts.append(start)
                 if not valid_starts:
+                    if self.cfg.causal_dual_view_required:
+                        continue
                     if self._window_shards is not None and self.cfg.trust_window_geom_cache:
                         # Node-sharded tar caches may share or symlink a broader
                         # base cache than the local window shard owns.
@@ -1288,12 +1363,27 @@ class OXEWindowDataset(Dataset):
         cid = _safe(rec.clip_id)
         T, k = self.cfg.T, self.cfg.k
         window_geom = None
-        window_geom_path = _window_geom_path(self.cfg.cache_root, self.cfg.window_geom_subdir, cid, start)
+        window_geom_path = _window_geom_path(
+            self.cfg.window_geom_cache_root or self.cfg.cache_root,
+            self.cfg.window_geom_subdir,
+            cid,
+            start,
+        )
         if self.cfg.load_geom_extra or self.cfg.require_geom_extra or self.cfg.use_window_tokens:
             if window_geom_path.exists():
                 window_geom = np.load(window_geom_path)
             elif self._window_shards is not None:
                 window_geom = self._window_shards.open_npz(_window_geom_name(cid, start))
+        if self.cfg.causal_dual_view_required:
+            if window_geom is None:
+                raise FileNotFoundError(f"missing causal dual-view window for {rec.clip_id} start={start}")
+            _validate_causal_window_identity(
+                window_geom,
+                clip_id=rec.clip_id,
+                start=start,
+                T=T,
+                k=k,
+            )
         pooled = None if self.cfg.use_window_tokens else np.load(self.cfg.cache_root / self.cfg.tokens_subdir / f"{cid}.npy", mmap_mode="r")
         need_geom_file = self.cfg.load_geom or self.cfg.load_policy_state or self.cfg.require_progress
         geom_path = self.cfg.cache_root / "vggt_geom" / f"{cid}.npz"
@@ -1353,7 +1443,14 @@ class OXEWindowDataset(Dataset):
         else:
             depth_arr = None
         window_depth_arr = None
-        if self.cfg.load_geom_extra or self.cfg.require_geom_extra or self.cfg.use_window_tokens:
+        if self.cfg.causal_dual_view_required:
+            window_depth_arr = _npz_first(window_geom, ("future_depth_patch",))
+            point_arr = _npz_first(window_geom, ("future_point_patch",))
+            point_conf_arr = _npz_first(window_geom, ("future_point_conf_patch",))
+            pose_arr = _npz_first(window_geom, ("future_pose_enc",))
+            pose_conf_arr = None
+            depth_conf_arr = _npz_first(window_geom, ("future_depth_conf_patch",))
+        elif self.cfg.load_geom_extra or self.cfg.require_geom_extra or self.cfg.use_window_tokens:
             window_depth_arr = _npz_first(window_geom, ("depth", "depth_map"))
             point_arr = _npz_first(window_geom, ("point", "world_points", "points", "point_map"))
             point_conf_arr = _npz_first(window_geom, ("point_conf", "world_points_conf", "points_conf", "conf"))
@@ -1391,10 +1488,19 @@ class OXEWindowDataset(Dataset):
             raise RuntimeError(f"cache window shorter than indexed range for {rec.clip_id}: end={end} lengths={required_lengths}")
         pooled_len = T + k if self.cfg.load_state_tgt else T
         if self.cfg.use_window_tokens:
-            pooled_arr = _npz_first(window_geom, ("pooled", "vggt_pooled"))
-            if pooled_arr is None or np.asarray(pooled_arr).shape[0] < pooled_len:
-                raise KeyError(f"use_window_tokens=True but window geom missing pooled tokens for {rec.clip_id} start={start}")
-            pooled_w = np.array(pooled_arr[:pooled_len])
+            if self.cfg.causal_dual_view_required:
+                context_codes = np.asarray(window_geom["context_codes"], dtype=np.int8)
+                context_scale = np.asarray(window_geom["context_scale"], dtype=np.float32)
+                future_codes = np.asarray(window_geom["future_codes"], dtype=np.int8)
+                future_scale = np.asarray(window_geom["future_scale"], dtype=np.float32)
+                context_tokens = context_codes.astype(np.float32) * context_scale
+                future_tokens = future_codes.astype(np.float32) * future_scale
+                pooled_w = np.concatenate((context_tokens, future_tokens), axis=0)
+            else:
+                pooled_arr = _npz_first(window_geom, ("pooled", "vggt_pooled"))
+                if pooled_arr is None or np.asarray(pooled_arr).shape[0] < pooled_len:
+                    raise KeyError(f"use_window_tokens=True but window geom missing pooled tokens for {rec.clip_id} start={start}")
+                pooled_w = np.array(pooled_arr[:pooled_len])
         else:
             pooled_w = np.array(pooled[start : start + pooled_len])
         rgb_w = np.array(rgb[start : start + T + k]) if rgb is not None else None
@@ -1512,7 +1618,10 @@ class OXEWindowDataset(Dataset):
                 }
             )
         if self.cfg.load_state_tgt:
-            sample["s_tgt"] = torch.from_numpy(pooled_w[T:]).float()
+            target_key = (
+                "s_tgt_codec" if self.cfg.causal_dual_view_required else "s_tgt"
+            )
+            sample[target_key] = torch.from_numpy(pooled_w[T:]).float()
         if depth_w is not None:
             sample["depth_in"] = torch.from_numpy(depth_w[:T]).float()
         if depth_tgt_w is not None:
