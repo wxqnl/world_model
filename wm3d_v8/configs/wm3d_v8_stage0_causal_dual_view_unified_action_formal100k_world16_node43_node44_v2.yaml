@@ -1,0 +1,19 @@
+_base_: wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2.yaml
+
+# node43 + node44 的正式拓扑模板。所有 PENDING 值必须由 sealed runtime
+# overlay 替换并通过 full preflight 后方可启动。
+contract:
+  canary_gate_receipt: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/audits/unified_action_canary_v2/formal_gate.json
+  canary_gate_receipt_sha256: PENDING_UNIFIED_ACTION_CANARY_GATE_SHA256
+
+train:
+  run_lineage: wm3d_v8_stage0_causal_dual_view_unified_action20_formal100k_world16_20260810_v2
+  num_nodes: 2
+  gpus_per_node: 8
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 2
+  effective_global_batch: 64
+
+out:
+  root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/results/unified_action_formal100k_world16_v2
+  require_empty_checkpoint_dir: true

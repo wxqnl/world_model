@@ -179,6 +179,8 @@ def _runtime_overlay(
     base_config: Path,
     oxe_paths: dict[str, list[Path]],
     combined_robocasa_index: Path,
+    action_sidecar_index: Path,
+    action_sidecar_stats: Path,
     max_steps: int | None = None,
     initial_stop_step: int | None = None,
     out_root: Path | None = None,
@@ -207,6 +209,10 @@ def _runtime_overlay(
         raise ValueError("run_lineage must be non-empty")
     combined = combined_robocasa_index.resolve()
     combined_sha = _sha256_file(combined)
+    action_index = action_sidecar_index.resolve()
+    action_index_sha = _sha256_file(action_index)
+    action_stats = action_sidecar_stats.resolve()
+    action_stats_sha = _sha256_file(action_stats)
     oxe_loader_binding = _oxe_window_binding(oxe_paths)
     indices: dict[str, Any] = {}
     for source in ("oxe_droid_action", "oxe_bridge_action"):
@@ -230,6 +236,10 @@ def _runtime_overlay(
         "data": {
             "compact_index": str(combined),
             "compact_index_sha256": combined_sha,
+            "v8_action_sidecar_index": str(action_index),
+            "v8_action_sidecar_index_sha256": action_index_sha,
+            "v8_action_sidecar_stats": str(action_stats),
+            "v8_action_sidecar_stats_sha256": action_stats_sha,
             "causal_dual_view_indices": indices,
             "direct_policy_oxe_overrides": oxe_loader_binding,
         },
@@ -268,6 +278,8 @@ def main() -> None:
     parser.add_argument("--robocasa-composite-index", type=Path, required=True)
     parser.add_argument("--robocasa-mg-index", type=Path, required=True)
     parser.add_argument("--combined-robocasa-index", type=Path, required=True)
+    parser.add_argument("--action-sidecar-index", type=Path, required=True)
+    parser.add_argument("--action-sidecar-stats", type=Path, required=True)
     parser.add_argument("--runtime-config", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--max-steps", type=int)
@@ -298,6 +310,8 @@ def main() -> None:
         base_config=args.base_config,
         oxe_paths=oxe_paths,
         combined_robocasa_index=args.combined_robocasa_index,
+        action_sidecar_index=args.action_sidecar_index,
+        action_sidecar_stats=args.action_sidecar_stats,
         max_steps=args.max_steps,
         initial_stop_step=args.initial_stop_step,
         out_root=args.out_root,
@@ -335,6 +349,14 @@ def main() -> None:
         },
         "combined_robocasa_index_sha256": combined_sha,
         "combined_robocasa_rows": len(merged),
+        "action_sidecar_index": str(args.action_sidecar_index.resolve()),
+        "action_sidecar_index_sha256": _sha256_file(
+            args.action_sidecar_index.resolve()
+        ),
+        "action_sidecar_stats": str(args.action_sidecar_stats.resolve()),
+        "action_sidecar_stats_sha256": _sha256_file(
+            args.action_sidecar_stats.resolve()
+        ),
         "preflight": preflight,
     }
     _publish_text_no_clobber(

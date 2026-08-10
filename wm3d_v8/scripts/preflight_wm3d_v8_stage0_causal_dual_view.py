@@ -19,11 +19,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.preflight_wm3d_v7_1b_actionpolicy_joint import (  # noqa: E402
-    _validate_checkpoint_lineage,
-    _validate_local_resources,
-)
-from scripts.preflight_wm3d_v7_stage0_actiondynamics import (  # noqa: E402
+from scripts.wm3d_v8_preflight_common import (  # noqa: E402
     CANONICAL_LAYOUT,
     CANONICAL_VERSION,
     EXPECTED_OXE_ACTION_KINDS,
@@ -36,6 +32,8 @@ from scripts.preflight_wm3d_v7_stage0_actiondynamics import (  # noqa: E402
     _scalar,
     _validate_action_cache_split,
     _validate_canonical_gate,
+    _validate_checkpoint_lineage,
+    _validate_local_resources,
     _validate_stats,
     load_config,
     resolved_config_sha256,
@@ -48,15 +46,28 @@ from wm3d_v3.data.v8_causal_dual_view import (  # noqa: E402
     TARGET_USAGE,
     validate_causal_dual_view_archive,
 )
+from wm3d_v3.data.v8_action_contract import (  # noqa: E402
+    DYNAMICS_ACTION_DIM,
+    POLICY_HISTORY_DIM,
+    POLICY_HISTORY_LEN,
+    POLICY_HORIZON,
+    V8_ACTION_SIDECAR_INDEX_SCHEMA,
+    V8_ACTION_SIDECAR_SCHEMA,
+    V8_ACTION_STATS_SCHEMA,
+    V8_DUAL_RATE_ACTION_SCHEMA,
+    V8_POLICY_HISTORY_SCHEMA,
+)
 from wm3d_v3.training.train import (  # noqa: E402
     apply_direct_policy_oxe_overrides,
+    build_v8_action_policy_contract,
     build_datasets,
+    validate_action_pretraining_preflight,
 )
 
 
 REPORT_SCHEMA = "wm3d_v8_stage0_causal_dual_view_preflight_report_v1"
-CANARY_SCHEMA = "wm3d_v8_stage0_causal_dual_view_actionpolicy_canary_v1"
-FORMAL_SCHEMA = "wm3d_v8_stage0_causal_dual_view_actionpolicy_formal_v1"
+CANARY_SCHEMA = "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2"
+FORMAL_SCHEMA = "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2"
 CANARY_GATE_SCHEMA = "wm3d_v8_stage0_causal_dual_view_canary_gate_v1"
 EXPECTED_PROFILES = {
     CANARY_SCHEMA: "canary_non_inheritable",
@@ -68,7 +79,10 @@ EXPECTED_PARTITIONS = {
     "robocasa_mg": "mg",
 }
 RUNTIME_FILES = (
+    PROJECT_ROOT / "scripts/preflight_wm3d_v8_stage0_causal_dual_view.py",
+    PROJECT_ROOT / "scripts/wm3d_v8_preflight_common.py",
     PROJECT_ROOT / "wm3d_v3/data/v8_causal_dual_view.py",
+    PROJECT_ROOT / "wm3d_v3/data/v8_action_contract.py",
     PROJECT_ROOT / "wm3d_v3/data/window_dataset.py",
     PROJECT_ROOT / "wm3d_v3/data/v7_compact_dataset.py",
     PROJECT_ROOT / "wm3d_v3/training/train.py",
@@ -150,6 +164,7 @@ def _validate_contract_and_objective(
     train = config.get("train") or {}
     loss = config.get("loss") or {}
     schema = contract.get("schema")
+    unified_action = schema in {CANARY_SCHEMA, FORMAL_SCHEMA}
 
     checks.expect(schema in EXPECTED_PROFILES, f"unsupported contract schema: {schema!r}")
     if schema in EXPECTED_PROFILES:
@@ -194,10 +209,38 @@ def _validate_contract_and_objective(
     )
 
     checks.equal(model.get("enable_action_policy"), True, "model.enable_action_policy")
-    checks.equal(model.get("policy_enable_flow_head"), True, "model.flow_head")
     checks.equal(model.get("policy_flow_use_as_policy"), False, "model.flow_serving")
-    checks.equal(model.get("policy_flow_action_dim"), 6, "model.flow_action_dim")
-    checks.equal(model.get("policy_grip_owner"), "delta_composed", "model.grip_owner")
+    if unified_action:
+        checks.equal(model.get("policy_enable_flow_head"), False, "model.flow_head")
+        checks.equal(model.get("policy_enable_grip_delta_head"), False, "model.delta_head")
+        checks.equal(model.get("policy_grip_owner"), "absolute", "model.grip_owner")
+        checks.equal(model.get("policy_action_add_trunk"), False, "model.trunk_action_owner")
+        checks.equal(model.get("policy_enable_local_residual"), False, "model.local_residual_owner")
+        checks.equal(model.get("policy_enable_waypoint_head"), False, "model.waypoint_owner")
+        checks.equal(model.get("policy_horizon"), POLICY_HORIZON, "model.policy_horizon")
+        checks.equal(
+            model.get("policy_action_history_len"),
+            POLICY_HISTORY_LEN,
+            "model.policy_action_history_len",
+        )
+        checks.equal(
+            model.get("policy_action_history_dim"),
+            POLICY_HISTORY_DIM,
+            "model.policy_action_history_dim",
+        )
+        checks.equal(
+            model.get("context_pixel_action_dim"),
+            DYNAMICS_ACTION_DIM,
+            "model.context_pixel_action_dim",
+        )
+        checks.equal(
+            contract.get("action_policy_contract_schema"),
+            "wm3d_v8_stage0_action_policy_contract_v2",
+            "contract.action_policy_contract_schema",
+        )
+        checks.equal(contract.get("world_state_hz"), 5, "contract.world_state_hz")
+        checks.equal(contract.get("policy_hz"), 20, "contract.policy_hz")
+        checks.equal(contract.get("policy_horizon"), 8, "contract.policy_horizon")
     checks.equal(model.get("enable_pixel"), True, "model.enable_pixel")
     checks.equal(model.get("enable_geom_extra"), True, "model.enable_geom_extra")
     checks.equal(model.get("token_codec_frozen"), True, "model.token_codec_frozen")
@@ -207,6 +250,12 @@ def _validate_contract_and_objective(
         checks.equal(section.get("P"), 64, f"model.{key}.P")
         checks.equal(section.get("D"), 2048, f"model.{key}.D")
         checks.equal(section.get("k"), 8, f"model.{key}.k")
+        if unified_action:
+            checks.equal(
+                section.get("action_cond_dim"),
+                DYNAMICS_ACTION_DIM,
+                f"model.{key}.action_cond_dim",
+            )
 
     checks.equal(data.get("dataset_type"), "v7_mixed", "data.dataset_type")
     checks.equal(data.get("T"), 16, "data.T")
@@ -226,6 +275,22 @@ def _validate_contract_and_objective(
         ["atomic", "composite", "mg"],
         "data.robocasa_partitions",
     )
+    if unified_action:
+        checks.equal(
+            data.get("v8_dual_rate_action_enabled"),
+            True,
+            "data.v8_dual_rate_action_enabled",
+        )
+        checks.equal(
+            data.get("policy_action_history_len"),
+            POLICY_HISTORY_LEN,
+            "data.policy_action_history_len",
+        )
+        checks.equal(
+            data.get("policy_action_history_dim"),
+            POLICY_HISTORY_DIM,
+            "data.policy_action_history_dim",
+        )
 
     checks.equal(
         train.get("joint_native_action_pretraining"),
@@ -233,10 +298,14 @@ def _validate_contract_and_objective(
         "train.joint_native_action_pretraining",
     )
     checks.equal(train.get("direct_policy_weight"), 1.0, "train.direct_policy_weight")
-    checks.equal(train.get("policy_flow_weight"), 0.25, "train.policy_flow_weight")
+    checks.equal(
+        train.get("policy_flow_weight"),
+        0.0,
+        "train.policy_flow_weight",
+    )
     checks.equal(
         train.get("native_action_no_teacher_weight"),
-        0.15,
+        0.0,
         "train.native_action_no_teacher_weight",
     )
     checks.equal(
@@ -259,9 +328,35 @@ def _validate_contract_and_objective(
         0,
         "train.native_future_no_teacher_weight_start_step",
     )
-    checks.equal(train.get("direct_policy_grip_owner"), "delta_composed", "train.grip_owner")
-    checks.equal(train.get("policy_flow_action_dim"), 6, "train.flow_action_dim")
-    checks.equal(train.get("policy_flow_grip_weight"), 0.0, "train.flow_grip_weight")
+    checks.equal(
+        train.get("direct_policy_grip_owner"),
+        "absolute",
+        "train.grip_owner",
+    )
+    if unified_action:
+        checks.equal(
+            train.get("v8_dual_rate_action_enabled"),
+            True,
+            "train.v8_dual_rate_action_enabled",
+        )
+        checks.equal(train.get("direct_policy_head"), "base", "train.direct_policy_head")
+        for key in (
+            "v8_policy_fine_pose_weight",
+            "v8_policy_fine_grip_weight",
+            "v8_policy_coarse_pose_weight",
+            "v8_policy_coarse_grip_weight",
+        ):
+            try:
+                positive = float(train.get(key, 0.0)) > 0.0
+            except (TypeError, ValueError):
+                positive = False
+            checks.expect(positive, f"train.{key} must be positive")
+        try:
+            validate_action_pretraining_preflight(config)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            checks.errors.append(f"V8 unified action preflight failed: {exc}")
+        action_contract = build_v8_action_policy_contract(config)
+        checks.expect(action_contract is not None, "V8 action checkpoint contract is missing")
     factual = train.get("factual_action_conditioning") or {}
     checks.equal(factual.get("enabled"), True, "train.factual.enabled")
     checks.equal(factual.get("start_step"), 0, "train.factual.start_step")
@@ -319,6 +414,22 @@ def _validate_contract_and_objective(
         )
         checks.equal(source.get("T"), 16, f"{name}.T")
         checks.equal(source.get("k"), 8, f"{name}.k")
+        if unified_action:
+            checks.equal(
+                source.get("v8_dual_rate_action_enabled"),
+                True,
+                f"{name}.v8_dual_rate_action_enabled",
+            )
+            checks.equal(
+                source.get("policy_action_history_len"),
+                POLICY_HISTORY_LEN,
+                f"{name}.policy_action_history_len",
+            )
+            checks.equal(
+                source.get("policy_action_history_dim"),
+                POLICY_HISTORY_DIM,
+                f"{name}.policy_action_history_dim",
+            )
         checks.equal(source.get("causal_dual_view_required"), True, f"{name}.causal_required")
         checks.equal(
             source.get("causal_dual_view_representation"),
@@ -346,6 +457,235 @@ def _validate_contract_and_objective(
     return sources
 
 
+def _validate_v8_action_sidecars(
+    checks: _Checks, data: dict[str, Any]
+) -> dict[str, Any]:
+    if not bool(data.get("v8_dual_rate_action_enabled", False)):
+        return {"enabled": False}
+    index_path = checks.pinned_file(
+        data.get("v8_action_sidecar_index"),
+        data.get("v8_action_sidecar_index_sha256"),
+        "robocasa.action20_index",
+    )
+    stats_path = checks.pinned_file(
+        data.get("v8_action_sidecar_stats"),
+        data.get("v8_action_sidecar_stats_sha256"),
+        "robocasa.action20_stats",
+    )
+    report: dict[str, Any] = {"enabled": True, "rows": 0}
+    if checks.mode != "full" or index_path is None or stats_path is None:
+        return report
+    compact_path = Path(str(data.get("compact_index") or ""))
+    compact_keys: set[tuple[str, str]] = set()
+    compact_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    try:
+        for line in compact_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            key = (str(row.get("split")), str(row.get("clip_hash")))
+            checks.expect(key not in compact_rows, f"robocasa compact duplicate: {key}")
+            compact_keys.add(key)
+            compact_rows[key] = row
+    except (OSError, json.JSONDecodeError) as exc:
+        checks.errors.append(f"robocasa compact index cannot be audited for action20: {exc}")
+    sidecar_keys: set[tuple[str, str]] = set()
+    sidecar_adapter_digests: set[str] = set()
+    train_fine_action_count = 0
+    try:
+        for line_number, line in enumerate(
+            index_path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            label = f"robocasa.action20_index[{line_number}]"
+            checks.equal(row.get("schema"), V8_ACTION_SIDECAR_INDEX_SCHEMA, f"{label}.schema")
+            key = (str(row.get("split")), str(row.get("clip_hash")))
+            checks.expect(key not in sidecar_keys, f"{label} duplicate identity: {key}")
+            sidecar_keys.add(key)
+            compact_row = compact_rows.get(key)
+            checks.expect(
+                compact_row is not None,
+                f"{label} has no matching compact row: {key}",
+            )
+            if compact_row is not None:
+                for identity_key in (
+                    "source",
+                    "v7_source",
+                    "action_audit_sha256",
+                ):
+                    checks.equal(
+                        row.get(identity_key),
+                        compact_row.get(identity_key),
+                        f"{label}.{identity_key}",
+                    )
+                checks.equal(
+                    row.get("source_archive_path"),
+                    str(Path(str(compact_row.get("path") or "")).resolve()),
+                    f"{label}.source_archive_path",
+                )
+                checks.equal(
+                    row.get("source_archive_sha256"),
+                    compact_row.get("artifact_sha256"),
+                    f"{label}.source_archive_sha256",
+                )
+            adapter_digest = str(row.get("action_audit_sha256") or "")
+            checks.expect(
+                LOWER_HEX64.fullmatch(adapter_digest) is not None,
+                f"{label}.action_audit_sha256 is invalid",
+            )
+            if LOWER_HEX64.fullmatch(adapter_digest) is not None:
+                sidecar_adapter_digests.add(adapter_digest)
+            if key[0] == "train":
+                train_fine_action_count += int(row.get("fine_action_count", 0) or 0)
+            artifact = Path(str(row.get("path") or ""))
+            expected_sha = str(row.get("artifact_sha256") or "")
+            checks.expect(artifact.is_file(), f"{label} artifact is missing: {artifact}")
+            checks.expect(
+                LOWER_HEX64.fullmatch(expected_sha) is not None,
+                f"{label} artifact SHA256 is invalid",
+            )
+            if not artifact.is_file() or LOWER_HEX64.fullmatch(expected_sha) is None:
+                continue
+            observed = sha256_file(artifact)
+            checks.equal(observed, expected_sha, f"{label}.artifact_sha256")
+            try:
+                with np.load(artifact, allow_pickle=False) as archive:
+                    checks.equal(
+                        _np_scalar(archive, "schema"),
+                        V8_ACTION_SIDECAR_SCHEMA,
+                        f"{label}.payload.schema",
+                    )
+                    checks.equal(
+                        _np_scalar(archive, "clip_hash"),
+                        key[1],
+                        f"{label}.payload.clip_hash",
+                    )
+                    for identity_key in (
+                        "split",
+                        "source",
+                        "v7_source",
+                        "source_archive_path",
+                        "source_archive_sha256",
+                        "action_audit_sha256",
+                    ):
+                        checks.equal(
+                            _np_scalar(archive, identity_key),
+                            row.get(identity_key),
+                            f"{label}.payload.{identity_key}",
+                        )
+                    checks.equal(
+                        int(_np_scalar(archive, "policy_hz")),
+                        20,
+                        f"{label}.payload.policy_hz",
+                    )
+                    checks.equal(
+                        int(_np_scalar(archive, "world_hz")),
+                        5,
+                        f"{label}.payload.world_hz",
+                    )
+                    actions = np.asarray(archive["fine_actions"], dtype=np.float32)
+                    checks.equal(actions.ndim, 2, f"{label}.fine_actions.ndim")
+                    if actions.ndim == 2:
+                        checks.equal(actions.shape[1], 7, f"{label}.fine_actions.dim")
+                        checks.equal(
+                            actions.shape[0],
+                            int(row.get("fine_action_count", -1)),
+                            f"{label}.fine_action_count",
+                        )
+                    checks.expect(
+                        bool(np.isfinite(actions).all()),
+                        f"{label}.fine_actions contains non-finite values",
+                    )
+                    native_indices = np.asarray(
+                        archive["native_frame_indices"], dtype=np.int64
+                    )
+                    checks.equal(
+                        native_indices.shape,
+                        (int(row.get("fine_action_count", -1)),),
+                        f"{label}.native_frame_indices",
+                    )
+                    composition_error = np.asarray(
+                        archive["composition_max_abs_by_dim"], dtype=np.float32
+                    )
+                    checks.equal(
+                        composition_error.shape,
+                        (7,),
+                        f"{label}.composition_error.shape",
+                    )
+                    checks.expect(
+                        bool(np.isfinite(composition_error).all())
+                        and bool((composition_error <= 2.0e-5).all()),
+                        f"{label}.composition error exceeds 2e-5",
+                    )
+                    checks.equal(
+                        int(_np_scalar(archive, "dropped_tail_actions")),
+                        int(row.get("dropped_tail_actions", -1)),
+                        f"{label}.dropped_tail_actions",
+                    )
+                    checks.expect(
+                        0 <= int(row.get("dropped_tail_actions", -1)) < 4,
+                        f"{label}.dropped_tail_actions must be in [0,3]",
+                    )
+            except (OSError, KeyError, ValueError) as exc:
+                checks.errors.append(f"{label} payload is invalid: {exc}")
+    except (OSError, json.JSONDecodeError) as exc:
+        checks.errors.append(f"robocasa action20 index is unreadable: {exc}")
+    checks.equal(sidecar_keys, compact_keys, "robocasa.action20 exact compact coverage")
+    report["rows"] = len(sidecar_keys)
+    try:
+        with np.load(stats_path, allow_pickle=False) as archive:
+            checks.equal(
+                _np_scalar(archive, "schema"),
+                V8_ACTION_STATS_SCHEMA,
+                "robocasa.action20_stats.schema",
+            )
+            checks.equal(
+                _np_scalar(archive, "split"),
+                "train",
+                "robocasa.action20_stats.split",
+            )
+            mean = np.asarray(archive["mean"], dtype=np.float32)
+            std = np.asarray(archive["std"], dtype=np.float32)
+            checks.equal(mean.shape, (6,), "robocasa.action20_stats.mean")
+            checks.equal(std.shape, (6,), "robocasa.action20_stats.std")
+            checks.expect(bool(np.isfinite(mean).all()), "action20 mean is non-finite")
+            checks.expect(
+                bool(np.isfinite(std).all()) and bool((std > 0.0).all()),
+                "action20 std must be finite and positive",
+            )
+            checks.expect(
+                int(_np_scalar(archive, "count")) > 0,
+                "action20 train stats count must be positive",
+            )
+            checks.equal(
+                int(_np_scalar(archive, "count")),
+                train_fine_action_count,
+                "robocasa.action20_stats.train_action_count",
+            )
+            input_indices = json.loads(
+                str(_np_scalar(archive, "input_indices_json"))
+            )
+            compact_resolved = str(compact_path.resolve())
+            checks.equal(
+                input_indices.get(compact_resolved),
+                data.get("compact_index_sha256"),
+                "robocasa.action20_stats.compact_index_sha256",
+            )
+            adapter_audits = json.loads(
+                str(_np_scalar(archive, "adapter_audits_json"))
+            )
+            checks.equal(
+                set(adapter_audits.values()),
+                sidecar_adapter_digests,
+                "robocasa.action20_stats.adapter_audits",
+            )
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        checks.errors.append(f"robocasa action20 stats are invalid: {exc}")
+    return report
+
+
 def _validate_training_assets(
     checks: _Checks,
     config: dict[str, Any],
@@ -356,6 +696,7 @@ def _validate_training_assets(
     model = config.get("model") or {}
     data = config.get("data") or {}
     contract = config.get("contract") or {}
+    action20_report = _validate_v8_action_sidecars(checks, data)
     checks.pinned_file(
         model.get("token_codec_checkpoint"),
         model.get("token_codec_checkpoint_sha256"),
@@ -486,7 +827,7 @@ def _validate_training_assets(
                 )
             except (OSError, json.JSONDecodeError) as exc:
                 checks.errors.append(f"canary gate is unreadable: {exc}")
-    return {"canary_gate": gate_report}
+    return {"canary_gate": gate_report, "action20": action20_report}
 
 
 def _row_matches_source(source: str, spec: dict[str, Any], row: dict[str, Any]) -> bool:
@@ -823,6 +1164,28 @@ def _validate_dataset_probe_v8(
         "point_tgt": None,
         "pose_geom_tgt": None,
     }
+    unified_action = bool(
+        (config.get("data") or {}).get("v8_dual_rate_action_enabled", False)
+    )
+    if unified_action:
+        required.update(
+            {
+                "v8_dynamics_action_cond": (8, DYNAMICS_ACTION_DIM),
+                "policy_action_tgt": (POLICY_HORIZON, 7),
+                "policy_action_tgt_norm": (POLICY_HORIZON, 6),
+                "policy_action_valid_mask": (POLICY_HORIZON,),
+                "policy_action_coarse_tgt": (
+                    POLICY_HORIZON // 4,
+                    7,
+                ),
+                "policy_action_coarse_tgt_norm": (
+                    POLICY_HORIZON // 4,
+                    6,
+                ),
+                "policy_action_coarse_valid_mask": (POLICY_HORIZON // 4,),
+                "action_history": (POLICY_HISTORY_LEN, POLICY_HISTORY_DIM),
+            }
+        )
     for name in EXPECTED_SOURCES:
         dataset = validation_sources.get(name)
         length = int(validation_lengths.get(name, 0) or 0)
@@ -875,6 +1238,68 @@ def _validate_dataset_probe_v8(
                     f"dataset_probe.{name}.{key} contains nonfinite values",
                 )
         sample_report["tensors"] = tensors
+        if unified_action:
+            checks.equal(
+                sample.get("v8_action_contract_version"),
+                V8_DUAL_RATE_ACTION_SCHEMA,
+                f"dataset_probe.{name}.v8_action_contract_version",
+            )
+            checks.equal(
+                sample.get("v8_action_history_schema"),
+                V8_POLICY_HISTORY_SCHEMA,
+                f"dataset_probe.{name}.v8_action_history_schema",
+            )
+            checks.expect(
+                bool(sample.get("v8_action_stats_key")),
+                f"dataset_probe.{name}.v8_action_stats_key is missing",
+            )
+            fine_mask = torch.as_tensor(sample["policy_action_valid_mask"]).bool()
+            coarse_mask = torch.as_tensor(
+                sample["policy_action_coarse_valid_mask"]
+            ).bool()
+            dynamics = torch.as_tensor(sample["v8_dynamics_action_cond"]).float()
+            checks.expect(
+                bool(coarse_mask.all()),
+                f"dataset_probe.{name} lacks factual 5 Hz composition labels",
+            )
+            if name.startswith("robocasa_"):
+                checks.expect(
+                    bool(fine_mask.all()),
+                    f"dataset_probe.{name} lacks real 20 Hz labels",
+                )
+                checks.expect(
+                    bool((dynamics[:, 28:32] == 1.0).all()),
+                    f"dataset_probe.{name} has invalid 20 Hz substep mask",
+                )
+                checks.expect(
+                    bool(torch.allclose(
+                        dynamics[:, 32:36],
+                        torch.full_like(dynamics[:, 32:36], 0.05),
+                        rtol=0.0,
+                        atol=1.0e-8,
+                    )),
+                    f"dataset_probe.{name} has invalid 20 Hz dt",
+                )
+            else:
+                checks.expect(
+                    not bool(fine_mask.any()),
+                    f"dataset_probe.{name} fabricated 20 Hz labels",
+                )
+                checks.expect(
+                    bool((dynamics[:, 28] == 1.0).all())
+                    and not bool((dynamics[:, 29:32] != 0.0).any()),
+                    f"dataset_probe.{name} has invalid coarse-only substep mask",
+                )
+                checks.expect(
+                    bool(torch.allclose(
+                        dynamics[:, 32],
+                        torch.full_like(dynamics[:, 32], 0.2),
+                        rtol=0.0,
+                        atol=1.0e-8,
+                    ))
+                    and not bool((dynamics[:, 33:36] != 0.0).any()),
+                    f"dataset_probe.{name} has invalid coarse-only dt",
+                )
         report["samples"][name] = sample_report
     return report
 
@@ -924,12 +1349,44 @@ def validate_preflight(
         "cache_contract_hashes": contract_hashes,
         "runtime_dependencies": runtime_dependencies,
         "action_objective": {
-            "direct_policy_weight": 1.0,
-            "policy_flow_weight": 0.25,
-            "native_action_no_teacher_weight": 0.15,
-            "native_future_no_teacher_weight": 0.20,
-            "native_action_start_step": 0,
-            "native_action_every": 1,
+            "contract_schema": (config.get("contract") or {}).get("schema"),
+            "v8_dual_rate_action_enabled": bool(
+                (config.get("train") or {}).get(
+                    "v8_dual_rate_action_enabled", False
+                )
+            ),
+            "serving_owner": (config.get("train") or {}).get(
+                "direct_policy_head"
+            ),
+            "gripper_owner": (config.get("train") or {}).get(
+                "direct_policy_grip_owner"
+            ),
+            "direct_policy_weight": float(
+                (config.get("train") or {}).get("direct_policy_weight", 0.0)
+            ),
+            "policy_flow_weight": float(
+                (config.get("train") or {}).get("policy_flow_weight", 0.0)
+            ),
+            "native_action_no_teacher_weight": float(
+                (config.get("train") or {}).get(
+                    "native_action_no_teacher_weight", 0.0
+                )
+            ),
+            "native_future_no_teacher_weight": float(
+                (config.get("train") or {}).get(
+                    "native_future_no_teacher_weight", 0.0
+                )
+            ),
+            "native_action_start_step": int(
+                (config.get("train") or {}).get(
+                    "native_action_no_teacher_start_step", 0
+                )
+            ),
+            "native_action_every": int(
+                (config.get("train") or {}).get(
+                    "native_action_no_teacher_every", 1
+                )
+            ),
             "factual_sources": list(EXPECTED_SOURCES),
         },
         "verified_artifacts": checks.verified_artifacts,

@@ -1,7 +1,9 @@
 """Dataset reader for the episode-shared WM3D-v7 compact cache."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,6 +15,25 @@ from .v8_causal_dual_view import (
     CAUSAL_DUAL_VIEW_SCHEMA,
     validate_causal_dual_view_archive,
 )
+from .v8_action_contract import (
+    POLICY_HISTORY_DIM,
+    POLICY_HISTORY_LEN,
+    PoseStats,
+    V8_ACTION_SIDECAR_INDEX_SCHEMA,
+    V8_ACTION_SIDECAR_SCHEMA,
+    V8_ACTION_STATS_SCHEMA,
+    build_real_20hz_window_contract,
+    require_v8_pinned_file,
+    torchify_v8_action_fields,
+)
+
+
+def _sha256_file(path: Path, chunk_bytes: int = 8 << 20) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while block := handle.read(chunk_bytes):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 @dataclass
@@ -26,6 +47,7 @@ class V7CompactDatasetConfig:
     seed: int = 0
     require_task_emb: bool = True
     action_stats: Path | None = None
+    action_stats_sha256: str | None = None
     require_action_stats: bool = True
     rgb_sidecar_indices: tuple[Path, ...] = ()
     require_rgb_sidecar: bool = False
@@ -34,6 +56,11 @@ class V7CompactDatasetConfig:
     policy_action_history_dim: int = 7
     causal_dual_view_required: bool = False
     causal_dual_view_representation: str | None = None
+    v8_dual_rate_action_enabled: bool = False
+    v8_action_sidecar_index: Path | None = None
+    v8_action_sidecar_index_sha256: str | None = None
+    v8_action_sidecar_stats: Path | None = None
+    v8_action_sidecar_stats_sha256: str | None = None
 
 
 @dataclass
@@ -58,7 +85,15 @@ class V7CompactWindowDataset(Dataset):
             raise ValueError("T, k, and stride must be positive")
         if cfg.policy_action_history_len < 0:
             raise ValueError("policy_action_history_len must be non-negative")
-        if cfg.policy_action_history_dim != 7:
+        if cfg.v8_dual_rate_action_enabled:
+            if (
+                cfg.policy_action_history_len != POLICY_HISTORY_LEN
+                or cfg.policy_action_history_dim != POLICY_HISTORY_DIM
+            ):
+                raise ValueError(
+                    "V8 dual-rate compact policy history must be exact [16,9]"
+                )
+        elif cfg.policy_action_history_dim != 7:
             raise ValueError("canonical V7 policy action history must be 7D")
         if cfg.causal_dual_view_required:
             if (
@@ -81,6 +116,101 @@ class V7CompactWindowDataset(Dataset):
                             raise ValueError(f"missing geometry pseudo-teacher provenance: {row.get('clip_hash')}")
                         rows.append(row)
         self.records = rows
+        self.v8_action_records: dict[str, dict] = {}
+        self._v8_action_array_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._v8_action_array_cache_capacity = 64
+        self.v8_fine_action_stats: PoseStats | None = None
+        self.v8_coarse_action_stats_key: str | None = None
+        if cfg.v8_dual_rate_action_enabled:
+            required_paths = (
+                cfg.v8_action_sidecar_index,
+                cfg.v8_action_sidecar_stats,
+            )
+            required_digests = (
+                cfg.v8_action_sidecar_index_sha256,
+                cfg.v8_action_sidecar_stats_sha256,
+            )
+            if any(path is None for path in required_paths) or any(
+                not digest for digest in required_digests
+            ):
+                raise ValueError(
+                    "V8 dual-rate compact mode requires pinned sidecar index and stats"
+                )
+            sidecar_index = Path(cfg.v8_action_sidecar_index).resolve()
+            sidecar_stats = Path(cfg.v8_action_sidecar_stats).resolve()
+            for path, expected, label in (
+                (
+                    sidecar_index,
+                    str(cfg.v8_action_sidecar_index_sha256),
+                    "V8 action sidecar index",
+                ),
+                (
+                    sidecar_stats,
+                    str(cfg.v8_action_sidecar_stats_sha256),
+                    "V8 action sidecar stats",
+                ),
+            ):
+                if path.is_symlink() or not path.is_file():
+                    raise FileNotFoundError(f"{label} is missing/not regular: {path}")
+                observed = _sha256_file(path)
+                if observed != expected:
+                    raise RuntimeError(
+                        f"{label} digest mismatch: observed={observed} expected={expected}"
+                    )
+            with sidecar_index.open(encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    action_row = json.loads(line)
+                    if action_row.get("schema") != V8_ACTION_SIDECAR_INDEX_SCHEMA:
+                        raise ValueError(
+                            f"unexpected V8 action sidecar schema at line {line_number}"
+                        )
+                    clip_hash = str(action_row.get("clip_hash", ""))
+                    if not clip_hash or clip_hash in self.v8_action_records:
+                        raise ValueError(
+                            f"blank/duplicate V8 action sidecar clip_hash {clip_hash!r}"
+                        )
+                    action_path = Path(action_row["path"])
+                    if action_path.is_symlink() or not action_path.is_file():
+                        raise FileNotFoundError(action_path)
+                    self.v8_action_records[clip_hash] = action_row
+            missing = [
+                row["clip_hash"]
+                for row in rows
+                if row["clip_hash"] not in self.v8_action_records
+            ]
+            if missing:
+                raise ValueError(
+                    f"V8 action sidecars omit {len(missing)} compact clips; first={missing[:8]}"
+                )
+            for row in rows:
+                action_row = self.v8_action_records[row["clip_hash"]]
+                for key in ("split", "source", "v7_source", "action_audit_sha256"):
+                    if str(action_row.get(key)) != str(row.get(key)):
+                        raise ValueError(
+                            f"V8 action sidecar {key} mismatch: {row['clip_hash']}"
+                        )
+            with np.load(sidecar_stats, allow_pickle=False) as stats:
+                if str(np.asarray(stats["schema"]).item()) != V8_ACTION_STATS_SCHEMA:
+                    raise ValueError("unexpected V8 action stats schema")
+                if str(np.asarray(stats["split"]).item()) != "train":
+                    raise ValueError("V8 action stats must be fit on train only")
+                self.v8_fine_action_stats = PoseStats(
+                    mean=np.asarray(stats["mean"], dtype=np.float32),
+                    std=np.asarray(stats["std"], dtype=np.float32),
+                    key=f"robocasa20:{cfg.v8_action_sidecar_stats_sha256}",
+                )
+            if cfg.action_stats is None:
+                raise ValueError("V8 dual-rate compact mode requires action_stats")
+            action_stats_path = require_v8_pinned_file(
+                cfg.action_stats,
+                str(cfg.action_stats_sha256 or ""),
+                label="V8 RoboCasa coarse action stats",
+            )
+            self.v8_coarse_action_stats_key = (
+                f"robocasa5:{cfg.action_stats_sha256}"
+            )
         self.rgb_records: dict[str, dict] = {}
         for index_path in cfg.rgb_sidecar_indices:
             with Path(index_path).open(encoding="utf-8") as handle:
@@ -237,6 +367,48 @@ class V7CompactWindowDataset(Dataset):
         )
         return bool(generator.random() < self.cfg.view_dropout)
 
+    def _load_v8_fine_actions(self, row: dict) -> np.ndarray:
+        clip_hash = str(row["clip_hash"])
+        cached = self._v8_action_array_cache.get(clip_hash)
+        if cached is not None:
+            self._v8_action_array_cache.move_to_end(clip_hash)
+            return cached
+        action_row = self.v8_action_records.get(clip_hash)
+        if action_row is None:
+            raise RuntimeError(f"V8 action sidecar is missing {clip_hash}")
+        path = Path(action_row["path"])
+        observed_sha256 = _sha256_file(path)
+        expected_sha256 = str(action_row.get("artifact_sha256", ""))
+        if not expected_sha256 or observed_sha256 != expected_sha256:
+            raise RuntimeError(
+                "V8 action sidecar digest mismatch "
+                f"{clip_hash}: observed={observed_sha256} expected={expected_sha256}"
+            )
+        with np.load(path, allow_pickle=False) as archive:
+            if str(np.asarray(archive["schema"]).item()) != V8_ACTION_SIDECAR_SCHEMA:
+                raise ValueError(f"unexpected V8 action sidecar payload: {clip_hash}")
+            for key in (
+                "clip_hash",
+                "split",
+                "source",
+                "v7_source",
+                "action_audit_sha256",
+            ):
+                if str(np.asarray(archive[key]).item()) != str(action_row.get(key)):
+                    raise ValueError(
+                        f"V8 action sidecar payload identity mismatch {key}: {clip_hash}"
+                    )
+            actions = np.asarray(archive["fine_actions"], dtype=np.float32)
+        if actions.ndim != 2 or actions.shape[1] != 7 or not np.isfinite(actions).all():
+            raise ValueError(f"invalid V8 fine action sidecar: {clip_hash}")
+        if int(action_row.get("fine_action_count", -1)) != len(actions):
+            raise ValueError(f"V8 fine action count mismatch: {clip_hash}")
+        self._v8_action_array_cache[clip_hash] = actions
+        self._v8_action_array_cache.move_to_end(clip_hash)
+        while len(self._v8_action_array_cache) > self._v8_action_array_cache_capacity:
+            self._v8_action_array_cache.popitem(last=False)
+        return actions
+
     def __getitem__(self, sample_index: int) -> dict:
         record_index, start = self.index[sample_index]
         row = self.records[record_index]
@@ -320,7 +492,10 @@ class V7CompactWindowDataset(Dataset):
         action_window = actions[action_start : action_start + k]
         previous_grip = actions[action_start - 1 : action_start, 6]
         action_history = None
-        if self.cfg.policy_action_history_len > 0:
+        if (
+            self.cfg.policy_action_history_len > 0
+            and not self.cfg.v8_dual_rate_action_enabled
+        ):
             history_start = action_start - self.cfg.policy_action_history_len
             if history_start < 0:
                 raise RuntimeError(f"short canonical action history: {row['clip_hash']}")
@@ -377,6 +552,24 @@ class V7CompactWindowDataset(Dataset):
         }
         if action_history is not None:
             sample["action_history"] = torch.from_numpy(action_history)
+        if self.cfg.v8_dual_rate_action_enabled:
+            if self.v8_fine_action_stats is None:
+                raise RuntimeError("V8 fine action statistics were not initialized")
+            if self.v8_coarse_action_stats_key is None:
+                raise RuntimeError("V8 coarse action statistics were not initialized")
+            v8_fields = build_real_20hz_window_contract(
+                fine_actions=self._load_v8_fine_actions(row),
+                world_actions=actions,
+                world_action_start=action_start,
+                world_horizon=k,
+                fine_stats=self.v8_fine_action_stats,
+                coarse_stats=PoseStats(
+                    mean=self.action_mean,
+                    std=self.action_std,
+                    key=self.v8_coarse_action_stats_key,
+                ),
+            )
+            sample.update(torchify_v8_action_fields(v8_fields))
         if not self.cfg.action_only:
             if self.cfg.causal_dual_view_required:
                 target_arrays = (future, depth, depth_conf, points, point_conf, pose)

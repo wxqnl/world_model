@@ -5,58 +5,47 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python}
 cd "${ROOT}"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONDONTWRITEBYTECODE=1
 
 usage() {
   cat <<'EOF'
 用法：
   ./run_v8.sh check
-  ./run_v8.sh stage0-static
-  ./run_v8.sh stage1-static [phase-config]
-  ./run_v8.sh stage1-data [phase-config]
+  ./run_v8.sh static [config]
+  ./run_v8.sh full <sealed-runtime-config> <report.json>
+  ./run_v8.sh transition <step_XXXXXXXX.pt> <sealed-stage0-config> <report.json>
 
-正式训练仍由封存的 Stage0/Stage1 启动脚本执行；本入口不自动跨阶段晋级。
+该入口负责代码自检、preflight 和 Stage0→下游继承审计，不自动启动或跨 milestone 晋级训练。
 EOF
 }
 
-stage1_cfg=${2:-configs/wm3d_v7_stage1_planner_dynamics10k.yaml}
+DEFAULT_CONFIG=configs/wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v2.yaml
 
 case "${1:-}" in
   check)
-    "${PYTHON_BIN}" -m compileall -q wm3d_v3 scripts tests
-    bash -n \
-      scripts/launch_wm3d_v7_1b_actionpolicy_joint_canary1000_node43_v3.sh \
-      scripts/launch_wm3d_v7_1b_actionpolicy_joint_formal100k_node_v3.sh \
-      scripts/start_wm3d_v7_1b_actionpolicy_joint_formal100k_3node24_v3.sh \
-      scripts/launch_wm3d_v7_stage1_planner.sh \
-      scripts/launch_wm3d_v8_stage0_causal_dual_view_canary.sh
-    "${PYTHON_BIN}" -m pytest -q \
-      tests/test_v7_action_loss_contract.py \
-      tests/test_v7_native_action_loss.py \
-      tests/test_v7_action_policy_transition.py \
-      tests/test_v7_distributed_transport.py \
-      tests/test_v7_compact_dataset.py \
-      tests/test_v7_compact_sharding.py \
-      tests/test_v7_data_contracts.py \
-      tests/test_v7_stage1_planner.py \
-      tests/test_v7_stage1_planner_contract.py \
-      tests/test_v8_causal_dual_view.py \
-      tests/test_v8_causal_dual_view_cache_builders.py \
-      tests/test_v8_causal_dual_view_datasets.py \
-      tests/test_v8_stage0_causal_dual_view_preflight.py \
-      tests/test_v8_stage0_causal_dual_view_review.py
+    "${PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+
+roots = (Path("wm3d_v3"), Path("scripts"), Path("tests"))
+files = sorted(path for root in roots for path in root.rglob("*.py"))
+for path in files:
+    compile(path.read_bytes(), str(path), "exec")
+print(f"compiled {len(files)} Python files")
+PY
+    bash -n run_v8.sh
+    "${PYTHON_BIN}" -m pytest -q -p no:cacheprovider tests
     ;;
-  stage0-static)
-    "${PYTHON_BIN}" scripts/preflight_wm3d_v7_1b_actionpolicy_joint.py \
-      --config configs/wm3d_v7_1b_native_actionpolicy_joint_formal100k_3node24_v3.yaml \
-      --mode static
+  static)
+    config=${2:-${DEFAULT_CONFIG}}
+    "${PYTHON_BIN}" scripts/preflight_wm3d_v8_stage0_causal_dual_view.py       --config "${config}" --mode static
     ;;
-  stage1-static)
-    "${PYTHON_BIN}" scripts/preflight_wm3d_v7_stage1_planner.py \
-      --cfg "${stage1_cfg}" --mode static
+  full)
+    [[ $# -eq 3 ]] || { usage; exit 2; }
+    "${PYTHON_BIN}" scripts/preflight_wm3d_v8_stage0_causal_dual_view.py       --config "$2" --mode full --json-out "$3"
     ;;
-  stage1-data)
-    "${PYTHON_BIN}" scripts/preflight_wm3d_v7_stage1_planner.py \
-      --cfg "${stage1_cfg}" --mode data
+  transition)
+    [[ $# -eq 4 ]] || { usage; exit 2; }
+    "${PYTHON_BIN}" scripts/audit_wm3d_v8_stage0_libero_transition.py       --checkpoint "$2" --expected-config "$3" --report "$4"
     ;;
   *)
     usage

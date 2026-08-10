@@ -1,0 +1,53 @@
+_base_: wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2.yaml
+
+contract:
+  schema: wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2
+  profile: formal
+  purpose: full_native3d_5hz_with_unified_executable_action20hz
+  canary_required: true
+  canary_config: configs/wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2.yaml
+  canary_gate_receipt: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/audits/unified_action_canary_v2/formal_gate.json
+  canary_gate_receipt_sha256: PENDING_UNIFIED_ACTION_CANARY_GATE_SHA256
+
+data:
+  compact_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/robocasa/index.jsonl
+  compact_index_sha256: PENDING_FORMAL_ROBOCASA_INDEX_SHA256
+  v8_action_sidecar_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/robocasa/action20_index.jsonl
+  v8_action_sidecar_index_sha256: PENDING_FORMAL_ACTION20_INDEX_SHA256
+  v8_action_sidecar_stats: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/robocasa/action20_stats_train.npz
+  v8_action_sidecar_stats_sha256: PENDING_FORMAL_ACTION20_STATS_SHA256
+  direct_policy_oxe_overrides:
+    max_windows_per_episode: 0
+
+train:
+  run_lineage: wm3d_v8_stage0_causal_dual_view_unified_action20_formal100k_20260810_v2
+  num_nodes: 3
+  gpus_per_node: 8
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 2
+  effective_global_batch: 96
+  max_steps: 100000
+  main_promotion_step: 100000
+  planned_review_stop_step: 100000
+  extension_cap_steps: 100000
+  warmup_steps: 2000
+  ckpt_every_steps: 5000
+  checkpoint_milestone_steps: [1000, 5000, 10000, 25000, 50000, 80000, 100000]
+  log_every: 20
+  grad_probe_every: 100
+  milestone_reviews:
+    fail_closed: true
+    pause_on_missing_or_failed_review: true
+    required_review_steps: [1000, 5000, 10000, 25000, 50000, 80000, 100000]
+
+lr_schedule:
+  type: wsd
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+  stable_frac: 0.78
+  decay_frac: 0.20
+
+out:
+  root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/results/unified_action_formal100k_v2
+  require_empty_checkpoint_dir: true

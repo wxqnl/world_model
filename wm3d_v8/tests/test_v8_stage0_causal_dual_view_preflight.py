@@ -42,9 +42,9 @@ MIX = {
 @pytest.mark.parametrize(
     "name,profile,max_steps",
     [
-        ("wm3d_v8_stage0_causal_dual_view_actionpolicy_canary.yaml",
+        ("wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2.yaml",
          "canary_non_inheritable", 100),
-        ("wm3d_v8_stage0_causal_dual_view_actionpolicy_formal.yaml",
+        ("wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2.yaml",
          "formal", 100000),
     ],
 )
@@ -65,14 +65,17 @@ def test_resolved_configs_lock_causal_action_policy_contract(
         "rgb", "depth", "point", "pose"
     ]
     assert model["enable_action_policy"] is True
-    assert model["policy_enable_flow_head"] is True
+    assert model["policy_enable_flow_head"] is False
     assert model["policy_flow_use_as_policy"] is False
-    assert model["policy_grip_owner"] == "delta_composed"
+    assert model["policy_grip_owner"] == "absolute"
+    assert model["policy_horizon"] == 8
+    assert model["state"]["action_cond_dim"] == 36
+    assert model["action"]["action_cond_dim"] == 36
 
     assert train["joint_native_action_pretraining"] is True
     assert train["direct_policy_weight"] == 1.0
-    assert train["policy_flow_weight"] == 0.25
-    assert train["native_action_no_teacher_weight"] == 0.15
+    assert train["policy_flow_weight"] == 0.0
+    assert train["native_action_no_teacher_weight"] == 0.0
     assert train["native_action_no_teacher_start_step"] == 0
     assert train["native_action_no_teacher_every"] == 1
     assert train["native_future_no_teacher_weight"] == 0.20
@@ -90,6 +93,7 @@ def test_resolved_configs_lock_causal_action_policy_contract(
     assert "causal_dual_view" in train["run_lineage"]
 
     assert data["T"] == 16 and data["k"] == 8
+    assert data["v8_dual_rate_action_enabled"] is True
     assert data["compact_causal_dual_view_required"] is True
     assert data["compact_causal_dual_view_representation"] == REPRESENTATION
     assert set(data["causal_dual_view_indices"]) == set(MIX)
@@ -223,12 +227,18 @@ def test_runtime_overlay_preserves_exact_resume_training_schedule(
         oxe_paths[source] = [path]
     robocasa = tmp_path / "robocasa.jsonl"
     robocasa.write_text("{}\n")
+    action_index = tmp_path / "action20.jsonl"
+    action_index.write_text("{}\n")
+    action_stats = tmp_path / "action20_stats.npz"
+    action_stats.write_bytes(b"sealed stats")
     out_root = tmp_path / "results"
 
     overlay = _runtime_overlay(
         base_config=base,
         oxe_paths=oxe_paths,
         combined_robocasa_index=robocasa,
+        action_sidecar_index=action_index,
+        action_sidecar_stats=action_stats,
         max_steps=100,
         initial_stop_step=20,
         out_root=out_root,
@@ -251,6 +261,18 @@ def test_runtime_overlay_preserves_exact_resume_training_schedule(
         "window_geom_shard_index": None,
         "window_geom_shard_root": None,
     }
+    assert overlay["data"]["v8_action_sidecar_index"] == str(
+        action_index.resolve()
+    )
+    assert overlay["data"]["v8_action_sidecar_index_sha256"] == _sha(
+        action_index
+    )
+    assert overlay["data"]["v8_action_sidecar_stats"] == str(
+        action_stats.resolve()
+    )
+    assert overlay["data"]["v8_action_sidecar_stats_sha256"] == _sha(
+        action_stats
+    )
 
 
 def test_runtime_overlay_rejects_split_oxe_window_directories(
@@ -266,19 +288,25 @@ def test_runtime_overlay_rejects_split_oxe_window_directories(
         oxe_paths[source] = [path]
     robocasa = tmp_path / "robocasa.jsonl"
     robocasa.write_text("{}\n")
+    action_index = tmp_path / "action20.jsonl"
+    action_index.write_text("{}\n")
+    action_stats = tmp_path / "action20_stats.npz"
+    action_stats.write_bytes(b"sealed stats")
 
     with pytest.raises(ValueError, match="one shared window directory"):
         _runtime_overlay(
             base_config=base,
             oxe_paths=oxe_paths,
             combined_robocasa_index=robocasa,
+            action_sidecar_index=action_index,
+            action_sidecar_stats=action_stats,
         )
 
 
 def _config(tmp_path: Path, legacy_source=None):
     cfg = load_config(
         ROOT / "configs" /
-        "wm3d_v8_stage0_causal_dual_view_actionpolicy_canary.yaml"
+        "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2.yaml"
     )
     indices = {}
     for source in ("oxe_droid_action", "oxe_bridge_action"):
@@ -431,38 +459,24 @@ def test_full_dataset_probe_requires_each_source_to_fill_global_batch(
     )
 
 
-def test_canary_launcher_supports_fresh_then_exact_resume_v10() -> None:
-    launcher = (
-        ROOT / "scripts" /
-        "launch_wm3d_v8_stage0_causal_dual_view_canary.sh"
-    ).read_text()
-
-    assert "runtime_config_canary100_v10.yaml" in launcher
-    assert "seal_report_canary100_v10.json" in launcher
-    assert "results/training_canary100_v10" in launcher
-    assert "logs/training_canary100_v10" in launcher
-    assert "training_canary100_v9" not in launcher
-    assert '"resume-check"' in launcher
-    assert '"resume"' in launcher
-    assert 'int(train.get("max_steps", -1)) != 100' in launcher
-    assert 'int(train.get("canary_initial_stop_step", -1)) != 20' in launcher
-    assert "--stop_after_step 20" in launcher
-    assert "--stop_after_step 100" in launcher
-    assert "--strict_resume" in launcher
-    assert '--exact-resume-checkpoint "${RESUME_CKPT}"' in launcher
-    assert "WM3D_V8_CANARY_RESUME_SHA256" in launcher
-    assert "step_00000020.pt" in launcher
-    assert "train_rank0_fresh_0_to_20.log" in launcher
-    assert "train_rank0_resume_20_to_100.log" in launcher
-    assert "training_canary20_v1" not in launcher
-    assert "training_canary20_v2" not in launcher
-    assert "training_canary20_v3" not in launcher
-    assert "training_canary20_v4" not in launcher
-    assert "training_canary20_v5" not in launcher
-    assert "training_canary20_v6" not in launcher
-    assert "training_canary20_v7" not in launcher
-    assert "training_canary20_v8" not in launcher
-
+def test_world16_v2_config_is_global64_and_unified_action() -> None:
+    cfg = load_config(
+        ROOT
+        / "configs"
+        / "wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v2.yaml"
+    )
+    assert cfg["contract"]["schema"] == (
+        "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2"
+    )
+    assert cfg["contract"]["serving_action_owner"] == (
+        "unified_base_policy_pose6_absolute_gripper"
+    )
+    assert cfg["train"]["num_nodes"] == 2
+    assert cfg["train"]["gpus_per_node"] == 8
+    assert cfg["train"]["batch_size_per_gpu"] == 2
+    assert cfg["train"]["gradient_accumulation_steps"] == 2
+    assert cfg["train"]["effective_global_batch"] == 64
+    assert cfg["train"]["max_steps"] == 100000
 
 def test_fresh_checkpoint_guard_allows_explicit_exact_resume(
     tmp_path: Path,

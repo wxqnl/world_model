@@ -56,6 +56,14 @@ from .v8_causal_dual_view import (
     CAUSAL_DUAL_VIEW_REPRESENTATION,
     validate_causal_dual_view_archive,
 )
+from .v8_action_contract import (
+    POLICY_HISTORY_DIM,
+    POLICY_HISTORY_LEN,
+    PoseStats,
+    build_coarse_5hz_window_contract,
+    require_v8_pinned_file,
+    torchify_v8_action_fields,
+)
 
 
 def _rss_mib() -> float:
@@ -134,11 +142,16 @@ class WindowConfig:
     canonical_action_enabled: bool = False
     canonical_action_sources: tuple[str, ...] = ()
     canonical_action_stats_by_source: dict[str, Path] | None = None
+    canonical_action_stats_sha256_by_source: dict[str, str] | None = None
     # Content-addressed offline canonicalization output.  This is mandatory in
     # canonical mode: runtime never replays whole-episode Euler/SO(3) Python
     # conversion and never depends on raw DROID state sidecars.
     canonical_action_cache_manifest: Path | None = None
     canonical_action_cache_manifest_sha256: str | None = None
+    # V8 keeps the native world lane at 5 Hz but exposes a 20 Hz policy lane.
+    # OXE only owns audited 5 Hz intervals, so this mode emits coarse
+    # composition supervision and never fabricates controller-rate labels.
+    v8_dual_rate_action_enabled: bool = False
 
 
 def _safe(cid: str) -> str:
@@ -733,6 +746,38 @@ class OXEWindowDataset(Dataset):
                     "canonical stats/source allowlist mismatch: "
                     f"missing={missing_stats} extra={extra_stats}"
                 )
+            if self.cfg.v8_dual_rate_action_enabled:
+                raw_stats_sha = self.cfg.canonical_action_stats_sha256_by_source
+                if not isinstance(raw_stats_sha, dict):
+                    raise CanonicalActionContractError(
+                        "V8 dual-rate OXE requires "
+                        "canonical_action_stats_sha256_by_source"
+                    )
+                normalized_stats_sha: dict[str, str] = {}
+                for raw_source, expected_sha in raw_stats_sha.items():
+                    source = canonical_action_source(raw_source)
+                    if source in normalized_stats_sha:
+                        raise CanonicalActionContractError(
+                            f"duplicate canonical action stats SHA source {source!r}"
+                        )
+                    normalized_stats_sha[source] = str(expected_sha)
+                missing_sha = sorted(
+                    self._canonical_action_sources - set(normalized_stats_sha)
+                )
+                extra_sha = sorted(
+                    set(normalized_stats_sha) - self._canonical_action_sources
+                )
+                if missing_sha or extra_sha:
+                    raise CanonicalActionContractError(
+                        "canonical stats SHA/source allowlist mismatch: "
+                        f"missing={missing_sha} extra={extra_sha}"
+                    )
+                for source in sorted(self._canonical_action_sources):
+                    require_v8_pinned_file(
+                        normalized_stats_paths[source],
+                        normalized_stats_sha[source],
+                        label=f"V8 OXE {source} action stats",
+                    )
             self._canonical_action_stats = {
                 source: load_canonical_action_stats(
                     normalized_stats_paths[source], expected_source=source
@@ -832,6 +877,18 @@ class OXEWindowDataset(Dataset):
                         f"canonical source {source} temporal evidence does not "
                         "match action_contract_evidence_sha256"
                     )
+        if self.cfg.v8_dual_rate_action_enabled:
+            if not self.cfg.canonical_action_enabled:
+                raise CanonicalActionContractError(
+                    "V8 dual-rate OXE mode requires the strict canonical action cache"
+                )
+            if (
+                self.cfg.policy_action_history_len != POLICY_HISTORY_LEN
+                or self.cfg.policy_action_history_dim != POLICY_HISTORY_DIM
+            ):
+                raise CanonicalActionContractError(
+                    "V8 dual-rate OXE policy history must be exact [16,9]"
+                )
         self._all_records_canonical = bool(
             self.cfg.canonical_action_enabled
             and all(
@@ -1659,7 +1716,10 @@ class OXEWindowDataset(Dataset):
 
         # Canonical action history is causal and comes from the already-audited
         # action stream; it does not depend on optional proprio/geometry caches.
-        if self.cfg.policy_action_history_len > 0:
+        if (
+            self.cfg.policy_action_history_len > 0
+            and not self.cfg.v8_dual_rate_action_enabled
+        ):
             if self.cfg.canonical_action_enabled:
                 # Never consume a legacy precomputed action_history in
                 # canonical mode: it can contain pooled normalization, RPY
@@ -1711,6 +1771,21 @@ class OXEWindowDataset(Dataset):
                         self.cfg.policy_action_history_dim,
                     )
             sample["action_history"] = torch.from_numpy(hist).float()
+        if self.cfg.v8_dual_rate_action_enabled:
+            if canonical_stats is None or not canonical_action_valid:
+                raise CanonicalActionContractError(
+                    f"V8 dual-rate factual source has no canonical stats: {rec.clip_id}"
+                )
+            v8_fields = build_coarse_5hz_window_contract(
+                episode_actions=episode_actions,
+                action_indices=action_indices,
+                coarse_stats=PoseStats(
+                    mean=np.asarray(canonical_stats.mean, dtype=np.float32),
+                    std=np.asarray(canonical_stats.std, dtype=np.float32),
+                    key=str(canonical_stats.stats_key),
+                ),
+            )
+            sample.update(torchify_v8_action_fields(v8_fields))
 
         progress_arr = _npz_first(geom, ("progress", "progress_tgt"))
         if progress_arr is not None:

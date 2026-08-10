@@ -61,6 +61,16 @@ from wm3d_v3.data.v7_compact_dataset import (
     V7SameRootBranchDataset,
     V7SameRootBranchDatasetConfig,
 )
+from wm3d_v3.data.v8_action_contract import (
+    DYNAMICS_ACTION_DIM as V8_DYNAMICS_ACTION_DIM,
+    POLICY_HISTORY_DIM as V8_POLICY_HISTORY_DIM,
+    POLICY_HISTORY_LEN as V8_POLICY_HISTORY_LEN,
+    POLICY_HORIZON as V8_POLICY_HORIZON,
+    SUBSTEPS_PER_WORLD as V8_SUBSTEPS_PER_WORLD,
+    V8_DUAL_RATE_ACTION_SCHEMA,
+    V8_POLICY_HISTORY_SCHEMA,
+    compose_base_delta_actions_torch,
+)
 from wm3d_v3.data.window_dataset import OXEWindowDataset, WindowConfig
 from wm3d_v3.losses import (
     LossWeights,
@@ -125,6 +135,7 @@ _DIRECT_POLICY_OXE_OVERRIDE_KEYS = frozenset(
         "policy_plan_state_dim",
         "policy_action_history_len",
         "policy_action_history_dim",
+        "v8_dual_rate_action_enabled",
         "window_geom_shard_index",
         "window_geom_shard_root",
     }
@@ -1317,6 +1328,7 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
     canonical_action_enabled = bool(data_cfg.get("canonical_action_enabled", False))
     canonical_action_sources: tuple[str, ...] = ()
     canonical_action_stats_by_source: dict[str, Path] | None = None
+    canonical_action_stats_sha256_by_source: dict[str, str] | None = None
     canonical_action_cache_manifest: Path | None = None
     canonical_action_cache_manifest_sha256: str | None = None
     action_contract_evidence_sha256: str | None = None
@@ -1352,6 +1364,18 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
         canonical_action_stats_by_source = {
             str(source): Path(path) for source, path in raw_stats.items()
         }
+        raw_stats_sha = data_cfg.get(
+            "canonical_action_stats_sha256_by_source"
+        )
+        if raw_stats_sha is not None:
+            if not isinstance(raw_stats_sha, dict):
+                raise ValueError(
+                    "canonical_action_stats_sha256_by_source must be a mapping"
+                )
+            canonical_action_stats_sha256_by_source = {
+                str(source): str(digest)
+                for source, digest in raw_stats_sha.items()
+            }
         canonical_action_cache_manifest = Path(
             data_cfg["canonical_action_cache_manifest"]
         )
@@ -1428,8 +1452,12 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
                         canonical_action_enabled=canonical_action_enabled,
                         canonical_action_sources=canonical_action_sources,
                         canonical_action_stats_by_source=canonical_action_stats_by_source,
+                        canonical_action_stats_sha256_by_source=canonical_action_stats_sha256_by_source,
                         canonical_action_cache_manifest=canonical_action_cache_manifest,
-                        canonical_action_cache_manifest_sha256=canonical_action_cache_manifest_sha256)
+                        canonical_action_cache_manifest_sha256=canonical_action_cache_manifest_sha256,
+                        v8_dual_rate_action_enabled=bool(
+                            data_cfg.get("v8_dual_rate_action_enabled", False)
+                        ))
 
 
 def _sample_record(dataset, sample_idx: int):
@@ -3283,6 +3311,7 @@ def build_datasets(cfg: dict, overfit_ids=None):
                 if data_cfg.get("action_stats")
                 else None
             ),
+            "action_stats_sha256": data_cfg.get("action_stats_sha256"),
             "require_action_stats": bool(data_cfg.get("require_action_stats", True)),
             "rgb_sidecar_indices": tuple(
                 Path(path) for path in data_cfg.get("rgb_sidecar_indices", ())
@@ -3308,6 +3337,23 @@ def build_datasets(cfg: dict, overfit_ids=None):
                     (cfg.get("model") or {}).get("policy_action_history_dim", 7),
                 )
                 or 7
+            ),
+            "v8_dual_rate_action_enabled": bool(
+                data_cfg.get("v8_dual_rate_action_enabled", False)
+            ),
+            "v8_action_sidecar_index": (
+                Path(data_cfg["v8_action_sidecar_index"])
+                if data_cfg.get("v8_action_sidecar_index") else None
+            ),
+            "v8_action_sidecar_index_sha256": data_cfg.get(
+                "v8_action_sidecar_index_sha256"
+            ),
+            "v8_action_sidecar_stats": (
+                Path(data_cfg["v8_action_sidecar_stats"])
+                if data_cfg.get("v8_action_sidecar_stats") else None
+            ),
+            "v8_action_sidecar_stats_sha256": data_cfg.get(
+                "v8_action_sidecar_stats_sha256"
             ),
         }
         robocasa_train = V7CompactWindowDataset(
@@ -3395,7 +3441,7 @@ def build_datasets(cfg: dict, overfit_ids=None):
                 "T": int(data_cfg["T"]),
                 "k": int(data_cfg["k"]),
                 "require_task_emb": bool(data_cfg.get("require_task_emb", True)),
-                "action_stats": (
+            "action_stats": (
                     Path(data_cfg["action_stats"])
                     if data_cfg.get("action_stats")
                     else None
@@ -3478,6 +3524,7 @@ def build_datasets(cfg: dict, overfit_ids=None):
             "seed": int(data_cfg.get("seed", 0)),
             "require_task_emb": bool(data_cfg.get("require_task_emb", True)),
             "action_stats": Path(data_cfg["action_stats"]) if data_cfg.get("action_stats") else None,
+            "action_stats_sha256": data_cfg.get("action_stats_sha256"),
             "require_action_stats": bool(data_cfg.get("require_action_stats", True)),
             "rgb_sidecar_indices": tuple(
                 Path(path) for path in data_cfg.get("rgb_sidecar_indices", ())
@@ -3503,6 +3550,23 @@ def build_datasets(cfg: dict, overfit_ids=None):
                     (cfg.get("model") or {}).get("policy_action_history_dim", 7),
                 )
                 or 7
+            ),
+            "v8_dual_rate_action_enabled": bool(
+                data_cfg.get("v8_dual_rate_action_enabled", False)
+            ),
+            "v8_action_sidecar_index": (
+                Path(data_cfg["v8_action_sidecar_index"])
+                if data_cfg.get("v8_action_sidecar_index") else None
+            ),
+            "v8_action_sidecar_index_sha256": data_cfg.get(
+                "v8_action_sidecar_index_sha256"
+            ),
+            "v8_action_sidecar_stats": (
+                Path(data_cfg["v8_action_sidecar_stats"])
+                if data_cfg.get("v8_action_sidecar_stats") else None
+            ),
+            "v8_action_sidecar_stats_sha256": data_cfg.get(
+                "v8_action_sidecar_stats_sha256"
             ),
         }
         train_dataset = V7CompactWindowDataset(
@@ -3820,6 +3884,18 @@ def batch_to_device(
         "renderer_action_cond",
         "renderer_zero_action_cond",
         "native_action_cond",
+        "v8_dynamics_action_cond",
+        "policy_action_tgt",
+        "policy_action_tgt_norm",
+        "policy_action_valid_mask",
+        "policy_action_coarse_tgt",
+        "policy_action_coarse_tgt_norm",
+        "policy_action_coarse_valid_mask",
+        "policy_action_pose_mean",
+        "policy_action_pose_std",
+        "policy_action_coarse_pose_mean",
+        "policy_action_coarse_pose_std",
+        "policy_action_prev_grip",
     ):
         if key in batch:
             tgt[key] = batch[key].to(device, non_blocking=True)
@@ -3849,6 +3925,49 @@ def batch_to_device(
         if not bool(torch.isfinite(native_action_cond).all()):
             raise RuntimeError("native_action_cond contains non-finite values")
         action_cond = native_action_cond
+    if "v8_dynamics_action_cond" in batch:
+        v8_action_cond = batch["v8_dynamics_action_cond"].to(
+            device, non_blocking=True
+        )
+        expected = (int(action_tgt.shape[0]), int(k), V8_DYNAMICS_ACTION_DIM)
+        if tuple(v8_action_cond.shape) != expected:
+            raise RuntimeError(
+                "v8_dynamics_action_cond must be exact [B,K,36], got "
+                f"{tuple(v8_action_cond.shape)} expected={expected}"
+            )
+        if not bool(torch.isfinite(v8_action_cond).all()):
+            raise RuntimeError("v8_dynamics_action_cond contains non-finite values")
+        versions = batch.get("v8_action_contract_version")
+        if versions is None:
+            raise RuntimeError("V8 dual-rate batch lacks action contract version")
+        if isinstance(versions, str):
+            versions = [versions] * int(action_tgt.shape[0])
+        if len(versions) != int(action_tgt.shape[0]) or any(
+            str(value) != V8_DUAL_RATE_ACTION_SCHEMA for value in versions
+        ):
+            raise RuntimeError(
+                f"V8 dual-rate action contract mismatch: {versions}"
+            )
+        history_schemas = batch.get("v8_action_history_schema")
+        if isinstance(history_schemas, str):
+            history_schemas = [history_schemas] * int(action_tgt.shape[0])
+        if history_schemas is None or len(history_schemas) != int(action_tgt.shape[0]) or any(
+            str(value) != V8_POLICY_HISTORY_SCHEMA for value in history_schemas
+        ):
+            raise RuntimeError(
+                f"V8 dual-rate history schema mismatch: {history_schemas}"
+            )
+        stats_keys = batch.get("v8_action_stats_key")
+        if isinstance(stats_keys, str):
+            stats_keys = [stats_keys] * int(action_tgt.shape[0])
+        if stats_keys is None or len(stats_keys) != int(action_tgt.shape[0]) or any(
+            not str(value) for value in stats_keys
+        ):
+            raise RuntimeError(f"V8 dual-rate stats identity mismatch: {stats_keys}")
+        tgt["v8_action_contract_version"] = V8_DUAL_RATE_ACTION_SCHEMA
+        tgt["v8_action_history_schema"] = V8_POLICY_HISTORY_SCHEMA
+        tgt["v8_action_stats_keys"] = [str(value) for value in stats_keys]
+        action_cond = v8_action_cond
     return s, c, action_cond, context_rgb, tgt
 
 
@@ -4413,6 +4532,104 @@ def validate_action_policy_resume_load(load_result) -> None:
         )
 
 
+def build_v8_action_policy_contract(cfg: dict) -> dict | None:
+    """Resolve the immutable V8 Stage0 action ABI stored in checkpoints."""
+
+    train_cfg = cfg.get("train") or {}
+    data_cfg = cfg.get("data") or {}
+    if not (
+        bool(train_cfg.get("v8_dual_rate_action_enabled", False))
+        or bool(data_cfg.get("v8_dual_rate_action_enabled", False))
+    ):
+        return None
+    model_cfg = cfg.get("model") or {}
+    oxe_normalizers: dict[str, object] = {}
+    raw_oxe = data_cfg.get("oxe_sources") or []
+    if isinstance(raw_oxe, dict):
+        source_items = sorted(raw_oxe.items())
+    elif isinstance(raw_oxe, list):
+        source_items = sorted(
+            (
+                str(source_cfg.get("source_name") or ""),
+                source_cfg,
+            )
+            for source_cfg in raw_oxe
+            if isinstance(source_cfg, dict)
+        )
+    else:
+        source_items = []
+    for source_name, source_cfg in source_items:
+        if not source_name or not isinstance(source_cfg, dict):
+            continue
+        oxe_normalizers[str(source_name)] = {
+            "sources": source_cfg.get("canonical_action_sources"),
+            "stats_by_source": source_cfg.get(
+                "canonical_action_stats_by_source"
+            ),
+            "stats_sha256_by_source": source_cfg.get(
+                "canonical_action_stats_sha256_by_source"
+            ),
+            "cache_manifest_sha256": source_cfg.get(
+                "canonical_action_cache_manifest_sha256"
+            ),
+            "audit_gate_sha256": source_cfg.get("action_audit_gate_sha256"),
+            "evidence_sha256": source_cfg.get(
+                "action_contract_evidence_sha256"
+            ),
+        }
+    contract = {
+        "schema": "wm3d_v8_stage0_action_policy_contract_v2",
+        "world_state_hz": 5,
+        "policy_hz": 20,
+        "policy_horizon": V8_POLICY_HORIZON,
+        "policy_chunk_seconds": 0.4,
+        "policy_output_shape": [V8_POLICY_HORIZON, 7],
+        "pose": {
+            "frame": "base",
+            "translation_unit": "meter",
+            "translation_semantics": "per_controller_step_delta",
+            "rotation": "axis_angle_rotvec_radian_delta",
+            "normalization": "source_bound_affine_pose6",
+        },
+        "gripper": {
+            "semantics": "absolute_close01",
+            "threshold": 0.5,
+            "environment_polarity_conversion": "execution_boundary_only",
+        },
+        "serving_owner": "action_policy.base_policy.[pose_norm,gripper_logit]",
+        "serving_decoder": "decode_v8_executable_action_chunk_v1",
+        "flow_owner": False,
+        "delta_event_owner": False,
+        "policy_context_source": str(model_cfg.get("policy_context_source")),
+        "policy_core_action_cond": str(model_cfg.get("policy_core_action_cond")),
+        "history": {
+            "schema": V8_POLICY_HISTORY_SCHEMA,
+            "length": V8_POLICY_HISTORY_LEN,
+            "dim": V8_POLICY_HISTORY_DIM,
+        },
+        "dynamics_condition": {
+            "schema": V8_DUAL_RATE_ACTION_SCHEMA,
+            "substeps_per_world_interval": V8_SUBSTEPS_PER_WORLD,
+            "dim": V8_DYNAMICS_ACTION_DIM,
+            "layout": "4x(action7)+valid4+dt_seconds4",
+        },
+        "normalizers": {
+            "robocasa_fine_stats_path": data_cfg.get("v8_action_sidecar_stats"),
+            "robocasa_fine_stats_sha256": data_cfg.get(
+                "v8_action_sidecar_stats_sha256"
+            ),
+            "robocasa_coarse_stats_path": data_cfg.get("action_stats"),
+            "robocasa_coarse_stats_sha256": data_cfg.get("action_stats_sha256"),
+            "oxe": oxe_normalizers,
+        },
+        "stage0_native3d_owner": True,
+    }
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return {**contract, "contract_sha256": hashlib.sha256(encoded).hexdigest()}
+
+
 def validate_action_pretraining_preflight(cfg: dict) -> bool:
     """Reject ambiguous direct/flow policy training before CUDA is initialized.
 
@@ -4434,6 +4651,81 @@ def validate_action_pretraining_preflight(cfg: dict) -> bool:
         return False
 
     errors: list[str] = []
+    v8_dual_rate = bool(train_cfg.get("v8_dual_rate_action_enabled", False))
+    if v8_dual_rate != bool(data_cfg.get("v8_dual_rate_action_enabled", False)):
+        errors.append("V8 dual-rate action mode must be enabled in both data and train")
+    if v8_dual_rate:
+        if int((model_cfg.get("state") or {}).get("action_cond_dim", -1)) != V8_DYNAMICS_ACTION_DIM:
+            errors.append("V8 state action_cond_dim must be 36")
+        if int((model_cfg.get("action") or {}).get("action_cond_dim", -1)) != V8_DYNAMICS_ACTION_DIM:
+            errors.append("V8 action-stream action_cond_dim must be 36")
+        if int(model_cfg.get("context_pixel_action_dim", -1)) != V8_DYNAMICS_ACTION_DIM:
+            errors.append("V8 context-pixel action dimension must be 36")
+        if int(model_cfg.get("policy_horizon", -1)) != V8_POLICY_HORIZON:
+            errors.append("V8 executable policy horizon must be 8")
+        if (
+            int(model_cfg.get("policy_action_history_len", -1)) != V8_POLICY_HISTORY_LEN
+            or int(model_cfg.get("policy_action_history_dim", -1)) != V8_POLICY_HISTORY_DIM
+        ):
+            errors.append("V8 policy action history must be exact [16,9]")
+        if str(model_cfg.get("policy_grip_owner", "")).strip().lower() != "absolute":
+            errors.append("V8 serving gripper owner must be absolute")
+        if bool(model_cfg.get("policy_enable_grip_delta_head", False)):
+            errors.append("V8 formal policy forbids the delta-event gripper head")
+        if bool(model_cfg.get("policy_enable_flow_head", False)):
+            errors.append("V8 formal policy forbids the flow action head")
+        if bool(model_cfg.get("policy_flow_use_as_policy", False)):
+            errors.append("V8 formal policy forbids flow serving ownership")
+        if bool(model_cfg.get("policy_action_add_trunk", False)):
+            errors.append("V8 serving owner forbids the duplicate native trunk action")
+        if bool(model_cfg.get("policy_enable_local_residual", False)):
+            errors.append("V8 serving owner forbids an unowned local residual head")
+        if bool(model_cfg.get("policy_enable_waypoint_head", False)):
+            errors.append("V8 serving owner forbids an unowned waypoint action head")
+        if float(train_cfg.get("policy_flow_weight", 0.0) or 0.0) != 0.0:
+            errors.append("V8 formal policy_flow_weight must be zero")
+        if float(train_cfg.get("native_action_no_teacher_weight", 0.0) or 0.0) != 0.0:
+            errors.append(
+                "V8 formal run disables the duplicate native action decoder loss"
+            )
+        if str(train_cfg.get("direct_policy_head", "")).strip().lower() not in {
+            "base", "base_policy"
+        }:
+            errors.append("V8 executable owner must be the base policy head")
+        if str(train_cfg.get("direct_policy_grip_owner", "")).strip().lower() != "absolute":
+            errors.append("V8 training gripper owner must be absolute")
+        delta_owner_loss_keys = (
+            "direct_policy_grip_delta_ce_weight",
+            "direct_policy_grip_delta_natural_ce_weight",
+            "direct_policy_grip_delta_state_bce_weight",
+            "direct_policy_grip_delta_transition_up_margin_weight",
+            "direct_policy_grip_delta_transition_down_margin_weight",
+            "direct_policy_grip_delta_boundary_up_margin_weight",
+            "direct_policy_grip_delta_boundary_down_margin_weight",
+        )
+        nonzero_delta_weights = sorted(
+            key
+            for key in delta_owner_loss_keys
+            if float(train_cfg.get(key, 0.0) or 0.0) != 0.0
+        )
+        if nonzero_delta_weights:
+            errors.append(
+                "V8 formal policy forbids delta-event losses: "
+                + ", ".join(nonzero_delta_weights)
+            )
+        for key in (
+            "v8_action_sidecar_index",
+            "v8_action_sidecar_index_sha256",
+            "v8_action_sidecar_stats",
+            "v8_action_sidecar_stats_sha256",
+        ):
+            if not data_cfg.get(key):
+                errors.append(f"V8 dual-rate data requires data.{key}")
+        oxe_overrides = data_cfg.get("direct_policy_oxe_overrides") or {}
+        if not bool(oxe_overrides.get("v8_dual_rate_action_enabled", False)):
+            errors.append("V8 dual-rate OXE override must be enabled explicitly")
+        if build_v8_action_policy_contract(cfg) is None:
+            errors.append("V8 action checkpoint contract could not be resolved")
     if not bool(model_cfg.get("enable_action_policy")):
         errors.append("action pretraining requires model.enable_action_policy=true")
     trainable_prefixes = tuple(train_cfg.get("trainable_prefixes") or ())
@@ -8079,6 +8371,192 @@ def compute_direct_policy_loss(
     }
 
 
+def _v8_masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_f = mask.to(device=values.device, dtype=values.dtype)
+    while mask_f.ndim < values.ndim:
+        mask_f = mask_f.unsqueeze(-1)
+    expanded = mask_f.expand_as(values)
+    return (values * expanded).sum() / expanded.sum().clamp_min(1.0)
+
+
+def compute_v8_unified_action_policy_loss(
+    out: dict[str, torch.Tensor],
+    tgt: dict[str, torch.Tensor],
+    train_cfg: dict,
+) -> dict[str, torch.Tensor]:
+    """Train the sole V8 executable ``[B,8,7]`` action owner.
+
+    Real 20 Hz RoboCasa samples supervise every controller command.  Audited
+    5 Hz-only OXE samples do not receive copied/interpolated pseudo-labels;
+    instead, four differentiable base-frame commands are composed and matched
+    to each factual interval action.
+    """
+
+    required_out = {"base_policy_pose_norm", "base_policy_gripper_logit"}
+    missing_out = sorted(required_out - out.keys())
+    if missing_out:
+        raise RuntimeError(f"V8 unified action owner outputs are missing: {missing_out}")
+    required_tgt = {
+        "policy_action_tgt",
+        "policy_action_tgt_norm",
+        "policy_action_valid_mask",
+        "policy_action_coarse_tgt",
+        "policy_action_coarse_tgt_norm",
+        "policy_action_coarse_valid_mask",
+        "policy_action_pose_mean",
+        "policy_action_pose_std",
+        "policy_action_coarse_pose_mean",
+        "policy_action_coarse_pose_std",
+    }
+    missing_tgt = sorted(required_tgt - tgt.keys())
+    if missing_tgt:
+        raise RuntimeError(f"V8 dual-rate action targets are missing: {missing_tgt}")
+
+    pose_pred = out["base_policy_pose_norm"].float()
+    grip_logit = out["base_policy_gripper_logit"].float()
+    batch_size = int(pose_pred.shape[0])
+    expected_pose = (batch_size, V8_POLICY_HORIZON, 6)
+    expected_grip = (batch_size, V8_POLICY_HORIZON)
+    if tuple(pose_pred.shape) != expected_pose or tuple(grip_logit.shape) != expected_grip:
+        raise RuntimeError(
+            "V8 action owner must be exact [B,8,6]+[B,8], got "
+            f"pose={tuple(pose_pred.shape)} grip={tuple(grip_logit.shape)}"
+        )
+    fine_tgt = tgt["policy_action_tgt"].float()
+    fine_tgt_norm = tgt["policy_action_tgt_norm"].float()
+    fine_valid = tgt["policy_action_valid_mask"].bool()
+    coarse_tgt = tgt["policy_action_coarse_tgt"].float()
+    coarse_tgt_norm = tgt["policy_action_coarse_tgt_norm"].float()
+    coarse_valid = tgt["policy_action_coarse_valid_mask"].bool()
+    coarse_horizon = V8_POLICY_HORIZON // V8_SUBSTEPS_PER_WORLD
+    exact_shapes = {
+        "policy_action_tgt": (batch_size, V8_POLICY_HORIZON, 7),
+        "policy_action_tgt_norm": expected_pose,
+        "policy_action_valid_mask": expected_grip,
+        "policy_action_coarse_tgt": (batch_size, coarse_horizon, 7),
+        "policy_action_coarse_tgt_norm": (batch_size, coarse_horizon, 6),
+        "policy_action_coarse_valid_mask": (batch_size, coarse_horizon),
+        "policy_action_pose_mean": (batch_size, 6),
+        "policy_action_pose_std": (batch_size, 6),
+        "policy_action_coarse_pose_mean": (batch_size, 6),
+        "policy_action_coarse_pose_std": (batch_size, 6),
+    }
+    for key, shape in exact_shapes.items():
+        if tuple(tgt[key].shape) != shape:
+            raise RuntimeError(f"{key} shape {tuple(tgt[key].shape)} != {shape}")
+        if not bool(torch.isfinite(tgt[key]).all()):
+            raise RuntimeError(f"{key} contains non-finite values")
+    if not bool(coarse_valid.any(dim=1).all()):
+        raise RuntimeError("every V8 sample must own factual 5 Hz composition labels")
+
+    huber_delta = float(
+        train_cfg.get("v8_policy_huber_delta", train_cfg.get("direct_policy_huber_delta", 1.0))
+    )
+    fine_pose_err = F.huber_loss(
+        pose_pred, fine_tgt_norm, reduction="none", delta=huber_delta
+    )
+    fine_grip_err = F.binary_cross_entropy_with_logits(
+        grip_logit, fine_tgt[..., 6], reduction="none"
+    )
+    fine_pose_loss = _v8_masked_mean(fine_pose_err, fine_valid)
+    fine_grip_loss = _v8_masked_mean(fine_grip_err, fine_valid)
+
+    fine_mean = tgt["policy_action_pose_mean"].float()[:, None, :]
+    fine_std = tgt["policy_action_pose_std"].float()[:, None, :]
+    if bool((fine_std <= 0.0).any()):
+        raise RuntimeError("V8 fine pose standard deviation must be positive")
+    fine_pose_physical = pose_pred * fine_std + fine_mean
+    fine_action_physical = torch.cat(
+        (fine_pose_physical, torch.sigmoid(grip_logit).unsqueeze(-1)), dim=-1
+    )
+    composed = compose_base_delta_actions_torch(
+        fine_action_physical.reshape(
+            batch_size, coarse_horizon, V8_SUBSTEPS_PER_WORLD, 7
+        )
+    )
+    coarse_mean = tgt["policy_action_coarse_pose_mean"].float()[:, None, :]
+    coarse_std = tgt["policy_action_coarse_pose_std"].float()[:, None, :]
+    if bool((coarse_std <= 0.0).any()):
+        raise RuntimeError("V8 coarse pose standard deviation must be positive")
+    composed_pose_norm = (composed[..., :6] - coarse_mean) / coarse_std
+    coarse_pose_err = F.huber_loss(
+        composed_pose_norm,
+        coarse_tgt_norm,
+        reduction="none",
+        delta=huber_delta,
+    )
+    coarse_grip_logit = grip_logit.reshape(
+        batch_size, coarse_horizon, V8_SUBSTEPS_PER_WORLD
+    )[..., -1]
+    coarse_grip_err = F.binary_cross_entropy_with_logits(
+        coarse_grip_logit, coarse_tgt[..., 6], reduction="none"
+    )
+    coarse_pose_loss = _v8_masked_mean(coarse_pose_err, coarse_valid)
+    coarse_grip_loss = _v8_masked_mean(coarse_grip_err, coarse_valid)
+
+    total = (
+        float(train_cfg.get("v8_policy_fine_pose_weight", 1.0)) * fine_pose_loss
+        + float(train_cfg.get("v8_policy_fine_grip_weight", 0.30)) * fine_grip_loss
+        + float(train_cfg.get("v8_policy_coarse_pose_weight", 1.0)) * coarse_pose_loss
+        + float(train_cfg.get("v8_policy_coarse_grip_weight", 0.30)) * coarse_grip_loss
+    )
+    fine_pose_l1 = _v8_masked_mean((pose_pred - fine_tgt_norm).abs(), fine_valid)
+    coarse_pose_l1 = _v8_masked_mean(
+        (composed_pose_norm - coarse_tgt_norm).abs(), coarse_valid
+    )
+    fine_grip_match = (
+        (torch.sigmoid(grip_logit) > 0.5) == (fine_tgt[..., 6] > 0.5)
+    ).float()
+    coarse_grip_match = (
+        (torch.sigmoid(coarse_grip_logit) > 0.5)
+        == (coarse_tgt[..., 6] > 0.5)
+    ).float()
+    return {
+        "L_direct_policy": total,
+        "v8_policy_fine_pose_huber": fine_pose_loss,
+        "v8_policy_fine_grip_bce": fine_grip_loss,
+        "v8_policy_coarse_pose_huber": coarse_pose_loss,
+        "v8_policy_coarse_grip_bce": coarse_grip_loss,
+        "v8_policy_fine_label_fraction": fine_valid.float().mean(),
+        "v8_policy_coarse_label_fraction": coarse_valid.float().mean(),
+        "v8_policy_fine_pose_l1": fine_pose_l1,
+        "v8_policy_coarse_pose_l1": coarse_pose_l1,
+        "v8_policy_composed_physical_pose_l1": _v8_masked_mean(
+            (composed[..., :6] - coarse_tgt[..., :6]).abs(), coarse_valid
+        ),
+        "v8_policy_fine_grip_acc": _v8_masked_mean(fine_grip_match, fine_valid),
+        "v8_policy_coarse_grip_acc": _v8_masked_mean(
+            coarse_grip_match, coarse_valid
+        ),
+        # Preserve existing dashboard names while making their semantics
+        # explicit in the V8-specific metrics above.
+        "direct_policy_pose_l1": fine_pose_l1 + coarse_pose_l1,
+        "direct_policy_first_pose_l1": coarse_pose_l1,
+        "direct_policy_grip_acc": _v8_masked_mean(
+            coarse_grip_match, coarse_valid
+        ),
+    }
+
+
+def compute_configured_action_policy_loss(
+    out: dict[str, torch.Tensor],
+    tgt: dict[str, torch.Tensor],
+    train_cfg: dict,
+    *,
+    step: int,
+) -> dict[str, torch.Tensor]:
+    if bool(train_cfg.get("v8_dual_rate_action_enabled", False)):
+        return compute_v8_unified_action_policy_loss(out, tgt, train_cfg)
+    return compute_direct_policy_loss(
+        out,
+        tgt["action_tgt"],
+        tgt["action_tgt_norm"],
+        train_cfg,
+        action_prev_grip=tgt.get("action_prev_grip"),
+        step=step,
+    )
+
+
 def build_hunyuan_latent_adapter(cfg: dict, device: torch.device) -> HunyuanLatentAdapter:
     model_cfg = cfg["model"]
     train_cfg = cfg["train"]
@@ -9694,12 +10172,10 @@ def main():
                         ),
                         collect_gradient_evidence=telemetry_enabled,
                     )
-                direct_losses = compute_direct_policy_loss(
+                direct_losses = compute_configured_action_policy_loss(
                     out,
-                    loss_tgt["action_tgt"],
-                    loss_tgt["action_tgt_norm"],
+                    loss_tgt,
                     cfg["train"],
-                    action_prev_grip=loss_tgt.get("action_prev_grip"),
                     step=step,
                 )
                 flow_losses = compute_policy_flow_matching_loss(
@@ -10365,6 +10841,7 @@ def main():
                     "resume_compat_sha256": resolved_resume_compat_sha256,
                     "run_lineage": resolved_run_lineage,
                     "stage_transition_audit": stage_transition_audit,
+                    "action_policy_contract": build_v8_action_policy_contract(cfg),
                     "rng_contract_rank0": capture_rng_contract(base_seed, rank),
                     "sampler_state": {
                         "schema": "wm3d_v7_exact_source_cycle_v1",
@@ -10630,12 +11107,10 @@ def main():
                                 future_value_task_bank,
                             )
                             losses.update(swap_metrics)
-                    direct_losses = compute_direct_policy_loss(
+                    direct_losses = compute_configured_action_policy_loss(
                         out,
-                        loss_tgt["action_tgt"],
-                        loss_tgt["action_tgt_norm"],
+                        loss_tgt,
                         cfg["train"],
-                        action_prev_grip=loss_tgt.get("action_prev_grip"),
                         step=step,
                     )
                     flow_losses = compute_policy_flow_matching_loss(
@@ -10725,6 +11200,7 @@ def main():
                     "resume_compat_sha256": resolved_resume_compat_sha256,
                     "run_lineage": resolved_run_lineage,
                     "stage_transition_audit": stage_transition_audit,
+                    "action_policy_contract": build_v8_action_policy_contract(cfg),
                     "rng_contract_rank0": capture_rng_contract(base_seed, rank),
                     "sampler_state": {
                         "schema": "wm3d_v7_exact_source_cycle_v1",

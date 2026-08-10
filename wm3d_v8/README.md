@@ -1,77 +1,51 @@
-# WM3D V8 预训练
+# WM3D V8
 
-## 训练定义
+WM3D V8 是一个动作条件的原生 3D 世界模型。模型在显式 3D 状态上预测未来 RGB、depth、point 和 camera/pose，同时输出可直接执行的机器人动作序列。
 
 ```mermaid
 flowchart LR
-  D["五源机器人数据<br/>DROID / Bridge / Atomic / Composite / MG"] --> S0
-  S0["Stage0<br/>native 3D dynamics + executable action policy"] --> C["封存 step 100000 checkpoint"]
-  C --> B["同根候选分支与 H32 native 3D cache"]
-  B --> A["Stage1-P/A<br/>dynamics calibration 10k"]
-  A --> P["Stage1-P/B<br/>planner 10k"]
-  P --> J["Stage1-P/C<br/>joint calibration 5k"]
-  J --> E["离线 H8/H16/H32 + 配对 RoboCasa 闭环 gate"]
+  O["历史 RGB / depth / point / pose"] --> C["Native 3D core<br/>5 Hz, T16/P64/D2048/K8"]
+  A["20 Hz 已执行动作历史"] --> C
+  C --> W["显式未来世界<br/>RGB / depth / point / pose"]
+  C --> H["统一 action policy"]
+  H --> P["20 Hz × 8<br/>6D delta pose + absolute gripper"]
 ```
 
-### Stage0
+核心约束：
 
-- 主干保持 `T16 / P64 / D2048 / K8` 原生 3D 表示。
-- 世界模型联合预测 RGB、depth、point、camera/pose 和未来 token。
-- serving action 由 deterministic pose head 与 delta-composed gripper head 共同拥有。
-- pose-only flow matching 只提供辅助 action 目标，不接管 serving。
-- 禁止未来 observation 输入，禁止 WAN/VLA action owner。
-- 正式配方为 3 节点、每节点 8 卡、全局 batch 96、100k steps。
+- 世界状态以 5 Hz 建模；高频动作不再被压缩成 5 Hz policy 标签。
+- dynamics 输入由每个世界步内 4 个真实动作子步组成，维度固定为 36。
+- serving action 只有一个 owner，输出形状固定为 `[B, 8, 7]`。
+- 前 6 维为归一化 delta pose，最后 1 维为 absolute close01 gripper。
+- RGB、depth、point、pose 始终是显式监督和显式输出；没有 WAN/VLA action 旁路。
+- Stage0 使用 DROID、Bridge、RoboCasa Atomic、Composite、MG 五源混合，周期为 `35/15/10/20/20`。
 
-Stage0 的正式配置是：
-
-```text
-configs/wm3d_v7_1b_native_actionpolicy_joint_formal100k_3node24_v3.yaml
-```
-
-文件名和 schema 中的 `v7` 是冻结的数据与 checkpoint 兼容标识。V8 沿用这些标识，
-避免破坏已经验证的 Stage0 lineage；V8 的版本变化体现在 Stage0 与 Stage1-P 的完整训练定义。
-
-### Stage1-P
-
-Stage1-P 不训练新的 serving action head。它冻结 Stage0 的 direct pose、gripper 和 flow
-proposal head，用同一 root state 生成候选 action，再由 WM3D 原生 3D rollout 预测候选后果。
-planner 只能读取 predicted token、depth、point、pose、置信度和 task embedding，不能读取
-候选 action 本身。
-
-每个候选使用 4 个连续 K8 chunk rollout 到 H32。训练分三段执行，阶段之间不自动晋级：
-
-| 阶段 | 配置 | 更新参数 | 硬停 |
-|---|---|---|---:|
-| A | `configs/wm3d_v7_stage1_planner_dynamics10k.yaml` | action-conditioned native 3D dynamics | 10k |
-| B | `configs/wm3d_v7_stage1_planner_planner10k.yaml` | action-blind planner | 10k |
-| C | `configs/wm3d_v7_stage1_planner_joint5k.yaml` | 低学习率 joint calibration | 5k |
-
-Stage1-P 的数据生成、候选定义、恢复规则和 gate 见
-[`wm3d_v3/stage1_planner/README.md`](wm3d_v3/stage1_planner/README.md)。
+动作修正的设计、ABI 和验收证据见 [Stage0 动作修正说明](docs/WM3D_V8_STAGE0_ACTION_CORRECTION.md)。因果双视图缓存合同见 [Stage0 数据流水线](docs/v8_stage0_causal_dual_view.md)。
 
 ## 目录
 
 ```text
 wm3d_v8/
-├── configs/                 # Stage0 与 Stage1-P 封存配置
-├── scripts/                 # 预检、cache、启动、评测与 gate
-├── tests/                   # action contract、分布式合同与 planner 回归测试
+├── configs/          # 三份 V8 Stage0 v2 模板
+├── docs/             # 数据流水线与 action ABI
+├── scripts/          # cache、finalize、sidecar、seal、preflight、review、gate
+├── tests/            # 当前 V8 与底层数据 ABI 回归测试
 ├── wm3d_v3/
-│   ├── data/                # 五源窗口、canonical action 与 mixed-source sampler
-│   ├── models/              # native 3D core、world heads 与 action heads
-│   ├── stage1_planner/      # H32 rollout、planner 与三阶段训练
-│   └── training/            # Stage0 trainer 与 action/world losses
+│   ├── data/         # 五源数据、双频动作、因果双视图
+│   ├── models/       # native 3D core 与统一 action policy
+│   ├── stage1/       # 数据证据/动作适配工具，不是旧 planner 训练阶段
+│   └── training/     # Stage0 trainer、checkpoint 与下游严格继承
 ├── requirements.txt
 └── run_v8.sh
 ```
 
-该发布树只收录 Stage0 与 Stage1-P 的 import closure、正式配置、入口脚本和定向测试。
-训练日志、cache、checkpoint、历史 WAN/VLA 实验和旧备份不在分支中。
+`v7_compact_dataset.py`、`v7_action_contract.py` 等文件名保留，是因为已封存的数据 schema 和 checkpoint ABI 仍使用这些名字。它们属于当前 V8 的输入兼容层，不是旧 V7 训练流水线。
+
+旧的 direct-pose/delta-gripper/flow 多 owner 配置和旧 Stage1 planner 没有进入本发布树；它们与当前统一 action ABI 不兼容。后续规划阶段必须从 V8 的统一 action owner 重新设计 transition。
 
 ## 环境
 
-当前封存环境使用 Python 3.10、PyTorch 2.7.1 和 CUDA 12.8。先安装与集群驱动匹配的
-PyTorch，再安装其余依赖：
+推荐 Python 3.10、PyTorch 2.7.1、CUDA 12.8。先安装与集群驱动匹配的 PyTorch，再安装项目依赖：
 
 ```bash
 cd wm3d_v8
@@ -82,36 +56,84 @@ python -m pip install -r requirements.txt
 export PYTHONPATH="$PWD"
 ```
 
-Stage0 的正式启动脚本包含当前三台训练机的 IP、IB HCA 映射、封存数据路径和确认串。
-换集群时先修改站点路径和网络映射，再重新生成 distributed transport receipt；不能沿用旧集群
-receipt 授权新训练。
-
-## 发布自检
+发布自检不会写入 `__pycache__` 或 pytest cache：
 
 ```bash
-./run_v8.sh check
-./run_v8.sh stage0-static
-./run_v8.sh stage1-static configs/wm3d_v7_stage1_planner_dynamics10k.yaml
+PYTHON_BIN=.venv/bin/python ./run_v8.sh check
 ```
 
-`stage1-static` 在 Stage0 step 100000 checkpoint 和 H32 cache 尚未封存时应当 fail closed。
-这两个 blocker 消失前不能启动 Stage1-P。
+## 配置
 
-## 正式执行顺序
+当前只保留三份配置：
 
-1. Stage0 canary 完成后运行 canary gate，并固定 receipt SHA。
-2. 三台节点分别运行 full preflight；比较配置、数据、runtime 和 IB closure。
-3. 从 node43 调用 Stage0 唯一 orchestrator：
+| 配置 | 用途 |
+|---|---|
+| `wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2.yaml` | 自包含的短 canary 基线 |
+| `wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2.yaml` | 正式 100k 配方 |
+| `wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v2.yaml` | 2×8 GPU、global batch 64 拓扑覆盖 |
 
-   ```bash
-   WM3D_V7_FORMAL_RETRAIN=EXECUTE_WM3D_V7_1B_ACTIONPOLICY_FORMAL100K_V3 \
-     scripts/start_wm3d_v7_1b_actionpolicy_joint_formal100k_3node24_v3.sh
-   ```
+canary 配置已展开为自包含文件，不依赖被删除的历史配置链。模板中的 `PENDING_*` 只能由 sealed runtime overlay 替换；模板可以做 static preflight，但不能直接启动训练。
 
-4. 等待 `step_00100000.pt` 自然产生，核验完整性并写入 Stage1-P 配置。
-5. 按 `root context -> candidates -> runtime branches -> H32 cache -> seal` 生成 Stage1-P 数据。
-6. 依次执行 Stage1-P A/B/C。每段先 preflight，完成后封存编号 checkpoint 和 SHA。
-7. 运行离线评测、配对 RoboCasa 闭环评测和最终 gate。
+```bash
+./run_v8.sh static   configs/wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v2.yaml
+```
 
-Stage0 正式训练进行中时，不得修改其配置、trainer、模型文件或启动脚本。V8 分支的
-Stage1-P 代码只有在 Stage0 100k endpoint 与 H32 cache 都封存后才具备启动条件。
+## 数据与缓存顺序
+
+正式输入包括：
+
+1. DROID/Bridge 的 source manifest、canonical action cache、action audit gate 和 train-only normalization stats；
+2. RoboCasa Atomic/Composite/MG 的事实动作 manifest、RGB sidecar index 和 adapter audit；
+3. 固定的 PCA384 token codec 及其 SHA；
+4. 本版本新生成的 causal dual-view archive 与 20 Hz action-only sidecar。
+
+执行顺序固定为：
+
+```text
+OXE/RoboCasa 原始事实数据
+  → causal dual-view cache（context 只读 T16，target 仅作 K8 监督）
+  → world16 index finalize
+  → RoboCasa 20 Hz action-only sidecar
+  → sealed runtime config
+  → full preflight
+  → 0→20→100 canary + review/gate
+  → formal training
+```
+
+缓存命令、输入字段和 no-clobber 规则见 [Stage0 数据流水线](docs/v8_stage0_causal_dual_view.md)。action sidecar 的完整命令见 [动作修正说明 8.2](docs/WM3D_V8_STAGE0_ACTION_CORRECTION.md#82-生成-robocasa-action-only-sidecar)。
+
+## Preflight 与训练
+
+sealed runtime config 生成后，两台训练机都必须独立执行 full preflight：
+
+```bash
+./run_v8.sh full "$SEALED_RUNTIME_CONFIG" "$PREFLIGHT_REPORT"
+```
+
+只有报告同时满足以下条件才允许启动：
+
+```text
+passed=true
+launch_ready=true
+errors=[]
+warnings=[]
+blockers=[]
+```
+
+随后在每个节点使用相同配置和 rendezvous 参数启动。下面只展示 node-local 命令；集群调度器负责给每个节点注入正确的 `NODE_RANK`、`MASTER_ADDR` 和 `MASTER_PORT`：
+
+```bash
+torchrun   --nnodes="$NNODES"   --nproc_per_node=8   --node_rank="$NODE_RANK"   --master_addr="$MASTER_ADDR"   --master_port="$MASTER_PORT"   -m wm3d_v3.training.train   --cfg "$SEALED_RUNTIME_CONFIG"   --print_every 20   --stop_after_step "$HARD_STOP_STEP"
+```
+
+必须从完整编号 checkpoint 恢复，并使用 trainer 的 strict resume；禁止把 `latest.pt` 当作 authority。每个 milestone 先核验 checkpoint、review 和 receipt，再进入下一段。
+
+## Stage0→LIBERO 继承
+
+Stage0 checkpoint 进入下游前必须运行严格审计：
+
+```bash
+./run_v8.sh transition   "$NUMBERED_STAGE0_CHECKPOINT"   "$SEALED_STAGE0_CONFIG"   "$TRANSITION_REPORT"
+```
+
+审计会在 CPU 上实例化目标模型并执行完整 key/shape/ABI strict load。下游执行时必须显式提供 pose normalization stats 和 gripper polarity，不能按数据集名称猜测。
