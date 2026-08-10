@@ -449,6 +449,7 @@ def test_canary_launcher_supports_fresh_then_exact_resume_v10() -> None:
     assert "--stop_after_step 20" in launcher
     assert "--stop_after_step 100" in launcher
     assert "--strict_resume" in launcher
+    assert '--exact-resume-checkpoint "${RESUME_CKPT}"' in launcher
     assert "WM3D_V8_CANARY_RESUME_SHA256" in launcher
     assert "step_00000020.pt" in launcher
     assert "train_rank0_fresh_0_to_20.log" in launcher
@@ -501,6 +502,37 @@ def test_checkpoint_rng_contract_is_not_none(
     assert contract["rank_stride"] == 100_003
     assert contract["step_offset"] == 10_000_019
     assert contract["torch_cpu_state"].numel() > 0
+
+
+def test_exact_resume_preflight_accepts_only_bound_checkpoint_lineage(
+    tmp_path: Path,
+) -> None:
+    out_root = tmp_path / "out"
+    ckpt_dir = out_root / "ckpt"
+    ckpt_dir.mkdir(parents=True)
+    resume = ckpt_dir / "step_00000020.pt"
+    resume.write_bytes(b"checkpoint")
+    (ckpt_dir / "latest.pt").symlink_to(resume.name)
+    config = {
+        "out": {
+            "root": str(out_root),
+            "require_empty_checkpoint_dir": True,
+        }
+    }
+    validator = getattr(preflight_module, "_validate_checkpoint_lineage")
+
+    checks = _Checks("full")
+    health = validator(checks, config, exact_resume_checkpoint=resume)
+    assert checks.errors == []
+    assert health["checkpoint_files"] == [
+        str(ckpt_dir / "latest.pt"),
+        str(resume),
+    ]
+
+    (ckpt_dir / "step_00000100.pt").write_bytes(b"unexpected")
+    checks = _Checks("full")
+    validator(checks, config, exact_resume_checkpoint=resume)
+    assert any("exact resume checkpoint lineage mismatch" in error for error in checks.errors)
 
 
 def test_runtime_dependency_gate_requires_lpips_for_pixel_training(

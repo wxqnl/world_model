@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.preflight_wm3d_v7_1b_actionpolicy_joint import (  # noqa: E402
+    _validate_checkpoint_lineage,
     _validate_local_resources,
 )
 from scripts.preflight_wm3d_v7_stage0_actiondynamics import (  # noqa: E402
@@ -884,6 +885,7 @@ def validate_preflight(
     *,
     verify_training_assets: bool = True,
     verify_local_resources: bool = True,
+    exact_resume_checkpoint: Path | None = None,
 ) -> dict[str, Any]:
     if mode not in {"static", "full"}:
         raise ValueError(f"unsupported mode: {mode}")
@@ -902,7 +904,9 @@ def validate_preflight(
         else {}
     )
     health = (
-        _validate_local_resources(checks, config)
+        _validate_local_resources(
+            checks, config, exact_resume_checkpoint=exact_resume_checkpoint
+        )
         if verify_local_resources
         else {}
     )
@@ -947,9 +951,14 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--mode", choices=("static", "full"), default="full")
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--exact-resume-checkpoint", type=Path)
     args = parser.parse_args()
     try:
-        report = validate_preflight(load_config(args.config), mode=args.mode)
+        report = validate_preflight(
+            load_config(args.config),
+            mode=args.mode,
+            exact_resume_checkpoint=args.exact_resume_checkpoint,
+        )
         exit_code = 0
     except (OSError, ValueError, yaml.YAMLError, CausalDualViewPreflightError) as exc:
         if isinstance(exc, CausalDualViewPreflightError):

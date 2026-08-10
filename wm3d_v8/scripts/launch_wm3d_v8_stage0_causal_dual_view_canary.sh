@@ -155,7 +155,11 @@ if nvidia-smi --query-gpu=ecc.errors.uncorrected.volatile.total,ecc.errors.uncor
 fi
 
 mkdir -p "${LOG_DIR}"
-"${PY}" scripts/preflight_wm3d_v8_stage0_causal_dual_view.py --config "${CFG}" --mode full > "${PREFLIGHT_LOG}"
+PREFLIGHT_ARGS=(scripts/preflight_wm3d_v8_stage0_causal_dual_view.py --config "${CFG}" --mode full)
+if [[ "${IS_RESUME}" -eq 1 ]]; then
+  PREFLIGHT_ARGS+=(--exact-resume-checkpoint "${RESUME_CKPT}")
+fi
+"${PY}" "${PREFLIGHT_ARGS[@]}" > "${PREFLIGHT_LOG}"
 
 if [[ "${MODE}" == "check" || "${MODE}" == "resume-check" ]]; then
   echo "V8 causal dual-view canary ${PHASE} launch check passed"

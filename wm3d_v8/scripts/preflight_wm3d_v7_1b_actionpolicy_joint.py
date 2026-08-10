@@ -701,7 +701,72 @@ def _validate_objective(checks: _Checks, config: dict[str, Any]) -> int:
     return computed_global
 
 
-def _validate_local_resources(checks: _Checks, config: dict[str, Any]) -> dict[str, Any]:
+def _validate_checkpoint_lineage(
+    checks: _Checks,
+    config: dict[str, Any],
+    *,
+    exact_resume_checkpoint: Path | None = None,
+) -> dict[str, Any]:
+    out = config.get("out") or {}
+    root = Path(str(out.get("root") or ""))
+    checks.expect(str(root) not in {"", "."}, "out.root is missing")
+    checks.equal(
+        out.get("require_empty_checkpoint_dir"),
+        True,
+        "out.require_empty_checkpoint_dir",
+    )
+    ckpt_dir = root / str(out.get("ckpt_dir", "ckpt"))
+    existing = (
+        sorted(
+            (*ckpt_dir.glob("step_*.pt"), *ckpt_dir.glob("latest.pt")),
+            key=lambda path: path.name,
+        )
+        if ckpt_dir.exists()
+        else []
+    )
+    if exact_resume_checkpoint is None:
+        checks.expect(
+            not existing,
+            f"formal output checkpoint lineage is not empty: {existing[:3]}",
+        )
+    else:
+        expected = exact_resume_checkpoint.resolve()
+        checks.expect(
+            exact_resume_checkpoint.parent.resolve() == ckpt_dir.resolve(),
+            "exact resume checkpoint must live in the configured checkpoint directory",
+        )
+        checks.expect(
+            bool(re.fullmatch(r"step_[0-9]{8}\.pt", exact_resume_checkpoint.name)),
+            f"exact resume checkpoint is not numbered: {exact_resume_checkpoint}",
+        )
+        checks.expect(
+            exact_resume_checkpoint.is_file(),
+            f"exact resume checkpoint is missing: {exact_resume_checkpoint}",
+        )
+        expected_names = {"latest.pt", exact_resume_checkpoint.name}
+        observed_names = {path.name for path in existing}
+        checks.expect(
+            observed_names == expected_names,
+            "exact resume checkpoint lineage mismatch: "
+            f"expected={sorted(expected_names)} observed={sorted(observed_names)}",
+        )
+        latest = ckpt_dir / "latest.pt"
+        checks.expect(
+            latest.is_symlink() and latest.resolve() == expected,
+            f"latest.pt does not resolve to exact resume checkpoint: {latest}",
+        )
+    return {
+        "checkpoint_dir": str(ckpt_dir),
+        "checkpoint_files": [str(path) for path in existing],
+    }
+
+
+def _validate_local_resources(
+    checks: _Checks,
+    config: dict[str, Any],
+    *,
+    exact_resume_checkpoint: Path | None = None,
+) -> dict[str, Any]:
     health: dict[str, Any] = {}
     if checks.mode != "full":
         return health
@@ -751,17 +816,11 @@ def _validate_local_resources(checks: _Checks, config: dict[str, Any]) -> dict[s
     except (OSError, subprocess.CalledProcessError) as exc:
         checks.errors.append(f"cannot inspect GPU health: {exc}")
 
-    out = config.get("out") or {}
-    root = Path(str(out.get("root") or ""))
-    checks.expect(str(root) not in {"", "."}, "out.root is missing")
-    checks.equal(out.get("require_empty_checkpoint_dir"), True, "out.require_empty_checkpoint_dir")
-    ckpt_dir = root / str(out.get("ckpt_dir", "ckpt"))
-    existing = []
-    if ckpt_dir.exists():
-        existing = sorted(ckpt_dir.glob("step_*.pt")) + sorted(ckpt_dir.glob("latest.pt"))
-    checks.expect(not existing, f"formal output checkpoint lineage is not empty: {existing[:3]}")
-    health["checkpoint_dir"] = str(ckpt_dir)
-    health["checkpoint_files"] = [str(path) for path in existing]
+    health.update(
+        _validate_checkpoint_lineage(
+            checks, config, exact_resume_checkpoint=exact_resume_checkpoint
+        )
+    )
     return health
 
 
