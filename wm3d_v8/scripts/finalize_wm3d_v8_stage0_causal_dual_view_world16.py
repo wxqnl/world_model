@@ -210,7 +210,17 @@ def collect_family(
             raise ValueError(f"{report_path}: source manifest SHA mismatch")
         if report.get("codec_sha256") != CODEC_SHA256:
             raise ValueError(f"{report_path}: codec SHA mismatch")
-        if report.get("representation") != REPRESENTATION:
+        # OXE producer-v1 predates the optional top-level representation field.
+        # Its representation contract is carried by every index row and is
+        # validated below by _validate_common_row. RoboCasa producer-v1 does
+        # publish the report field and remains strict.
+        if spec.kind == "robocasa":
+            if report.get("representation") != REPRESENTATION:
+                raise ValueError(f"{report_path}: representation mismatch")
+        elif (
+            "representation" in report
+            and report.get("representation") != REPRESENTATION
+        ):
             raise ValueError(f"{report_path}: representation mismatch")
         if report.get("selection_sha256"):
             selection_digests.add(str(report["selection_sha256"]))

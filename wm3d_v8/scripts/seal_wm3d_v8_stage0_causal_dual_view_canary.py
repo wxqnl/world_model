@@ -28,6 +28,7 @@ from scripts.preflight_wm3d_v8_stage0_causal_dual_view import (
 
 REPORT_SCHEMA = "wm3d_v8_stage0_causal_dual_view_canary_seal_v1"
 ROBOCASA_PARTITIONS = ("atomic", "composite", "mg")
+PROPRIO_SOURCES = ("robocasa", "droid", "bridge")
 
 
 def _sha256_file(path: Path) -> str:
@@ -181,6 +182,7 @@ def _runtime_overlay(
     combined_robocasa_index: Path,
     action_sidecar_index: Path,
     action_sidecar_stats: Path,
+    proprio_assets: dict[str, tuple[Path, Path]] | None = None,
     max_steps: int | None = None,
     initial_stop_step: int | None = None,
     out_root: Path | None = None,
@@ -213,6 +215,21 @@ def _runtime_overlay(
     action_index_sha = _sha256_file(action_index)
     action_stats = action_sidecar_stats.resolve()
     action_stats_sha = _sha256_file(action_stats)
+    proprio_specs: dict[str, dict[str, str]] = {}
+    if proprio_assets is not None:
+        if set(proprio_assets) != set(PROPRIO_SOURCES):
+            raise ValueError(
+                "proprio assets must contain robocasa/droid/bridge exactly"
+            )
+        for source in PROPRIO_SOURCES:
+            index_path = Path(proprio_assets[source][0]).resolve()
+            stats_path = Path(proprio_assets[source][1]).resolve()
+            proprio_specs[source] = {
+                "v8_proprio_index": str(index_path),
+                "v8_proprio_index_sha256": _sha256_file(index_path),
+                "v8_proprio_stats": str(stats_path),
+                "v8_proprio_stats_sha256": _sha256_file(stats_path),
+            }
     oxe_loader_binding = _oxe_window_binding(oxe_paths)
     indices: dict[str, Any] = {}
     for source in ("oxe_droid_action", "oxe_bridge_action"):
@@ -231,18 +248,24 @@ def _runtime_overlay(
             "partition": partition,
             "paired_views": True,
         }
+    data_overlay: dict[str, Any] = {
+        "compact_index": str(combined),
+        "compact_index_sha256": combined_sha,
+        "v8_action_sidecar_index": str(action_index),
+        "v8_action_sidecar_index_sha256": action_index_sha,
+        "v8_action_sidecar_stats": str(action_stats),
+        "v8_action_sidecar_stats_sha256": action_stats_sha,
+        "causal_dual_view_indices": indices,
+        "direct_policy_oxe_overrides": oxe_loader_binding,
+    }
+    if proprio_specs:
+        data_overlay.update(proprio_specs["robocasa"])
+        data_overlay["v8_proprio_by_source"] = {
+            source: proprio_specs[source] for source in ("droid", "bridge")
+        }
     overlay: dict[str, Any] = {
         "_base_": str(base_config.resolve()),
-        "data": {
-            "compact_index": str(combined),
-            "compact_index_sha256": combined_sha,
-            "v8_action_sidecar_index": str(action_index),
-            "v8_action_sidecar_index_sha256": action_index_sha,
-            "v8_action_sidecar_stats": str(action_stats),
-            "v8_action_sidecar_stats_sha256": action_stats_sha,
-            "causal_dual_view_indices": indices,
-            "direct_policy_oxe_overrides": oxe_loader_binding,
-        },
+        "data": data_overlay,
     }
     if max_steps is not None:
         stop = int(max_steps)
@@ -280,6 +303,12 @@ def main() -> None:
     parser.add_argument("--combined-robocasa-index", type=Path, required=True)
     parser.add_argument("--action-sidecar-index", type=Path, required=True)
     parser.add_argument("--action-sidecar-stats", type=Path, required=True)
+    parser.add_argument("--robocasa-proprio-index", type=Path)
+    parser.add_argument("--robocasa-proprio-stats", type=Path)
+    parser.add_argument("--droid-proprio-index", type=Path)
+    parser.add_argument("--droid-proprio-stats", type=Path)
+    parser.add_argument("--bridge-proprio-index", type=Path)
+    parser.add_argument("--bridge-proprio-stats", type=Path)
     parser.add_argument("--runtime-config", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--max-steps", type=int)
@@ -289,6 +318,31 @@ def main() -> None:
     parser.add_argument("--skip-training-assets", action="store_true")
     parser.add_argument("--skip-local-resources", action="store_true")
     args = parser.parse_args()
+
+    proprio_values = (
+        args.robocasa_proprio_index,
+        args.robocasa_proprio_stats,
+        args.droid_proprio_index,
+        args.droid_proprio_stats,
+        args.bridge_proprio_index,
+        args.bridge_proprio_stats,
+    )
+    if any(value is not None for value in proprio_values) and not all(
+        value is not None for value in proprio_values
+    ):
+        parser.error(
+            "v3 proprio sealing requires all six proprio index/stats arguments"
+        )
+    proprio_assets = None
+    if all(value is not None for value in proprio_values):
+        proprio_assets = {
+            "robocasa": (
+                args.robocasa_proprio_index,
+                args.robocasa_proprio_stats,
+            ),
+            "droid": (args.droid_proprio_index, args.droid_proprio_stats),
+            "bridge": (args.bridge_proprio_index, args.bridge_proprio_stats),
+        }
 
     robo_inputs = {
         "atomic": args.robocasa_atomic_index,
@@ -312,6 +366,7 @@ def main() -> None:
         combined_robocasa_index=args.combined_robocasa_index,
         action_sidecar_index=args.action_sidecar_index,
         action_sidecar_stats=args.action_sidecar_stats,
+        proprio_assets=proprio_assets,
         max_steps=args.max_steps,
         initial_stop_step=args.initial_stop_step,
         out_root=args.out_root,
@@ -359,6 +414,16 @@ def main() -> None:
         ),
         "preflight": preflight,
     }
+    if proprio_assets is not None:
+        report["proprio_assets"] = {
+            source: {
+                "index": str(Path(paths[0]).resolve()),
+                "index_sha256": _sha256_file(Path(paths[0]).resolve()),
+                "stats": str(Path(paths[1]).resolve()),
+                "stats_sha256": _sha256_file(Path(paths[1]).resolve()),
+            }
+            for source, paths in proprio_assets.items()
+        }
     _publish_text_no_clobber(
         args.report,
         json.dumps(report, indent=2, sort_keys=True) + "\n",

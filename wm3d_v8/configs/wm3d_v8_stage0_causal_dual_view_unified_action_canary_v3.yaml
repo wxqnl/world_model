@@ -1,0 +1,49 @@
+_base_: wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2.yaml
+
+# V8 Stage0 v3 keeps the native 3D/world and action20 contracts from v2 and
+# adds one strict current-robot-state ABI for pretraining and downstream use.
+contract:
+  schema: wm3d_v8_stage0_causal_dual_view_unified_action_canary_v3
+  action_policy_contract_schema: wm3d_v8_stage0_action_policy_contract_v3
+  purpose: full_native3d_5hz_with_unified_action20hz_and_current_proprio
+
+model:
+  policy_head_type: native
+  policy_lowdim_dim: 10
+  policy_require_lowdim_state: true
+  policy_embodiment_vocab_size: 3
+  policy_require_embodiment: true
+
+data:
+  v8_proprio_enabled: true
+  load_policy_state: false
+  v8_proprio_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/proprio/robocasa/index.jsonl
+  v8_proprio_index_sha256: PENDING_CANARY_ROBOCASA_PROPRIO_INDEX_SHA256
+  v8_proprio_stats: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/proprio/robocasa/stats_train.npz
+  v8_proprio_stats_sha256: PENDING_CANARY_ROBOCASA_PROPRIO_STATS_SHA256
+  v8_proprio_by_source:
+    droid:
+      v8_proprio_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/proprio/droid/index.jsonl
+      v8_proprio_index_sha256: PENDING_CANARY_DROID_PROPRIO_INDEX_SHA256
+      v8_proprio_stats: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/proprio/droid/stats_train.npz
+      v8_proprio_stats_sha256: PENDING_CANARY_DROID_PROPRIO_STATS_SHA256
+    bridge:
+      v8_proprio_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/proprio/bridge/index.jsonl
+      v8_proprio_index_sha256: PENDING_CANARY_BRIDGE_PROPRIO_INDEX_SHA256
+      v8_proprio_stats: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/canary/proprio/bridge/stats_train.npz
+      v8_proprio_stats_sha256: PENDING_CANARY_BRIDGE_PROPRIO_STATS_SHA256
+
+train:
+  run_lineage: wm3d_v8_stage0_causal_dual_view_unified_action20_proprio10_canary_20260811_v3
+
+out:
+  root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/results/unified_action_proprio_canary_v3
+  require_empty_checkpoint_dir: true
+
+metadata:
+  correction_document: docs/WM3D_V8_STAGE0_PROPRIO_CORRECTION.md
+  proprio_schema: wm3d_v8_policy_proprio10_v1
+  proprio_anchor: first_policy_action_target
+  native_world_hz: 5
+  policy_hz: 20
+  legacy_v2_checkpoint_compatible: false

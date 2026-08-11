@@ -64,6 +64,11 @@ from .v8_action_contract import (
     require_v8_pinned_file,
     torchify_v8_action_fields,
 )
+from .v8_proprio_contract import (
+    V8_PROPRIO_ANCHOR,
+    V8_PROPRIO_DIM,
+    V8ProprioStore,
+)
 
 
 def _rss_mib() -> float:
@@ -152,6 +157,11 @@ class WindowConfig:
     # OXE only owns audited 5 Hz intervals, so this mode emits coarse
     # composition supervision and never fabricates controller-rate labels.
     v8_dual_rate_action_enabled: bool = False
+    v8_proprio_enabled: bool = False
+    v8_proprio_index: Path | None = None
+    v8_proprio_index_sha256: str | None = None
+    v8_proprio_stats: Path | None = None
+    v8_proprio_stats_sha256: str | None = None
 
 
 def _safe(cid: str) -> str:
@@ -889,6 +899,29 @@ class OXEWindowDataset(Dataset):
                 raise CanonicalActionContractError(
                     "V8 dual-rate OXE policy history must be exact [16,9]"
                 )
+        self.v8_proprio_store: V8ProprioStore | None = None
+        if self.cfg.v8_proprio_enabled:
+            if not self.cfg.v8_dual_rate_action_enabled:
+                raise CanonicalActionContractError(
+                    "V8 OXE proprio requires dual-rate canonical action mode"
+                )
+            if self.cfg.policy_lowdim_dim != V8_PROPRIO_DIM:
+                raise CanonicalActionContractError(
+                    f"V8 OXE proprio requires policy_lowdim_dim={V8_PROPRIO_DIM}"
+                )
+            if self.cfg.load_policy_state:
+                raise CanonicalActionContractError(
+                    "V8 OXE proprio forbids legacy optional policy-state loading"
+                )
+            if (
+                self.cfg.v8_proprio_index is None
+                or not self.cfg.v8_proprio_index_sha256
+                or self.cfg.v8_proprio_stats is None
+                or not self.cfg.v8_proprio_stats_sha256
+            ):
+                raise CanonicalActionContractError(
+                    "V8 OXE proprio needs pinned index and train-only stats"
+                )
         self._all_records_canonical = bool(
             self.cfg.canonical_action_enabled
             and all(
@@ -1287,6 +1320,18 @@ class OXEWindowDataset(Dataset):
                 starts = list(range(0, usable - win + 1, self.cfg.stride))
             for start in starts:
                 self.index.append((i, start))
+        if self.cfg.v8_proprio_enabled:
+            source = next(iter(self._canonical_action_sources))
+            self.v8_proprio_store = V8ProprioStore(
+                index_path=self.cfg.v8_proprio_index,
+                index_sha256=str(self.cfg.v8_proprio_index_sha256),
+                stats_path=self.cfg.v8_proprio_stats,
+                stats_sha256=str(self.cfg.v8_proprio_stats_sha256),
+                source=source,
+                split=None,
+                expected_identities=(record.clip_id for record in self.records),
+                exact_coverage=False,
+            )
         _dataset_startup_log(
             "end",
             scan_started,
@@ -1696,6 +1741,21 @@ class OXEWindowDataset(Dataset):
         if rgb_w is not None:
             sample["rgb_in"] = torch.from_numpy(rgb_w[:T]).float() / 255.0
             sample["rgb_tgt"] = torch.from_numpy(rgb_w[T:]).float() / 255.0
+
+        if self.v8_proprio_store is not None:
+            proprio = self.v8_proprio_store.current(rec.clip_id, action_indices[0])
+            sample.update(
+                {
+                    "lowdim_state": torch.from_numpy(proprio.normalized),
+                    "policy_proprio_raw": torch.from_numpy(proprio.raw),
+                    "embodiment_id": torch.tensor(
+                        proprio.embodiment_id, dtype=torch.long
+                    ),
+                    "policy_proprio_stats_key": proprio.stats_key,
+                    "policy_proprio_anchor": V8_PROPRIO_ANCHOR,
+                    "policy_proprio_frame_index": proprio.anchor_frame_index,
+                }
+            )
 
         if self.cfg.load_policy_state:
             frame_idx = start + T - 1

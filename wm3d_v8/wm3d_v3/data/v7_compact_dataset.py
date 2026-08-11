@@ -26,6 +26,7 @@ from .v8_action_contract import (
     require_v8_pinned_file,
     torchify_v8_action_fields,
 )
+from .v8_proprio_contract import V8_PROPRIO_ANCHOR, V8ProprioStore
 
 
 def _sha256_file(path: Path, chunk_bytes: int = 8 << 20) -> str:
@@ -61,6 +62,11 @@ class V7CompactDatasetConfig:
     v8_action_sidecar_index_sha256: str | None = None
     v8_action_sidecar_stats: Path | None = None
     v8_action_sidecar_stats_sha256: str | None = None
+    v8_proprio_enabled: bool = False
+    v8_proprio_index: Path | None = None
+    v8_proprio_index_sha256: str | None = None
+    v8_proprio_stats: Path | None = None
+    v8_proprio_stats_sha256: str | None = None
 
 
 @dataclass
@@ -116,6 +122,28 @@ class V7CompactWindowDataset(Dataset):
                             raise ValueError(f"missing geometry pseudo-teacher provenance: {row.get('clip_hash')}")
                         rows.append(row)
         self.records = rows
+        self.v8_proprio_store: V8ProprioStore | None = None
+        if cfg.v8_proprio_enabled:
+            if not cfg.v8_dual_rate_action_enabled:
+                raise ValueError(
+                    "V8 compact proprio requires the V8 dual-rate action contract"
+                )
+            if (
+                cfg.v8_proprio_index is None
+                or not cfg.v8_proprio_index_sha256
+                or cfg.v8_proprio_stats is None
+                or not cfg.v8_proprio_stats_sha256
+            ):
+                raise ValueError("V8 compact proprio needs pinned index and stats")
+            self.v8_proprio_store = V8ProprioStore(
+                index_path=cfg.v8_proprio_index,
+                index_sha256=cfg.v8_proprio_index_sha256,
+                stats_path=cfg.v8_proprio_stats,
+                stats_sha256=cfg.v8_proprio_stats_sha256,
+                source="robocasa",
+                split=cfg.split,
+                expected_identities=(row["clip_hash"] for row in rows),
+            )
         self.v8_action_records: dict[str, dict] = {}
         self._v8_action_array_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._v8_action_array_cache_capacity = 64
@@ -550,6 +578,20 @@ class V7CompactWindowDataset(Dataset):
             "action_contract_key": "robocasa365|5|wm3d_v7_base_delta_axisangle_gripclose_v1",
             "action_frame_offset": -1,
         }
+        if self.v8_proprio_store is not None:
+            proprio = self.v8_proprio_store.current(row["clip_hash"], action_start)
+            sample.update(
+                {
+                    "lowdim_state": torch.from_numpy(proprio.normalized),
+                    "policy_proprio_raw": torch.from_numpy(proprio.raw),
+                    "embodiment_id": torch.tensor(
+                        proprio.embodiment_id, dtype=torch.long
+                    ),
+                    "policy_proprio_stats_key": proprio.stats_key,
+                    "policy_proprio_anchor": V8_PROPRIO_ANCHOR,
+                    "policy_proprio_frame_index": proprio.anchor_frame_index,
+                }
+            )
         if action_history is not None:
             sample["action_history"] = torch.from_numpy(action_history)
         if self.cfg.v8_dual_rate_action_enabled:

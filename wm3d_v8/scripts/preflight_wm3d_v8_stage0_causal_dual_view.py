@@ -57,6 +57,15 @@ from wm3d_v3.data.v8_action_contract import (  # noqa: E402
     V8_DUAL_RATE_ACTION_SCHEMA,
     V8_POLICY_HISTORY_SCHEMA,
 )
+from wm3d_v3.data.v8_proprio_contract import (  # noqa: E402
+    V8_EMBODIMENT_VOCAB,
+    V8_EMBODIMENT_VOCAB_SHA256,
+    V8_PROPRIO_ANCHOR,
+    V8_PROPRIO_DIM,
+    V8_PROPRIO_LAYOUT,
+    V8_PROPRIO_SCHEMA,
+    V8ProprioStore,
+)
 from wm3d_v3.training.train import (  # noqa: E402
     apply_direct_policy_oxe_overrides,
     build_v8_action_policy_contract,
@@ -68,10 +77,14 @@ from wm3d_v3.training.train import (  # noqa: E402
 REPORT_SCHEMA = "wm3d_v8_stage0_causal_dual_view_preflight_report_v1"
 CANARY_SCHEMA = "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2"
 FORMAL_SCHEMA = "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2"
+CANARY_SCHEMA_V3 = "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v3"
+FORMAL_SCHEMA_V3 = "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v3"
 CANARY_GATE_SCHEMA = "wm3d_v8_stage0_causal_dual_view_canary_gate_v1"
 EXPECTED_PROFILES = {
     CANARY_SCHEMA: "canary_non_inheritable",
     FORMAL_SCHEMA: "formal",
+    CANARY_SCHEMA_V3: "canary_non_inheritable",
+    FORMAL_SCHEMA_V3: "formal",
 }
 EXPECTED_PARTITIONS = {
     "robocasa_atomic": "atomic",
@@ -83,6 +96,7 @@ RUNTIME_FILES = (
     PROJECT_ROOT / "scripts/wm3d_v8_preflight_common.py",
     PROJECT_ROOT / "wm3d_v3/data/v8_causal_dual_view.py",
     PROJECT_ROOT / "wm3d_v3/data/v8_action_contract.py",
+    PROJECT_ROOT / "wm3d_v3/data/v8_proprio_contract.py",
     PROJECT_ROOT / "wm3d_v3/data/window_dataset.py",
     PROJECT_ROOT / "wm3d_v3/data/v7_compact_dataset.py",
     PROJECT_ROOT / "wm3d_v3/training/train.py",
@@ -164,9 +178,26 @@ def _validate_contract_and_objective(
     train = config.get("train") or {}
     loss = config.get("loss") or {}
     schema = contract.get("schema")
-    unified_action = schema in {CANARY_SCHEMA, FORMAL_SCHEMA}
+    unified_action = schema in EXPECTED_PROFILES
+    proprio_v3 = schema in {CANARY_SCHEMA_V3, FORMAL_SCHEMA_V3}
 
     checks.expect(schema in EXPECTED_PROFILES, f"unsupported contract schema: {schema!r}")
+    checks.equal(
+        bool(data.get("v8_proprio_enabled", False)),
+        proprio_v3,
+        "contract.schema/data.v8_proprio_enabled",
+    )
+    if not proprio_v3:
+        checks.equal(
+            bool(model.get("policy_require_lowdim_state", False)),
+            False,
+            "v2.model.policy_require_lowdim_state",
+        )
+        checks.equal(
+            bool(model.get("policy_require_embodiment", False)),
+            False,
+            "v2.model.policy_require_embodiment",
+        )
     if schema in EXPECTED_PROFILES:
         checks.equal(contract.get("profile"), EXPECTED_PROFILES[schema], "contract.profile")
     checks.equal(
@@ -235,12 +266,56 @@ def _validate_contract_and_objective(
         )
         checks.equal(
             contract.get("action_policy_contract_schema"),
-            "wm3d_v8_stage0_action_policy_contract_v2",
+            (
+                "wm3d_v8_stage0_action_policy_contract_v3"
+                if proprio_v3
+                else "wm3d_v8_stage0_action_policy_contract_v2"
+            ),
             "contract.action_policy_contract_schema",
         )
+        try:
+            built_action_contract = build_v8_action_policy_contract(config)
+        except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+            checks.errors.append(f"action contract build failed: {exc}")
+        else:
+            checks.equal(
+                (built_action_contract or {}).get("schema"),
+                (
+                    "wm3d_v8_stage0_action_policy_contract_v3"
+                    if proprio_v3
+                    else "wm3d_v8_stage0_action_policy_contract_v2"
+                ),
+                "built action contract schema",
+            )
         checks.equal(contract.get("world_state_hz"), 5, "contract.world_state_hz")
         checks.equal(contract.get("policy_hz"), 20, "contract.policy_hz")
         checks.equal(contract.get("policy_horizon"), 8, "contract.policy_horizon")
+    if proprio_v3:
+        checks.equal(
+            model.get("policy_head_type"),
+            "native",
+            "model.policy_head_type",
+        )
+        checks.equal(
+            model.get("policy_lowdim_dim"),
+            V8_PROPRIO_DIM,
+            "model.policy_lowdim_dim",
+        )
+        checks.equal(
+            model.get("policy_require_lowdim_state"),
+            True,
+            "model.policy_require_lowdim_state",
+        )
+        checks.equal(
+            model.get("policy_embodiment_vocab_size"),
+            len(V8_EMBODIMENT_VOCAB),
+            "model.policy_embodiment_vocab_size",
+        )
+        checks.equal(
+            model.get("policy_require_embodiment"),
+            True,
+            "model.policy_require_embodiment",
+        )
     checks.equal(model.get("enable_pixel"), True, "model.enable_pixel")
     checks.equal(model.get("enable_geom_extra"), True, "model.enable_geom_extra")
     checks.equal(model.get("token_codec_frozen"), True, "model.token_codec_frozen")
@@ -291,7 +366,13 @@ def _validate_contract_and_objective(
             POLICY_HISTORY_DIM,
             "data.policy_action_history_dim",
         )
-
+    if proprio_v3:
+        checks.equal(data.get("v8_proprio_enabled"), True, "data.v8_proprio_enabled")
+        checks.equal(
+            data.get("load_policy_state", False),
+            False,
+            "data.load_policy_state",
+        )
     checks.equal(
         train.get("joint_native_action_pretraining"),
         True,
@@ -430,6 +511,27 @@ def _validate_contract_and_objective(
                 POLICY_HISTORY_DIM,
                 f"{name}.policy_action_history_dim",
             )
+        if proprio_v3:
+            checks.equal(
+                source.get("v8_proprio_enabled"),
+                True,
+                f"{name}.v8_proprio_enabled",
+            )
+            checks.equal(
+                source.get("load_policy_state", False),
+                False,
+                f"{name}.load_policy_state",
+            )
+            for key in (
+                "v8_proprio_index",
+                "v8_proprio_index_sha256",
+                "v8_proprio_stats",
+                "v8_proprio_stats_sha256",
+            ):
+                checks.expect(
+                    bool(source.get(key)),
+                    f"{name}.{key} is missing",
+                )
         checks.equal(source.get("causal_dual_view_required"), True, f"{name}.causal_required")
         checks.equal(
             source.get("causal_dual_view_representation"),
@@ -686,6 +788,73 @@ def _validate_v8_action_sidecars(
     return report
 
 
+def _validate_v8_proprio_assets(
+    checks: _Checks,
+    data: dict[str, Any],
+    sources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not bool(data.get("v8_proprio_enabled", False)):
+        return {"enabled": False, "sources": {}}
+    specs: dict[str, dict[str, Any]] = {"robocasa": data}
+    for source_name, source_cfg in sources.items():
+        canonical_sources = list(source_cfg.get("canonical_action_sources") or ())
+        if len(canonical_sources) != 1:
+            checks.errors.append(
+                f"{source_name}: V8 proprio canonical source is ambiguous: "
+                f"{canonical_sources}"
+            )
+            continue
+        canonical_source = str(canonical_sources[0])
+        checks.expect(
+            canonical_source not in specs,
+            f"duplicate V8 proprio source: {canonical_source}",
+        )
+        specs[canonical_source] = source_cfg
+    checks.equal(
+        set(specs),
+        {"robocasa", "droid", "bridge"},
+        "V8 proprio source coverage",
+    )
+    report: dict[str, Any] = {"enabled": True, "sources": {}}
+    for source, source_cfg in sorted(specs.items()):
+        index_path = checks.pinned_file(
+            source_cfg.get("v8_proprio_index"),
+            source_cfg.get("v8_proprio_index_sha256"),
+            f"{source}.proprio_index",
+        )
+        stats_path = checks.pinned_file(
+            source_cfg.get("v8_proprio_stats"),
+            source_cfg.get("v8_proprio_stats_sha256"),
+            f"{source}.proprio_stats",
+        )
+        source_report: dict[str, Any] = {
+            "index": str(index_path) if index_path is not None else None,
+            "stats": str(stats_path) if stats_path is not None else None,
+        }
+        if checks.mode == "full" and index_path is not None and stats_path is not None:
+            try:
+                store = V8ProprioStore(
+                    index_path=index_path,
+                    index_sha256=str(source_cfg.get("v8_proprio_index_sha256")),
+                    stats_path=stats_path,
+                    stats_sha256=str(source_cfg.get("v8_proprio_stats_sha256")),
+                    source=source,
+                    split=None,
+                )
+                source_report["records"] = len(store.records)
+                checks.expect(
+                    len(store.records) > 0,
+                    f"{source}.proprio_index contains no records",
+                )
+            except Exception as exc:
+                checks.errors.append(
+                    f"{source} V8 proprio assets are invalid: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        report["sources"][source] = source_report
+    return report
+
+
 def _validate_training_assets(
     checks: _Checks,
     config: dict[str, Any],
@@ -697,6 +866,7 @@ def _validate_training_assets(
     data = config.get("data") or {}
     contract = config.get("contract") or {}
     action20_report = _validate_v8_action_sidecars(checks, data)
+    proprio_report = _validate_v8_proprio_assets(checks, data, sources)
     checks.pinned_file(
         model.get("token_codec_checkpoint"),
         model.get("token_codec_checkpoint_sha256"),
@@ -827,7 +997,11 @@ def _validate_training_assets(
                 )
             except (OSError, json.JSONDecodeError) as exc:
                 checks.errors.append(f"canary gate is unreadable: {exc}")
-    return {"canary_gate": gate_report, "action20": action20_report}
+    return {
+        "canary_gate": gate_report,
+        "action20": action20_report,
+        "proprio": proprio_report,
+    }
 
 
 def _row_matches_source(source: str, spec: dict[str, Any], row: dict[str, Any]) -> bool:
@@ -1167,6 +1341,9 @@ def _validate_dataset_probe_v8(
     unified_action = bool(
         (config.get("data") or {}).get("v8_dual_rate_action_enabled", False)
     )
+    proprio_enabled = bool(
+        (config.get("data") or {}).get("v8_proprio_enabled", False)
+    )
     if unified_action:
         required.update(
             {
@@ -1184,6 +1361,14 @@ def _validate_dataset_probe_v8(
                 ),
                 "policy_action_coarse_valid_mask": (POLICY_HORIZON // 4,),
                 "action_history": (POLICY_HISTORY_LEN, POLICY_HISTORY_DIM),
+            }
+        )
+    if proprio_enabled:
+        required.update(
+            {
+                "lowdim_state": (V8_PROPRIO_DIM,),
+                "policy_proprio_raw": (V8_PROPRIO_DIM,),
+                "embodiment_id": (),
             }
         )
     for name in EXPECTED_SOURCES:
@@ -1238,6 +1423,42 @@ def _validate_dataset_probe_v8(
                     f"dataset_probe.{name}.{key} contains nonfinite values",
                 )
         sample_report["tensors"] = tensors
+        if proprio_enabled:
+            checks.equal(
+                sample.get("policy_proprio_anchor"),
+                V8_PROPRIO_ANCHOR,
+                f"dataset_probe.{name}.policy_proprio_anchor",
+            )
+            checks.expect(
+                bool(sample.get("policy_proprio_stats_key")),
+                f"dataset_probe.{name}.policy_proprio_stats_key is missing",
+            )
+            embodiment_id = int(torch.as_tensor(sample["embodiment_id"]).item())
+            checks.expect(
+                embodiment_id in set(V8_EMBODIMENT_VOCAB.values()),
+                f"dataset_probe.{name}.embodiment_id is invalid: {embodiment_id}",
+            )
+            normalized = torch.as_tensor(sample["lowdim_state"]).float()
+            raw = torch.as_tensor(sample["policy_proprio_raw"]).float()
+            checks.expect(
+                bool(torch.isfinite(normalized).all())
+                and bool(torch.isfinite(raw).all()),
+                f"dataset_probe.{name}.policy_proprio is non-finite",
+            )
+            proprio_frame = int(
+                torch.as_tensor(sample["policy_proprio_frame_index"]).item()
+            )
+            action_frames = torch.as_tensor(sample["action_frame_indices"])
+            checks.expect(
+                action_frames.ndim == 1 and len(action_frames) >= 1,
+                f"dataset_probe.{name}.action_frame_indices is invalid",
+            )
+            if action_frames.ndim == 1 and len(action_frames) >= 1:
+                checks.equal(
+                    proprio_frame,
+                    int(action_frames[0].item()),
+                    f"dataset_probe.{name}.proprio/action anchor frame",
+                )
         if unified_action:
             checks.equal(
                 sample.get("v8_action_contract_version"),

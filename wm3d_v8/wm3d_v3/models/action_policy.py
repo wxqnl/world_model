@@ -31,6 +31,9 @@ class ActionChunkPolicyConfig:
     use_context_rgb: bool = False
     rgb_spatial_tokens: int = 64
     lowdim_dim: int = 0
+    require_lowdim_state: bool = False
+    embodiment_vocab_size: int = 0
+    require_embodiment: bool = False
     object_state_dim: int = 0
     plan_state_dim: int = 0
     action_history_len: int = 0
@@ -122,6 +125,12 @@ class ActionChunkPolicy(nn.Module):
             raise ValueError(
                 f"policy horizon={self.cfg.horizon} exceeds OFT max_horizon={self.cfg.oft_max_horizon}"
             )
+        if self.cfg.require_lowdim_state and self.cfg.lowdim_dim <= 0:
+            raise ValueError("required lowdim state needs a positive lowdim_dim")
+        if self.cfg.require_embodiment and self.cfg.embodiment_vocab_size <= 0:
+            raise ValueError(
+                "required embodiment token needs a positive vocabulary size"
+            )
         self.policy_feature_dim = int(
             self.cfg.oft_mlp_hidden or self.cfg.hidden
             if self.cfg.head_type == "oft"
@@ -160,6 +169,11 @@ class ActionChunkPolicy(nn.Module):
             )
         else:
             self.lowdim_proj = None
+        self.embodiment_embed = (
+            nn.Embedding(self.cfg.embodiment_vocab_size, self.cfg.hidden)
+            if self.cfg.embodiment_vocab_size > 0
+            else None
+        )
         if self.cfg.object_state_dim > 0:
             self.object_state_proj = nn.Sequential(
                 nn.LayerNorm(self.cfg.object_state_dim),
@@ -761,6 +775,7 @@ class ActionChunkPolicy(nn.Module):
         task_emb: torch.Tensor | None = None,
         *,
         lowdim_state: torch.Tensor | None = None,
+        embodiment_id: torch.Tensor | None = None,
         action_history: torch.Tensor | None = None,
         progress_state: torch.Tensor | None = None,
         object_state: torch.Tensor | None = None,
@@ -860,6 +875,8 @@ class ActionChunkPolicy(nn.Module):
         plan_h: torch.Tensor | None = None
         if self.lowdim_proj is not None and not generic_oft:
             if lowdim_state is None:
+                if self.cfg.require_lowdim_state:
+                    raise ValueError("lowdim_state is required by the policy ABI")
                 lowdim_state = torch.zeros(
                     bsz,
                     self.cfg.lowdim_dim,
@@ -867,8 +884,40 @@ class ActionChunkPolicy(nn.Module):
                     dtype=context_tokens.dtype,
                 )
             if lowdim_state.shape != (bsz, self.cfg.lowdim_dim):
-                raise ValueError(f"lowdim_state must be {(bsz, self.cfg.lowdim_dim)}, got {tuple(lowdim_state.shape)}")
-            aux_tokens.append(self.lowdim_proj(lowdim_state.to(device=context_tokens.device, dtype=frame_h.dtype))[:, None])
+                raise ValueError(
+                    f"lowdim_state must be {(bsz, self.cfg.lowdim_dim)}, "
+                    f"got {tuple(lowdim_state.shape)}"
+                )
+            lowdim_state = lowdim_state.to(
+                device=context_tokens.device, dtype=frame_h.dtype
+            )
+            if not torch.isfinite(lowdim_state).all():
+                raise ValueError("lowdim_state contains non-finite values")
+            aux_tokens.append(self.lowdim_proj(lowdim_state)[:, None])
+        if self.embodiment_embed is not None and not generic_oft:
+            if embodiment_id is None:
+                if self.cfg.require_embodiment:
+                    raise ValueError("embodiment_id is required by the policy ABI")
+                embodiment_id = torch.zeros(
+                    bsz, device=context_tokens.device, dtype=torch.long
+                )
+            if embodiment_id.shape != (bsz,):
+                raise ValueError(
+                    f"embodiment_id must be {(bsz,)}, got {tuple(embodiment_id.shape)}"
+                )
+            if embodiment_id.dtype not in (
+                torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8
+            ):
+                raise ValueError("embodiment_id must use an integer dtype")
+            embodiment_id = embodiment_id.to(
+                device=context_tokens.device, dtype=torch.long
+            )
+            if bool((
+                (embodiment_id < 0)
+                | (embodiment_id >= self.cfg.embodiment_vocab_size)
+            ).any()):
+                raise ValueError("embodiment_id lies outside the sealed vocabulary")
+            aux_tokens.append(self.embodiment_embed(embodiment_id)[:, None])
         if self.object_state_proj is not None:
             if object_state is None:
                 object_state = torch.zeros(

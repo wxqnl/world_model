@@ -275,6 +275,99 @@ def test_runtime_overlay_preserves_exact_resume_training_schedule(
     )
 
 
+def test_runtime_overlay_seals_all_v3_proprio_assets(tmp_path: Path) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text("{}\n")
+    windows = tmp_path / "causal_windows"
+    oxe_paths = {}
+    for source in ("oxe_droid_action", "oxe_bridge_action"):
+        path = tmp_path / f"{source}.jsonl"
+        path.write_text(json.dumps({
+            "path": str(windows / f"{source}__start_000000.npz"),
+        }) + "\n")
+        oxe_paths[source] = [path]
+    robocasa = tmp_path / "robocasa.jsonl"
+    robocasa.write_text("{}\n")
+    action_index = tmp_path / "action20.jsonl"
+    action_index.write_text("{}\n")
+    action_stats = tmp_path / "action20_stats.npz"
+    action_stats.write_bytes(b"sealed action stats")
+    proprio_assets = {}
+    for source in ("robocasa", "droid", "bridge"):
+        index = tmp_path / f"{source}_proprio.jsonl"
+        stats = tmp_path / f"{source}_proprio_stats.npz"
+        index.write_text(f"{source}\n")
+        stats.write_bytes(f"{source}-stats".encode())
+        proprio_assets[source] = (index, stats)
+
+    overlay = _runtime_overlay(
+        base_config=base,
+        oxe_paths=oxe_paths,
+        combined_robocasa_index=robocasa,
+        action_sidecar_index=action_index,
+        action_sidecar_stats=action_stats,
+        proprio_assets=proprio_assets,
+    )
+
+    data = overlay["data"]
+    for key, path in (
+        ("v8_proprio_index", proprio_assets["robocasa"][0]),
+        ("v8_proprio_stats", proprio_assets["robocasa"][1]),
+    ):
+        assert data[key] == str(path.resolve())
+        assert data[f"{key}_sha256"] == _sha(path)
+    assert set(data["v8_proprio_by_source"]) == {"droid", "bridge"}
+    for source in ("droid", "bridge"):
+        spec = data["v8_proprio_by_source"][source]
+        assert spec["v8_proprio_index"] == str(
+            proprio_assets[source][0].resolve()
+        )
+        assert spec["v8_proprio_index_sha256"] == _sha(
+            proprio_assets[source][0]
+        )
+        assert spec["v8_proprio_stats"] == str(
+            proprio_assets[source][1].resolve()
+        )
+        assert spec["v8_proprio_stats_sha256"] == _sha(
+            proprio_assets[source][1]
+        )
+
+
+def test_runtime_overlay_rejects_partial_v3_proprio_assets(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "base.yaml"
+    base.write_text("{}\n")
+    windows = tmp_path / "causal_windows"
+    oxe_paths = {}
+    for source in ("oxe_droid_action", "oxe_bridge_action"):
+        path = tmp_path / f"{source}.jsonl"
+        path.write_text(json.dumps({
+            "path": str(windows / f"{source}__start_000000.npz"),
+        }) + "\n")
+        oxe_paths[source] = [path]
+    robocasa = tmp_path / "robocasa.jsonl"
+    robocasa.write_text("{}\n")
+    action_index = tmp_path / "action20.jsonl"
+    action_index.write_text("{}\n")
+    action_stats = tmp_path / "action20_stats.npz"
+    action_stats.write_bytes(b"sealed action stats")
+    proprio_index = tmp_path / "robocasa_proprio.jsonl"
+    proprio_stats = tmp_path / "robocasa_proprio_stats.npz"
+    proprio_index.write_text("robocasa\n")
+    proprio_stats.write_bytes(b"robocasa-stats")
+
+    with pytest.raises(ValueError, match="robocasa/droid/bridge exactly"):
+        _runtime_overlay(
+            base_config=base,
+            oxe_paths=oxe_paths,
+            combined_robocasa_index=robocasa,
+            action_sidecar_index=action_index,
+            action_sidecar_stats=action_stats,
+            proprio_assets={"robocasa": (proprio_index, proprio_stats)},
+        )
+
+
 def test_runtime_overlay_rejects_split_oxe_window_directories(
     tmp_path: Path,
 ) -> None:

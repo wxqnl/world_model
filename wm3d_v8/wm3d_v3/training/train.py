@@ -71,6 +71,14 @@ from wm3d_v3.data.v8_action_contract import (
     V8_POLICY_HISTORY_SCHEMA,
     compose_base_delta_actions_torch,
 )
+from wm3d_v3.data.v8_proprio_contract import (
+    V8_EMBODIMENT_VOCAB,
+    V8_EMBODIMENT_VOCAB_SHA256,
+    V8_PROPRIO_ANCHOR,
+    V8_PROPRIO_DIM,
+    V8_PROPRIO_LAYOUT,
+    V8_PROPRIO_SCHEMA,
+)
 from wm3d_v3.data.window_dataset import OXEWindowDataset, WindowConfig
 from wm3d_v3.losses import (
     LossWeights,
@@ -136,6 +144,11 @@ _DIRECT_POLICY_OXE_OVERRIDE_KEYS = frozenset(
         "policy_action_history_len",
         "policy_action_history_dim",
         "v8_dual_rate_action_enabled",
+        "v8_proprio_enabled",
+        "v8_proprio_index",
+        "v8_proprio_index_sha256",
+        "v8_proprio_stats",
+        "v8_proprio_stats_sha256",
         "window_geom_shard_index",
         "window_geom_shard_root",
     }
@@ -159,7 +172,39 @@ def apply_direct_policy_oxe_overrides(source_cfg: dict, data_cfg: dict) -> dict:
             "data.direct_policy_oxe_overrides contains non-loader keys: "
             + ", ".join(forbidden)
         )
-    return _deep_merge_config(source_cfg, raw)
+    result = _deep_merge_config(source_cfg, raw)
+    if bool(data_cfg.get("v8_proprio_enabled", False)):
+        by_source = data_cfg.get("v8_proprio_by_source") or {}
+        if not isinstance(by_source, dict):
+            raise ValueError("data.v8_proprio_by_source must be a mapping")
+        canonical_sources = list(result.get("canonical_action_sources") or ())
+        if len(canonical_sources) != 1:
+            raise ValueError(
+                "V8 proprio requires one canonical source per OXE dataset: "
+                f"{canonical_sources}"
+            )
+        canonical_source = str(canonical_sources[0])
+        source_proprio = by_source.get(canonical_source)
+        if not isinstance(source_proprio, dict):
+            raise ValueError(
+                f"data.v8_proprio_by_source lacks {canonical_source!r}"
+            )
+        expected_keys = {
+            "v8_proprio_index",
+            "v8_proprio_index_sha256",
+            "v8_proprio_stats",
+            "v8_proprio_stats_sha256",
+        }
+        if set(source_proprio) != expected_keys:
+            raise ValueError(
+                f"V8 proprio {canonical_source} keys must be exact: "
+                f"{sorted(expected_keys)}"
+            )
+        result = _deep_merge_config(
+            result,
+            {"v8_proprio_enabled": True, **source_proprio},
+        )
+    return result
 
 
 def load_train_config(path: Path, _seen: set[Path] | None = None) -> dict:
@@ -1209,6 +1254,15 @@ def _legacy_build_model(cfg: dict) -> JointWorldModel:
         policy_use_context_rgb=cfg["model"].get("policy_use_context_rgb", False),
         policy_rgb_spatial_tokens=cfg["model"].get("policy_rgb_spatial_tokens", 64),
         policy_lowdim_dim=cfg["model"].get("policy_lowdim_dim", 0),
+        policy_require_lowdim_state=cfg["model"].get(
+            "policy_require_lowdim_state", False
+        ),
+        policy_embodiment_vocab_size=cfg["model"].get(
+            "policy_embodiment_vocab_size", 0
+        ),
+        policy_require_embodiment=cfg["model"].get(
+            "policy_require_embodiment", False
+        ),
         policy_object_state_dim=cfg["model"].get("policy_object_state_dim", 0),
         policy_plan_state_dim=cfg["model"].get("policy_plan_state_dim", 0),
         policy_action_history_len=cfg["model"].get("policy_action_history_len", 0),
@@ -1319,10 +1373,19 @@ def _explicit_clip_ids(data_cfg: dict, split_cfg: dict) -> tuple[list[str] | Non
 
 def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfig:
     model_cfg = model_cfg or {}
-    policy_state_default = any(
-        int(model_cfg.get(k, 0) or 0) > 0
-        for k in ("policy_lowdim_dim", "policy_object_state_dim", "policy_plan_state_dim", "policy_action_history_len")
-    ) or bool(model_cfg.get("policy_use_progress", False))
+    v8_proprio_enabled = bool(data_cfg.get("v8_proprio_enabled", False))
+    policy_state_default = (not v8_proprio_enabled) and (
+        any(
+            int(model_cfg.get(k, 0) or 0) > 0
+            for k in (
+                "policy_lowdim_dim",
+                "policy_object_state_dim",
+                "policy_plan_state_dim",
+                "policy_action_history_len",
+            )
+        )
+        or bool(model_cfg.get("policy_use_progress", False))
+    )
     shard_indices = data_cfg.get("window_geom_shard_indices")
     shard_roots = data_cfg.get("window_geom_shard_roots")
     canonical_action_enabled = bool(data_cfg.get("canonical_action_enabled", False))
@@ -1457,7 +1520,23 @@ def _window_config(data_cfg: dict, model_cfg: dict | None = None) -> WindowConfi
                         canonical_action_cache_manifest_sha256=canonical_action_cache_manifest_sha256,
                         v8_dual_rate_action_enabled=bool(
                             data_cfg.get("v8_dual_rate_action_enabled", False)
-                        ))
+                        ),
+                        v8_proprio_enabled=v8_proprio_enabled,
+                        v8_proprio_index=(
+                            Path(data_cfg["v8_proprio_index"])
+                            if data_cfg.get("v8_proprio_index") else None
+                        ),
+                        v8_proprio_index_sha256=data_cfg.get(
+                            "v8_proprio_index_sha256"
+                        ),
+                        v8_proprio_stats=(
+                            Path(data_cfg["v8_proprio_stats"])
+                            if data_cfg.get("v8_proprio_stats") else None
+                        ),
+                        v8_proprio_stats_sha256=data_cfg.get(
+                            "v8_proprio_stats_sha256"
+                        ),
+                    )
 
 
 def _sample_record(dataset, sample_idx: int):
@@ -3355,6 +3434,23 @@ def build_datasets(cfg: dict, overfit_ids=None):
             "v8_action_sidecar_stats_sha256": data_cfg.get(
                 "v8_action_sidecar_stats_sha256"
             ),
+            "v8_proprio_enabled": bool(
+                data_cfg.get("v8_proprio_enabled", False)
+            ),
+            "v8_proprio_index": (
+                Path(data_cfg["v8_proprio_index"])
+                if data_cfg.get("v8_proprio_index") else None
+            ),
+            "v8_proprio_index_sha256": data_cfg.get(
+                "v8_proprio_index_sha256"
+            ),
+            "v8_proprio_stats": (
+                Path(data_cfg["v8_proprio_stats"])
+                if data_cfg.get("v8_proprio_stats") else None
+            ),
+            "v8_proprio_stats_sha256": data_cfg.get(
+                "v8_proprio_stats_sha256"
+            ),
         }
         robocasa_train = V7CompactWindowDataset(
             V7CompactDatasetConfig(
@@ -3567,6 +3663,23 @@ def build_datasets(cfg: dict, overfit_ids=None):
             ),
             "v8_action_sidecar_stats_sha256": data_cfg.get(
                 "v8_action_sidecar_stats_sha256"
+            ),
+            "v8_proprio_enabled": bool(
+                data_cfg.get("v8_proprio_enabled", False)
+            ),
+            "v8_proprio_index": (
+                Path(data_cfg["v8_proprio_index"])
+                if data_cfg.get("v8_proprio_index") else None
+            ),
+            "v8_proprio_index_sha256": data_cfg.get(
+                "v8_proprio_index_sha256"
+            ),
+            "v8_proprio_stats": (
+                Path(data_cfg["v8_proprio_stats"])
+                if data_cfg.get("v8_proprio_stats") else None
+            ),
+            "v8_proprio_stats_sha256": data_cfg.get(
+                "v8_proprio_stats_sha256"
             ),
         }
         train_dataset = V7CompactWindowDataset(
@@ -3862,6 +3975,8 @@ def batch_to_device(
         "pose_geom_conf_tgt",
         "depth_conf_tgt",
         "lowdim_state",
+        "policy_proprio_raw",
+        "embodiment_id",
         "object_state",
         "plan_state",
         "action_history",
@@ -3899,6 +4014,86 @@ def batch_to_device(
     ):
         if key in batch:
             tgt[key] = batch[key].to(device, non_blocking=True)
+    v8_proprio_metadata = (
+        "policy_proprio_raw",
+        "embodiment_id",
+        "policy_proprio_stats_key",
+        "policy_proprio_anchor",
+        "policy_proprio_frame_index",
+    )
+    required_v8_proprio_metadata = (
+        "lowdim_state",
+        *v8_proprio_metadata,
+    )
+    if any(key in batch for key in v8_proprio_metadata):
+        missing = [key for key in required_v8_proprio_metadata if key not in batch]
+        if "action_frame_indices" not in batch:
+            missing.append("action_frame_indices")
+        if missing:
+            raise RuntimeError(f"incomplete V8 policy proprio batch: {missing}")
+        batch_size = int(action_tgt.shape[0])
+        if tuple(tgt["lowdim_state"].shape) != (batch_size, 10):
+            raise RuntimeError(
+                "V8 normalized proprio must be exact [B,10], got "
+                f"{tuple(tgt['lowdim_state'].shape)}"
+            )
+        if tuple(tgt["policy_proprio_raw"].shape) != (batch_size, 10):
+            raise RuntimeError(
+                "V8 raw proprio must be exact [B,10], got "
+                f"{tuple(tgt['policy_proprio_raw'].shape)}"
+            )
+        if tuple(tgt["embodiment_id"].shape) != (batch_size,):
+            raise RuntimeError(
+                "V8 embodiment id must be exact [B], got "
+                f"{tuple(tgt['embodiment_id'].shape)}"
+            )
+        integer_dtypes = {
+            torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8
+        }
+        if tgt["embodiment_id"].dtype not in integer_dtypes or bool((
+            (tgt["embodiment_id"] < 0)
+            | (tgt["embodiment_id"] >= len(V8_EMBODIMENT_VOCAB))
+        ).any()):
+            raise RuntimeError(
+                "V8 embodiment id violates the sealed vocabulary"
+            )
+        if not bool(torch.isfinite(tgt["lowdim_state"]).all()) or not bool(
+            torch.isfinite(tgt["policy_proprio_raw"]).all()
+        ):
+            raise RuntimeError("V8 policy proprio contains non-finite values")
+        stats_keys = batch["policy_proprio_stats_key"]
+        anchors = batch["policy_proprio_anchor"]
+        if isinstance(stats_keys, str):
+            stats_keys = [stats_keys] * batch_size
+        if isinstance(anchors, str):
+            anchors = [anchors] * batch_size
+        if len(stats_keys) != batch_size or len(set(map(str, stats_keys))) != 1:
+            raise RuntimeError(f"V8 proprio stats identity mismatch: {stats_keys}")
+        if len(anchors) != batch_size or any(
+            str(value) != "first_policy_action_target" for value in anchors
+        ):
+            raise RuntimeError(f"V8 proprio temporal anchor mismatch: {anchors}")
+        proprio_frames = torch.as_tensor(batch["policy_proprio_frame_index"])
+        action_frames = torch.as_tensor(batch["action_frame_indices"])
+        if (
+            proprio_frames.shape != (batch_size,)
+            or action_frames.ndim != 2
+            or action_frames.shape[0] != batch_size
+            or action_frames.shape[1] < 1
+            or proprio_frames.dtype not in integer_dtypes
+            or action_frames.dtype not in integer_dtypes
+        ):
+            raise RuntimeError(
+                "V8 proprio/action frame metadata has an invalid shape or dtype"
+            )
+        if not torch.equal(proprio_frames, action_frames[:, 0]):
+            raise RuntimeError(
+                "V8 proprio frame must equal the first policy action target"
+            )
+        tgt["policy_proprio_frame_index"] = proprio_frames.to(
+            device, non_blocking=True
+        )
+        tgt["policy_proprio_stats_keys"] = [str(value) for value in stats_keys]
     if "progress_tgt" in batch:
         tgt["progress_tgt"] = batch["progress_tgt"].to(device, non_blocking=True)
     if "terminal_success_tgt" in batch:
@@ -4532,6 +4727,22 @@ def validate_action_policy_resume_load(load_result) -> None:
         )
 
 
+V8_STAGE0_CONFIG_ACTION_CONTRACT_SCHEMAS = {
+    "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2": (
+        "wm3d_v8_stage0_action_policy_contract_v2"
+    ),
+    "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2": (
+        "wm3d_v8_stage0_action_policy_contract_v2"
+    ),
+    "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v3": (
+        "wm3d_v8_stage0_action_policy_contract_v3"
+    ),
+    "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v3": (
+        "wm3d_v8_stage0_action_policy_contract_v3"
+    ),
+}
+
+
 def build_v8_action_policy_contract(cfg: dict) -> dict | None:
     """Resolve the immutable V8 Stage0 action ABI stored in checkpoints."""
 
@@ -4558,6 +4769,91 @@ def build_v8_action_policy_contract(cfg: dict) -> dict | None:
         )
     else:
         source_items = []
+    source_items = [
+        (
+            source_name,
+            apply_direct_policy_oxe_overrides(source_cfg, data_cfg),
+        )
+        for source_name, source_cfg in source_items
+    ]
+    proprio_enabled = bool(data_cfg.get("v8_proprio_enabled", False))
+    proprio_contract: dict[str, object] | None = None
+    if proprio_enabled:
+
+        def pinned_proprio_source(
+            source_cfg: dict, *, source: str, embodiment: str
+        ) -> dict[str, object]:
+            if not bool(source_cfg.get("v8_proprio_enabled", False)):
+                raise RuntimeError(f"V8 proprio is not enabled for {source}")
+            result: dict[str, object] = {
+                "index_path": str(source_cfg.get("v8_proprio_index") or ""),
+                "index_sha256": str(
+                    source_cfg.get("v8_proprio_index_sha256") or ""
+                ),
+                "stats_path": str(source_cfg.get("v8_proprio_stats") or ""),
+                "stats_sha256": str(
+                    source_cfg.get("v8_proprio_stats_sha256") or ""
+                ),
+                "embodiment": embodiment,
+                "embodiment_id": V8_EMBODIMENT_VOCAB[embodiment],
+            }
+            for key in ("index_path", "stats_path"):
+                if not result[key]:
+                    raise RuntimeError(f"V8 proprio {source} lacks {key}")
+            for key in ("index_sha256", "stats_sha256"):
+                digest = str(result[key])
+                if len(digest) != 64 or any(
+                    character not in "0123456789abcdef" for character in digest
+                ):
+                    raise RuntimeError(
+                        f"V8 proprio {source} has invalid {key}: {digest!r}"
+                    )
+            return result
+
+        proprio_sources = {
+            "robocasa": pinned_proprio_source(
+                data_cfg,
+                source="robocasa",
+                embodiment="panda_robocasa_libero",
+            )
+        }
+        oxe_embodiment = {
+            "droid": "franka_droid",
+            "bridge": "widowx_bridge",
+        }
+        for source_name, source_cfg in source_items:
+            canonical_sources = list(
+                source_cfg.get("canonical_action_sources") or ()
+            )
+            if (
+                len(canonical_sources) != 1
+                or canonical_sources[0] not in oxe_embodiment
+            ):
+                raise RuntimeError(
+                    f"V8 proprio source identity is ambiguous for {source_name}: "
+                    f"{canonical_sources}"
+                )
+            source = canonical_sources[0]
+            if source in proprio_sources:
+                raise RuntimeError(f"duplicate V8 proprio source {source}")
+            proprio_sources[source] = pinned_proprio_source(
+                source_cfg, source=source, embodiment=oxe_embodiment[source]
+            )
+        if set(proprio_sources) != {"robocasa", "droid", "bridge"}:
+            raise RuntimeError(
+                f"V8 proprio source coverage mismatch: {sorted(proprio_sources)}"
+            )
+        proprio_contract = {
+            "schema": V8_PROPRIO_SCHEMA,
+            "required": True,
+            "dim": V8_PROPRIO_DIM,
+            "layout": list(V8_PROPRIO_LAYOUT),
+            "anchor": V8_PROPRIO_ANCHOR,
+            "normalization": "source_bound_train_only_affine",
+            "embodiment_vocab": dict(V8_EMBODIMENT_VOCAB),
+            "embodiment_vocab_sha256": V8_EMBODIMENT_VOCAB_SHA256,
+            "sources": proprio_sources,
+        }
     for source_name, source_cfg in source_items:
         if not source_name or not isinstance(source_cfg, dict):
             continue
@@ -4578,7 +4874,11 @@ def build_v8_action_policy_contract(cfg: dict) -> dict | None:
             ),
         }
     contract = {
-        "schema": "wm3d_v8_stage0_action_policy_contract_v2",
+        "schema": (
+            "wm3d_v8_stage0_action_policy_contract_v3"
+            if proprio_enabled
+            else "wm3d_v8_stage0_action_policy_contract_v2"
+        ),
         "world_state_hz": 5,
         "policy_hz": 20,
         "policy_horizon": V8_POLICY_HORIZON,
@@ -4624,6 +4924,8 @@ def build_v8_action_policy_contract(cfg: dict) -> dict | None:
         },
         "stage0_native3d_owner": True,
     }
+    if proprio_contract is not None:
+        contract["proprio"] = proprio_contract
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
     )
@@ -4651,6 +4953,29 @@ def validate_action_pretraining_preflight(cfg: dict) -> bool:
         return False
 
     errors: list[str] = []
+    contract_cfg = cfg.get("contract") or {}
+    config_schema = str(contract_cfg.get("schema") or "")
+    expected_action_contract_schema = (
+        V8_STAGE0_CONFIG_ACTION_CONTRACT_SCHEMAS.get(config_schema)
+    )
+    if expected_action_contract_schema is not None:
+        config_requires_proprio = expected_action_contract_schema.endswith("_v3")
+        data_enables_proprio = bool(data_cfg.get("v8_proprio_enabled", False))
+        if data_enables_proprio != config_requires_proprio:
+            errors.append(
+                "V8 Stage0 config schema/proprio mode mismatch: "
+                f"schema={config_schema!r} v8_proprio_enabled={data_enables_proprio}"
+            )
+        declared_action_contract_schema = str(
+            contract_cfg.get("action_policy_contract_schema") or ""
+        )
+        if declared_action_contract_schema != expected_action_contract_schema:
+            errors.append(
+                "V8 Stage0 config/action contract declaration mismatch: "
+                f"schema={config_schema!r} "
+                f"declared={declared_action_contract_schema!r} "
+                f"expected={expected_action_contract_schema!r}"
+            )
     v8_dual_rate = bool(train_cfg.get("v8_dual_rate_action_enabled", False))
     if v8_dual_rate != bool(data_cfg.get("v8_dual_rate_action_enabled", False)):
         errors.append("V8 dual-rate action mode must be enabled in both data and train")
@@ -4713,6 +5038,34 @@ def validate_action_pretraining_preflight(cfg: dict) -> bool:
                 "V8 formal policy forbids delta-event losses: "
                 + ", ".join(nonzero_delta_weights)
             )
+        if bool(data_cfg.get("v8_proprio_enabled", False)):
+            if model_cfg.get("policy_head_type") != "native":
+                errors.append("V8 proprio requires the native unified policy head")
+            if int(model_cfg.get("policy_lowdim_dim", -1)) != V8_PROPRIO_DIM:
+                errors.append("V8 proprio policy_lowdim_dim must be exact 10")
+            if not bool(model_cfg.get("policy_require_lowdim_state", False)):
+                errors.append("V8 proprio must require current lowdim state")
+            if int(model_cfg.get("policy_embodiment_vocab_size", -1)) != len(
+                V8_EMBODIMENT_VOCAB
+            ):
+                errors.append("V8 proprio embodiment vocabulary size must be exact 3")
+            if not bool(model_cfg.get("policy_require_embodiment", False)):
+                errors.append("V8 proprio must require embodiment identity")
+            if bool(data_cfg.get("load_policy_state", False)):
+                errors.append("V8 proprio forbids legacy optional policy state")
+            for key in (
+                "v8_proprio_index",
+                "v8_proprio_index_sha256",
+                "v8_proprio_stats",
+                "v8_proprio_stats_sha256",
+            ):
+                if not data_cfg.get(key):
+                    errors.append(f"V8 proprio data requires data.{key}")
+        elif any(
+            bool(model_cfg.get(key, False))
+            for key in ("policy_require_lowdim_state", "policy_require_embodiment")
+        ):
+            errors.append("required policy current state needs V8 proprio data")
         for key in (
             "v8_action_sidecar_index",
             "v8_action_sidecar_index_sha256",
@@ -4724,8 +5077,19 @@ def validate_action_pretraining_preflight(cfg: dict) -> bool:
         oxe_overrides = data_cfg.get("direct_policy_oxe_overrides") or {}
         if not bool(oxe_overrides.get("v8_dual_rate_action_enabled", False)):
             errors.append("V8 dual-rate OXE override must be enabled explicitly")
-        if build_v8_action_policy_contract(cfg) is None:
+        resolved_action_contract = build_v8_action_policy_contract(cfg)
+        if resolved_action_contract is None:
             errors.append("V8 action checkpoint contract could not be resolved")
+        elif (
+            expected_action_contract_schema is not None
+            and resolved_action_contract.get("schema")
+            != expected_action_contract_schema
+        ):
+            errors.append(
+                "V8 Stage0 built action contract disagrees with config schema: "
+                f"built={resolved_action_contract.get('schema')!r} "
+                f"expected={expected_action_contract_schema!r}"
+            )
     if not bool(model_cfg.get("enable_action_policy")):
         errors.append("action pretraining requires model.enable_action_policy=true")
     trainable_prefixes = tuple(train_cfg.get("trainable_prefixes") or ())
@@ -5057,6 +5421,7 @@ def action_policy_kwargs_from_targets(tgt: dict) -> dict:
     kwargs = {}
     for src, dst in (
         ("lowdim_state", "lowdim_state"),
+        ("embodiment_id", "embodiment_id"),
         ("object_state", "object_state"),
         ("plan_state", "plan_state"),
         ("action_history", "action_history"),

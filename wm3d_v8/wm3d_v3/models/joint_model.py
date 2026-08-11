@@ -118,6 +118,9 @@ class JointConfig:
     policy_use_context_rgb: bool = False
     policy_rgb_spatial_tokens: int = 64
     policy_lowdim_dim: int = 0
+    policy_require_lowdim_state: bool = False
+    policy_embodiment_vocab_size: int = 0
+    policy_require_embodiment: bool = False
     policy_object_state_dim: int = 0
     policy_plan_state_dim: int = 0
     policy_action_history_len: int = 0
@@ -329,6 +332,9 @@ class JointWorldModel(nn.Module):
                 use_context_rgb=cfg.policy_use_context_rgb,
                 rgb_spatial_tokens=cfg.policy_rgb_spatial_tokens,
                 lowdim_dim=cfg.policy_lowdim_dim,
+                require_lowdim_state=cfg.policy_require_lowdim_state,
+                embodiment_vocab_size=cfg.policy_embodiment_vocab_size,
+                require_embodiment=cfg.policy_require_embodiment,
                 object_state_dim=cfg.policy_object_state_dim,
                 plan_state_dim=cfg.policy_plan_state_dim,
                 action_history_len=cfg.policy_action_history_len,
@@ -507,6 +513,7 @@ class JointWorldModel(nn.Module):
         flow_sample_steps: int | None = None,
         flow_noise_scale: float | None = None,
         lowdim_state: torch.Tensor | None = None,
+        embodiment_id: torch.Tensor | None = None,
         object_state: torch.Tensor | None = None,
         plan_state: torch.Tensor | None = None,
         action_history: torch.Tensor | None = None,
@@ -587,6 +594,7 @@ class JointWorldModel(nn.Module):
             expanded_tokens,
             task_emb=expanded_task,
             lowdim_state=expand_optional(lowdim_state),
+            embodiment_id=expand_optional(embodiment_id),
             object_state=expand_optional(object_state),
             plan_state=expand_optional(plan_state),
             action_history=expand_optional(action_history),
@@ -678,6 +686,7 @@ class JointWorldModel(nn.Module):
                 action_cond: torch.Tensor | None = None,
                 context_rgb: torch.Tensor | None = None,
                 lowdim_state: torch.Tensor | None = None,
+                embodiment_id: torch.Tensor | None = None,
                 object_state: torch.Tensor | None = None,
                 plan_state: torch.Tensor | None = None,
                 action_history: torch.Tensor | None = None,
@@ -855,6 +864,7 @@ class JointWorldModel(nn.Module):
                 policy_tokens,
                 task_emb=c,
                 lowdim_state=lowdim_state,
+                embodiment_id=embodiment_id,
                 object_state=object_state,
                 plan_state=plan_state,
                 action_history=action_history,
@@ -904,6 +914,7 @@ class JointWorldModel(nn.Module):
         c: torch.Tensor,
         *,
         lowdim_state: torch.Tensor | None = None,
+        embodiment_id: torch.Tensor | None = None,
         object_state: torch.Tensor | None = None,
         plan_state: torch.Tensor | None = None,
         action_history: torch.Tensor | None = None,
@@ -970,6 +981,7 @@ class JointWorldModel(nn.Module):
             policy_tokens,
             task_emb=c,
             lowdim_state=lowdim_state,
+            embodiment_id=embodiment_id,
             object_state=object_state,
             plan_state=plan_state,
             action_history=action_history,

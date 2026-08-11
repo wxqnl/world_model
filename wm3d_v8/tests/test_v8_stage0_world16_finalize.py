@@ -49,7 +49,6 @@ def _write_shard(root: Path, spec: FamilySpec, shard: int, identity: str) -> Non
     report = {
         "schema": OXE_SCHEMA,
         "pass": True,
-        "representation": REPRESENTATION,
         "source": spec.source,
         "split": spec.split,
         "shard_id": shard,
@@ -170,6 +169,20 @@ def test_collect_family_rejects_tampered_index(tmp_path: Path) -> None:
     index = tmp_path / "oxe_unit_train.shard-00001-of-00002.jsonl"
     index.write_text(index.read_text() + "{}\n")
     with pytest.raises(ValueError, match="index SHA mismatch"):
+        collect_family(tmp_path, spec)
+
+
+def test_collect_oxe_rejects_wrong_optional_report_representation(
+    tmp_path: Path,
+) -> None:
+    spec = _spec()
+    _write_shard(tmp_path, spec, 0, "x")
+    _write_shard(tmp_path, spec, 1, "y")
+    report = tmp_path / "oxe_unit_train.shard-00000-of-00002.report.json"
+    payload = json.loads(report.read_text())
+    payload["representation"] = "wrong"
+    report.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="representation mismatch"):
         collect_family(tmp_path, spec)
 
 

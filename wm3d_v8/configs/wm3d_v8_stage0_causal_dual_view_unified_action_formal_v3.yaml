@@ -1,0 +1,42 @@
+_base_: wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2.yaml
+
+contract:
+  schema: wm3d_v8_stage0_causal_dual_view_unified_action_formal_v3
+  action_policy_contract_schema: wm3d_v8_stage0_action_policy_contract_v3
+  purpose: full_native3d_5hz_with_unified_action20hz_and_current_proprio
+  canary_config: configs/wm3d_v8_stage0_causal_dual_view_unified_action_canary_v3.yaml
+  canary_gate_receipt: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/audits/unified_action_proprio_canary_v3/formal_gate.json
+  canary_gate_receipt_sha256: PENDING_UNIFIED_ACTION_PROPRIO_CANARY_GATE_SHA256
+
+model:
+  policy_head_type: native
+  policy_lowdim_dim: 10
+  policy_require_lowdim_state: true
+  policy_embodiment_vocab_size: 3
+  policy_require_embodiment: true
+
+data:
+  v8_proprio_enabled: true
+  load_policy_state: false
+  v8_proprio_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/proprio/robocasa/index.jsonl
+  v8_proprio_index_sha256: PENDING_FORMAL_ROBOCASA_PROPRIO_INDEX_SHA256
+  v8_proprio_stats: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/proprio/robocasa/stats_train.npz
+  v8_proprio_stats_sha256: PENDING_FORMAL_ROBOCASA_PROPRIO_STATS_SHA256
+  v8_proprio_by_source:
+    droid:
+      v8_proprio_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/proprio/droid/index.jsonl
+      v8_proprio_index_sha256: PENDING_FORMAL_DROID_PROPRIO_INDEX_SHA256
+      v8_proprio_stats: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/proprio/droid/stats_train.npz
+      v8_proprio_stats_sha256: PENDING_FORMAL_DROID_PROPRIO_STATS_SHA256
+    bridge:
+      v8_proprio_index: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/proprio/bridge/index.jsonl
+      v8_proprio_index_sha256: PENDING_FORMAL_BRIDGE_PROPRIO_INDEX_SHA256
+      v8_proprio_stats: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/manifests/formal/proprio/bridge/stats_train.npz
+      v8_proprio_stats_sha256: PENDING_FORMAL_BRIDGE_PROPRIO_STATS_SHA256
+
+train:
+  run_lineage: wm3d_v8_stage0_causal_dual_view_unified_action20_proprio10_formal100k_20260811_v3
+
+out:
+  root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/results/unified_action_proprio_formal100k_v3
+  require_empty_checkpoint_dir: true

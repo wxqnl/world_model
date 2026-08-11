@@ -14,9 +14,27 @@ from typing import Any, Mapping
 
 import torch
 
+from wm3d_v3.data.v8_proprio_contract import (
+    V8_EMBODIMENT_VOCAB,
+    V8_EMBODIMENT_VOCAB_SHA256,
+    V8_PROPRIO_ANCHOR,
+    V8_PROPRIO_DIM,
+    V8_PROPRIO_LAYOUT,
+    V8_PROPRIO_SCHEMA,
+)
+
 
 ACTION_POLICY_PREFIX = "action_policy."
-CONTRACT_SCHEMA = "wm3d_v8_stage0_action_policy_contract_v2"
+CONTRACT_SCHEMA_V2 = "wm3d_v8_stage0_action_policy_contract_v2"
+CONTRACT_SCHEMA_V3 = "wm3d_v8_stage0_action_policy_contract_v3"
+CONTRACT_SCHEMA = CONTRACT_SCHEMA_V2
+CONTRACT_SCHEMAS = {CONTRACT_SCHEMA_V2, CONTRACT_SCHEMA_V3}
+CONFIG_SCHEMA_TO_CONTRACT_SCHEMA = {
+    "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2": CONTRACT_SCHEMA_V2,
+    "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2": CONTRACT_SCHEMA_V2,
+    "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v3": CONTRACT_SCHEMA_V3,
+    "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v3": CONTRACT_SCHEMA_V3,
+}
 LOWER_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -61,8 +79,8 @@ def checkpoint_config_sha256(config: Mapping[str, Any]) -> str:
 def validate_v8_action_policy_contract(contract: Any) -> dict[str, Any]:
     if not isinstance(contract, dict):
         raise V8ActionPolicyTransitionError("Stage0 checkpoint has no V8 action contract")
+    schema = str(contract.get("schema") or "")
     expected = {
-        "schema": CONTRACT_SCHEMA,
         "world_state_hz": 5,
         "policy_hz": 20,
         "policy_horizon": 8,
@@ -76,11 +94,17 @@ def validate_v8_action_policy_contract(contract: Any) -> dict[str, Any]:
         "policy_core_action_cond": "none",
         "stage0_native3d_owner": True,
     }
-    mismatches = {
+    mismatches: dict[str, dict[str, Any]] = {}
+    if schema not in CONTRACT_SCHEMAS:
+        mismatches["schema"] = {
+            "actual": schema,
+            "expected": sorted(CONTRACT_SCHEMAS),
+        }
+    mismatches.update({
         key: {"actual": contract.get(key), "expected": value}
         for key, value in expected.items()
         if contract.get(key) != value
-    }
+    })
     pose = contract.get("pose") or {}
     gripper = contract.get("gripper") or {}
     history = contract.get("history") or {}
@@ -167,6 +191,82 @@ def validate_v8_action_policy_contract(contract: Any) -> dict[str, Any]:
                 "actual": stats_by_source,
                 "expected": "non-empty source-to-SHA256 mapping",
             }
+    proprio = contract.get("proprio")
+    if schema == CONTRACT_SCHEMA_V2 and proprio is not None:
+        mismatches["proprio"] = {
+            "actual": "present",
+            "expected": "absent from v2",
+        }
+    if schema == CONTRACT_SCHEMA_V3:
+        if not isinstance(proprio, dict):
+            mismatches["proprio"] = {
+                "actual": type(proprio).__name__,
+                "expected": "mapping",
+            }
+            proprio = {}
+        expected_proprio = {
+            "schema": V8_PROPRIO_SCHEMA,
+            "required": True,
+            "dim": V8_PROPRIO_DIM,
+            "layout": list(V8_PROPRIO_LAYOUT),
+            "anchor": V8_PROPRIO_ANCHOR,
+            "normalization": "source_bound_train_only_affine",
+            "embodiment_vocab": dict(V8_EMBODIMENT_VOCAB),
+            "embodiment_vocab_sha256": V8_EMBODIMENT_VOCAB_SHA256,
+        }
+        for key, expected_value in expected_proprio.items():
+            actual = proprio.get(key)
+            if actual != expected_value:
+                mismatches[f"proprio.{key}"] = {
+                    "actual": actual,
+                    "expected": expected_value,
+                }
+        sources = proprio.get("sources") or {}
+        expected_sources = {
+            "robocasa": ("panda_robocasa_libero", 2),
+            "droid": ("franka_droid", 0),
+            "bridge": ("widowx_bridge", 1),
+        }
+        if not isinstance(sources, dict) or set(sources) != set(expected_sources):
+            mismatches["proprio.sources"] = {
+                "actual": (
+                    sorted(sources)
+                    if isinstance(sources, dict)
+                    else type(sources).__name__
+                ),
+                "expected": sorted(expected_sources),
+            }
+            sources = sources if isinstance(sources, dict) else {}
+        for source, (embodiment, embodiment_id) in expected_sources.items():
+            value = sources.get(source)
+            if not isinstance(value, dict):
+                mismatches[f"proprio.sources.{source}"] = {
+                    "actual": type(value).__name__,
+                    "expected": "mapping",
+                }
+                continue
+            for key, expected_value in (
+                ("embodiment", embodiment),
+                ("embodiment_id", embodiment_id),
+            ):
+                if value.get(key) != expected_value:
+                    mismatches[f"proprio.sources.{source}.{key}"] = {
+                        "actual": value.get(key),
+                        "expected": expected_value,
+                    }
+            for key in ("index_path", "stats_path"):
+                if not str(value.get(key) or ""):
+                    mismatches[f"proprio.sources.{source}.{key}"] = {
+                        "actual": value.get(key),
+                        "expected": "non-empty path",
+                    }
+            for key in ("index_sha256", "stats_sha256"):
+                digest = str(value.get(key) or "")
+                if LOWER_HEX64.fullmatch(digest) is None:
+                    mismatches[f"proprio.sources.{source}.{key}"] = {
+                        "actual": digest,
+                        "expected": "lowercase SHA256",
+                    }
     embedded_sha = str(contract.get("contract_sha256") or "")
     observed_sha = action_contract_sha256(contract)
     if embedded_sha != observed_sha:
@@ -284,10 +384,7 @@ def validate_v8_stage0_checkpoint_payload(
     if not isinstance(cfg, dict):
         raise V8ActionPolicyTransitionError("Stage0 checkpoint cfg is missing")
     config_schema = str(((cfg.get("contract") or {}).get("schema")) or "")
-    if config_schema not in {
-        "wm3d_v8_stage0_causal_dual_view_unified_action_canary_v2",
-        "wm3d_v8_stage0_causal_dual_view_unified_action_formal_v2",
-    }:
+    if config_schema not in CONFIG_SCHEMA_TO_CONTRACT_SCHEMA:
         raise V8ActionPolicyTransitionError(
             f"checkpoint is not a V8 unified-action Stage0 artifact: {config_schema!r}"
         )
@@ -319,6 +416,19 @@ def validate_v8_stage0_checkpoint_payload(
             f"Stage0 checkpoint step must be a positive numbered milestone, got {step}"
         )
     contract = validate_v8_action_policy_contract(payload.get("action_policy_contract"))
+    expected_contract_schema = CONFIG_SCHEMA_TO_CONTRACT_SCHEMA[config_schema]
+    if contract["schema"] != expected_contract_schema:
+        raise V8ActionPolicyTransitionError(
+            "Stage0 config/action contract schema mismatch: "
+            + json.dumps(
+                {
+                    "config_schema": config_schema,
+                    "actual_contract_schema": contract["schema"],
+                    "expected_contract_schema": expected_contract_schema,
+                },
+                sort_keys=True,
+            )
+        )
     if expected_contract is not None and contract != dict(expected_contract):
         raise V8ActionPolicyTransitionError(
             "downstream expected action ABI differs from Stage0: "

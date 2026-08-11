@@ -1,0 +1,19 @@
+_base_: wm3d_v8_stage0_causal_dual_view_unified_action_formal_v3.yaml
+
+train:
+  run_lineage: wm3d_v8_stage0_causal_dual_view_unified_action20_proprio10_formal100k_world16_20260811_v3
+  num_nodes: 2
+  gpus_per_node: 8
+  batch_size_per_gpu: 2
+  gradient_accumulation_steps: 2
+  effective_global_batch: 64
+
+out:
+  root: /data/Minko/world_model/wm3d_v8_stage0_causal_dual_view_20260809/results/unified_action_proprio_formal100k_world16_v3
+  require_empty_checkpoint_dir: true
+
+metadata:
+  topology: node43_node44_world16
+  gpus: 16
+  global_batch: 64
+  launch_only_after_canary_gate: true
