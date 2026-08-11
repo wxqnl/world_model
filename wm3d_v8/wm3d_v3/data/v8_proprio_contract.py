@@ -23,6 +23,11 @@ V8_PROPRIO_LAYOUT = (
 )
 V8_PROPRIO_ANCHOR = "first_policy_action_target"
 V8_PROPRIO_STD_FLOOR = 1.0e-6
+PANDA_NOMINAL_CLOSED_WIDTH_M = 0.0
+PANDA_NOMINAL_OPEN_WIDTH_M = 0.08
+PANDA_OBSERVATION_MAX_WIDTH_M = float(np.float32(0.12))
+BRIDGE_OBSERVATION_MIN_OPEN01 = float(np.float32(-0.05))
+BRIDGE_OBSERVATION_MAX_OPEN01 = float(np.float32(1.12))
 V8_EMBODIMENT_VOCAB = {
     "franka_droid": 0,
     "widowx_bridge": 1,
@@ -164,16 +169,30 @@ def encode_rpy_proprio10(
 def panda_finger_qpos_to_close01(
     finger_qpos: np.ndarray,
     *,
-    closed_width: float = 0.0,
-    open_width: float = 0.08,
+    closed_width: float = PANDA_NOMINAL_CLOSED_WIDTH_M,
+    open_width: float = PANDA_NOMINAL_OPEN_WIDTH_M,
+    max_observed_width: float = PANDA_OBSERVATION_MAX_WIDTH_M,
 ) -> np.float32:
     fingers = _finite_vector(finger_qpos, 2, label="Panda finger qpos")
-    width = float(np.abs(fingers).sum())
-    tolerance = 2.0e-2
-    if width < closed_width - tolerance or width > open_width + tolerance:
+    bounds = np.asarray(
+        [closed_width, open_width, max_observed_width], dtype=np.float64
+    )
+    if (
+        not np.isfinite(bounds).all()
+        or closed_width < 0.0
+        or not closed_width < open_width <= max_observed_width
+    ):
+        raise V8ProprioContractError("invalid sealed Panda aperture bounds")
+    # RoboCasa/LIBERO store signed opposing finger coordinates. Their physical
+    # aperture is the joint separation, not the sum of coordinate magnitudes;
+    # the two expressions differ when acquisition noise puts both joints on the
+    # same side of zero.
+    width = abs(float(fingers[0] - fingers[1]))
+    if width < closed_width or width > max_observed_width:
         raise V8ProprioContractError(
-            f"Panda finger width {width} is outside sealed "
-            f"[{closed_width},{open_width}]"
+            f"Panda finger width {width} is outside sealed observation "
+            f"envelope [{closed_width},{max_observed_width}] "
+            f"with nominal open width {open_width}"
         )
     open01 = (width - closed_width) / (open_width - closed_width)
     return _require_close01(
@@ -214,8 +233,10 @@ def encode_droid_state(
 def encode_bridge_state(state_xyz_rpy_open01: np.ndarray) -> np.ndarray:
     state = _finite_vector(state_xyz_rpy_open01, 7, label="Bridge state")
     open01 = float(state[6])
-    hardware_tolerance = 5.0e-2
-    if open01 < -hardware_tolerance or open01 > 1.0 + hardware_tolerance:
+    if (
+        open01 < BRIDGE_OBSERVATION_MIN_OPEN01
+        or open01 > BRIDGE_OBSERVATION_MAX_OPEN01
+    ):
         raise V8ProprioContractError(f"Bridge open01 is invalid: {open01}")
     return encode_rpy_proprio10(
         state[:3], state[3:6], 1.0 - float(np.clip(open01, 0.0, 1.0))

@@ -79,10 +79,17 @@ pad/truncate。
 - `[10:14]`：EEF quaternion，`xyzw`；
 - `[14:16]`：Panda finger qpos。
 
-两指是正负对称关节，finger width 必须取
-`abs(qpos_left)+abs(qpos_right)`，不能直接求和。固定合同为
-`0.00=closed, 0.08=open`；允许数据采集端不超过 0.02 m 的机械越界后显式
-clip，超过该范围、字段缺失或 episode/frame 身份不一致必须失败。
+两指保存的是有符号的相向关节坐标，物理 aperture 必须固定为
+`abs(qpos_left-qpos_right)`；这也与既有 factual-action audit 的定义一致。
+`abs(left)+abs(right)` 只在两指严格异号时等价，在同号采集帧上会产生错误宽度。
+固定名义合同为 `0.00=closed, 0.08=open`，超出名义开口的状态显式饱和为
+open；严格观测 envelope 为 `[0.00,0.12]`，超过该范围、字段缺失或
+episode/frame 身份不一致必须失败。
+
+正式原始数据全量审计覆盖 402 个 parquet、145,352,665 帧：4,587,206 帧
+两指同号，aperture 最大值为 0.118746579 m，423 帧超过 0.10 m，没有任何
+一帧超过 0.12 m。因此这里不是放宽为无界 clip，而是以完整数据和物理开口
+共同封存可接受观测上界；归一化仍使用名义 0.08 m。
 
 ### DROID
 
@@ -95,9 +102,13 @@ clip，超过该范围、字段缺失或 episode/frame 身份不一致必须失�
 ### Bridge
 
 从原始 RLDS pickle 读取 `xyz + fixed-extrinsic xyz Euler + open01`，
-将 `open01` 唯一转换为 `close01 = 1-open01`。采集值允许不超过 0.05
-的硬件越界后显式 clip；更大越界必须失败。原始 tar/member 与 manifest
-身份必须一致。
+将 `open01` 唯一转换为 `close01 = 1-open01`。名义区间仍为 `[0,1]`，
+严格观测 envelope 为 `[-0.05,1.12]`，区间内的采集过冲显式饱和到名义
+区间，更大越界必须失败。原始 tar/member 与 manifest 身份必须一致。
+
+正式 Bridge 全量审计覆盖 7,267 clips、262,794 帧：只有两个重复来源 clip
+各有两帧超过 1.05，四帧最大值为 1.115462542；相邻序列连续回落，属于
+观测过冲而非字段错位。全量最小值为 0.049614936，没有低端越界。
 
 ### LIBERO
 
@@ -185,10 +196,12 @@ cache producer 和已封存 cache 均未改动。新增/修改点为：
 8. V8 完整 proprio 合同只由 V8 专属 metadata 触发；旧 V7/v2 batch 单独携带
    通用 `lowdim_state` 时仍走原兼容路径，不得被误判为不完整的 v3 batch。
 
-代码回归在 2026-08-12 使用项目训练环境完成：`118 passed`，并包含并发
+代码回归在 2026-08-12 使用项目训练环境完成：`120 passed`，并包含并发
 no-clobber 竞态、source manifest 重复 identity、legacy lowdim 兼容、v2/v3
 checkpoint contract 交叉组合，以及 training/structure preflight 对
-schema↔proprio 模式双向冒充的确定性回归。另外对真实数据
+schema↔proprio 模式双向冒充、signed Panda aperture 与封存观测 envelope
+的确定性回归；envelope 端点与其 float32 `nextafter` 外侧分别测试，禁止
+隐式浮点容差放宽。对真实数据
 执行了 sidecar dry-run 和实际 no-clobber 双次发布验证：
 
 - RoboCasa：9 个真实 causal-dual-view archive，train/val/test 均覆盖；

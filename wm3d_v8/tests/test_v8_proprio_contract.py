@@ -23,6 +23,9 @@ from scripts.preflight_wm3d_v8_stage0_causal_dual_view import (
 )
 from scripts.wm3d_v8_preflight_common import _Checks
 from wm3d_v3.data.v8_proprio_contract import (
+    BRIDGE_OBSERVATION_MAX_OPEN01,
+    BRIDGE_OBSERVATION_MIN_OPEN01,
+    PANDA_OBSERVATION_MAX_WIDTH_M,
     V8_EMBODIMENT_VOCAB,
     V8_EMBODIMENT_VOCAB_SHA256,
     V8_PROPRIO_ANCHOR,
@@ -194,8 +197,11 @@ def test_real_robot_state_adapters_obey_the_same_proprio10_abi() -> None:
     assert panda_finger_qpos_to_close01(
         np.asarray([0.0, 0.0])
     ) == pytest.approx(1.0)
+    assert panda_finger_qpos_to_close01(
+        np.asarray([0.059, -0.059])
+    ) == pytest.approx(0.0)
     with pytest.raises(V8ProprioContractError, match="outside sealed"):
-        panda_finger_qpos_to_close01(np.asarray([0.06, -0.06]))
+        panda_finger_qpos_to_close01(np.asarray([0.0601, -0.0601]))
     assert panda_finger_qpos_to_close01(
         np.asarray([0.0405, -0.0405])
     ) == pytest.approx(0.0)
@@ -209,16 +215,58 @@ def test_real_robot_state_adapters_obey_the_same_proprio10_abi() -> None:
     assert encoded[-1] == pytest.approx(0.0, abs=1e-6)
 
     bridge = encode_bridge_state(
-        np.asarray([0, 0, 0, 0, 0, 0, 1.02], dtype=np.float32)
+        np.asarray([0, 0, 0, 0, 0, 0, 1.1154625], dtype=np.float32)
     )
     assert bridge[-1] == pytest.approx(0.0)
     with pytest.raises(V8ProprioContractError, match="Bridge open01"):
-        encode_bridge_state(np.asarray([0, 0, 0, 0, 0, 0, 1.06]))
+        encode_bridge_state(np.asarray([0, 0, 0, 0, 0, 0, 1.121]))
 
     droid = encode_droid_state(
         np.asarray([0, 0, 0, 0, 0, 0], dtype=np.float32), 1.0
     )
     assert droid[-1] == pytest.approx(1.0)
+
+
+def test_panda_aperture_uses_signed_joint_separation() -> None:
+    assert panda_finger_qpos_to_close01(
+        np.asarray([0.04, 0.03], dtype=np.float32)
+    ) == pytest.approx(0.875)
+
+
+def test_gripper_observation_envelopes_are_strict_at_float32_boundary() -> None:
+    panda_limit = np.float32(PANDA_OBSERVATION_MAX_WIDTH_M)
+    assert panda_finger_qpos_to_close01(
+        np.asarray([panda_limit, 0.0], dtype=np.float32)
+    ) == pytest.approx(0.0)
+    panda_outside = np.nextafter(panda_limit, np.float32(np.inf))
+    with pytest.raises(V8ProprioContractError, match="outside sealed"):
+        panda_finger_qpos_to_close01(
+            np.asarray([panda_outside, 0.0], dtype=np.float32)
+        )
+
+    bridge_upper = np.float32(BRIDGE_OBSERVATION_MAX_OPEN01)
+    assert encode_bridge_state(
+        np.asarray([0, 0, 0, 0, 0, 0, bridge_upper], dtype=np.float32)
+    )[-1] == pytest.approx(0.0)
+    bridge_upper_outside = np.nextafter(bridge_upper, np.float32(np.inf))
+    with pytest.raises(V8ProprioContractError, match="Bridge open01"):
+        encode_bridge_state(
+            np.asarray(
+                [0, 0, 0, 0, 0, 0, bridge_upper_outside], dtype=np.float32
+            )
+        )
+
+    bridge_lower = np.float32(BRIDGE_OBSERVATION_MIN_OPEN01)
+    assert encode_bridge_state(
+        np.asarray([0, 0, 0, 0, 0, 0, bridge_lower], dtype=np.float32)
+    )[-1] == pytest.approx(1.0)
+    bridge_lower_outside = np.nextafter(bridge_lower, np.float32(-np.inf))
+    with pytest.raises(V8ProprioContractError, match="Bridge open01"):
+        encode_bridge_state(
+            np.asarray(
+                [0, 0, 0, 0, 0, 0, bridge_lower_outside], dtype=np.float32
+            )
+        )
 
 
 def test_bridge_builder_reads_only_exact_observation_state() -> None:
