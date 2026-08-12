@@ -1,0 +1,62 @@
+schema: wm3d_v8_unified_stage1_runtime_v1
+
+# 必须指向同一份已封存 Stage0 runtime 和完整编号 DCP；模板不会猜路径或 SHA。
+stage0_runtime: PENDING_ABSOLUTE_STAGE0_RUNTIME
+stage0_checkpoint: PENDING_ABSOLUTE_COMMITTED_STEP_DIRECTORY
+
+branch:
+  index: PENDING_ABSOLUTE_STAGE1_BRANCH_INDEX
+  index_sha256: PENDING_SHA256
+  seal: PENDING_ABSOLUTE_STAGE1_BRANCH_SEAL
+  seal_sha256: PENDING_SHA256
+  stage0_runtime_sha256: PENDING_SHA256
+  stage0_checkpoint_commit_sha256: PENDING_SHA256
+
+planner:
+  # H 必须与 branch seal 一致且 0 < H <= Stage0 K；当前不允许多段自回归。
+  horizon: 0
+  candidate_microbatch: 0
+  model:
+    # 下面 8 个 0 由 sealed Stage0 model profile 派生，显式非零值必须完全相同。
+    token_dim: 0
+    task_dim: 0
+    patches: 0
+    num_views: 0
+    max_horizon: 0
+    time_fourier_dim: 0
+    time_min_period_s: 0.0
+    time_max_period_s: 0.0
+    hidden: 256
+    spatial_layers: 2
+    temporal_layers: 4
+    heads: 8
+    mlp_mult: 4
+    dropout: 0.1
+  loss:
+    progress_weight: 0.5
+    success_weight: 1.0
+    risk_weight: 0.5
+    uncertainty_weight: 0.25
+    ranking_weight: 1.0
+    ranking_margin: 0.05
+  # 真实 serving score 的各项权重；属于 planner DCP 模型合同，不能隐藏在代码默认值里。
+  score:
+    progress_weight: 0.5
+    success_weight: 1.0
+    risk_weight: 0.5
+    uncertainty_weight: 0.25
+    action_cost_weight: 0.05
+
+run:
+  lineage: PENDING_STAGE1_LINEAGE
+  output_root: PENDING_ABSOLUTE_OUTPUT_ROOT
+  seed: 27081
+  total_steps: 10000
+  checkpoint_interval: 1000
+  micro_batch_size: 1
+  gradient_accumulation: 1
+  global_batch_size: 1
+  num_workers: 4
+  lr: 0.0002
+  weight_decay: 0.01
+  gradient_clip: 1.0

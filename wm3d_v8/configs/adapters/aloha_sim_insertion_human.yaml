@@ -1,0 +1,46 @@
+schema: wm3d_v8_source_adapter_v3
+name: aloha_sim_insertion_human
+raw_format: lerobot_parquet_video
+observation_time_key: timestamp
+
+# 上游只有 top 视角。left_wrist/right_wrist 在统一 cache 中保留 false mask，
+# 禁止复制 top 图像来伪造多视角。
+views:
+  - name: head
+    key: observation.images.top
+
+# 上游 info.json 只把 14 维标成左右臂 motor channel，没有声明夹爪的
+# open/close 极性或物理标定。因此烟测合同保留原始连续 controller 通道，
+# 不把第 7/14 维冒充 absolute_gripper_open01。正式接入新数据时也必须遵循
+# 同一规则：只有数据文档和数值审计共同确认后才能升级语义。
+groups:
+  - group: left_arm
+    supervision: fine_command
+    action:
+      - key: action
+        columns: [0, 1, 2, 3, 4, 5, 6]
+        scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    state:
+      - key: observation.state
+        columns: [0, 1, 2, 3, 4, 5, 6]
+        scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    action_time_key: timestamp
+    state_time_key: timestamp
+    world_interval_index_key: null
+  - group: right_arm
+    supervision: fine_command
+    action:
+      - key: action
+        columns: [7, 8, 9, 10, 11, 12, 13]
+        scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    state:
+      - key: observation.state
+        columns: [7, 8, 9, 10, 11, 12, 13]
+        scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    action_time_key: timestamp
+    state_time_key: timestamp
+    world_interval_index_key: null

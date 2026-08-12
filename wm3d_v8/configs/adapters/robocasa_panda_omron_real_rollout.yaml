@@ -1,0 +1,72 @@
+schema: wm3d_v8_source_adapter_v3
+name: robocasa_panda_omron_real_rollout
+raw_format: lerobot_parquet_video
+observation_time_key: timestamp
+
+# Canonical order is identical to the pinned simulator camera tuple. Missing
+# views are never duplicated.
+views:
+  - name: agentview_left
+    key: observation.images.robot0_agentview_left
+  - name: agentview_right
+    key: observation.images.robot0_agentview_right
+  - name: eye_in_hand
+    key: observation.images.robot0_eye_in_hand
+
+groups:
+  - group: base
+    supervision: fine_command
+    action:
+      - key: action
+        columns: [0, 1, 2, 3]
+        scale: [1.0, 1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0, 0.0]
+    state:
+      - key: observation.state
+        columns: [0, 1, 2, 3, 4, 5, 6]
+        scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    action_time_key: timestamp
+    state_time_key: timestamp
+    world_interval_index_key: null
+  - group: mode
+    supervision: fine_command
+    action:
+      - key: action
+        columns: [4]
+        scale: [0.5]
+        offset: [0.5]
+    state: []
+    action_time_key: timestamp
+    state_time_key: null
+    world_interval_index_key: null
+  - group: arm
+    supervision: fine_command
+    action:
+      - key: action
+        columns: [5, 6, 7]
+        scale: [0.010797412134706974, 0.011273571290075779, 0.010780979879200459]
+        offset: [0.0, 0.0, 0.0]
+      - key: action
+        columns: [8, 9, 10]
+        scale: [0.0976465567946434, 0.09016355127096176, 0.10008708387613297]
+        offset: [0.0, 0.0, 0.0]
+      - key: action
+        columns: [11]
+        scale: [-0.5]
+        offset: [0.5]
+    state:
+      - key: observation.state
+        columns: [7, 8, 9]
+        scale: [1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0]
+      # Upstream declares a relative quaternion and two gripper qpos channels.
+      # The declarative V8 adapter preserves them as audited controller state;
+      # it does not guess a quaternion convention or synthesize 6D rotation.
+      - key: observation.state
+        columns: [10, 11, 12, 13, 14, 15]
+        scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    action_time_key: timestamp
+    state_time_key: timestamp
+    world_interval_index_key: null

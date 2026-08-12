@@ -1,280 +1,231 @@
 #!/usr/bin/env python3
-"""Evaluate V8 Stage1 on sealed real branches and optional native imagination."""
+"""Evaluate a committed unified Stage1 DCP and publish an immutable receipt."""
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
-import sys
+import subprocess
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from wm3d_v3.stage1_planner.candidates import deterministic_action_cost  # noqa: E402
-from wm3d_v3.stage1_planner.dataset import Stage1BranchDataset  # noqa: E402
-from wm3d_v3.stage1_planner.system import NativePlanningSystem, Stage1SystemConfig  # noqa: E402
-from wm3d_v3.stage1_planner.train import (  # noqa: E402
-    OVERLAY_SCHEMA,
-    _dataset_config,
-    _load_planner_state,
+from wm3d_v3.stage1_planner.candidates import deterministic_action_cost
+from wm3d_v3.stage1_planner.train import (
+    _checkpoint_commit_sha,
+    _dataset,
+    _device,
+    _expectations,
+    _load_stage1,
+    validate_stage1_bindings,
+)
+from wm3d_v3.stage1_planner.losses import PlannerLossConfig, planner_loss
+from wm3d_v3.stage1_planner.planner_head import NativePlannerConfig
+from wm3d_v3.stage1_planner.system import NativePlanningSystem, Stage1SystemConfig
+from wm3d_v3.training.distributed_checkpoint import (
+    DistributedCheckpointManager,
+    ResumeExpectations,
     sha256_file,
 )
-from wm3d_v3.stage1_planner.planner_head import NativePlannerConfig  # noqa: E402
-from wm3d_v3.training.train import build_model, config_sha256, load_train_config  # noqa: E402
-from wm3d_v3.training.train import module_state_sha256  # noqa: E402
+from wm3d_v3.training.distributed_runtime import (
+    destroy_distributed,
+    initialize_distributed,
+    strategy_from_mapping,
+    wrap_model,
+)
+from wm3d_v3.training.runtime_contract import load_materialized_runtime
+from wm3d_v3.models.model_factory import build_world_model
 
 
-SCHEMA = "wm3d_v8_stage1_native_planner_eval_v1"
-
-
-def _move(value, device: torch.device):
-    return value.to(device=device, non_blocking=True) if torch.is_tensor(value) else value
+EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_eval_receipt_v1"
 
 
 def _auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
-    labels = np.asarray(labels, dtype=np.bool_)
-    scores = np.asarray(scores, dtype=np.float64)
-    positive = int(labels.sum())
-    negative = int((~labels).sum())
-    if positive == 0 or negative == 0:
-        return None
+    labels = labels.astype(bool).reshape(-1); scores = scores.reshape(-1)
+    positive = int(labels.sum()); negative = int((~labels).sum())
+    if not positive or not negative: return None
     order = np.argsort(scores, kind="mergesort")
-    sorted_scores = scores[order]
-    ranks = np.empty(len(scores), dtype=np.float64)
-    start = 0
-    while start < len(scores):
-        stop = start + 1
-        while stop < len(scores) and sorted_scores[stop] == sorted_scores[start]:
-            stop += 1
-        ranks[order[start:stop]] = 0.5 * (start + 1 + stop)
-        start = stop
-    rank_sum = ranks[labels].sum()
-    return float(
-        (rank_sum - positive * (positive + 1) / 2) / (positive * negative)
-    )
+    ranks = np.empty(len(scores)); ranks[order] = np.arange(1, len(scores) + 1)
+    return float((ranks[labels].sum() - positive * (positive + 1) / 2) / (positive * negative))
 
 
-def _selection(scores: np.ndarray, success: np.ndarray) -> dict[str, float | int]:
-    selectable = scores[:, 1:]
-    selected = 1 + selectable.argmax(axis=1)
-    rows = np.arange(len(scores))
-    selected_success = success[rows, selected].astype(np.float64)
-    direct_success = success[:, 1].astype(np.float64)
-    oracle_success = success[:, 1:].max(axis=1).astype(np.float64)
-    ranks = []
-    reciprocal = []
-    for score, labels in zip(selectable, success[:, 1:]):
-        order = np.argsort(-score, kind="mergesort")
-        successful = np.flatnonzero(labels[order])
-        rank = int(successful[0]) + 1 if len(successful) else len(order) + 1
-        ranks.append(rank)
-        reciprocal.append(1.0 / rank if rank <= len(order) else 0.0)
-    return {
-        "success_at1": float(selected_success.mean()),
-        "direct_success": float(direct_success.mean()),
-        "success_at1_uplift": float((selected_success - direct_success).mean()),
-        "oracle_success": float(oracle_success.mean()),
-        "mean_first_success_rank": float(np.mean(ranks)),
-        "mean_reciprocal_success_rank": float(np.mean(reciprocal)),
-        "roots": int(len(scores)),
-    }
-
-
-def _planner_outputs(
-    system: NativePlanningSystem,
-    batch: dict,
-    *,
-    imagined: bool,
-) -> tuple[dict[str, torch.Tensor], dict[str, float] | None]:
-    physical = batch["branch_actions_physical"]
-    cost = deterministic_action_cost(physical)
-    if not imagined:
-        return (
-            system.score_true_futures(
-                batch["branch_s_tgt_codec"],
-                batch["c"],
-                depth=batch["branch_depth_tgt"],
-                point=batch["branch_point_tgt"],
-                pose=batch["branch_pose_geom_tgt"],
-                action_cost=cost,
-            ),
-            None,
-        )
-    rollout = system.imagine(
-        batch["s_in"],
-        batch["c"],
-        batch["candidate_actions"],
-        wrist=batch["s_wrist"],
-        view_mask=batch["view_mask"],
-    )
-    outputs = system.score_rollout(rollout, batch["c"], cost)
-    truth = system.world.decode_input_tokens(
-        batch["branch_s_tgt_codec"].flatten(0, 1)
-    ).unflatten(0, batch["branch_s_tgt_codec"].shape[:2])
-    token_mse = float((rollout.tokens.float() - truth.float()).square().mean().cpu())
-    token_cosine = float(
-        F.cosine_similarity(
-            rollout.tokens.float().flatten(start_dim=3),
-            truth.float().flatten(start_dim=3),
-            dim=-1,
-        ).mean().cpu()
-    )
-    return outputs, {"token_mse": token_mse, "token_cosine": token_cosine}
+def _publish(path: Path, value: dict) -> None:
+    payload = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with temporary.open("xb") as handle: handle.write(payload); handle.flush()
+    try: os.link(temporary, path)
+    finally: temporary.unlink(missing_ok=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg", type=Path, required=True)
-    parser.add_argument("--overlay", type=Path)
-    parser.add_argument("--overlay-sha256")
-    parser.add_argument("--split", choices=("train", "val", "test"), default="val")
-    parser.add_argument("--mode", choices=("true", "imagined", "both"), default="true")
-    parser.add_argument("--max-roots", type=int, default=0)
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--runtime", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--split", choices=("val", "test"), default="val")
+    parser.add_argument("--max-branches", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    cfg = load_train_config(args.cfg)
-    stage_cfg = dict(cfg["planner_stage"])
-    data_cfg = dict(cfg["planner_data"])
-    seed = int(stage_cfg["seed"])
-    np.random.seed(seed % (2**32))
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    source_path = Path(stage_cfg["source_checkpoint"])
-    source_sha = sha256_file(source_path)
-    if source_sha != stage_cfg["source_checkpoint_sha256"]:
-        raise SystemExit("Stage0 checkpoint SHA256 mismatch")
-    source = torch.load(source_path, map_location="cpu", weights_only=False, mmap=True)
-    world = build_model(cfg)
-    loaded = world.load_state_dict(source["model"], strict=True)
-    if loaded.missing_keys or loaded.unexpected_keys:
-        raise RuntimeError("Stage0 strict load was not clean")
-    source_contract = source["action_policy_contract"]
-    del source
-    system = NativePlanningSystem(
-        world,
-        Stage1SystemConfig(
-            planner=NativePlannerConfig(**dict(stage_cfg.get("planner_model") or {})),
-            candidate_microbatch=int(stage_cfg.get("candidate_microbatch", 1)),
-            activation_checkpointing=False,
-            detach_between_chunks=True,
-        ),
-    )
-    overlay_sha = None
-    overlay_step = 0
-    if args.overlay is not None:
-        if not args.overlay_sha256:
-            raise SystemExit("--overlay-sha256 is required with --overlay")
-        overlay_sha = sha256_file(args.overlay)
-        if overlay_sha != args.overlay_sha256:
-            raise SystemExit("Stage1 overlay SHA256 mismatch")
-        payload = torch.load(args.overlay, map_location="cpu", weights_only=False)
-        if payload.get("schema") != OVERLAY_SCHEMA:
-            raise RuntimeError("Stage1 overlay schema mismatch")
-        if payload.get("source_checkpoint_sha256") != source_sha:
-            raise RuntimeError("Stage1 overlay is bound to another Stage0 checkpoint")
-        _load_planner_state(system, payload["stage1_state"])
-        overlay_step = int(payload["step"])
-    planner_hash = module_state_sha256(system.planner)
-
-    device = torch.device(args.device)
-    system.to(device).eval()
-    dataset = Stage1BranchDataset(_dataset_config(data_cfg, args.split))
-    if args.max_roots > 0:
-        dataset.records = dataset.records[: args.max_roots]
-    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-
-    requested_modes = ("true", "imagined") if args.mode == "both" else (args.mode,)
-    mode_scores = {mode: [] for mode in requested_modes}
-    mode_logits = {mode: [] for mode in requested_modes}
-    successes = []
-    imagined_fidelity = []
-    roots = []
-    with torch.inference_mode():
-        for raw in loader:
-            batch = {key: _move(value, device) for key, value in raw.items()}
-            success = batch["branch_success"].any(dim=-1)[0].cpu().numpy().astype(bool)
-            successes.append(success)
-            roots.append(str(raw["root_id"][0]))
-            for mode in requested_modes:
-                outputs, fidelity = _planner_outputs(
-                    system, batch, imagined=mode == "imagined"
-                )
-                mode_scores[mode].append(outputs["score"][0].float().cpu().numpy())
-                mode_logits[mode].append(
-                    outputs["success_logit"][0].float().cpu().numpy()
-                )
-                if fidelity is not None:
-                    imagined_fidelity.append(fidelity)
-
-    success_array = np.stack(successes)
-    report_modes = {}
-    for mode in requested_modes:
-        score = np.stack(mode_scores[mode])
-        logits = np.stack(mode_logits[mode])
-        report_modes[mode] = {
-            "success_auc_selectable": _auc(
-                success_array[:, 1:].reshape(-1), logits[:, 1:].reshape(-1)
-            ),
-            "serving_score_auc_selectable": _auc(
-                success_array[:, 1:].reshape(-1), score[:, 1:].reshape(-1)
-            ),
-            **_selection(score, success_array),
-        }
-    report = {
-        "schema": SCHEMA,
-        "passed_execution": True,
-        "config": str(args.cfg.resolve()),
-        "config_sha256": config_sha256(cfg),
-        "source_checkpoint": str(source_path.resolve()),
-        "source_checkpoint_sha256": source_sha,
-        "source_checkpoint_step": int(stage_cfg["source_checkpoint_step"]),
-        "source_action_contract_sha256": source_contract["contract_sha256"],
-        "overlay": str(args.overlay.resolve()) if args.overlay else None,
-        "overlay_sha256": overlay_sha,
-        "overlay_step": overlay_step,
-        "planner_hash": planner_hash,
-        "split": args.split,
-        "roots": roots,
-        "modes": report_modes,
-        "imagined_fidelity": (
-            {
-                key: float(np.mean([item[key] for item in imagined_fidelity]))
-                for key in ("token_mse", "token_cosine")
-            }
-            if imagined_fidelity
-            else None
-        ),
-        "branch_index_sha256": data_cfg["branch_index_sha256"],
-        "branch_payload_sha256_manifest_sha256": data_cfg[
-            "branch_payload_sha256_manifest_sha256"
-        ],
-        "runtime_index_sha256": data_cfg["runtime_index_sha256"],
-        "candidate_zero_excluded_from_selection": True,
-        "planner_action_inputs": False,
-        "stage0_frozen": True,
-        "future_observation_leakage": False,
-    }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.output.with_name(f".{args.output.name}.tmp.{os.getpid()}")
-    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    os.replace(temporary, args.output)
-    print(json.dumps(report, indent=2, sort_keys=True))
-    print(
-        json.dumps(
-            {"report_sha256": hashlib.sha256(args.output.read_bytes()).hexdigest()},
-            sort_keys=True,
+    stage1, stage1_sha = _load_stage1(args.runtime)
+    stage0, stage0_sha = load_materialized_runtime(Path(stage1["stage0_runtime"]))
+    repo = Path(__file__).resolve().parents[1]
+    current_commit = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+    ).strip()
+    if current_commit != stage0["run"]["code_commit"]:
+        raise ValueError("Stage1 evaluation code commit differs from sealed runtime")
+    validate_stage1_bindings(stage1, stage0)
+    if stage0_sha != stage1["branch"]["stage0_runtime_sha256"]:
+        raise ValueError("Stage1 branch belongs to another Stage0 runtime")
+    stage0_source = Path(stage1["stage0_checkpoint"])
+    if _checkpoint_commit_sha(stage0_source) != stage1["branch"]["stage0_checkpoint_commit_sha256"]:
+        raise ValueError("Stage1 branch belongs to another Stage0 checkpoint")
+    strategy = strategy_from_mapping(stage0["runtime_profile"]["distributed"])
+    context = initialize_distributed(strategy)
+    try:
+        seed = int(stage1["run"]["seed"]); torch.manual_seed(seed)
+        with torch.device("meta" if strategy.initialization == "meta_sharded" else context.device):
+            world = build_world_model(stage0["model_profile"])
+        world = wrap_model(world, context, strategy, initialization_seed=seed if strategy.initialization == "meta_sharded" else None).model
+        source_step = int(stage0_source.name.split("_")[1])
+        run_contract = json.loads((Path(stage0["run"]["output_root"]) / "run_contract.json").read_text())
+        DistributedCheckpointManager(stage0_source.parent).load_model_for_evaluation(
+            path=stage0_source, model=world, expected=ResumeExpectations(
+                step=source_step, run_lineage=stage0["run"]["lineage"], runtime_config_sha256=stage0_sha,
+                data_closure_sha256=stage0["bindings"]["data_closure_sha256"],
+                model_contract_sha256=stage0["bindings"]["model_contract_sha256"], world_size=context.world_size,
+                shard_degree=int(stage0["runtime_profile"]["distributed"]["shard_degree"]), distributed_strategy=strategy.strategy,
+                global_batch_size=int(stage0["runtime_profile"]["train"]["global_batch_size"]),
+                topology_contract_sha256=run_contract["topology_contract_sha256"]),
         )
-    )
+        for parameter in world.parameters(): parameter.requires_grad_(False)
+        system = NativePlanningSystem(world, Stage1SystemConfig(
+            planner=NativePlannerConfig(**stage1["planner"]["model"]), horizon=int(stage1["planner"]["horizon"]),
+            candidate_microbatch=int(stage1["planner"]["candidate_microbatch"]),
+            **stage1["planner"]["score"]))
+        planner = system.planner.to(context.device)
+        if context.world_size > 1:
+            planner = DistributedDataParallel(
+                planner, device_ids=[context.local_rank], broadcast_buffers=False
+            )
+            system.planner = planner
+        step = int(args.checkpoint.name.split("_")[1])
+        DistributedCheckpointManager(args.checkpoint.parent).load_model_for_evaluation(
+            path=args.checkpoint, model=planner,
+            expected=_expectations(step=step, stage1=stage1, stage1_sha=stage1_sha, runtime=stage0, world_size=context.world_size))
+        system.eval(); dataset = _dataset(stage0, stage1, args.split)
+        limit = len(dataset) if args.max_branches <= 0 else min(len(dataset), args.max_branches)
+        if limit <= 0:
+            raise ValueError("Stage1 evaluation selected no sealed branches")
+        scores=[]; success=[]; imagined=[]; roots=[]
+        gate_batch = _device(next(iter(DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0))), context.device)
+        planner.eval()
+        planner.zero_grad(set_to_none=True)
+        gate_output = system.score_observed_batch(gate_batch)
+        horizon = system.cfg.horizon
+        loss_cfg = PlannerLossConfig(**stage1["planner"]["loss"])
+        gate_loss = planner_loss(
+            gate_output,
+            branch_rewards=gate_batch["branch_rewards"][:, :, :horizon],
+            branch_dones=gate_batch["branch_dones"][:, :, :horizon],
+            branch_success=gate_batch["branch_success"][:, :, :horizon],
+            branch_valid=gate_batch["branch_valid"],
+            uncertainty_target=torch.zeros_like(gate_batch["branch_valid"], dtype=torch.float32),
+            cfg=loss_cfg,
+        )["loss"]
+        # A one-slot cyclic permutation changes every non-constant candidate
+        # target vector; the branch seal already rejects constant utility.
+        permutation = torch.roll(
+            torch.arange(gate_batch["branch_success"].shape[1], device=context.device),
+            shifts=1,
+        )
+        shuffled_loss = planner_loss(
+            gate_output,
+            branch_rewards=gate_batch["branch_rewards"][:, permutation, :horizon],
+            branch_dones=gate_batch["branch_dones"][:, permutation, :horizon],
+            branch_success=gate_batch["branch_success"][:, permutation, :horizon],
+            branch_valid=gate_batch["branch_valid"],
+            uncertainty_target=torch.zeros_like(gate_batch["branch_valid"], dtype=torch.float32),
+            cfg=loss_cfg,
+        )["loss"]
+        gate_loss.backward()
+        planner_grads = [parameter.grad for parameter in planner.parameters() if parameter.grad is not None]
+        planner_grad_finite_nonzero = bool(planner_grads) and all(bool(torch.isfinite(value).all()) for value in planner_grads) and sum(float(value.abs().sum()) for value in planner_grads) > 0
+        stage0_grad_owned = any(parameter.grad is not None for parameter in world.parameters())
+        label_shuffle_sensitive = not bool(torch.isclose(gate_loss.detach(), shuffled_loss.detach(), atol=1e-8, rtol=1e-6))
+        # Shuffle every grouped action lane while holding evidence fixed.  The
+        # learned fields must remain bitwise identical; only the deterministic
+        # external action-cost component is allowed to change.
+        shuffled_batch = dict(gate_batch)
+        for name in (
+            "candidate_fine_action_values", "candidate_fine_action_mask",
+            "candidate_fine_action_dt", "candidate_fine_sample_mask",
+            "candidate_coarse_action_values", "candidate_coarse_action_mask",
+        ):
+            shuffled_batch[name] = gate_batch[name][:, permutation]
+        with torch.no_grad():
+            action_after = system.score_observed_batch(shuffled_batch)
+        learned_fields = ("progress_logit", "success_logit", "risk_logit", "uncertainty_logit")
+        action_shuffle_invariant = all(
+            torch.equal(gate_output[name].detach(), action_after[name].detach())
+            for name in learned_fields
+        )
+        if context.world_size > 1:
+            pass_gates = torch.tensor(
+                [planner_grad_finite_nonzero, label_shuffle_sensitive, action_shuffle_invariant],
+                dtype=torch.int64,
+                device=context.device,
+            )
+            owned_gate = torch.tensor(
+                [stage0_grad_owned], dtype=torch.int64, device=context.device
+            )
+            torch.distributed.all_reduce(pass_gates, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(owned_gate, op=torch.distributed.ReduceOp.MAX)
+            planner_grad_finite_nonzero = bool(pass_gates[0].item())
+            label_shuffle_sensitive = bool(pass_gates[1].item())
+            action_shuffle_invariant = bool(pass_gates[2].item())
+            stage0_grad_owned = bool(owned_gate[0].item())
+        if not (planner_grad_finite_nonzero and not stage0_grad_owned and label_shuffle_sensitive and action_shuffle_invariant):
+            raise RuntimeError("Stage1 ownership/invariance/sensitivity gate failed")
+        planner.zero_grad(set_to_none=True); system.eval()
+        with torch.inference_mode():
+            for index, raw in enumerate(DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)):
+                if index >= limit: break
+                batch = _device(raw, context.device)
+                observed = system.score_observed_batch(batch)
+                costs = deterministic_action_cost(
+                    batch["candidate_fine_action_values"][:, :, :system.cfg.horizon],
+                    batch["candidate_fine_action_mask"][:, :, :system.cfg.horizon],
+                    batch["candidate_fine_sample_mask"][:, :, :system.cfg.horizon],
+                    batch["candidate_coarse_action_values"][:, :, :system.cfg.horizon],
+                    batch["candidate_coarse_action_mask"][:, :, :system.cfg.horizon],
+                )
+                rollout = system.imagine(batch)
+                imagined_output = system.score_rollout(rollout, batch["task_embedding"], costs)
+                scores.append(observed["score"][0].float().cpu().numpy())
+                imagined.append(imagined_output["score"][0].float().cpu().numpy())
+                success.append(batch["branch_success"][0, :, :system.cfg.horizon].any(dim=-1).cpu().numpy())
+                roots.append(str(raw["branch_id"][0]))
+        score=np.stack(scores); imagined_score=np.stack(imagined); labels=np.stack(success)
+        receipt={"schema": EVAL_RECEIPT_SCHEMA, "passed": True, "runtime_sha256": stage1_sha,
+            "code_commit": current_commit,
+            "stage0_checkpoint_commit_sha256": _checkpoint_commit_sha(stage0_source),
+            "stage1_checkpoint_commit_sha256": sha256_file(args.checkpoint / "COMMITTED.json"),
+            "branch_index_sha256": stage1["branch"]["index_sha256"], "split": args.split,
+            "branch_ids": roots, "success_auc": _auc(labels, score), "imagined_success_auc": _auc(labels, imagined_score),
+            "selected_success": float(labels[np.arange(len(labels)), score.argmax(1)].mean()),
+            "oracle_success": float(labels.max(1).mean()), "stage0_frozen": True,
+            "planner_action_inputs": False, "imagined_rollout": "single_trained_K_only",
+            "gates": {"action_shuffle_invariance": action_shuffle_invariant,
+                "label_shuffle_sensitivity": label_shuffle_sensitive,
+                "planner_gradient_finite_nonzero": planner_grad_finite_nonzero,
+                "stage0_gradient_absent": not stage0_grad_owned}}
+        if context.rank == 0: _publish(args.output, receipt); print(json.dumps(receipt, sort_keys=True))
+    finally:
+        destroy_distributed()
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

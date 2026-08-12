@@ -1,22 +1,22 @@
-"""Frozen V8 world model plus a trainable native-future planner."""
+"""Frozen unified Stage0 plus a trainable action-blind native-future planner."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Mapping
 
 import torch
 import torch.nn as nn
 
 from .candidates import deterministic_action_cost
 from .planner_head import NativePlannerConfig, NativePlannerHead, planning_score
-from .rollout import NativeRollout, multichunk_native_rollout
+from .rollout import NativeRollout, _world_config, single_horizon_native_rollout
 
 
 @dataclass(frozen=True)
 class Stage1SystemConfig:
     planner: NativePlannerConfig = field(default_factory=NativePlannerConfig)
-    candidate_microbatch: int = 1
-    detach_between_chunks: bool = True
-    activation_checkpointing: bool = False
+    horizon: int = 0
+    candidate_microbatch: int = 0
     progress_weight: float = 0.5
     success_weight: float = 1.0
     risk_weight: float = 0.5
@@ -25,75 +25,65 @@ class Stage1SystemConfig:
 
 
 class NativePlanningSystem(nn.Module):
-    """Explicit V8 rollout and an action-blind planner reader.
-
-    Candidate actions are consumed only by the frozen causal world dynamics.
-    The planner itself reads predicted/observed native tokens plus explicit
-    depth, point and pose evidence.  Physical action cost is added outside the
-    learned head, preventing a hidden VLA shortcut.
-    """
+    """One Stage0 owner; candidate actions never enter the learned planner."""
 
     def __init__(self, world: nn.Module, cfg: Stage1SystemConfig | None = None):
         super().__init__()
         self.world = world
-        self.cfg = cfg or Stage1SystemConfig()
-        if self.cfg.planner.token_dim != int(world.cfg.dual.state.D):
-            raise ValueError("planner/world token dimensions differ")
-        if self.cfg.planner.task_dim != int(world.cfg.dual.state.cond_dim):
-            raise ValueError("planner/world task dimensions differ")
-        if self.cfg.planner.patches != int(world.cfg.dual.state.P):
-            raise ValueError("planner/world patch counts differ")
-        if int(world.cfg.dual.state.action_cond_dim) != 36:
-            raise ValueError("V8 Stage1 requires the exact 36D causal action lane")
-        self.planner = NativePlannerHead(self.cfg.planner)
+        requested = cfg or Stage1SystemConfig()
+        world_cfg = _world_config(world)
+        horizon = int(requested.horizon or world_cfg.K)
+        if not 0 < horizon <= int(world_cfg.K):
+            raise ValueError("Stage1 horizon must lie inside the trained Stage0 K")
+        planner_cfg = requested.planner
+        derived = {
+            "token_dim": int(world_cfg.token_dim),
+            "task_dim": int(world_cfg.task_dim),
+            "patches": int(world_cfg.P),
+            "max_horizon": horizon,
+            "num_views": int(world_cfg.num_views),
+            "time_fourier_dim": int(world_cfg.time_fourier_dim),
+            "time_min_period_s": float(world_cfg.time_min_period_s),
+            "time_max_period_s": float(world_cfg.time_max_period_s),
+        }
+        for name, value in derived.items():
+            current = getattr(planner_cfg, name)
+            if current not in {0, value}:
+                raise ValueError(f"planner {name}={current} differs from sealed Stage0 {value}")
+        planner_cfg = replace(planner_cfg, **derived)
+        self.cfg = replace(requested, planner=planner_cfg, horizon=horizon)
+        self.planner = NativePlannerHead(planner_cfg)
 
-    def fuse_context(
-        self,
-        context: torch.Tensor,
-        *,
-        wrist: torch.Tensor | None = None,
-        view_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.world.fuse_views(context, wrist, view_mask=view_mask)
-
-    def imagine(
-        self,
-        context: torch.Tensor,
-        task_emb: torch.Tensor,
-        candidate_actions: torch.Tensor,
-        *,
-        wrist: torch.Tensor | None = None,
-        view_mask: torch.Tensor | None = None,
-    ) -> NativeRollout:
-        fused = self.fuse_context(context, wrist=wrist, view_mask=view_mask)
-        return multichunk_native_rollout(
+    def imagine(self, batch: Mapping[str, torch.Tensor]) -> NativeRollout:
+        return single_horizon_native_rollout(
             self.world,
-            fused,
-            task_emb,
-            candidate_actions,
-            include_geometry=True,
+            batch,
+            horizon=self.cfg.horizon,
             candidate_microbatch=self.cfg.candidate_microbatch,
-            detach_between_chunks=self.cfg.detach_between_chunks,
-            activation_checkpointing=self.cfg.activation_checkpointing,
         )
 
     def score_rollout(
         self,
         rollout: NativeRollout,
-        task_emb: torch.Tensor,
+        task_embedding: torch.Tensor,
         action_cost: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        if rollout.depth is None or rollout.point is None or rollout.pose is None:
-            raise ValueError("planner requires explicit native geometry")
-        outputs = self.planner(
+        output = self.planner(
             rollout.tokens,
-            task_emb,
+            task_embedding,
+            future_dt_s=rollout.future_dt_s,
+            token_mask=rollout.token_mask,
             depth=rollout.depth,
+            depth_mask=rollout.depth_mask,
             point=rollout.point,
+            point_mask=rollout.point_mask,
             pose=rollout.pose,
+            pose_mask=rollout.pose_mask,
+            geometry_confidence=rollout.confidence,
+            view_mask=rollout.view_mask,
         )
-        outputs["score"] = planning_score(
-            outputs,
+        output["score"] = planning_score(
+            output,
             action_cost,
             progress_weight=self.cfg.progress_weight,
             success_weight=self.cfg.success_weight,
@@ -101,76 +91,48 @@ class NativePlanningSystem(nn.Module):
             uncertainty_weight=self.cfg.uncertainty_weight,
             action_cost_weight=self.cfg.action_cost_weight,
         )
-        return outputs
+        return output
 
-    def score_true_futures(
-        self,
-        future_codec: torch.Tensor,
-        task_emb: torch.Tensor,
-        *,
-        depth: torch.Tensor,
-        point: torch.Tensor,
-        pose: torch.Tensor,
-        action_cost: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        if future_codec.ndim != 5:
-            raise ValueError("true branch futures must be [B,C,H,P,Dcodec]")
-        bsz, candidates, horizon, patches, codec_dim = future_codec.shape
-        decoded = self.world.decode_input_tokens(
-            future_codec.reshape(bsz * candidates, horizon, patches, codec_dim)
-        ).reshape(bsz, candidates, horizon, patches, -1)
-        return self.score_rollout(
-            NativeRollout(tokens=decoded, depth=depth, point=point, pose=pose),
-            task_emb,
-            action_cost,
+    def score_observed_batch(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        horizon = self.cfg.horizon
+        cost = deterministic_action_cost(
+            batch["candidate_fine_action_values"][:, :, :horizon],
+            batch["candidate_fine_action_mask"][:, :, :horizon],
+            batch["candidate_fine_sample_mask"][:, :, :horizon],
+            batch["candidate_coarse_action_values"][:, :, :horizon],
+            batch["candidate_coarse_action_mask"][:, :, :horizon],
         )
+        rollout = NativeRollout(
+            tokens=batch["branch_future_tokens"][:, :, : self.cfg.horizon],
+            future_dt_s=batch["branch_future_dt_s"][:, :, : self.cfg.horizon],
+            token_mask=batch["branch_token_mask"][:, :, : self.cfg.horizon],
+            depth=batch["branch_depth"][:, :, : self.cfg.horizon],
+            depth_mask=batch["branch_depth_mask"][:, :, : self.cfg.horizon],
+            point=batch["branch_point"][:, :, : self.cfg.horizon],
+            point_mask=batch["branch_point_mask"][:, :, : self.cfg.horizon],
+            pose=batch["branch_camera_pose"][:, :, : self.cfg.horizon],
+            pose_mask=batch["branch_camera_pose_mask"][:, :, : self.cfg.horizon],
+            confidence=batch["branch_geometry_confidence"][:, :, : self.cfg.horizon],
+            view_mask=batch["branch_view_mask"][:, :, : self.cfg.horizon],
+        )
+        return self.score_rollout(rollout, batch["task_embedding"], cost)
 
-    def score_observed_batch(
-        self,
-        future_codec: torch.Tensor,
-        task_emb: torch.Tensor,
-        physical_actions: torch.Tensor,
-        *,
-        depth: torch.Tensor,
-        point: torch.Tensor,
-        pose: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        cost = deterministic_action_cost(physical_actions)
-        return self.score_true_futures(
-            future_codec,
-            task_emb,
-            depth=depth,
-            point=point,
-            pose=pose,
-            action_cost=cost,
+    def forward(self, batch: Mapping[str, torch.Tensor]) -> dict[str, object]:
+        horizon = self.cfg.horizon
+        cost = deterministic_action_cost(
+            batch["candidate_fine_action_values"][:, :, :horizon],
+            batch["candidate_fine_action_mask"][:, :, :horizon],
+            batch["candidate_fine_sample_mask"][:, :, :horizon],
+            batch["candidate_coarse_action_values"][:, :, :horizon],
+            batch["candidate_coarse_action_mask"][:, :, :horizon],
         )
-
-    def forward(
-        self,
-        context: torch.Tensor,
-        task_emb: torch.Tensor,
-        candidate_actions: torch.Tensor,
-        physical_actions: torch.Tensor,
-        *,
-        wrist: torch.Tensor | None = None,
-        view_mask: torch.Tensor | None = None,
-    ) -> dict[str, object]:
-        rollout = self.imagine(
-            context,
-            task_emb,
-            candidate_actions,
-            wrist=wrist,
-            view_mask=view_mask,
-        )
-        cost = deterministic_action_cost(physical_actions)
+        with torch.no_grad():
+            rollout = self.imagine(batch)
         detached = NativeRollout(
-            tokens=rollout.tokens.detach(),
-            depth=rollout.depth.detach() if rollout.depth is not None else None,
-            point=rollout.point.detach() if rollout.point is not None else None,
-            pose=rollout.pose.detach() if rollout.pose is not None else None,
+            **{name: value.detach() for name, value in rollout.__dict__.items()}
         )
         return {
             "rollout": rollout,
             "action_cost": cost,
-            "planner": self.score_rollout(detached, task_emb, cost),
+            "planner": self.score_rollout(detached, batch["task_embedding"], cost),
         }

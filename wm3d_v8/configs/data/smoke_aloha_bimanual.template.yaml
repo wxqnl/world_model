@@ -1,0 +1,73 @@
+schema: wm3d_v8_data_profile_v4
+name: smoke_aloha_bimanual
+
+cache_representation:
+  schema: wm3d_v8_episode_representation_v1
+  token_grid: 12
+  spatial_tokens: 144
+  token_dim: 2048
+  num_views: 3
+  view_slots: [head, left_wrist, right_wrist]
+  rgb_size: 384
+  time_binding: episode_row_ordinal_with_pts_audit
+  missing_view_policy: mask_without_duplication
+  state_frame_selection:
+    mode: observed_greedy_minimum_separation
+    # 50Hz 原始 observation 中保留约 10Hz 的 native world state；时间戳仍为
+    # 实测值。模型的 world cadence 由 window/profile 决定，不写死在 cache ABI。
+    minimum_separation_seconds: 0.1
+    preserve_observed_timestamps: true
+    interpolation: forbidden
+
+cache:
+  schema: wm3d_v8_unified_window_index_v3
+  task_partition: episode
+  feature_workers_per_node: 2
+  decode_workers_per_gpu: 2
+  writer_threads_per_worker: 2
+  task_claim: atomic_no_clobber
+  resume: receipt_and_sha
+  view_token_codec: int8_per_vector
+  depth_codec: fp16
+  point_codec: fp16
+  camera_pose_codec: fp32
+  rgb_codec: jpeg_pack
+  action_proprio_storage: same_episode_artifact
+
+sources:
+  - name: aloha_smoke
+    adapter: lerobot
+    raw_root: __MATERIALIZE_REQUIRED__/raw/aloha_smoke
+    adapter_config: __MATERIALIZE_REQUIRED__/adapters/aloha_sim_insertion_human.yaml
+    adapter_contract_sha256: __MATERIALIZE_REQUIRED__
+    manifest: __MATERIALIZE_REQUIRED__/aloha_smoke.jsonl
+    manifest_sha256: __MATERIALIZE_REQUIRED__
+    embodiment: aloha_bimanual
+    weight: 100
+    nominal_hours: 0.2777777778
+    license_id: MIT
+
+embodiments:
+  - name: aloha_bimanual
+    embodiment_id: 100
+    groups:
+      - name: left_arm
+        group_id: 100
+        action_semantics: [controller_command, controller_command, controller_command, controller_command, controller_command, controller_command, controller_command]
+        state_semantics: [controller_state, controller_state, controller_state, controller_state, controller_state, controller_state, controller_state]
+        action_frame: left_controller_native
+        state_frame: left_controller_native
+        composition_operators: [last, last, last, last, last, last, last]
+      - name: right_arm
+        group_id: 101
+        action_semantics: [controller_command, controller_command, controller_command, controller_command, controller_command, controller_command, controller_command]
+        state_semantics: [controller_state, controller_state, controller_state, controller_state, controller_state, controller_state, controller_state]
+        action_frame: right_controller_native
+        state_frame: right_controller_native
+        composition_operators: [last, last, last, last, last, last, last]
+
+notes:
+  purpose: 真实公开双臂数据的从零发布烟测，不作为性能基准
+  cadence_contract: 保留 50Hz source-native action/state timestamps，不做全局固定频率重采样
+  gripper_contract: 上游未声明开合极性，烟测按 opaque continuous controller channel 保留
+  subset_contract: 可用显式 episode-index 文件选择少量 episode，receipt 必须绑定文件 SHA

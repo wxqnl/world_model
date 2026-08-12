@@ -1,0 +1,7 @@
+schema: wm3d_v8_task_encoder_v1
+model_name: Qwen/Qwen3-VL-Embedding-2B
+model_revision: 9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
+embedding_dim: 2048
+pooling: sentence_transformers_registered_pooling
+image_conditioning: disabled_for_stage0_task_text
+dtype: bf16

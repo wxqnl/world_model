@@ -1,64 +1,67 @@
 # WM3D V8
 
-WM3D V8 是一个动作条件的原生 3D 世界模型。模型在显式 3D 状态上预测未来 RGB、depth、point 和 camera/pose，同时输出可直接执行的机器人动作序列。
+WM3D V8 是一个动作条件的原生 3D 世界模型。模型在显式 3D 状态上预测未来 RGB、depth、point 和 camera/pose，同时输出可直接执行的机器人动作序列。1B 与 5B 使用同一个模型类、数据 ABI、训练器和命令，只选择不同 profile。
 
 ```mermaid
 flowchart LR
-  O["历史 RGB / depth / point / pose"] --> C["Native 3D core<br/>5 Hz, T16/P64/D2048/K8"]
-  A["20 Hz 已执行动作历史"] --> C
-  S["当前 10D proprio + embodiment"] --> H
+  O["真实时间戳的多视角观测"] --> C["Native 3D core<br/>连续时间 + 可配置 T/P/K"]
+  A["source-native 已执行动作"] --> C
+  S["group-aware 当前状态 + embodiment"] --> H
   C --> W["显式未来世界<br/>RGB / depth / point / pose"]
   C --> H["统一 action policy"]
-  H --> P["20 Hz × 8<br/>6D delta pose + absolute gripper"]
+  H --> P["显式 query timestamp<br/>grouped executable action"]
   W --> G["Stage1 action-blind planner"]
 ```
 
 核心约束：
 
-- 世界状态以 5 Hz 建模；高频动作不再被压缩成 5 Hz policy 标签。
-- dynamics 输入由每个世界步内 4 个真实动作子步组成，维度固定为 36。
-- serving action 只有一个 owner，输出形状固定为 `[B, 8, 7]`。
-- policy 直接读取与 action chunk 首帧严格对齐的 10D current-state proprio 和 embodiment token；不存在 zero/fallback/padding 旁路。
-- 前 6 维为归一化 delta pose，最后 1 维为 absolute close01 gripper。
+- 世界状态、action 和 current-state 均保留数据源真实时间戳；不存在全局固定 Hz 或整数频率比。
+- dynamics 输入保留每个真实 world interval 内的 source-native action 子步，不从 coarse effect 伪造 fine command。
+- serving action 只有一个 grouped owner；单臂、双臂、底盘、腰部和头部通过 group/mask/semantic ABI 表达。
+- policy 直接读取与 action chunk 首个真实 query timestamp 对齐的 current-state 和 embodiment token；缺失即拒绝样本。
+- Panda/LIBERO 的 `[B,8,7]`、20 Hz 和 10D state 只是 benchmark adapter，不是统一模型 ABI。
 - RGB、depth、point、pose 始终是显式监督和显式输出；没有 WAN/VLA action 旁路。
-- Stage0 使用 DROID、Bridge、RoboCasa Atomic、Composite、MG 五源混合，周期为 `35/15/10/20/20`。
+- 数据源和采样权重完全由 materialized data profile 决定；训练器不认识数据集名称。
 
-动作修正的设计、ABI 和验收证据见 [Stage0 动作修正说明](docs/WM3D_V8_STAGE0_ACTION_CORRECTION.md)，current-state 合同见 [Stage0 proprio 修正说明](docs/WM3D_V8_STAGE0_PROPRIO_CORRECTION.md)，因果双视图缓存合同见 [Stage0 数据流水线](docs/v8_stage0_causal_dual_view.md)。本版本从 Stage0 到 Stage1 的实跑结果见 [V8 快速完整验证](docs/WM3D_V8_QUICK_VALIDATION.md)。
+统一实现相对 V7 的修正、真实训练曲线和发布边界见
+[V8 发布验收](docs/WM3D_V8_RELEASE_VALIDATION.md)。数据处理命令见
+[从零数据与训练手册](docs/WM3D_V8_FROM_ZERO.md)，1B/5B 参数组成与多机方案见
+[统一扩展说明](docs/WM3D_V8_UNIFIED_SCALING.md)。
 
 ## 目录
 
 ```text
 wm3d_v8/
-├── configs/          # Stage0 v3 主配置、v2 兼容模板与 Stage1 验证配置
-├── docs/             # 数据流水线、action/proprio ABI 与实跑证据
-├── scripts/          # cache、sidecar、seal、preflight、eval、review、gate
-├── tests/            # 当前 V8 与底层数据 ABI 回归测试
+├── configs/          # 数据、encoder、1B/5B、runtime、objective 与 Stage1 profile
+├── docs/             # 从零操作、扩展设计、Stage1 与发布验收
+├── scripts/          # 下载、audit、cache、seal、runtime、eval 与 Stage1
+├── tests/            # 统一入口及数据/模型/分布式合同回归
 ├── wm3d_v3/
-│   ├── data/         # 五源数据、双频动作、因果双视图
-│   ├── models/       # native 3D core 与统一 action policy
-│   ├── stage1/       # 已封存数据证据/动作适配兼容层
+│   ├── data/         # source-native cadence、grouped robot 与 episode cache
+│   ├── models/       # 1B/5B 共用 native 3D core 与 action policy
 │   ├── stage1_planner/ # 冻结 Stage0 的原生 3D 规划阶段
-│   └── training/     # Stage0 trainer、checkpoint 与下游严格继承
+│   └── training/     # FSDP2/DDP、DCP、Stage0 与 offline eval
 ├── requirements.txt
 └── run_v8.sh
 ```
 
-`v7_compact_dataset.py`、`v7_action_contract.py` 等文件名保留，是因为已封存的数据 schema 和 checkpoint ABI 仍使用这些名字。它们属于当前 V8 的输入兼容层，不是旧 V7 训练流水线。
-
-旧的 direct-pose/delta-gripper/flow 多 owner 配置没有进入本发布树；它们与当前统一 action ABI 不兼容。当前 `stage1_planner` 只在冻结的 V8 原生 3D future 上训练 action-blind planner，不会重新取得 action serving 权。
+发布入口只构造 `native_world_model`。旧 direct-pose/delta-gripper/flow、fixed-rate
+sidecar、V7 trainer 和 single-file checkpoint eval 不属于 V8 发布闭包。当前
+`stage1_planner` 只在冻结的 V8 native future 上训练 action-blind planner，不会取得
+action serving 权。
 
 ## 环境
 
-推荐 Python 3.10、PyTorch 2.7.1、CUDA 12.8。先安装与集群驱动匹配的 PyTorch，再安装项目依赖：
+推荐 Python 3.10、PyTorch 2.7.1、CUDA 12.8。空服务器不需要 Docker：
 
 ```bash
-cd wm3d_v8
-python3.10 -m venv .venv
+git clone --branch v8 https://github.com/wxqnl/world_model.git
+cd world_model/wm3d_v8
+./run_v8.sh env
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-export PYTHONPATH="$PWD"
 ```
+
+安装脚本会执行 `pip check` 并写出 `.venv/environment_receipt.json`。集群驱动不兼容 CUDA 12.8 wheel 时，应修改 `PYTORCH_INDEX_URL`，不能在 receipt 中伪装成已验证环境。
 
 发布自检不会写入 `__pycache__` 或 pytest cache：
 
@@ -68,87 +71,88 @@ PYTHON_BIN=.venv/bin/python ./run_v8.sh check
 
 ## 配置
 
-新训练以 v3 为准；v2 仅用于读取和审计已封存的旧 ABI，不能冒充带 current-state proprio 的 v3：
+模型规模、数据和拓扑是三个正交 profile：
 
 | 配置 | 用途 |
 |---|---|
-| `wm3d_v8_stage0_causal_dual_view_unified_action_canary_v3.yaml` | 带 10D proprio 的短 canary 模板 |
-| `wm3d_v8_stage0_causal_dual_view_unified_action_formal_v3.yaml` | 带 10D proprio 的正式 Stage0 配方 |
-| `wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v3.yaml` | v3 的 2×8 GPU、global batch 64 拓扑覆盖 |
-| `wm3d_v8_stage1_native_planner_quick.yaml` | 从已编号 Stage0 checkpoint 进入规划阶段的 node43 验证配方 |
-| 对应 `*_v2.yaml` | 旧 ABI 兼容与历史审计，不用于新训练 |
-
-canary 配置已展开为自包含文件，不依赖被删除的历史配置链。模板中的 `PENDING_*` 只能由 sealed runtime overlay 替换；模板可以做 static preflight，但不能直接启动训练。
+| `model/native_1b.yaml` | 1,194,740,883 参数模型 |
+| `model/native_5b.yaml` | 5,108,342,963 参数模型 |
+| `runtime/smoke_2gpu_fsdp2.yaml` | 两卡 0→1→2 correctness smoke |
+| `runtime/canary_2gpu_fsdp2.yaml` | 两卡 100-step 可学习性 gate |
+| `runtime/h100_8_fsdp2.yaml` | 单节点 8 卡运行 profile |
+| `runtime/h200_128_fsdp2.yaml` | 16 节点、128 卡运行 profile |
+| `stage1/unified_native_planner.template.yaml` | 从 committed Stage0 DCP 进入统一规划阶段的 fail-closed 模板 |
 
 ```bash
-./run_v8.sh static \
-  configs/wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v3.yaml
+PYTHON_BIN=.venv/bin/python ./run_v8.sh check
 ```
 
-## 数据与缓存顺序
+## 从零数据链路
 
-正式输入包括：
-
-1. DROID/Bridge 的 source manifest、canonical action cache、action audit gate 和 train-only normalization stats；
-2. RoboCasa Atomic/Composite/MG 的事实动作 manifest、RGB sidecar index 和 adapter audit；
-3. 固定的 PCA384 token codec 及其 SHA；
-4. 本版本新生成的 causal dual-view archive 与 20 Hz action-only sidecar；
-5. RoboCasa、DROID、Bridge 三源分别封存的 current-state proprio index/stats/payload SHA。
-
-执行顺序固定为：
+完整命令与每个 receipt 的含义见 [从零数据与训练手册](docs/WM3D_V8_FROM_ZERO.md)。主线固定为：
 
 ```text
-OXE/RoboCasa 原始事实数据
-  → causal dual-view cache（context 只读 T16，target 仅作 K8 监督）
-  → world16 index finalize
-  → RoboCasa 20 Hz action-only sidecar
-  → 三源 current-state proprio sidecar
-  → sealed runtime config
-  → full preflight
-  → 0→20→100 canary + review/gate
-  → formal training
+锁定 revision/file list → 断点下载 → 必要的版本锁定转换/collection 拆分
+→ schema inventory + adapter 候选 → 人工确认 action/state 语义
+→ strict adapter audit → source inventory → sealed data profile
+→ task embedding bank → episode cache plan/并行 worker/seal
+→ 1B 或 5B window index → grouped normalization → runtime materialize
+→ preflight → train → eval
 ```
 
-缓存命令、输入字段和 no-clobber 规则见 [Stage0 数据流水线](docs/v8_stage0_causal_dual_view.md)。action sidecar 的完整命令见 [动作修正说明 8.2](docs/WM3D_V8_STAGE0_ACTION_CORRECTION.md#82-生成-robocasa-action-only-sidecar)。
+第一处必须由人确认的是 adapter 语义：字段名可以自动列出，但单位、坐标系、gripper 极性、group 边界和 fine/coarse supervision 不能靠代码猜。`adapter-audit` 要求显式确认字面量并输出 SHA-bound receipt；在此之前 inventory 会拒绝运行。
 
-## Preflight 与训练
+AgiBotWorld2026 的一个下载快照会按冻结目录 `ImitationLearning/`、`RichInteraction/`、`ReinforcementLearning/` 分别生成三个 collection/source receipt，不能把三类数据混成一个 source。AgiBot Beta 必须先使用同一 source lock 中冻结的 AgiBot Alpha 官方 converter；若冻结 revision 的 schema 与 converter 不兼容，流程会停在 conversion/schema audit，不会给出猜测 adapter。
 
-sealed runtime config 生成后，两台训练机都必须独立执行 full preflight：
+昂贵 episode cache 与模型规模无关：它绑定 raw manifest row、adapter、视觉 encoder、task encoder/bank 与 representation SHA，不绑定 T/K、训练步数或 1B/5B profile。view token 按 int8 per-vector 保存，depth/point 为 fp16；切换 1B/5B 只需重建便宜的 window index/runtime。
+
+交付前可先在一台双卡服务器执行真实公开小样本的一键 smoke：
 
 ```bash
-./run_v8.sh full "$SEALED_RUNTIME_CONFIG" "$PREFLIGHT_REPORT"
+./run_v8.sh smoke-real --work-root /data/wm3d_v8_smoke --gpus 0,1 \
+  --accept-dataset-license --confirm-adapter-semantics
 ```
 
-只有报告同时满足以下条件才允许启动：
+该命令从空目录下载冻结 revision，依次完成 schema/adapter audit、双臂 inventory、
+task bank、episode cache、window、normalization、runtime、0→1、独立进程 exact resume
+1→2 和 offline eval，并输出绑定代码 commit 与全部 SHA 的总 receipt。已有产物只有在
+receipt 和内容 SHA 全部一致时才会跳过。
 
-```text
-passed=true
-launch_ready=true
-errors=[]
-warnings=[]
-blockers=[]
-```
+## Preflight、训练与评测
 
-随后在每个节点使用相同配置和 rendezvous 参数启动。下面只展示 node-local 命令；集群调度器负责给每个节点注入正确的 `NODE_RANK`、`MASTER_ADDR` 和 `MASTER_PORT`：
+sealed runtime config 生成后，每台训练机必须执行同一个 preflight：
 
 ```bash
-torchrun   --nnodes="$NNODES"   --nproc_per_node=8   --node_rank="$NODE_RANK"   --master_addr="$MASTER_ADDR"   --master_port="$MASTER_PORT"   -m wm3d_v3.training.train   --cfg "$SEALED_RUNTIME_CONFIG"   --print_every 20   --stop_after_step "$HARD_STOP_STEP"
+./run_v8.sh preflight "$SEALED_RUNTIME_CONFIG"
 ```
 
-必须从完整编号 checkpoint 恢复，并使用 trainer 的 strict resume；禁止把 `latest.pt` 当作 authority。每个 milestone 先核验 checkpoint、review 和 receipt，再进入下一段。
-
-## Stage0→Stage1 快速验证
-
-本仓库已在 node43 上真实完成：Stage0 `0→1000`、独立进程 `1000→1020` 恢复、固定真实验证集，以及 Stage1 `0→25→100` 独立恢复和 train/val/test 双证据评测。复现命令、checkpoint/report SHA 和结果边界均记录在 [V8 快速完整验证](docs/WM3D_V8_QUICK_VALIDATION.md)，机器可读结果见 [验证凭证](docs/WM3D_V8_QUICK_VALIDATION_RECEIPT.json)。
-
-Stage1 的 quick 数据只有 20 个固定 simulator roots，适合验证 transition、loss、resume 和 imagined-future 路径，不是正式规模的规划训练集。正式训练必须用 V8 统一 action owner 重新生成更大的候选集合。
-
-## Stage0→LIBERO 继承
-
-Stage0 checkpoint 进入下游前必须运行严格审计：
+随后每个节点使用相同 runtime 和 rendezvous 参数启动；下面示例的 GPU 数、节点数都来自 runtime profile，不由模型名称决定：
 
 ```bash
-./run_v8.sh transition   "$NUMBERED_STAGE0_CHECKPOINT"   "$SEALED_STAGE0_CONFIG"   "$TRANSITION_REPORT"
+./run_v8.sh train \
+  --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" -- \
+  --runtime "$SEALED_RUNTIME_CONFIG" --stop-after-step "$HARD_STOP_STEP"
+
+./run_v8.sh eval \
+  --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port="$EVAL_MASTER_PORT" -- \
+  --runtime "$SEALED_RUNTIME_CONFIG" \
+  --checkpoint "$RUN_ROOT/checkpoints/step_XXXXXXXX" \
+  --output "$RUN_ROOT/eval_step_XXXXXXXX.json"
 ```
 
-审计会在 CPU 上实例化目标模型并执行完整 key/shape/ABI strict load。下游执行时必须显式提供 pose normalization stats 和 gripper polarity，不能按数据集名称猜测。
+必须从完整编号 DCP `step_XXXXXXXX/` 恢复；禁止把 `latest` 当作 authority。新集群先用 `native_1b + smoke_2gpu_fsdp2` 完成真实 optimizer step、checkpoint、独立进程 exact resume 和 eval，再切换 `native_5b + h200_128_fsdp2`；两者不更换代码或数据格式。
+
+## Stage0→Stage1 统一规划
+
+Stage1 不读取旧 V7 `[*,384]` codec，也不保留固定 H32/7D/单臂路径。它从同一 sealed Stage0 runtime 与 committed DCP 加载冻结世界模型，在真实 simulator 候选的显式 native 3D future evidence 上训练 action-blind planner；`H` 必须落在 Stage0 已训练的单次 `K` 内。
+
+真实 branch receipt、materialize、DCP exact resume 和 eval 门禁见 [Stage1 统一规划手册](docs/WM3D_V8_STAGE1_UNIFIED.md)。入口为 `stage1-materialize`、`stage1-train`、`stage1-eval`。历史 quick 结果仅保留在验证文档中作为旧实现记录，不能提升为当前 unified Stage1 的发布证据。
+
+## 下游继承
+
+下游从同一 `step_XXXXXXXX/` DCP 加载 `native_world_model`，并沿用相同 grouped action、
+current-state、normalization 和 embodiment ABI。LIBERO adapter 可以选择 20 Hz、8-step、
+单臂 7D contract，但这些值属于 adapter，不写回 world model。下游若需要不同 action
+表示，必须在 adapter 边界显式转换并封存统计；不能新增第二个 serving head。

@@ -1,0 +1,44 @@
+schema: wm3d_v8_runtime_profile_v1
+name: smoke_2gpu_fsdp2_shard2
+expected_world_size: 2
+distributed:
+  strategy: fsdp2
+  initialization: meta_sharded
+  shard_degree: 2
+  param_dtype: bf16
+  reduce_dtype: fp32
+  output_dtype: bf16
+  reshard_after_forward: true
+  find_unused_parameters: false
+  broadcast_buffers: false
+  timeout_minutes: 15
+train:
+  micro_batch_size: 1
+  gradient_accumulation: 1
+  global_batch_size: 2
+  total_steps: 2
+  seed: 3407
+  validation_seed: 7340
+  num_workers: 0
+  prefetch_factor: 2
+  persistent_workers: false
+  gradient_clip: 1.0
+  log_every: 1
+  validate_every: 0
+  validation_steps: 1
+  checkpoint_interval: 1
+  checkpoint_steps: []
+optimizer:
+  name: adamw
+  peak_lr: 0.00001
+  min_lr: 0.000001
+  betas: [0.9, 0.95]
+  eps: 0.00000001
+  weight_decay: 0.1
+schedule:
+  name: warmup_stable_cosine
+  warmup_steps: 1
+  stable_fraction: 0.5
+checkpoint:
+  allow_topology_reshard: false
+  async_save: false

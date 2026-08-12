@@ -1,0 +1,16 @@
+schema: wm3d_v8_objective_profile_v1
+name: stage0_native
+objective:
+  token_mse: 1.0
+  token_cosine: 0.1
+  rgb_charbonnier: 2.0
+  rgb_gradient: 0.5
+  depth_log: 1.5
+  point: 0.5
+  camera_pose: 0.1
+  action_fine: 2.0
+  action_coarse: 1.0
+  # 不同 source-native cadence 及 delta/absolute semantic 没有统一速度正则定义。
+  action_velocity: 0.0
+  epsilon: 0.000001
+  huber_delta: 0.05

@@ -1,0 +1,24 @@
+schema: wm3d_v8_external_converter_contract_v1
+name: agibot_beta_official_alpha_converter
+input_source: agibot_beta
+converter_source: agibot_alpha_converter
+converter_relative_path: scripts/convert_to_lerobot.py
+
+# 必须替换为独立 converter venv 的 environment_receipt.json SHA；模板值会
+# 被 runner 拒绝，不能直接用于正式转换。
+environment_receipt_sha256: __MATERIALIZE_REQUIRED_64_HEX_SHA256__
+required_bindings: [task_id]
+
+# argv 由官方 AgiBot Alpha converter 已公开的 CLI 定义。{python}、
+# {converter}、{input_root}、{output_root} 是 runner 唯一允许的占位符。
+argv:
+  - "{python}"
+  - "{converter}"
+  - --src_path
+  - "{input_root}"
+  - --task_id
+  - "{task_id}"
+  - --tgt_path
+  - "{output_root}"
+output_kind: lerobot_collection
+lerobot_root_glob: "**/meta/info.json"

@@ -1,124 +1,178 @@
-"""Autoregressive WM3D-V8 native rollout over K=8 core chunks."""
+"""One-shot candidate-conditioned rollout through the frozen unified Stage0."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 import torch
-from torch.utils.checkpoint import checkpoint
 
 
-@dataclass
+@dataclass(frozen=True)
 class NativeRollout:
     tokens: torch.Tensor
-    depth: torch.Tensor | None
-    point: torch.Tensor | None
-    pose: torch.Tensor | None
+    future_dt_s: torch.Tensor
+    token_mask: torch.Tensor
+    depth: torch.Tensor
+    depth_mask: torch.Tensor
+    point: torch.Tensor
+    point_mask: torch.Tensor
+    pose: torch.Tensor
+    pose_mask: torch.Tensor
+    confidence: torch.Tensor
+    view_mask: torch.Tensor
 
 
-def _reshape_candidate(value: torch.Tensor, bsz: int, candidates: int) -> torch.Tensor:
-    return value.reshape(bsz, candidates, *value.shape[1:])
+_CONTEXT_KEYS = (
+    "world_tokens",
+    "view_mask",
+    "world_times_s",
+    "task_embedding",
+    "history_fine_action_values",
+    "history_fine_action_mask",
+    "history_fine_action_dt",
+    "history_fine_sample_mask",
+    "history_coarse_action_values",
+    "history_coarse_action_mask",
+    "action_group_ids",
+    "action_group_mask",
+    "action_semantic_ids",
+    "current_state_values",
+    "current_state_mask",
+    "state_semantic_ids",
+    "embodiment_ids",
+    "policy_query_dt",
+    "policy_query_mask",
+    "action_normalization_offset",
+    "action_normalization_scale",
+    "aux_values",
+    "aux_mask",
+    "aux_type_ids",
+)
 
 
-def multichunk_native_rollout(
-    world,
-    context_tokens: torch.Tensor,
-    task_emb: torch.Tensor,
-    candidate_actions: torch.Tensor,
+def _expand_candidates(value: torch.Tensor, candidates: int) -> torch.Tensor:
+    return value[:, None].expand(-1, candidates, *([-1] * (value.ndim - 1))).flatten(0, 1)
+
+
+def _world_config(world: torch.nn.Module):
+    current = world
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        if hasattr(current, "cfg"):
+            return current.cfg
+        wrapped = getattr(current, "module", None)
+        if not isinstance(wrapped, torch.nn.Module):
+            break
+        current = wrapped
+    raise ValueError("frozen Stage0 wrapper does not expose its sealed model config")
+
+
+def single_horizon_native_rollout(
+    world: torch.nn.Module,
+    batch: Mapping[str, torch.Tensor],
     *,
-    include_geometry: bool = True,
+    horizon: int,
     candidate_microbatch: int = 0,
-    detach_between_chunks: bool = False,
-    activation_checkpointing: bool = False,
 ) -> NativeRollout:
-    """Roll H=8/16/32 in native token/geometry space.
+    """Run exactly one trained Stage0 horizon, then slice to ``H <= K``.
 
-    The world model core still predicts explicit VGGT tokens and its native
-    depth/point/pose heads.  No latent-3D replacement or future observation is
-    accepted.  Candidate microbatching changes memory use only, not semantics.
+    There is intentionally no autoregressive loop: the current native model
+    has only been trained for one factual K-window.  Candidate actions already
+    use the sealed grouped/timestamped/normalized ABI from the Stage1 branch
+    materializer.
     """
 
-    if context_tokens.ndim != 4 or task_emb.ndim != 2 or candidate_actions.ndim != 4:
-        raise ValueError("expected context[B,T,P,D], task[B,D], actions[B,C,H,A]")
-    bsz, candidates, horizon, action_dim = candidate_actions.shape
-    if bsz != context_tokens.shape[0] or bsz != task_emb.shape[0]:
-        raise ValueError("rollout batch dimensions do not match")
-    if action_dim != int(world.cfg.dual.state.action_cond_dim):
-        raise ValueError("candidate action dimension differs from native core contract")
-    core_horizon = int(world.cfg.dual.state.k)
-    if horizon <= 0 or horizon % core_horizon:
-        raise ValueError(f"planning horizon must be a positive multiple of K={core_horizon}")
+    required = set(_CONTEXT_KEYS) | {
+        "candidate_fine_action_values",
+        "candidate_fine_action_mask",
+        "candidate_fine_action_dt",
+        "candidate_fine_sample_mask",
+        "candidate_coarse_action_values",
+        "candidate_coarse_action_mask",
+    }
+    missing = sorted(required - set(batch))
+    if missing:
+        raise ValueError(f"rollout batch misses unified fields: {missing}")
+    cfg = _world_config(world)
+    if not 0 < int(horizon) <= int(cfg.K):
+        raise ValueError(f"Stage1 horizon H={horizon} must satisfy 0 < H <= K={cfg.K}")
+    fine = batch["candidate_fine_action_values"]
+    if fine.ndim != 6:
+        raise ValueError("candidate fine actions must be [B,C,K,G,S,A]")
+    bsz, candidates = fine.shape[:2]
     if candidates < 2:
-        raise ValueError("planning requires at least two candidates")
-    micro = candidates if candidate_microbatch <= 0 else int(candidate_microbatch)
+        raise ValueError("Stage1 planning requires at least two candidates")
+    for name in _CONTEXT_KEYS:
+        value = batch[name]
+        if not isinstance(value, torch.Tensor) or value.shape[0] != bsz:
+            raise ValueError(f"unified context field {name} is not batched")
+    expected_fine = (
+        bsz, candidates, cfg.K, cfg.max_action_groups,
+        fine.shape[-2], cfg.max_action_dim,
+    )
+    if tuple(fine.shape) != expected_fine or not 0 < fine.shape[-2] <= cfg.max_action_substeps:
+        raise ValueError("candidate fine actions differ from sealed Stage0 grouped capacities")
+    if batch["candidate_fine_action_mask"].shape != fine.shape:
+        raise ValueError("candidate fine action mask mismatch")
+    if (
+        batch["candidate_fine_action_dt"].shape != fine.shape[:-1]
+        or batch["candidate_fine_sample_mask"].shape != fine.shape[:-1]
+    ):
+        raise ValueError("candidate fine action timestamps/mask mismatch")
+    coarse_shape = (bsz, candidates, cfg.K, cfg.max_action_groups, cfg.max_action_dim)
+    if (
+        tuple(batch["candidate_coarse_action_values"].shape) != coarse_shape
+        or batch["candidate_coarse_action_mask"].shape != batch["candidate_coarse_action_values"].shape
+    ):
+        raise ValueError("candidate coarse actions differ from sealed Stage0 capacities")
+    candidate_fields = {
+        "future_factual_fine_action_values": "candidate_fine_action_values",
+        "future_factual_fine_action_mask": "candidate_fine_action_mask",
+        "future_factual_fine_action_dt": "candidate_fine_action_dt",
+        "future_factual_fine_sample_mask": "candidate_fine_sample_mask",
+        "future_factual_coarse_action_values": "candidate_coarse_action_values",
+        "future_factual_coarse_action_mask": "candidate_coarse_action_mask",
+    }
+    micro = candidates if int(candidate_microbatch) <= 0 else int(candidate_microbatch)
     if micro <= 0:
         raise ValueError("candidate_microbatch must be non-negative")
-
-    token_slices: list[torch.Tensor] = []
-    depth_slices: list[torch.Tensor] = []
-    point_slices: list[torch.Tensor] = []
-    pose_slices: list[torch.Tensor] = []
-    for candidate_start in range(0, candidates, micro):
-        candidate_stop = min(candidates, candidate_start + micro)
-        local_candidates = candidate_stop - candidate_start
-        local_context = context_tokens[:, None].expand(
-            -1, local_candidates, -1, -1, -1
-        ).reshape(bsz * local_candidates, *context_tokens.shape[1:])
-        local_task = task_emb[:, None].expand(-1, local_candidates, -1).reshape(
-            bsz * local_candidates, -1
-        )
-        local_actions = candidate_actions[:, candidate_start:candidate_stop].reshape(
-            bsz * local_candidates, horizon, action_dim
-        )
-        chunk_tokens: list[torch.Tensor] = []
-        chunk_depth: list[torch.Tensor] = []
-        chunk_point: list[torch.Tensor] = []
-        chunk_pose: list[torch.Tensor] = []
-        for start in range(0, horizon, core_horizon):
-            action_chunk = local_actions[:, start : start + core_horizon]
-            if activation_checkpointing and torch.is_grad_enabled():
-                predicted = checkpoint(
-                    lambda state, task, action: world.dual(
-                        state, task, action_cond=action
-                    )["pred_tokens"],
-                    local_context,
-                    local_task,
-                    action_chunk,
-                    use_reentrant=False,
-                )
-            else:
-                predicted = world.dual(
-                    local_context, local_task, action_cond=action_chunk
-                )["pred_tokens"]
-            if predicted.shape[1] != core_horizon:
-                raise RuntimeError("native core returned an unexpected rollout horizon")
-            chunk_tokens.append(predicted)
-            if include_geometry:
-                geometry = world.geom(predicted)
-                chunk_depth.append(geometry["depth"])
-                if "point" not in geometry or "pose" not in geometry:
-                    raise RuntimeError("Stage1-P requires native depth, point and pose heads")
-                chunk_point.append(geometry["point"])
-                chunk_pose.append(geometry["pose"])
-            appended = predicted.detach() if detach_between_chunks else predicted
-            local_context = torch.cat((local_context, appended), dim=1)[
-                :, -int(world.cfg.dual.state.T) :
-            ]
-        token_slices.append(
-            _reshape_candidate(torch.cat(chunk_tokens, dim=1), bsz, local_candidates)
-        )
-        if include_geometry:
-            depth_slices.append(
-                _reshape_candidate(torch.cat(chunk_depth, dim=1), bsz, local_candidates)
-            )
-            point_slices.append(
-                _reshape_candidate(torch.cat(chunk_point, dim=1), bsz, local_candidates)
-            )
-            pose_slices.append(
-                _reshape_candidate(torch.cat(chunk_pose, dim=1), bsz, local_candidates)
-            )
+    collected: dict[str, list[torch.Tensor]] = {
+        name: [] for name in ("pred_tokens", "depth", "point", "camera_pose", "geometry_confidence")
+    }
+    for start in range(0, candidates, micro):
+        stop = min(candidates, start + micro)
+        local = stop - start
+        kwargs = {name: _expand_candidates(batch[name], local) for name in _CONTEXT_KEYS}
+        for target, source in candidate_fields.items():
+            value = batch[source][:, start:stop]
+            kwargs[target] = value.flatten(0, 1)
+        kwargs["rgb_frame_indices"] = ()
+        output = world(**kwargs)
+        for name in collected:
+            value = output[name][:, :horizon]
+            collected[name].append(value.reshape(bsz, local, *value.shape[1:]))
+    merged = {name: torch.cat(values, dim=1) for name, values in collected.items()}
+    future_dt = batch["world_times_s"][:, cfg.T : cfg.T + horizon]
+    future_dt = future_dt - batch["world_times_s"][:, cfg.T - 1 : cfg.T]
+    future_dt = future_dt[:, None].expand(-1, candidates, -1)
+    token_mask = torch.ones(
+        bsz, candidates, horizon, cfg.P, dtype=torch.bool, device=fine.device
+    )
+    view_mask = torch.ones(
+        bsz, candidates, horizon, cfg.num_views, dtype=torch.bool, device=fine.device
+    )
+    evidence_mask = view_mask[..., None].expand(-1, -1, -1, -1, cfg.P)
     return NativeRollout(
-        tokens=torch.cat(token_slices, dim=1),
-        depth=torch.cat(depth_slices, dim=1) if depth_slices else None,
-        point=torch.cat(point_slices, dim=1) if point_slices else None,
-        pose=torch.cat(pose_slices, dim=1) if pose_slices else None,
+        tokens=merged["pred_tokens"],
+        future_dt_s=future_dt,
+        token_mask=token_mask,
+        depth=merged["depth"],
+        depth_mask=evidence_mask,
+        point=merged["point"],
+        point_mask=evidence_mask,
+        pose=merged["camera_pose"],
+        pose_mask=view_mask,
+        confidence=merged["geometry_confidence"],
+        view_mask=view_mask,
     )

@@ -1,0 +1,15 @@
+schema: wm3d_v8_raw_source_lock_v1
+sources:
+  - name: aloha_smoke
+    transport: huggingface_dataset
+    repo_id: lerobot/aloha_sim_insertion_human
+    revision: cc571a3c661df81b566dbfde3d5c1e85fcdf7884
+    include:
+      - README.md
+      - meta/**
+      - meta_data/**
+      - data/**
+      - train/**
+      - videos/**
+    destination: aloha_smoke
+    gated: false

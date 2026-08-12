@@ -1,5 +1,10 @@
 # WM3D V8 快速完整验证方案
 
+> 历史记录（旧 Stage1 ABI）：本页中的 Stage1 quick 命令与 `[*,384]` branch
+> 资产不属于当前 unified Stage1 发布合同，不能复跑或提升为发布证据。当前
+> 入口见 [Stage1 统一规划手册](WM3D_V8_STAGE1_UNIFIED.md)。本页仅保留当时的
+> Stage0/实验审计事实，避免把历史结果改写成新实现的证据。
+
 ## 目标
 
 本次不继续把 Stage0 训练到 100K。验证门槛收敛为：
