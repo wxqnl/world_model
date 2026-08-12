@@ -1100,6 +1100,36 @@ def save_step_checkpoint_once(
     return step_path
 
 
+def resolve_milestone_review_stop_steps(train_cfg: dict) -> frozenset[int]:
+    """Return required review milestones that must hard-stop this invocation."""
+
+    review_cfg = train_cfg.get("milestone_reviews")
+    if review_cfg is None:
+        return frozenset()
+    if not isinstance(review_cfg, dict):
+        raise ValueError("train.milestone_reviews must be a mapping")
+    if not (
+        bool(review_cfg.get("fail_closed", False))
+        and bool(review_cfg.get("pause_on_missing_or_failed_review", False))
+    ):
+        return frozenset()
+    raw_steps = review_cfg.get("required_review_steps", ())
+    if not isinstance(raw_steps, (list, tuple)):
+        raise ValueError(
+            "train.milestone_reviews.required_review_steps must be a list"
+        )
+    steps: list[int] = []
+    for value in raw_steps:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                "milestone review steps must be positive integer optimizer steps"
+            )
+        steps.append(int(value))
+    if len(set(steps)) != len(steps):
+        raise ValueError("milestone review steps must be unique")
+    return frozenset(steps)
+
+
 def setup_ddp():
     if "RANK" in os.environ:
         backend = os.environ.get("WM3D_DDP_BACKEND", "nccl")
@@ -9738,6 +9768,9 @@ def main():
             f"--stop_after_step={stop_after_step} exceeds configured max_steps={max_steps}"
         )
     invocation_stop_step = stop_after_step or max_steps
+    milestone_review_stop_steps = resolve_milestone_review_stop_steps(
+        train_cfg
+    )
     if len(tr_loader) % gradient_accumulation_steps != 0:
         raise ValueError(
             f"micro-batches per epoch ({len(tr_loader)}) must be divisible by "
@@ -11241,6 +11274,14 @@ def main():
             if world > 1 and checkpoint_due:
                 dist.barrier()
             step += 1
+            if step in milestone_review_stop_steps:
+                invocation_stop_step = step
+                if rank == 0:
+                    print(
+                        f"[rank0] reached required milestone review step={step}; "
+                        "hard-stopping this invocation after validation",
+                        flush=True,
+                    )
             if invocation_stop_step > 0 and step >= invocation_stop_step:
                 if rank == 0:
                     print(
@@ -11609,7 +11650,10 @@ def main():
             # resumable, even when max_steps is not aligned to the periodic
             # checkpoint interval and best-checkpoint saving is disabled.
             if reached_invocation_stop and (
-                ckpt_every_steps <= 0 or step % ckpt_every_steps != 0
+                not (
+                    (ckpt_every_steps > 0 and step % ckpt_every_steps == 0)
+                    or step in checkpoint_milestones
+                )
             ):
                 save_step_checkpoint_once(ckpt, ckpt_dir, step)
             val_direct = validation_mean("L_direct_policy")
