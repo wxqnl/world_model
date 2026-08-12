@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -297,6 +298,7 @@ def _write_compact_fixture(
         "source": "robocasa365",
         "path": str(archive_path),
         "model_frames": 7,
+        "windows": len(starts),
         "window_starts": starts.tolist(),
         "paired_views": True,
         "action_valid": True,
@@ -322,6 +324,10 @@ def _compact_config(index_path: Path) -> V7CompactDatasetConfig:
     )
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_compact_loader_maps_each_start_to_one_dual_view_window(
     tmp_path: Path,
 ) -> None:
@@ -344,6 +350,50 @@ def test_compact_loader_maps_each_start_to_one_dual_view_window(
     assert second["action_tgt"][:, 0].tolist() == [4.0, 5.0]
     assert second["depth_tgt"].shape == (2, 8, 8)
     assert second["point_tgt"].shape == (2, 8, 8, 3)
+
+
+def test_compact_trusted_index_fast_init_is_digest_bound_and_lazy(
+    tmp_path: Path,
+) -> None:
+    index_path = _write_compact_fixture(tmp_path)
+    archive_path = Path(json.loads(index_path.read_text())["path"])
+    config = replace(
+        _compact_config(index_path),
+        trusted_index_fast_init=True,
+        trusted_index_sha256=_sha256(index_path),
+    )
+
+    archive_path.rename(archive_path.with_suffix(".hidden"))
+    dataset = V7CompactWindowDataset(config)
+    with pytest.raises(FileNotFoundError):
+        dataset[0]
+
+    with pytest.raises(RuntimeError, match="trusted compact index digest mismatch"):
+        V7CompactWindowDataset(
+            replace(config, trusted_index_sha256="0" * 64)
+        )
+
+
+def test_compact_trusted_index_fast_init_revalidates_sampled_payload(
+    tmp_path: Path,
+) -> None:
+    index_path = _write_compact_fixture(tmp_path)
+    row = json.loads(index_path.read_text())
+    archive_path = Path(row["path"])
+    config = replace(
+        _compact_config(index_path),
+        trusted_index_fast_init=True,
+        trusted_index_sha256=_sha256(index_path),
+    )
+    dataset = V7CompactWindowDataset(config)
+
+    with np.load(archive_path, allow_pickle=False) as archive:
+        payload = {key: archive[key] for key in archive.files}
+    payload["window_starts"] = np.asarray([0, 1], dtype=np.int64)
+    np.savez_compressed(archive_path, **payload)
+
+    with pytest.raises(ValueError, match="compact window_starts identity mismatch"):
+        dataset[0]
 
 
 @pytest.mark.parametrize(

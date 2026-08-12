@@ -57,6 +57,8 @@ class V7CompactDatasetConfig:
     policy_action_history_dim: int = 7
     causal_dual_view_required: bool = False
     causal_dual_view_representation: str | None = None
+    trusted_index_fast_init: bool = False
+    trusted_index_sha256: str | None = None
     v8_dual_rate_action_enabled: bool = False
     v8_action_sidecar_index: Path | None = None
     v8_action_sidecar_index_sha256: str | None = None
@@ -109,6 +111,22 @@ class V7CompactWindowDataset(Dataset):
                 raise ValueError("causal compact mode needs the exact V8 representation")
             if cfg.action_only:
                 raise ValueError("causal compact mode requires native 3D targets")
+        if cfg.trusted_index_fast_init:
+            if not cfg.causal_dual_view_required:
+                raise ValueError(
+                    "trusted compact index fast init is V8 causal dual-view only"
+                )
+            if not cfg.trusted_index_sha256:
+                raise ValueError(
+                    "trusted compact index fast init needs a pinned index digest"
+                )
+            observed_index_sha256 = _sha256_file(Path(cfg.index_path))
+            if observed_index_sha256 != str(cfg.trusted_index_sha256):
+                raise RuntimeError(
+                    "trusted compact index digest mismatch: "
+                    f"observed={observed_index_sha256} "
+                    f"expected={cfg.trusted_index_sha256}"
+                )
         rows: list[dict] = []
         with Path(cfg.index_path).open(encoding="utf-8") as handle:
             for line in handle:
@@ -306,28 +324,57 @@ class V7CompactWindowDataset(Dataset):
                     raise ValueError(f"target_usage must be supervision_only: {row.get('clip_hash')}")
                 if row.get("geometry_coordinate_frame") != "first_observed_camera":
                     raise ValueError(f"unexpected geometry gauge: {row.get('clip_hash')}")
-                with np.load(row["path"], allow_pickle=False) as archive:
-                    summary = validate_causal_dual_view_archive(
-                        archive,
-                        T=cfg.T,
-                        k=cfg.k,
-                        paired_views=bool(row.get("paired_views", False)),
-                    )
-                    if not summary["compact"]:
-                        raise ValueError("RoboCasa causal cache must have a W dimension")
-                    for key, expected in (
-                        ("clip_hash", row["clip_hash"]),
-                        ("split", row["split"]),
-                        ("source", row["source"]),
-                        ("action_adapter_version", row["action_adapter_version"]),
-                        ("action_audit_sha256", row["action_audit_sha256"]),
-                    ):
-                        if str(np.asarray(archive[key]).item()) != str(expected):
-                            raise ValueError(f"compact cache identity mismatch for {key}: {row['clip_hash']}")
-                    archive_starts = np.asarray(archive["window_starts"], dtype=np.int64)
                 row_starts = np.asarray(row.get("window_starts"), dtype=np.int64)
-                if row_starts.ndim != 1 or not np.array_equal(row_starts, archive_starts):
-                    raise ValueError(f"compact window_starts identity mismatch: {row['clip_hash']}")
+                if row_starts.ndim != 1:
+                    raise ValueError(
+                        f"compact window_starts must be 1D: {row['clip_hash']}"
+                    )
+                declared_windows = row.get("windows")
+                if declared_windows is None:
+                    if cfg.trusted_index_fast_init:
+                        raise ValueError(
+                            "trusted compact index row omits window count: "
+                            f"{row['clip_hash']}"
+                        )
+                elif int(declared_windows) != len(row_starts):
+                    raise ValueError(
+                        f"compact window count mismatch: {row['clip_hash']}"
+                    )
+                if not cfg.trusted_index_fast_init:
+                    with np.load(row["path"], allow_pickle=False) as archive:
+                        summary = validate_causal_dual_view_archive(
+                            archive,
+                            T=cfg.T,
+                            k=cfg.k,
+                            paired_views=bool(row.get("paired_views", False)),
+                        )
+                        if not summary["compact"]:
+                            raise ValueError(
+                                "RoboCasa causal cache must have a W dimension"
+                            )
+                        for key, expected in (
+                            ("clip_hash", row["clip_hash"]),
+                            ("split", row["split"]),
+                            ("source", row["source"]),
+                            (
+                                "action_adapter_version",
+                                row["action_adapter_version"],
+                            ),
+                            ("action_audit_sha256", row["action_audit_sha256"]),
+                        ):
+                            if str(np.asarray(archive[key]).item()) != str(expected):
+                                raise ValueError(
+                                    "compact cache identity mismatch for "
+                                    f"{key}: {row['clip_hash']}"
+                                )
+                        archive_starts = np.asarray(
+                            archive["window_starts"], dtype=np.int64
+                        )
+                    if not np.array_equal(row_starts, archive_starts):
+                        raise ValueError(
+                            "compact window_starts identity mismatch: "
+                            f"{row['clip_hash']}"
+                        )
                 if len(row_starts) == 0 or np.any(np.diff(row_starts) <= 0):
                     raise ValueError(f"compact window_starts must be sorted unique: {row['clip_hash']}")
                 if any(
@@ -467,6 +514,15 @@ class V7CompactWindowDataset(Dataset):
             )
             task = np.asarray(archive["task_emb"], dtype=np.float32)
             if self.cfg.causal_dual_view_required:
+                archive_starts = np.asarray(
+                    archive["window_starts"], dtype=np.int64
+                )
+                row_starts = np.asarray(row["window_starts"], dtype=np.int64)
+                if not np.array_equal(archive_starts, row_starts):
+                    raise ValueError(
+                        "compact window_starts identity mismatch: "
+                        f"{row['clip_hash']}"
+                    )
                 window_index = row["_causal_window_lookup"].get(int(start))
                 if window_index is None:
                     raise ValueError(f"compact cache omits indexed start {start}")

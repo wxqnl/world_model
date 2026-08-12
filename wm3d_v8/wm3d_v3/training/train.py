@@ -3403,6 +3403,13 @@ def build_datasets(cfg: dict, overfit_ids=None):
             "causal_dual_view_representation": data_cfg.get(
                 "compact_causal_dual_view_representation"
             ),
+            "trusted_index_fast_init": bool(
+                data_cfg.get("compact_trusted_index_fast_init", False)
+            ),
+            "trusted_index_sha256": (
+                str(data_cfg["compact_index_sha256"])
+                if data_cfg.get("compact_index_sha256") else None
+            ),
             "policy_action_history_len": int(
                 data_cfg.get(
                     "policy_action_history_len",
