@@ -78,6 +78,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             "name",
             "expected_world_size",
             "distributed",
+            "resources",
             "train",
             "optimizer",
             "schedule",
@@ -92,6 +93,56 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
     if not isinstance(distributed, dict):
         raise RuntimeContractError("distributed must be a mapping")
     strategy_from_mapping(distributed).validate(world_size=expected_world_size)
+    resources = value.get("resources")
+    if resources is not None:
+        if not isinstance(resources, dict):
+            raise RuntimeContractError("resources must be a mapping")
+        required_resources = {
+            "gpu_name_substring",
+            "minimum_gpu_memory_mib",
+            "require_zero_uncorrected_ecc",
+            "require_idle_gpu",
+            "require_full_local_nvlink_clique",
+            "minimum_ib_rate_gbps",
+            "forbid_nccl_ib_disable",
+            "minimum_memlock_bytes",
+            "minimum_nofile",
+            "minimum_shm_bytes",
+            "minimum_data_free_bytes",
+            "minimum_output_free_bytes",
+            "minimum_allreduce_gbps",
+            "maximum_preflight_age_seconds",
+        }
+        if set(resources) != required_resources:
+            raise RuntimeContractError(
+                "resource fields mismatch: "
+                f"missing={sorted(required_resources-set(resources))} "
+                f"unknown={sorted(set(resources)-required_resources)}"
+            )
+        if not str(resources["gpu_name_substring"]):
+            raise RuntimeContractError("resources.gpu_name_substring must be non-empty")
+        for field in (
+            "minimum_gpu_memory_mib",
+            "minimum_memlock_bytes",
+            "minimum_nofile",
+            "minimum_shm_bytes",
+            "minimum_data_free_bytes",
+            "minimum_output_free_bytes",
+            "maximum_preflight_age_seconds",
+        ):
+            if isinstance(resources[field], bool) or int(resources[field]) <= 0:
+                raise RuntimeContractError(f"resources.{field} must be a positive integer")
+        for field in ("minimum_ib_rate_gbps", "minimum_allreduce_gbps"):
+            if isinstance(resources[field], bool) or float(resources[field]) <= 0:
+                raise RuntimeContractError(f"resources.{field} must be positive")
+        for field in (
+            "require_zero_uncorrected_ecc",
+            "require_idle_gpu",
+            "require_full_local_nvlink_clique",
+            "forbid_nccl_ib_disable",
+        ):
+            if not isinstance(resources[field], bool):
+                raise RuntimeContractError(f"resources.{field} must be boolean")
     train = value.get("train")
     optimizer = value.get("optimizer")
     schedule = value.get("schedule")

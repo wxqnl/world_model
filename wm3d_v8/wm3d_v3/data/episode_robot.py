@@ -13,6 +13,7 @@ from .grouped_robot import (
     COMPOSITION_OPERATOR_IDS,
     STATE_SEMANTIC_IDS,
     EmbodimentSpec,
+    GroupedRobotLimits,
     GroupedRobotContractError,
     RawActionSeries,
     RawStateSeries,
@@ -475,8 +476,6 @@ def assemble_robot_window_from_prepared_episode(
     policy_target_horizon_s: float,
 ) -> dict[str, torch.Tensor]:
     """Assemble a window without re-decoding the episode ragged streams."""
-
-    from .grouped_robot import GroupedRobotLimits
 
     if not isinstance(limits, GroupedRobotLimits):
         raise GroupedRobotContractError("limits must be GroupedRobotLimits")

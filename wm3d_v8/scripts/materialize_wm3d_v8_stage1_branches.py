@@ -123,7 +123,7 @@ def _validate_candidate_payload(value: dict, *, model: dict, horizon: int) -> No
     if bool((value["branch_geometry_confidence"] < 0).any()):
         raise ValueError("candidate geometry confidence must be non-negative")
     fine = value["candidate_fine_action_values"]
-    if fine.ndim != 6 or fine.shape[:2] != (candidates, K):
+    if fine.ndim != 5 or fine.shape[:2] != (candidates, K):
         raise ValueError("candidate fine actions must cover the same sealed K")
     if fine.shape[2:] != (
         int(model["max_action_groups"]), int(model["max_action_substeps"]),

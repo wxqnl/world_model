@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from typing import Any, Iterable, Mapping
 
-from .manifest_contract import safe_relative_path, sha256_file
+from .manifest_contract import safe_relative_path
 
 
 CACHE_TASK_SCHEMA = "wm3d_v8_episode_cache_task_v4"

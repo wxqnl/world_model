@@ -557,6 +557,36 @@ class DistributedCheckpointManager:
             )
         return metadata, files
 
+    def inspect_committed(
+        self,
+        *,
+        path: Path,
+        expected: ResumeExpectations,
+    ) -> dict[str, Any]:
+        """Validate immutable controls before a launch qualification is published.
+
+        Payload shards are still verified collectively by :meth:`load`; this
+        method only exposes the already strict, rank-0-safe control verdict and
+        the COMMITTED digest needed to bind the launch to an explicit source.
+        """
+
+        checkpoint_path = Path(path).resolve(strict=True)
+        root = self.root.resolve(strict=True)
+        if checkpoint_path.parent != root:
+            raise CheckpointIntegrityError(
+                f"checkpoint escaped run root: {checkpoint_path}"
+            )
+        metadata, _ = self._verify_controls(checkpoint_path)
+        resume_mode = _validate_metadata(metadata, expected)
+        return {
+            "path": str(checkpoint_path),
+            "step": int(metadata["step"]),
+            "committed_sha256": sha256_file(checkpoint_path / "COMMITTED.json"),
+            "saved_world_size": int(metadata["world_size"]),
+            "saved_shard_degree": int(metadata["shard_degree"]),
+            "resume_mode": resume_mode,
+        }
+
     def load(
         self,
         *,

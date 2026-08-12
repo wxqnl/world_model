@@ -146,3 +146,6 @@ def test_topology_hash_excludes_launch_shape_but_not_training_semantics() -> Non
     second["runtime_profile"]["train"]["global_batch_size"] = 256  # type: ignore[index]
     assert _topology_contract_sha256(first) != _topology_contract_sha256(second)
 
+    second = deepcopy(first)
+    second["runtime_profile"]["resources"] = {"minimum_shm_bytes": 64_000_000_000}  # type: ignore[index]
+    assert _topology_contract_sha256(first) != _topology_contract_sha256(second)

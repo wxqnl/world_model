@@ -3,7 +3,6 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
-import torch
 
 from tests.test_native_world_model import _batch, _tiny_config
 from wm3d_v3.models.native_world_model import NativeWorldModel

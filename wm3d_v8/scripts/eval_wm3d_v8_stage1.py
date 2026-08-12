@@ -41,14 +41,56 @@ from wm3d_v3.models.model_factory import build_world_model
 
 
 EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_eval_receipt_v1"
+_ACTION_FIELDS = (
+    "candidate_fine_action_values",
+    "candidate_fine_action_mask",
+    "candidate_fine_action_dt",
+    "candidate_fine_sample_mask",
+    "candidate_coarse_action_values",
+    "candidate_coarse_action_mask",
+)
+_LEARNED_FIELDS = (
+    "progress_logit",
+    "success_logit",
+    "risk_logit",
+    "uncertainty_logit",
+)
+
+
+def _action_shuffle_invariant(
+    system: NativePlanningSystem,
+    batch: dict[str, torch.Tensor],
+    permutation: torch.Tensor,
+) -> bool:
+    """Compare learned scores with both forwards in the same execution mode."""
+    shuffled_batch = dict(batch)
+    for name in _ACTION_FIELDS:
+        shuffled_batch[name] = batch[name][:, permutation]
+    with torch.no_grad():
+        before = system.score_observed_batch(batch)
+        after = system.score_observed_batch(shuffled_batch)
+    return all(torch.equal(before[name], after[name]) for name in _LEARNED_FIELDS)
 
 
 def _auc(labels: np.ndarray, scores: np.ndarray) -> float | None:
-    labels = labels.astype(bool).reshape(-1); scores = scores.reshape(-1)
-    positive = int(labels.sum()); negative = int((~labels).sum())
-    if not positive or not negative: return None
+    labels = labels.astype(bool).reshape(-1)
+    scores = scores.reshape(-1)
+    positive = int(labels.sum())
+    negative = int((~labels).sum())
+    if not positive or not negative:
+        return None
     order = np.argsort(scores, kind="mergesort")
-    ranks = np.empty(len(scores)); ranks[order] = np.arange(1, len(scores) + 1)
+    sorted_scores = scores[order]
+    sorted_ranks = np.empty(len(scores), dtype=np.float64)
+    start = 0
+    while start < len(scores):
+        stop = start + 1
+        while stop < len(scores) and sorted_scores[stop] == sorted_scores[start]:
+            stop += 1
+        sorted_ranks[start:stop] = (start + 1 + stop) / 2
+        start = stop
+    ranks = np.empty(len(scores), dtype=np.float64)
+    ranks[order] = sorted_ranks
     return float((ranks[labels].sum() - positive * (positive + 1) / 2) / (positive * negative))
 
 
@@ -56,9 +98,13 @@ def _publish(path: Path, value: dict) -> None:
     payload = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    with temporary.open("xb") as handle: handle.write(payload); handle.flush()
-    try: os.link(temporary, path)
-    finally: temporary.unlink(missing_ok=True)
+    with temporary.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+    try:
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -86,7 +132,8 @@ def main() -> None:
     strategy = strategy_from_mapping(stage0["runtime_profile"]["distributed"])
     context = initialize_distributed(strategy)
     try:
-        seed = int(stage1["run"]["seed"]); torch.manual_seed(seed)
+        seed = int(stage1["run"]["seed"])
+        torch.manual_seed(seed)
         with torch.device("meta" if strategy.initialization == "meta_sharded" else context.device):
             world = build_world_model(stage0["model_profile"])
         world = wrap_model(world, context, strategy, initialization_seed=seed if strategy.initialization == "meta_sharded" else None).model
@@ -101,7 +148,8 @@ def main() -> None:
                 global_batch_size=int(stage0["runtime_profile"]["train"]["global_batch_size"]),
                 topology_contract_sha256=run_contract["topology_contract_sha256"]),
         )
-        for parameter in world.parameters(): parameter.requires_grad_(False)
+        for parameter in world.parameters():
+            parameter.requires_grad_(False)
         system = NativePlanningSystem(world, Stage1SystemConfig(
             planner=NativePlannerConfig(**stage1["planner"]["model"]), horizon=int(stage1["planner"]["horizon"]),
             candidate_microbatch=int(stage1["planner"]["candidate_microbatch"]),
@@ -116,11 +164,15 @@ def main() -> None:
         DistributedCheckpointManager(args.checkpoint.parent).load_model_for_evaluation(
             path=args.checkpoint, model=planner,
             expected=_expectations(step=step, stage1=stage1, stage1_sha=stage1_sha, runtime=stage0, world_size=context.world_size))
-        system.eval(); dataset = _dataset(stage0, stage1, args.split)
+        system.eval()
+        dataset = _dataset(stage0, stage1, args.split)
         limit = len(dataset) if args.max_branches <= 0 else min(len(dataset), args.max_branches)
         if limit <= 0:
             raise ValueError("Stage1 evaluation selected no sealed branches")
-        scores=[]; success=[]; imagined=[]; roots=[]
+        scores = []
+        success = []
+        imagined = []
+        roots = []
         gate_batch = _device(next(iter(DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0))), context.device)
         planner.eval()
         planner.zero_grad(set_to_none=True)
@@ -159,19 +211,8 @@ def main() -> None:
         # Shuffle every grouped action lane while holding evidence fixed.  The
         # learned fields must remain bitwise identical; only the deterministic
         # external action-cost component is allowed to change.
-        shuffled_batch = dict(gate_batch)
-        for name in (
-            "candidate_fine_action_values", "candidate_fine_action_mask",
-            "candidate_fine_action_dt", "candidate_fine_sample_mask",
-            "candidate_coarse_action_values", "candidate_coarse_action_mask",
-        ):
-            shuffled_batch[name] = gate_batch[name][:, permutation]
-        with torch.no_grad():
-            action_after = system.score_observed_batch(shuffled_batch)
-        learned_fields = ("progress_logit", "success_logit", "risk_logit", "uncertainty_logit")
-        action_shuffle_invariant = all(
-            torch.equal(gate_output[name].detach(), action_after[name].detach())
-            for name in learned_fields
+        action_shuffle_invariant = _action_shuffle_invariant(
+            system, gate_batch, permutation
         )
         if context.world_size > 1:
             pass_gates = torch.tensor(
@@ -188,12 +229,23 @@ def main() -> None:
             label_shuffle_sensitive = bool(pass_gates[1].item())
             action_shuffle_invariant = bool(pass_gates[2].item())
             stage0_grad_owned = bool(owned_gate[0].item())
-        if not (planner_grad_finite_nonzero and not stage0_grad_owned and label_shuffle_sensitive and action_shuffle_invariant):
-            raise RuntimeError("Stage1 ownership/invariance/sensitivity gate failed")
-        planner.zero_grad(set_to_none=True); system.eval()
+        gate_status = {
+            "planner_gradient_finite_nonzero": planner_grad_finite_nonzero,
+            "stage0_gradient_absent": not stage0_grad_owned,
+            "label_shuffle_sensitivity": label_shuffle_sensitive,
+            "action_shuffle_invariance": action_shuffle_invariant,
+        }
+        if not all(gate_status.values()):
+            raise RuntimeError(
+                "Stage1 ownership/invariance/sensitivity gate failed: "
+                + json.dumps(gate_status, sort_keys=True)
+            )
+        planner.zero_grad(set_to_none=True)
+        system.eval()
         with torch.inference_mode():
             for index, raw in enumerate(DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)):
-                if index >= limit: break
+                if index >= limit:
+                    break
                 batch = _device(raw, context.device)
                 observed = system.score_observed_batch(batch)
                 costs = deterministic_action_cost(
@@ -209,7 +261,9 @@ def main() -> None:
                 imagined.append(imagined_output["score"][0].float().cpu().numpy())
                 success.append(batch["branch_success"][0, :, :system.cfg.horizon].any(dim=-1).cpu().numpy())
                 roots.append(str(raw["branch_id"][0]))
-        score=np.stack(scores); imagined_score=np.stack(imagined); labels=np.stack(success)
+        score = np.stack(scores)
+        imagined_score = np.stack(imagined)
+        labels = np.stack(success)
         receipt={"schema": EVAL_RECEIPT_SCHEMA, "passed": True, "runtime_sha256": stage1_sha,
             "code_commit": current_commit,
             "stage0_checkpoint_commit_sha256": _checkpoint_commit_sha(stage0_source),
@@ -219,13 +273,13 @@ def main() -> None:
             "selected_success": float(labels[np.arange(len(labels)), score.argmax(1)].mean()),
             "oracle_success": float(labels.max(1).mean()), "stage0_frozen": True,
             "planner_action_inputs": False, "imagined_rollout": "single_trained_K_only",
-            "gates": {"action_shuffle_invariance": action_shuffle_invariant,
-                "label_shuffle_sensitivity": label_shuffle_sensitive,
-                "planner_gradient_finite_nonzero": planner_grad_finite_nonzero,
-                "stage0_gradient_absent": not stage0_grad_owned}}
-        if context.rank == 0: _publish(args.output, receipt); print(json.dumps(receipt, sort_keys=True))
+            "gates": gate_status}
+        if context.rank == 0:
+            _publish(args.output, receipt)
+            print(json.dumps(receipt, sort_keys=True))
     finally:
         destroy_distributed()
 
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()

@@ -1,10 +1,9 @@
 schema: wm3d_v8_runtime_profile_v1
-name: h200_128_fsdp2_formal600k
+name: h200_128_fsdp2_canary1k
 expected_world_size: 128
 distributed:
   strategy: fsdp2
   initialization: meta_sharded
-  # 16 个 data-parallel replica，每个 replica 在节点内 8 卡分片。
   shard_degree: 8
   param_dtype: bf16
   reduce_dtype: fp32
@@ -19,7 +18,7 @@ resources:
   require_zero_uncorrected_ecc: true
   require_idle_gpu: true
   require_full_local_nvlink_clique: true
-  minimum_ib_rate_gbps: 400.0
+  minimum_ib_rate_gbps: 200.0
   forbid_nccl_ib_disable: true
   minimum_memlock_bytes: 1073741824
   minimum_nofile: 1048576
@@ -32,7 +31,7 @@ train:
   micro_batch_size: 1
   gradient_accumulation: 1
   global_batch_size: 128
-  total_steps: 600000
+  total_steps: 1000
   seed: 271828
   validation_seed: 314159
   num_workers: 8
@@ -40,10 +39,10 @@ train:
   persistent_workers: true
   gradient_clip: 1.0
   log_every: 10
-  validate_every: 5000
-  validation_steps: 100
-  checkpoint_interval: 20000
-  checkpoint_steps: [1000, 5000, 20000]
+  validate_every: 250
+  validation_steps: 20
+  checkpoint_interval: 1000
+  checkpoint_steps: [100, 500]
 optimizer:
   name: adamw
   peak_lr: 0.00012
@@ -53,7 +52,7 @@ optimizer:
   weight_decay: 0.1
 schedule:
   name: warmup_stable_cosine
-  warmup_steps: 2000
+  warmup_steps: 100
   stable_fraction: 0.8
 checkpoint:
   allow_topology_reshard: false

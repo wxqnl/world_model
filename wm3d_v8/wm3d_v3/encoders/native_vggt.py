@@ -220,7 +220,6 @@ class NativeVGGTEncoder(torch.nn.Module):
         point = point.reshape(batch, times, views, patches, 3)
         confidence = confidence.reshape(batch, times, views, patches)
         pose = pose.reshape(batch, times, views, 9)
-        weights = confidence[..., None]
         rgb = F.interpolate(
             images.reshape(batch * times * views, 3, height, width),
             size=(self.config.target_rgb_size, self.config.target_rgb_size),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Mapping
 
 import torch
 import torch.nn.functional as F
@@ -462,7 +462,47 @@ def compute_native_objective(
         "action_coarse": action_coarse,
         "action_velocity": action_velocity,
         "fine_supervised_dimensions": fine_mask.sum().to(dtype=token_mse.dtype),
+        "fine_continuous_supervised_dimensions": continuous_mask.sum().to(
+            dtype=token_mse.dtype
+        ),
+        "fine_binary_supervised_dimensions": gripper_mask.sum().to(
+            dtype=token_mse.dtype
+        ),
         "coarse_supervised_dimensions": coarse_mask.sum().to(dtype=token_mse.dtype),
+        "current_state_supervised_dimensions": (
+            batch["current_state_mask"].sum().to(dtype=token_mse.dtype)
+            if "current_state_mask" in batch
+            else zero
+        ),
+        "native_token_supervised_elements": torch.broadcast_to(
+            token_mask[..., None], target_tokens.shape
+        ).sum().to(dtype=token_mse.dtype),
+        "rgb_supervised_elements": (
+            torch.broadcast_to(rgb_mask, target_rgb.shape).sum().to(dtype=token_mse.dtype)
+            if "target_rgb" in batch and output["rgb"].numel()
+            else zero
+        ),
+        "depth_supervised_elements": (
+            depth_mask.sum().to(dtype=token_mse.dtype)
+            if "target_depth" in batch
+            else zero
+        ),
+        "point_supervised_elements": (
+            torch.broadcast_to(point_mask[..., None], batch["target_point"].shape)
+            .sum()
+            .to(dtype=token_mse.dtype)
+            if "target_point" in batch
+            else zero
+        ),
+        "camera_pose_supervised_elements": (
+            torch.broadcast_to(
+                camera_mask[..., None], batch["target_camera_pose"].shape
+            )
+            .sum()
+            .to(dtype=token_mse.dtype)
+            if "target_camera_pose" in batch
+            else zero
+        ),
     }
     total = (
         config.token_mse * token_mse

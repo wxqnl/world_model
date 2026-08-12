@@ -8,7 +8,6 @@ from typing import Any, Mapping, Sequence
 
 from safetensors import safe_open
 import numpy as np
-import torch
 
 from .episode_robot import (
     assemble_robot_window_from_prepared_episode,

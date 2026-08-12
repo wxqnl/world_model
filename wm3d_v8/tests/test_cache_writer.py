@@ -359,7 +359,6 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
 
 
 def test_policy_target_horizon_is_half_open() -> None:
-    clock = _clock()
     prepared = prepare_episode_robot_tensors(
         _robot(), embodiment=bimanual_arm_spec()
     )

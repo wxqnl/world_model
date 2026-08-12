@@ -26,7 +26,7 @@ install -m 600 /dev/null "$WORK/hf.token"
 
 ```bash
 ./run_v8.sh lock-resolve \
-  --template configs/sources/public_sources.template.yaml \
+  --template configs/sources/public_sources_5649h_v7_compatible.template.yaml \
   --output "$WORK/public_sources.lock.yaml" \
   --token-file "$WORK/hf.token" \
   --confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES
@@ -127,6 +127,34 @@ ADAPTER_SHA=$(sha256sum "$ADAPTER" | awk '{print $1}')
 adapter 引用的字段、列、view 或 group 与任一 root 不一致即失败。rich/RL/Beta 各自需要 receipt；可复用经过确认的 adapter YAML，但不能复用别的 source receipt。
 
 ## 6. Inventory 与 data profile
+
+### 6.1 默认交付：V7-compatible 5649.4h
+
+默认正式模板是 `configs/data/public_robot_5649h_v7_compatible.template.yaml`。它保留
+V7 已交付的六个数据家庭、小时预算和整数采样周期，但不复用 V7 action/state cache。
+其中 397 小时 residual 必须先运行：
+
+```bash
+./run_v8.sh legacy-residual-import \
+  --legacy-plan "$WORK/v7/legacy_residual_plan.jsonl" \
+  --raw-root "$WORK/v7/raw_relocated" \
+  --data-template configs/data/public_robot_5649h_v7_compatible.template.yaml \
+  --source legacy_v7_formal \
+  --adapter-contract "$WORK/adapters/legacy_v7_residual.yaml" \
+  --adapter-contract-sha256 "$LEGACY_ADAPTER_SHA" \
+  --adapter-audit-receipt "$AUDIT/legacy_v7_residual.adapter_receipt.json" \
+  --output-manifest "$INVENTORY/legacy_v7_formal.jsonl" \
+  --output-receipt "$INVENTORY/legacy_v7_formal.receipt.json"
+```
+
+importer 会重新读取真实 Parquet/video，证明 arm6+gripper1 的全部 action 列被 V8 arm7
+adapter 恰好覆盖，重新审计 10D current state 与 action 首帧时钟，并拒绝 MG 重复来源、
+symlink/path escape、损坏视频或缺失字段。旧 plan 的 split、fps 和 duration 不被信任。
+
+`public_robot_6106h.template.yaml` 是额外加入 DROID、Bridge 和拆分 RoboCasa 的可选扩展
+profile。只有在希望改变数据家庭/权重时才选它；不能把它的结果写成 5649.4h 兼容运行。
+
+### 6.2 普通 inventory
 
 单 root：
 
@@ -235,7 +263,7 @@ grouped normalization 只读 train split 的真实 window，按 embodiment/group
 ## 9. Runtime、canary、恢复和 eval
 
 ```bash
-RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2.yaml
+RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_canary1k.yaml
 ./run_v8.sh runtime \
   --model "$MODEL_PROFILE" --data "$WORK/public_robot_6106h.yaml" \
   --runtime "$RUNTIME_PROFILE" --objective configs/objective/stage0_native.yaml \
@@ -247,10 +275,20 @@ RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2.yaml
   --run-name wm3d_v8_native_5b --run-lineage public_robot_6106h_native_5b_v1 \
   --output-root "$RUNS/wm3d_v8_native_5b" \
   --output "$RUNS/wm3d_v8_native_5b/runtime.yaml"
-./run_v8.sh preflight "$RUNS/wm3d_v8_native_5b/runtime.yaml"
+./run_v8.sh preflight \
+  --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port="$PREFLIGHT_MASTER_PORT" -- \
+  --runtime "$RUNS/wm3d_v8_native_5b/runtime.yaml"
 ```
 
 正式大作业前，用相同链路配 `native_1b + smoke_2gpu_fsdp2` 跑真实两卡 canary：0→编号 checkpoint，退出进程，再从该目录 exact resume；随后运行统一 offline eval。训练/eval 的 torchrun 命令见根 README。checkpoint authority 只能是原子提交的 `step_XXXXXXXX/`。
+
+目标 128×H200 集群不能从模板直接启动 600K。先用
+`h200_128_fsdp2_canary1k.yaml` 完成 1K、编号 DCP、独立进程 exact resume 和固定验证；
+再用 `h200_128_fsdp2_validation100k.yaml` 做 100K 扩展验证；两者通过后才物化
+`h200_128_fsdp2.yaml` 的 600K 正式 runtime。三个 profile 都要求新鲜 resource receipt：
+GPU 型号/HBM、ECC、GPU 空闲、节点内 NVLink clique、IB、ulimit、`/dev/shm`、数据/输出
+磁盘余量和真实 all-reduce 带宽任一不达标即拒绝启动。
 
 ## 10. Fail-closed 清单
 

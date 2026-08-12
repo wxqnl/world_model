@@ -250,7 +250,8 @@ def _atomic_receipt(path: Path, value: Mapping[str, Any]) -> None:
     payload = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     with temporary.open("xb") as handle:
-        handle.write(payload); handle.flush()
+        handle.write(payload)
+        handle.flush()
     try:
         os.link(temporary, path)
     finally:
@@ -282,8 +283,10 @@ def main() -> None:
     context = initialize_distributed(strategy)
     try:
         seed = int(stage1["run"]["seed"])
-        random.seed(seed + context.rank); np.random.seed((seed + context.rank) % 2**32)
-        torch.manual_seed(seed + context.rank); torch.cuda.manual_seed(seed + context.rank)
+        random.seed(seed + context.rank)
+        np.random.seed((seed + context.rank) % 2**32)
+        torch.manual_seed(seed + context.rank)
+        torch.cuda.manual_seed(seed + context.rank)
         with torch.device("meta" if strategy.initialization == "meta_sharded" else context.device):
             world = build_world_model(stage0_runtime["model_profile"])
         wrapped_world = wrap_model(world, context, strategy, initialization_seed=seed if strategy.initialization == "meta_sharded" else None).model
@@ -302,7 +305,8 @@ def main() -> None:
                 topology_contract_sha256=str(json.loads((Path(stage0_runtime["run"]["output_root"]) / "run_contract.json").read_text())["topology_contract_sha256"]),
             ),
         )
-        for parameter in wrapped_world.parameters(): parameter.requires_grad_(False)
+        for parameter in wrapped_world.parameters():
+            parameter.requires_grad_(False)
         planner_cfg = NativePlannerConfig(**stage1["planner"]["model"])
         system = NativePlanningSystem(wrapped_world, Stage1SystemConfig(
             planner=planner_cfg, horizon=int(stage1["planner"]["horizon"]),
@@ -331,17 +335,22 @@ def main() -> None:
         if not start < stop <= total or stop % int(stage1["run"]["checkpoint_interval"]):
             raise ValueError("Stage1 stop must be a future sealed checkpoint step")
         dataset = _dataset(stage0_runtime, stage1, "train")
-        micro = int(stage1["run"]["micro_batch_size"]); accum = int(stage1["run"]["gradient_accumulation"])
+        micro = int(stage1["run"]["micro_batch_size"])
+        accum = int(stage1["run"]["gradient_accumulation"])
         if context.world_size * micro * accum != int(stage1["run"]["global_batch_size"]):
             raise ValueError("Stage1 global batch contract mismatch")
         sampler = StepAddressedBatchSampler({"stage1": (0, len(dataset))}, ("stage1",), {"stage1": 1},
             world_size=context.world_size, rank=context.rank, micro_batch_size=micro,
             gradient_accumulation=accum, start_optimizer_step=start, num_optimizer_steps=stop-start, seed=seed)
         loader = DataLoader(dataset, batch_sampler=sampler, num_workers=int(stage1["run"]["num_workers"]), collate_fn=_trim)
-        iterator = iter(loader); loss_cfg = PlannerLossConfig(**stage1["planner"]["loss"])
-        planner.train(); wrapped_world.eval(); last = {}
+        iterator = iter(loader)
+        loss_cfg = PlannerLossConfig(**stage1["planner"]["loss"])
+        planner.train()
+        wrapped_world.eval()
+        last = {}
         for step in range(start, stop):
-            optimizer.zero_grad(set_to_none=True); accumulated = {}
+            optimizer.zero_grad(set_to_none=True)
+            accumulated = {}
             for micro_step in range(accum):
                 batch = _device(next(iterator), context.device)
                 with no_sync_context(planner, enabled=micro_step + 1 < accum):
@@ -353,12 +362,19 @@ def main() -> None:
                             branch_success=batch["branch_success"][:, :, :system.cfg.horizon],
                             branch_valid=batch["branch_valid"], uncertainty_target=torch.zeros_like(batch["branch_valid"], dtype=torch.float32), cfg=loss_cfg)
                     (losses["loss"] / accum).backward()
-                for name, value in losses.items(): accumulated[name] = accumulated.get(name, torch.zeros_like(value)) + value.detach()/accum
+                for name, value in losses.items():
+                    accumulated[name] = (
+                        accumulated.get(name, torch.zeros_like(value))
+                        + value.detach() / accum
+                    )
             if any(parameter.grad is not None for parameter in wrapped_world.parameters()):
                 raise RuntimeError("frozen Stage0 received gradients")
             grad = torch.nn.utils.clip_grad_norm_(planner.parameters(), float(stage1["run"]["gradient_clip"]))
-            if not bool(torch.isfinite(grad)) or float(grad) <= 0: raise FloatingPointError("planner gradient is not finite/nonzero")
-            optimizer.step(); completed = step + 1; last = reduce_metrics(accumulated)
+            if not bool(torch.isfinite(grad)) or float(grad) <= 0:
+                raise FloatingPointError("planner gradient is not finite/nonzero")
+            optimizer.step()
+            completed = step + 1
+            last = reduce_metrics(accumulated)
             if completed % int(stage1["run"]["checkpoint_interval"]) == 0:
                 manager.save(step=completed, model=planner, optimizer=optimizer,
                     metadata={"run_lineage": stage1["run"]["lineage"], "runtime_config_sha256": stage1_sha,

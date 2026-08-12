@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 
 import numpy as np
@@ -27,9 +29,14 @@ def _sha(path: Path) -> str:
 
 
 def _run(*arguments: object) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT), environment.get("PYTHONPATH", "")]
+    ).rstrip(os.pathsep)
     return subprocess.run(
-        ["python", *map(str, arguments)],
+        [sys.executable, *map(str, arguments)],
         cwd=ROOT,
+        env=environment,
         check=True,
         text=True,
         stdout=subprocess.PIPE,

@@ -72,6 +72,43 @@ _BRANCH_KEYS = {
 }
 
 
+def _validate_candidate_action_shapes(
+    payload: dict[str, torch.Tensor],
+    *,
+    candidates: int,
+    K: int,
+    model: dict[str, Any],
+) -> None:
+    fine = payload["candidate_fine_action_values"]
+    if fine.ndim != 5 or fine.shape[:2] != (candidates, K):
+        raise Stage1BranchError("candidate fine actions do not cover sealed K")
+    if tuple(fine.shape[2:]) != (
+        int(model["max_action_groups"]),
+        int(model["max_action_substeps"]),
+        int(model["max_action_dim"]),
+    ):
+        raise Stage1BranchError("candidate fine action capacities differ from Stage0")
+    if payload["candidate_fine_action_mask"].shape != fine.shape:
+        raise Stage1BranchError("candidate fine action mask mismatch")
+    expected_sample_shape = fine.shape[:-1]
+    if (
+        payload["candidate_fine_action_dt"].shape != expected_sample_shape
+        or payload["candidate_fine_sample_mask"].shape != expected_sample_shape
+    ):
+        raise Stage1BranchError("candidate fine action timestamps/mask mismatch")
+    coarse = payload["candidate_coarse_action_values"]
+    expected_coarse_shape = (
+        candidates,
+        K,
+        int(model["max_action_groups"]),
+        int(model["max_action_dim"]),
+    )
+    if tuple(coarse.shape) != expected_coarse_shape:
+        raise Stage1BranchError("candidate coarse action capacities differ from Stage0")
+    if payload["candidate_coarse_action_mask"].shape != coarse.shape:
+        raise Stage1BranchError("candidate coarse action mask mismatch")
+
+
 class Stage1BranchDataset(Dataset[dict[str, Any]]):
     """Join one sealed Stage0 window with real candidate branch evidence."""
 
@@ -287,20 +324,13 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             raise Stage1BranchError("branch camera poses exist outside measured views")
         if bool((payload["branch_geometry_confidence"] < 0).any()):
             raise Stage1BranchError("branch geometry confidence must be non-negative")
-        fine = payload["candidate_fine_action_values"]
-        if fine.ndim != 6 or fine.shape[:2] != (candidates, int(row["K"])):
-            raise Stage1BranchError("candidate fine actions do not cover sealed K")
         model = self.stage0_dataset.model
-        if tuple(fine.shape[2:]) != (
-            int(model["max_action_groups"]),
-            int(model["max_action_substeps"]),
-            int(model["max_action_dim"]),
-        ):
-            raise Stage1BranchError("candidate fine action capacities differ from Stage0")
-        if payload["candidate_fine_action_mask"].shape != fine.shape:
-            raise Stage1BranchError("candidate fine action mask mismatch")
-        if payload["candidate_fine_action_dt"].shape != fine.shape[:-1] or payload["candidate_fine_sample_mask"].shape != fine.shape[:-1]:
-            raise Stage1BranchError("candidate fine action timestamps/mask mismatch")
+        _validate_candidate_action_shapes(
+            payload,
+            candidates=candidates,
+            K=int(row["K"]),
+            model=model,
+        )
         if payload["candidate_fine_action_mask"].dtype != torch.bool or payload["candidate_fine_sample_mask"].dtype != torch.bool:
             raise Stage1BranchError("candidate fine action masks must be boolean")
         if bool((payload["candidate_fine_action_mask"].any(dim=-1) & ~payload["candidate_fine_sample_mask"]).any()):
@@ -322,14 +352,8 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             ).any()
         ):
             raise Stage1BranchError("candidate fine command lies outside its world interval")
-        coarse = payload["candidate_coarse_action_values"]
         if (
-            tuple(coarse.shape) != (
-                candidates, int(row["K"]), int(model["max_action_groups"]),
-                int(model["max_action_dim"]),
-            )
-            or payload["candidate_coarse_action_mask"].shape != coarse.shape
-            or payload["candidate_coarse_action_mask"].dtype != torch.bool
+            payload["candidate_coarse_action_mask"].dtype != torch.bool
         ):
             raise Stage1BranchError("candidate coarse action ABI mismatch")
         if not bool(

@@ -10,7 +10,10 @@ sampling:
   # Eight exact observed future states. These are not an interpolated rate.
   future_offsets_seconds: [0.6, 1.4, 2.0, 2.8, 3.4, 4.2, 4.8, 5.6]
   minimum_horizon_coverage: 0.9
-  minimum_anchor_separation_seconds: 0.05
+  # This source records a nominal 20 Hz clock in float32, whose audited
+  # minimum positive delta is 0.049999237060546875 s.  Keep every observed
+  # row eligible instead of accidentally dropping alternating anchors.
+  minimum_anchor_separation_seconds: 0.049999
   policy_target_horizon_seconds: 5.6
   policy_training_times: observed_action_timestamps
   interpolation: forbidden

@@ -20,6 +20,7 @@ from .episode_robot import (
 )
 from .grouped_robot import GroupedRobotLimits
 from .grouped_normalization import (
+    GroupedNormalizationError,
     GroupedRobotNormalizer,
     normalize_grouped_masked,
     validate_grouped_lane_mask,
@@ -31,6 +32,34 @@ from wm3d_v3.models.native_world_model import native_config_from_mapping
 
 class CacheDataError(RuntimeError):
     pass
+
+
+def _active_source_names(
+    *,
+    source_order: Sequence[str],
+    selected_sources: Sequence[str],
+    entries: Sequence[CacheIndexEntry],
+    split: str,
+) -> tuple[str, ...]:
+    """Return sources that actually contribute to one sealed split.
+
+    Every configured training source is contractual: silently dropping one
+    would change the training mixture.  Validation and test closures, however,
+    may legitimately omit a source as long as the split remains non-empty.
+    """
+
+    selected = set(selected_sources)
+    present = {entry.source for entry in entries if entry.split == split}
+    active = tuple(name for name in source_order if name in selected and name in present)
+    if not active:
+        raise CacheDataError("cache selection produced no samples")
+    if split == "train":
+        missing = tuple(name for name in source_order if name in selected and name not in present)
+        if missing:
+            raise CacheDataError(
+                f"training sources have no cache windows: {list(missing)}"
+            )
+    return active
 
 
 class _ShardStore:
@@ -344,11 +373,16 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             raise CacheDataError(f"selected sources not in data profile: {unknown}")
         self.source_to_id = {name: index for index, name in enumerate(source_order)}
         self.data_profile = data_profile
+        active_sources = _active_source_names(
+            source_order=source_order,
+            selected_sources=tuple(selected),
+            entries=entries,
+            split=split,
+        )
+        active = set(active_sources)
         filtered = [
-            entry for entry in entries if entry.split == split and entry.source in selected
+            entry for entry in entries if entry.split == split and entry.source in active
         ]
-        if not filtered:
-            raise CacheDataError("cache selection produced no samples")
         for entry in filtered:
             if len(entry.context_feature_rows) != self.T:
                 raise CacheDataError(
@@ -362,7 +396,7 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         self.entries = tuple(
             sorted(filtered, key=lambda item: (order[item.source], item.sample_id))
         )
-        self._source_names = tuple(name for name in source_order if name in selected)
+        self._source_names = active_sources
         spans: dict[str, tuple[int, int]] = {}
         cursor = 0
         for name in self._source_names:

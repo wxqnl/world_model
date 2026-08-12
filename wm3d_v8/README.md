@@ -81,6 +81,8 @@ PYTHON_BIN=.venv/bin/python ./run_v8.sh check
 | `runtime/canary_2gpu_fsdp2.yaml` | 两卡 100-step 可学习性 gate |
 | `runtime/h100_8_fsdp2.yaml` | 单节点 8 卡运行 profile |
 | `runtime/h200_128_fsdp2.yaml` | 16 节点、128 卡运行 profile |
+| `runtime/h200_128_fsdp2_canary1k.yaml` | 同拓扑 1K 启动/恢复 canary |
+| `runtime/h200_128_fsdp2_validation100k.yaml` | 同拓扑 100K 扩展验证，不是正式预算 |
 | `stage1/unified_native_planner.template.yaml` | 从 committed Stage0 DCP 进入统一规划阶段的 fail-closed 模板 |
 
 ```bash
@@ -106,11 +108,18 @@ AgiBotWorld2026 的一个下载快照会按冻结目录 `ImitationLearning/`、`
 
 昂贵 episode cache 与模型规模无关：它绑定 raw manifest row、adapter、视觉 encoder、task encoder/bank 与 representation SHA，不绑定 T/K、训练步数或 1B/5B profile。view token 按 int8 per-vector 保存，depth/point 为 fp16；切换 1B/5B 只需重建便宜的 window index/runtime。
 
+交给已有 V7 下载任务的默认数据合同是
+`configs/data/public_robot_5649h_v7_compatible.template.yaml`：它原样保留六个数据家庭、
+5649.4 小时预算和 `10/15/10/8/12/45` 的 100-sample 周期，但每条数据都必须重新通过
+V8 grouped action/current-state/native-time ABI。旧 397 小时 residual 用
+`legacy-residual-import` 严格导入，不能直接消费 V7 cache。`public_robot_6106h.template.yaml`
+是增加 DROID/Bridge/拆分 RoboCasa 的可选扩展 profile，不得冒充 V7-compatible 默认交付。
+
 交付前可先在一台双卡服务器执行真实公开小样本的一键 smoke：
 
 ```bash
 ./run_v8.sh smoke-real --work-root /data/wm3d_v8_smoke --gpus 0,1 \
-  --accept-dataset-license --confirm-adapter-semantics
+  --operator "$USER" --accept-dataset-license --confirm-adapter-semantics
 ```
 
 该命令从空目录下载冻结 revision，依次完成 schema/adapter audit、双臂 inventory、
@@ -123,7 +132,10 @@ receipt 和内容 SHA 全部一致时才会跳过。
 sealed runtime config 生成后，每台训练机必须执行同一个 preflight：
 
 ```bash
-./run_v8.sh preflight "$SEALED_RUNTIME_CONFIG"
+./run_v8.sh preflight \
+  --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port="$PREFLIGHT_MASTER_PORT" -- \
+  --runtime "$SEALED_RUNTIME_CONFIG"
 ```
 
 随后每个节点使用相同 runtime 和 rendezvous 参数启动；下面示例的 GPU 数、节点数都来自 runtime profile，不由模型名称决定：
@@ -143,6 +155,11 @@ sealed runtime config 生成后，每台训练机必须执行同一个 preflight
 ```
 
 必须从完整编号 DCP `step_XXXXXXXX/` 恢复；禁止把 `latest` 当作 authority。新集群先用 `native_1b + smoke_2gpu_fsdp2` 完成真实 optimizer step、checkpoint、独立进程 exact resume 和 eval，再切换 `native_5b + h200_128_fsdp2`；两者不更换代码或数据格式。
+
+128×H200 必须按 `canary1k → validation100k → formal600k` 依次提升。三个 profile 使用同一
+FSDP2 trainer 和相同 128 卡拓扑；每次启动先生成新鲜 resource receipt，实测 GPU/HBM、
+ECC、空闲进程、节点内 NVLink、IB 速率、ulimit、`/dev/shm`、磁盘余量和分布式
+all-reduce。缺一项即停止，不能直接跳到 600K。
 
 ## Stage0→Stage1 统一规划
 

@@ -25,9 +25,10 @@ commit 上生成的 `smoke-real` 总 receipt 为准；开发 worktree 的结果�
 PYTHON_BIN=.venv/bin/python ./run_v8.sh check
 ```
 
-开发阶段最近一次全树结果为 `264 passed`。移除旧 V7 trainer、fixed-rate sidecar、
-single-file checkpoint eval 和它们的专属历史测试后，统一入口依赖闭包为 `131 passed`。
-发布 commit 仍需由 `smoke-real` 在空目录重新执行这组测试，并把结果写入总 receipt。
+移除旧 V7 trainer、fixed-rate sidecar、single-file checkpoint eval 和它们的专属历史
+测试后，最终发布候选必须直接执行上述 `./run_v8.sh check`，并且不能使用 `-k`、路径筛选、
+排除列表或允许失败项。测试数量会随代码变化，不作为发布合同；以发布 commit 上无排除的
+完整命令退出码为准。发布 commit 还要由 `smoke-real` 在空目录重跑并写入总 receipt。
 
 这些测试覆盖：
 
@@ -148,11 +149,33 @@ SHA256 为 `3d3584c8c63ed245cf10068789f9e6986e5a0d940c803e9a0c91f4efbd7e8244`，
 model/runtime profile。集群交付前仍需在目标环境执行 NCCL、吞吐、checkpoint 带宽和
 128-rank preflight；本地双卡结果不能代替目标集群通信验收。
 
-## 5. 发布判定
+目标集群配置分为同拓扑的 1K canary、100K validation 和 600K formal。每个进程边界都
+必须先消费 30 分钟内生成的 resource receipt；receipt 绑定 128 rank 的 hostname、GPU
+UUID、H200/HBM/ECC/空闲状态、节点内 NVLink、IB、ulimit、`/dev/shm`、磁盘和真实
+all-reduce。复制旧 receipt 或更换 rank/GPU 会被当前身份复核拒绝。
+
+## 5. 真实 Stage1 双 source、四 root 证据
+
+真实 Stage1 v7 验收批次使用两个独立 RoboCasa source：`OpenBlenderLid` 提供 train/val/test 各一个 root，`CoffeeServeMug` 提供第二个 train root；selection 为 train 2、val 1、test 1，没有复制、有放回采样或跨 source 伪装。rollout audit、candidate manifest、统一 branch index/seal、同 lineage Stage0 DCP、Stage1 0→1、换新进程 exact resume 1→2 以及独立 val/test eval 都已完成。
+
+关键 receipt：
+
+| 证据 | SHA256 |
+|---|---|
+| 四 root rollout audit | `59c6af619650e2114ca280cb87b0cd1198741d3be19faae06e0871cb99aa80c3` |
+| candidate manifest | `fca7e0a86023acfdfebc251ed53932ba6740dc63926a3731de69f76143dfdd07` |
+| branch index / seal | `cd09c16d2afe81bf55a485240634039e967a6b1c71ad0f7cc539df9409c8cd65` / `0cae27f603cc422edd5fae31a3bca907aa93244e0ddce7725abebdef113eca20` |
+| Stage1 step 1 DCP / train receipt | `6f87a2cff7725d8a63969780180b84f0c8b24c021a5e8edfd7f51c670b6cc5f3` / `1959b5b7773102e5b9774aae67918144dde10c0c96a415f48c651f17a10d6c73` |
+| Stage1 exact-resume step 2 DCP / train receipt | `8b8e926adeeff6d93e493ccd71a57b9104a0b369111478a5f1c575a55c3834a5` / `38e4a22f0d043fd5754924c44542ce39964fa1b66e535de3fa47544945cc4977` |
+| final val / test eval receipt | `38ddd3bbfced4f817aaedcd07c4c42af91bc75c879a51457c2bdf4078fcf4575` / `30e05f8d80432d861c27e6f0636fffd3932a439f2763da551c1a1d447d42e1bc` |
+
+val/test 的四项 action-blind、label sensitivity 与梯度 ownership 门禁全部通过，但这个 correctness canary 只训练了两个 optimizer step。val/test 的 `selected_success` 都是 0，success AUC 分别为 0.25 和约 0.0333。结论只能是 Stage1 真实 pipeline 已闭合，不能声称规划质量提升或策略已经可用。
+
+## 6. 发布判定
 
 以下项目全部满足后，V8 才标记为可交付：
 
-1. clean commit 上的 `./run_v8.sh check` 通过；
+1. clean commit 上的 `./run_v8.sh check` 无排除通过；
 2. 空目录执行 `smoke-real`，真实完成下载、cache、0→1、exact resume 1→2 和 eval；
 3. 总 receipt 绑定代码 commit 与全部输入/输出 SHA；
 4. 5B 参数封印、真实 optimizer step、committed DCP 与独立进程重载 eval 通过；

@@ -12,8 +12,6 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 import yaml
 
 from .grouped_robot import (
-    ACTION_SEMANTIC_IDS,
-    STATE_SEMANTIC_IDS,
     ActionGroupSpec,
     EmbodimentSpec,
 )

@@ -1,18 +1,62 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from scripts.eval_wm3d_v8_stage1 import (
+    _ACTION_FIELDS,
+    _LEARNED_FIELDS,
+    _action_shuffle_invariant,
+    _auc,
+)
 from wm3d_v3.models.native_world_model import NativeWorldModel, NativeWorldModelConfig
+from wm3d_v3.data.unified_cache_dataset import CacheDataError, _active_source_names
 from wm3d_v3.stage1_planner.candidates import deterministic_action_cost
+from wm3d_v3.stage1_planner.dataset import (
+    Stage1BranchError,
+    _validate_candidate_action_shapes,
+)
 from wm3d_v3.stage1_planner.losses import planner_loss
 from wm3d_v3.stage1_planner.planner_head import NativePlannerConfig, NativePlannerHead, planning_score
 from wm3d_v3.stage1_planner.rollout import single_horizon_native_rollout
 from wm3d_v3.stage1_planner.system import NativePlanningSystem, Stage1SystemConfig
 from wm3d_v3.stage1_planner.train import _expectations, _planner_contract_sha, _topology_sha
-from scripts.materialize_wm3d_v8_stage1_branches import _validate_stage0_window_clock
+from scripts.materialize_wm3d_v8_stage1_branches import (
+    _validate_candidate_payload,
+    _validate_stage0_window_clock,
+)
+
+
+def test_multisource_split_requires_all_train_sources_but_not_eval_sources() -> None:
+    entries = (
+        SimpleNamespace(source="blender", split="train"),
+        SimpleNamespace(source="coffee", split="train"),
+        SimpleNamespace(source="blender", split="val"),
+        SimpleNamespace(source="blender", split="test"),
+    )
+    kwargs = {
+        "source_order": ("blender", "coffee"),
+        "selected_sources": ("blender", "coffee"),
+        "entries": entries,
+    }
+    assert _active_source_names(**kwargs, split="train") == ("blender", "coffee")
+    assert _active_source_names(**kwargs, split="val") == ("blender",)
+    assert _active_source_names(**kwargs, split="test") == ("blender",)
+
+    missing_train = tuple(entry for entry in entries if entry.source != "coffee")
+    with pytest.raises(CacheDataError, match="training sources have no cache windows"):
+        _active_source_names(
+            source_order=("blender", "coffee"),
+            selected_sources=("blender", "coffee"),
+            entries=missing_train,
+            split="train",
+        )
+
+    with pytest.raises(CacheDataError, match="cache selection produced no samples"):
+        _active_source_names(**kwargs, split="missing")
 
 
 def _planner() -> NativePlannerHead:
@@ -50,22 +94,63 @@ def _forward(planner: NativePlannerHead, evidence: dict[str, torch.Tensor]):
 
 
 def test_planner_action_shuffle_invariance() -> None:
-    torch.manual_seed(7); planner = _planner().eval(); evidence = _evidence()
+    torch.manual_seed(7)
+    planner = _planner().eval()
+    evidence = _evidence()
     actions = torch.randn(2, 3, 4, 2, 5, 6)
     first = _forward(planner, evidence)
     shuffled_actions = actions[:, torch.tensor([2, 0, 1])]
     second = _forward(planner, evidence)
     assert not torch.equal(actions, shuffled_actions)
-    for name in first: assert torch.equal(first[name], second[name])
+    for name in first:
+        assert torch.equal(first[name], second[name])
     assert not any("action" in name for name, _ in planner.named_parameters())
 
 
+def test_eval_action_shuffle_gate_uses_one_execution_mode() -> None:
+    class ModeSensitiveActionBlindSystem:
+        def score_observed_batch(self, batch):
+            bias = float(torch.is_grad_enabled())
+            return {
+                name: batch["fixed_evidence"] + bias for name in _LEARNED_FIELDS
+            }
+
+    batch = {"fixed_evidence": torch.tensor([[3.0, 5.0, 7.0]])}
+    for index, name in enumerate(_ACTION_FIELDS):
+        batch[name] = torch.tensor([[index, index + 10, index + 20]])
+    system = ModeSensitiveActionBlindSystem()
+    grad_output = system.score_observed_batch(batch)
+    with torch.no_grad():
+        no_grad_output = system.score_observed_batch(batch)
+    assert not torch.equal(
+        grad_output["progress_logit"], no_grad_output["progress_logit"]
+    )
+    assert _action_shuffle_invariant(system, batch, torch.tensor([2, 0, 1]))
+
+
+def test_eval_auc_uses_average_ranks_for_score_ties() -> None:
+    assert _auc(
+        labels=torch.tensor([True, False]).numpy(),
+        scores=torch.tensor([4.0, 4.0]).numpy(),
+    ) == 0.5
+    labels = torch.tensor([False, True, True, False]).numpy()
+    scores = torch.tensor([0.0, 1.0, 1.0, 1.0]).numpy()
+    assert _auc(labels=labels, scores=scores) == 0.75
+    permutation = [2, 3, 0, 1]
+    assert _auc(labels=labels[permutation], scores=scores[permutation]) == 0.75
+
+
 def test_masked_native_evidence_is_not_treated_as_a_real_zero() -> None:
-    torch.manual_seed(19); planner = _planner().eval(); evidence = _evidence()
+    torch.manual_seed(19)
+    planner = _planner().eval()
+    evidence = _evidence()
     missing = copy.deepcopy(evidence)
-    missing["depth"].zero_(); missing["depth_mask"].zero_()
-    missing["point"].zero_(); missing["point_mask"].zero_()
-    missing["pose"].zero_(); missing["pose_mask"].zero_()
+    missing["depth"].zero_()
+    missing["depth_mask"].zero_()
+    missing["point"].zero_()
+    missing["point_mask"].zero_()
+    missing["pose"].zero_()
+    missing["pose_mask"].zero_()
     invalid_values = copy.deepcopy(missing)
     invalid_values["depth"].fill_(1e6)
     invalid_values["point"].fill_(-1e6)
@@ -82,28 +167,37 @@ def test_masked_native_evidence_is_not_treated_as_a_real_zero() -> None:
 
 
 def test_label_shuffle_sensitivity_and_finite_planner_gradients() -> None:
-    torch.manual_seed(11); planner = _planner().train(); evidence = _evidence()
+    torch.manual_seed(11)
+    planner = _planner().train()
+    evidence = _evidence()
     evidence = {name: value[:1] for name, value in evidence.items()}
     labels = torch.tensor([[[0,0,0,0],[0,1,1,1],[0,0,0,0]]], dtype=torch.bool)
     def loss_for(current: torch.Tensor) -> torch.Tensor:
-        output = _forward(planner, evidence); output["score"] = planning_score(output, torch.zeros(1,3))
+        output = _forward(planner, evidence)
+        output["score"] = planning_score(output, torch.zeros(1,3))
         return planner_loss(output, branch_rewards=current.float(), branch_dones=torch.zeros_like(current),
             branch_success=current, branch_valid=torch.ones(1,3,dtype=torch.bool),
             uncertainty_target=torch.zeros(1,3))["loss"]
-    original = loss_for(labels); shuffled = loss_for(labels[:, torch.tensor([1,0,2])])
+    original = loss_for(labels)
+    shuffled = loss_for(labels[:, torch.tensor([1,0,2])])
     assert not torch.allclose(original, shuffled)
-    original.backward(); grads=[p.grad for p in planner.parameters() if p.grad is not None]
+    original.backward()
+    grads=[p.grad for p in planner.parameters() if p.grad is not None]
     assert grads and all(torch.isfinite(value).all() for value in grads)
     assert sum(float(value.abs().sum()) for value in grads) > 0
 
 
 def test_grouped_action_cost_is_masked_and_not_fixed_7d() -> None:
-    actions=torch.zeros(2,3,4,2,5,9); mask=torch.zeros_like(actions,dtype=torch.bool)
+    actions=torch.zeros(2,3,4,2,5,9)
+    mask=torch.zeros_like(actions,dtype=torch.bool)
     samples=torch.zeros(actions.shape[:-1],dtype=torch.bool)
-    mask[...,0,:3]=True; samples[...,0]=True; actions[...,0,0]=2
+    mask[...,0,:3]=True
+    samples[...,0]=True
+    actions[...,0,0]=2
     cost=deterministic_action_cost(actions,mask,samples)
     assert cost.shape==(2,3) and bool((cost>0).all())
-    coarse=torch.full((2,3,4,2,9),3.0); coarse_mask=torch.ones_like(coarse,dtype=torch.bool)
+    coarse=torch.full((2,3,4,2,9),3.0)
+    coarse_mask=torch.ones_like(coarse,dtype=torch.bool)
     coarse_only=deterministic_action_cost(
         torch.zeros_like(actions), torch.zeros_like(mask), torch.zeros_like(samples),
         coarse, coarse_mask)
@@ -113,7 +207,10 @@ def test_grouped_action_cost_is_masked_and_not_fixed_7d() -> None:
 
 
 def test_branch_clocks_must_match_stage0_window_and_interval_ownership() -> None:
-    world_times = torch.tensor([0., .3, .7, 1.2])
+    world_times = torch.tensor(
+        [0.0, 0.3, 0.9000001430511475, 1.700000047683716],
+        dtype=torch.float64,
+    )
     future_dt = world_times[2:] - world_times[1]
     candidate = {
         "branch_future_dt_s": future_dt[None].expand(2, -1).clone(),
@@ -127,12 +224,109 @@ def test_branch_clocks_must_match_stage0_window_and_interval_ownership() -> None
         "future_world_boundaries_dt": torch.tensor([0., .4, .9]),
     }
     _validate_stage0_window_clock(candidate, sample=sample, context=2, K=2, horizon=2)
-    drifted = copy.deepcopy(candidate); drifted["branch_future_dt_s"][0, 0] += .01
+    drifted = copy.deepcopy(candidate)
+    drifted["branch_future_dt_s"][0, 0] += .01
     with pytest.raises(ValueError, match="differ from Stage0"):
         _validate_stage0_window_clock(drifted, sample=sample, context=2, K=2, horizon=2)
-    escaped = copy.deepcopy(candidate); escaped["candidate_fine_action_dt"][0, 0, 0, 1] = .4
+    escaped = copy.deepcopy(candidate)
+    escaped["candidate_fine_action_dt"][0, 0, 0, 1] = .4
     with pytest.raises(ValueError, match="outside its world interval"):
         _validate_stage0_window_clock(escaped, sample=sample, context=2, K=2, horizon=2)
+    rounded = copy.deepcopy(candidate)
+    rounded["branch_future_dt_s"] = rounded["branch_future_dt_s"].to(torch.float32)
+    with pytest.raises(ValueError, match="differ from Stage0"):
+        _validate_stage0_window_clock(
+            rounded, sample=sample, context=2, K=2, horizon=2
+        )
+
+
+def test_candidate_payload_accepts_exact_ckgsa_grouped_action_abi() -> None:
+    C, K, H, G, S, A, V, P, D = 3, 2, 2, 2, 4, 5, 2, 4, 8
+    value = {
+        "candidate_fine_action_values": torch.ones(C, K, G, S, A),
+        "candidate_fine_action_mask": torch.ones(C, K, G, S, A, dtype=torch.bool),
+        "candidate_fine_action_dt": torch.zeros(C, K, G, S),
+        "candidate_fine_sample_mask": torch.ones(C, K, G, S, dtype=torch.bool),
+        "candidate_coarse_action_values": torch.zeros(C, K, G, A),
+        "candidate_coarse_action_mask": torch.zeros(C, K, G, A, dtype=torch.bool),
+        "branch_future_tokens": torch.randn(C, H, P, D),
+        "branch_future_dt_s": torch.tensor([[0.2, 0.5]]).expand(C, -1).clone(),
+        "branch_token_mask": torch.ones(C, H, P, dtype=torch.bool),
+        "branch_depth": torch.ones(C, H, V, P),
+        "branch_depth_mask": torch.ones(C, H, V, P, dtype=torch.bool),
+        "branch_point": torch.ones(C, H, V, P, 3),
+        "branch_point_mask": torch.ones(C, H, V, P, dtype=torch.bool),
+        "branch_camera_pose": torch.ones(C, H, V, 9),
+        "branch_camera_pose_mask": torch.ones(C, H, V, dtype=torch.bool),
+        "branch_geometry_confidence": torch.ones(C, H, V, P),
+        "branch_view_mask": torch.ones(C, H, V, dtype=torch.bool),
+        "branch_rewards": torch.tensor([[0.0, 0.0], [0.0, 1.0], [0.0, 0.0]]),
+        "branch_dones": torch.zeros(C, H, dtype=torch.bool),
+        "branch_success": torch.tensor(
+            [[False, False], [False, True], [False, False]]
+        ),
+        "branch_valid": torch.ones(C, dtype=torch.bool),
+    }
+    _validate_candidate_payload(
+        value,
+        model={
+            "K": K,
+            "P": P,
+            "token_dim": D,
+            "num_views": V,
+            "max_action_groups": G,
+            "max_action_substeps": S,
+            "max_action_dim": A,
+        },
+        horizon=H,
+    )
+    malformed = copy.deepcopy(value)
+    malformed["candidate_fine_action_values"] = malformed[
+        "candidate_fine_action_values"
+    ].unsqueeze(0)
+    with pytest.raises(ValueError, match="same sealed K"):
+        _validate_candidate_payload(
+            malformed,
+            model={
+                "K": K,
+                "P": P,
+                "token_dim": D,
+                "num_views": V,
+                "max_action_groups": G,
+                "max_action_substeps": S,
+                "max_action_dim": A,
+            },
+            horizon=H,
+        )
+
+
+def test_stage1_dataset_accepts_ckgsa_and_rejects_extra_or_missing_axis() -> None:
+    C, K, G, S, A = 11, 8, 8, 128, 16
+    payload = {
+        "candidate_fine_action_values": torch.zeros(C, K, G, S, A),
+        "candidate_fine_action_mask": torch.zeros(
+            C, K, G, S, A, dtype=torch.bool
+        ),
+        "candidate_fine_action_dt": torch.zeros(C, K, G, S),
+        "candidate_fine_sample_mask": torch.zeros(C, K, G, S, dtype=torch.bool),
+        "candidate_coarse_action_values": torch.zeros(C, K, G, A),
+        "candidate_coarse_action_mask": torch.zeros(C, K, G, A, dtype=torch.bool),
+    }
+    model = {
+        "max_action_groups": G,
+        "max_action_substeps": S,
+        "max_action_dim": A,
+    }
+    _validate_candidate_action_shapes(payload, candidates=C, K=K, model=model)
+
+    for malformed in (
+        payload["candidate_fine_action_values"].unsqueeze(0),
+        payload["candidate_fine_action_values"][..., 0],
+    ):
+        broken = dict(payload)
+        broken["candidate_fine_action_values"] = malformed
+        with pytest.raises(Stage1BranchError, match="do not cover sealed K"):
+            _validate_candidate_action_shapes(broken, candidates=C, K=K, model=model)
 
 
 def test_stage1_dcp_exact_resume_contract_is_planner_ddp_and_branch_bound() -> None:
@@ -188,7 +382,9 @@ def _rollout_batch() -> dict[str, torch.Tensor]:
 
 
 def test_rollout_is_single_trained_horizon_and_gradient_owner_is_planner() -> None:
-    torch.manual_seed(3); world=_tiny_world().eval(); batch=_rollout_batch()
+    torch.manual_seed(3)
+    world=_tiny_world().eval()
+    batch=_rollout_batch()
     with pytest.raises(ValueError, match="H <= K"):
         single_horizon_native_rollout(world,batch,horizon=3)
     rollout=single_horizon_native_rollout(world,batch,horizon=1,candidate_microbatch=2)
@@ -199,8 +395,10 @@ def test_rollout_is_single_trained_horizon_and_gradient_owner_is_planner() -> No
         token_dim=0,task_dim=0,hidden=16,spatial_layers=1,temporal_layers=1,heads=4,mlp_mult=2,
         dropout=0,max_horizon=0,patches=0,num_views=0,time_fourier_dim=0,
         time_min_period_s=0,time_max_period_s=0),horizon=1))
-    for parameter in world.parameters(): parameter.requires_grad_(False)
+    for parameter in world.parameters():
+        parameter.requires_grad_(False)
     cost=deterministic_action_cost(batch["candidate_fine_action_values"],batch["candidate_fine_action_mask"],batch["candidate_fine_sample_mask"])
-    out=system.score_rollout(rollout,batch["task_embedding"],cost); out["score"].sum().backward()
+    out=system.score_rollout(rollout,batch["task_embedding"],cost)
+    out["score"].sum().backward()
     assert all(parameter.grad is None for parameter in world.parameters())
     assert any(parameter.grad is not None and bool(torch.isfinite(parameter.grad).all()) for parameter in system.planner.parameters())

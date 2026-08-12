@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
 import re
-import subprocess
 import time
 from typing import Any, Mapping
 
@@ -50,9 +50,26 @@ from wm3d_v3.training.gradient_ownership import (
     validate_gradient_ownership_receipt,
 )
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
+from wm3d_v3.training.resource_preflight import (
+    ResourcePreflightError,
+    current_rank_identity,
+    run_resource_preflight,
+    validate_current_rank_identities,
+    validate_resource_receipt,
+)
+from wm3d_v3.training.launch_qualification import (
+    LaunchQualificationError,
+    build_launch_qualification,
+    load_published_launch_qualification,
+    publish_launch_qualification,
+    resource_contract_sha256,
+    validate_launch_qualification,
+    verify_clean_runtime_checkout,
+)
 
 
-RUN_CONTRACT_SCHEMA = "wm3d_v8_run_contract_v2"
+RUN_CONTRACT_SCHEMA = "wm3d_v8_run_contract_v3"
+RESOURCE_PREFLIGHT_PREFIX = "resource_preflight_"
 
 
 class PretrainError(RuntimeError):
@@ -121,6 +138,140 @@ def _atomic_json_no_clobber(path: Path, value: Mapping[str, Any]) -> None:
         os.link(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _resource_preflight(
+    config: Mapping[str, Any], config_sha: str, context: Any
+) -> str | None:
+    resources = config["runtime_profile"].get("resources")
+    if resources is None:
+        return None
+    output_root = Path(config["run"]["output_root"])
+    status: list[Any] = [None]
+    try:
+        receipt = run_resource_preflight(
+            resources=resources,
+            context=context,
+            runtime_config_sha256=config_sha,
+            cache_root=Path(config["data_closure"]["cache_root"]),
+            output_root=output_root,
+        )
+        if context.is_rank0:
+            receipt_path = output_root / (
+                f"{RESOURCE_PREFLIGHT_PREFIX}{int(receipt['created_unix_ns'])}.json"
+            )
+            try:
+                _atomic_json_no_clobber(receipt_path, receipt)
+                receipt_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+                if receipt.get("passed") is True and receipt.get("errors") == []:
+                    status[0] = {
+                        "ok": True,
+                        "sha256": receipt_sha256,
+                        "path": str(receipt_path),
+                    }
+                else:
+                    status[0] = {
+                        "ok": False,
+                        "type": ResourcePreflightError.__name__,
+                        "error": "; ".join(str(value) for value in receipt["errors"]),
+                        "sha256": receipt_sha256,
+                        "path": str(receipt_path),
+                    }
+            except Exception as exc:
+                status[0] = {
+                    "ok": False,
+                    "type": type(exc).__name__,
+                    "error": str(exc),
+                }
+    except ResourcePreflightError as exc:
+        if context.is_rank0:
+            status[0] = {
+                "ok": False,
+                "type": type(exc).__name__,
+                "error": str(exc),
+            }
+    dist.broadcast_object_list(status, src=0)
+    if not status[0]["ok"]:
+        raise PretrainError(f"resource preflight failed: {status[0]}")
+    return str(status[0]["sha256"])
+
+
+def _require_recent_resource_preflight(
+    config: Mapping[str, Any], config_sha: str, context: Any
+) -> dict[str, Any] | None:
+    resources = config["runtime_profile"].get("resources")
+    if resources is None:
+        return None
+    selection: list[Any] = [None]
+    if context.is_rank0:
+        try:
+            output_root = Path(config["run"]["output_root"])
+            candidates = sorted(output_root.glob(f"{RESOURCE_PREFLIGHT_PREFIX}*.json"))
+            if not candidates:
+                raise PretrainError(
+                    "resource-qualified runtime requires a prior --preflight-only receipt"
+                )
+            expected_world = int(config["runtime_profile"]["expected_world_size"])
+            errors: list[str] = []
+            valid: list[tuple[int, Path, dict[str, Any]]] = []
+            for path in candidates:
+                try:
+                    if path.is_symlink() or not path.is_file():
+                        raise PretrainError("not a regular file")
+                    receipt = json.loads(path.read_text(encoding="utf-8"))
+                    created_ns = validate_resource_receipt(
+                        receipt,
+                        resources=resources,
+                        runtime_config_sha256=config_sha,
+                        world_size=expected_world,
+                    )
+                    valid.append((created_ns, path, receipt))
+                except Exception as exc:
+                    errors.append(f"{path.name}: {exc}")
+            if not valid:
+                raise PretrainError(
+                    "no matching fresh resource preflight receipt: " + "; ".join(errors)
+                )
+            _, path, receipt = max(valid, key=lambda item: item[0])
+            selection[0] = {
+                "ok": True,
+                "receipt": receipt,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "path": str(path.resolve(strict=True)),
+                "created_unix_ns": int(receipt["created_unix_ns"]),
+            }
+        except Exception as exc:
+            selection[0] = {
+                "ok": False,
+                "type": type(exc).__name__,
+                "error": str(exc),
+            }
+    dist.broadcast_object_list(selection, src=0)
+    if not selection[0]["ok"]:
+        raise PretrainError(f"resource preflight receipt failed: {selection[0]}")
+    identity_error: Exception | None = None
+    identity: dict[str, Any] | None = None
+    try:
+        identity = current_rank_identity(int(os.environ["LOCAL_RANK"]))
+    except Exception as exc:
+        identity_error = exc
+    local = {
+        "identity": identity,
+        "error": None if identity_error is None else str(identity_error),
+    }
+    gathered: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local)
+    failures = [item["error"] for item in gathered if item.get("error") is not None]
+    if failures:
+        raise PretrainError(f"current rank identity probe failed: {failures}")
+    validate_current_rank_identities(
+        selection[0]["receipt"], [item["identity"] for item in gathered]
+    )
+    return {
+        "path": str(selection[0]["path"]),
+        "sha256": str(selection[0]["sha256"]),
+        "created_unix_ns": int(selection[0]["created_unix_ns"]),
+    }
 
 
 def _checkpoint_steps(train: Mapping[str, Any]) -> set[int]:
@@ -296,7 +447,10 @@ def _make_loader(
     sampler = StepAddressedBatchSampler(
         dataset.source_spans,
         dataset.source_names,
-        profile.source_weights,
+        {
+            name: profile.source_weights[name]
+            for name in dataset.source_names
+        },
         world_size=world_size,
         rank=rank,
         micro_batch_size=int(train["micro_batch_size"]),
@@ -367,9 +521,118 @@ def _run_contract(
         "code_commit": config["run"]["code_commit"],
         "environment_lock_sha256": config["run"]["environment_lock_sha256"],
         "topology_contract_sha256": _topology_contract_sha256(config),
+        "resource_contract_sha256": resource_contract_sha256(
+            config["runtime_profile"].get("resources")
+        ),
         "parameter_counts": dict(parameter_counts),
         "required_gradient_owners": list(required_gradient_owner_names(native_model)),
     }
+
+
+def _resume_expectations(
+    config: Mapping[str, Any], config_sha: str, *, step: int, world_size: int
+) -> ResumeExpectations:
+    runtime = config["runtime_profile"]
+    distributed = runtime["distributed"]
+    return ResumeExpectations(
+        step=int(step),
+        run_lineage=config["run"]["lineage"],
+        runtime_config_sha256=config_sha,
+        data_closure_sha256=config["bindings"]["data_closure_sha256"],
+        model_contract_sha256=config["bindings"]["model_contract_sha256"],
+        world_size=int(world_size),
+        shard_degree=int(distributed["shard_degree"]),
+        distributed_strategy=str(distributed["strategy"]),
+        global_batch_size=int(runtime["train"]["global_batch_size"]),
+        topology_contract_sha256=_topology_contract_sha256(config),
+        allow_topology_reshard=bool(runtime["checkpoint"]["allow_topology_reshard"]),
+    )
+
+
+def _rank_identities(context: Any) -> list[dict[str, Any]]:
+    local: dict[str, Any] | None = None
+    error: str | None = None
+    try:
+        current = current_rank_identity(int(context.local_rank))
+        local = {"rank": int(context.rank), **current}
+    except Exception as exc:
+        error = str(exc)
+    gathered: list[Any] = [None] * int(context.world_size)
+    dist.all_gather_object(gathered, {"identity": local, "error": error})
+    failures = [value["error"] for value in gathered if value.get("error")]
+    if failures:
+        raise PretrainError(f"current rank identity probe failed: {failures}")
+    identities = [value["identity"] for value in gathered]
+    if [value.get("rank") for value in identities] != list(range(context.world_size)):
+        raise PretrainError("current rank identity closure is invalid")
+    return identities
+
+
+def _publish_and_validate_launch(
+    *,
+    config: Mapping[str, Any],
+    config_sha: str,
+    context: Any,
+    strategy: Any,
+    run_contract: Mapping[str, Any],
+    resource_preflight: Mapping[str, Any] | None,
+    source_checkpoint: Mapping[str, Any] | None,
+    launch_kind: str,
+) -> tuple[str, str]:
+    identities = _rank_identities(context)
+    resources = config["runtime_profile"].get("resources")
+    output_root = Path(config["run"]["output_root"])
+    publication: list[Any] = [None]
+    if context.is_rank0:
+        try:
+            value = build_launch_qualification(
+                launch_kind=launch_kind,
+                runtime_config_sha256=config_sha,
+                run_contract=run_contract,
+                resources=resources,
+                resource_preflight=resource_preflight,
+                rank_identities=identities,
+                world_size=context.world_size,
+                local_world_size=context.local_world_size,
+                distributed_strategy=strategy.strategy,
+                shard_degree=strategy.shard_degree,
+                source_checkpoint=source_checkpoint,
+            )
+            path, digest = publish_launch_qualification(output_root, value)
+            publication[0] = {
+                "ok": True,
+                "path": str(path.resolve(strict=True)),
+                "sha256": digest,
+            }
+        except Exception as exc:
+            publication[0] = {
+                "ok": False,
+                "type": type(exc).__name__,
+                "error": str(exc),
+            }
+    dist.broadcast_object_list(publication, src=0)
+    if not publication[0]["ok"]:
+        raise PretrainError(f"launch qualification publication failed: {publication[0]}")
+    try:
+        value = load_published_launch_qualification(
+            Path(publication[0]["path"]), str(publication[0]["sha256"])
+        )
+        validate_launch_qualification(
+            value,
+            launch_kind=launch_kind,
+            runtime_config_sha256=config_sha,
+            run_contract=run_contract,
+            resources=resources,
+            rank_identities=identities,
+            world_size=context.world_size,
+            local_world_size=context.local_world_size,
+            distributed_strategy=strategy.strategy,
+            shard_degree=strategy.shard_degree,
+            source_checkpoint=source_checkpoint,
+        )
+    except LaunchQualificationError as exc:
+        raise PretrainError("launch qualification validation failed") from exc
+    return str(publication[0]["path"]), str(publication[0]["sha256"])
 
 
 def _topology_contract_sha256(config: Mapping[str, Any]) -> str:
@@ -392,6 +655,7 @@ def _topology_contract_sha256(config: Mapping[str, Any]) -> str:
             "model_contract_sha256": config["bindings"]["model_contract_sha256"],
             "data_closure_sha256": config["bindings"]["data_closure_sha256"],
             "objective_profile_sha256": config["bindings"]["objective_profile_sha256"],
+            "resource_contract": runtime.get("resources"),
             "optimizer": runtime["optimizer"],
             "schedule": runtime["schedule"],
             "train": {
@@ -439,12 +703,23 @@ def main() -> None:
             raise PretrainError(
                 f"WORLD_SIZE={context.world_size} != {runtime['expected_world_size']}"
             )
+        preflight_result_sha256 = (
+            _resource_preflight(config, config_sha, context)
+            if args.preflight_only
+            else None
+        )
+        resource_preflight = None
+        if not args.preflight_only:
+            resource_preflight = _require_recent_resource_preflight(
+                config, config_sha, context
+            )
         repo = Path(__file__).resolve().parents[2]
-        current_commit = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
-        ).strip()
-        if current_commit != config["run"]["code_commit"]:
-            raise PretrainError("runtime code commit does not match current checkout")
+        try:
+            verify_clean_runtime_checkout(
+                repo, str(config["run"]["code_commit"])
+            )
+        except LaunchQualificationError as exc:
+            raise PretrainError("runtime code provenance failed") from exc
         train_dataset, profile = _build_mixed_dataset(config, split="train")
         model_cfg = config["model_profile"]["model"]
         cache_representation = profile.cache_representation
@@ -470,6 +745,7 @@ def main() -> None:
                             "world_size": context.world_size,
                             "train_windows": len(train_dataset),
                             "sources": profile.source_order,
+                            "resource_preflight_sha256": preflight_result_sha256,
                         },
                         sort_keys=True,
                     ),
@@ -532,29 +808,67 @@ def main() -> None:
         manager = DistributedCheckpointManager(output_root / "checkpoints")
         start_step = 0
         gradient_ownership: Mapping[str, Any] | None = None
+        source_checkpoint: Mapping[str, Any] | None = None
+        expectations: ResumeExpectations | None = None
         if args.resume is not None:
             if re.fullmatch(r"step_[0-9]{8}", args.resume.name) is None:
                 raise PretrainError("resume must be an explicit step_XXXXXXXX directory")
             expected_step = int(args.resume.name.split("_")[1])
+            expectations = _resume_expectations(
+                config,
+                config_sha,
+                step=expected_step,
+                world_size=context.world_size,
+            )
+            inspection: list[Any] = [None]
+            if context.is_rank0:
+                try:
+                    inspection[0] = {
+                        "ok": True,
+                        "source": manager.inspect_committed(
+                            path=args.resume, expected=expectations
+                        ),
+                    }
+                except Exception as exc:
+                    inspection[0] = {
+                        "ok": False,
+                        "type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+            dist.broadcast_object_list(inspection, src=0)
+            if not inspection[0]["ok"]:
+                raise PretrainError(
+                    f"resume checkpoint inspection failed: {inspection[0]}"
+                )
+            source_checkpoint = inspection[0]["source"]
+        launch_kind = (
+            "fresh"
+            if source_checkpoint is None
+            else (
+                "exact_resume"
+                if source_checkpoint["resume_mode"] == "exact"
+                else "topology_reshard"
+            )
+        )
+        launch_qualification_path, launch_qualification_sha256 = (
+            _publish_and_validate_launch(
+                config=config,
+                config_sha=config_sha,
+                context=context,
+                strategy=strategy,
+                run_contract=status[0]["contract"],
+                resource_preflight=resource_preflight,
+                source_checkpoint=source_checkpoint,
+                launch_kind=launch_kind,
+            )
+        )
+        if args.resume is not None:
+            assert expectations is not None
             metadata, progress = manager.load(
                 path=args.resume,
                 model=model,
                 optimizer=optimizer,
-                expected=ResumeExpectations(
-                    step=expected_step,
-                    run_lineage=config["run"]["lineage"],
-                    runtime_config_sha256=config_sha,
-                    data_closure_sha256=config["bindings"]["data_closure_sha256"],
-                    model_contract_sha256=config["bindings"]["model_contract_sha256"],
-                    world_size=context.world_size,
-                    shard_degree=int(runtime["distributed"]["shard_degree"]),
-                    distributed_strategy=strategy.strategy,
-                    global_batch_size=int(runtime["train"]["global_batch_size"]),
-                    topology_contract_sha256=_topology_contract_sha256(config),
-                    allow_topology_reshard=bool(
-                        runtime["checkpoint"]["allow_topology_reshard"]
-                    ),
-                ),
+                expected=expectations,
             )
             if int(progress.get("next_optimizer_step", -1)) != expected_step:
                 raise PretrainError("checkpoint sampler progress is not exact")
@@ -700,6 +1014,8 @@ def main() -> None:
                         "distributed_strategy": strategy.strategy,
                         "global_batch_size": int(runtime["train"]["global_batch_size"]),
                         "topology_contract_sha256": _topology_contract_sha256(config),
+                        "launch_qualification_path": launch_qualification_path,
+                        "launch_qualification_sha256": launch_qualification_sha256,
                         "sampler_progress": {"next_optimizer_step": completed},
                         "initial_seed": seed,
                         "gradient_ownership": gradient_ownership,

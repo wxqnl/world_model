@@ -48,6 +48,57 @@ Stage1 不可能从一条离线 demonstration 安全推导 counterfactual 成功
 
 没有 simulator revision、真实 outcome、同源 adapter receipt 或统一 encoder evidence 时，materializer 会拒绝发布；不会生成猜测标签或用旧 codec 占位。
 
+### 已审计的 RoboCasa 双 source、四 root 真实闭环
+
+仓库提供的是“重新审计和重新编码”入口，不把旧 V7 的 `D=384` token 当作 V8 数据。已跑通的最小发布验证使用两个独立 source：`OpenBlenderLid` 提供 train/val/test 各一个真实 same-root simulator root，`CoffeeServeMug` 再提供一个独立 train root，最终 selection 为 train 2、val 1、test 1。这样 world2 的训练 batch 不依赖复制、有放回采样或跨 source 伪装。顺序如下：
+
+1. 用 `stage1-audit-rollouts` 校验旧 runtime NPZ 的 payload SHA、root-context SHA、candidate index/seal、真实 simulator revision、执行 seed、真实 RGB/reward/done/success；factual branch 的 12D simulator command 必须重排后与源 LeRobot action 行逐字节相同。
+2. 用 `configs/adapters/robocasa_panda_omron_real_rollout.yaml` 分别对两个 source 的四个 episode 建立严格 source inventory。action 审计已封存末端平移/旋转单位、robot-base 坐标系与 gripper 极性；base、controller mode 与 current-state 字段仍由上游 `modality.json` / `embodiment.json` 的 SHA 约束。
+3. 用 `configs/model/native_1b_stage1_real_k8_5p6s.yaml` 建 Stage0 window。这里的八个 future state 是源数据中真实存在的非均匀时间点 `0.6/1.4/2.0/2.8/3.4/4.2/4.8/5.6s`；没有插值、补帧、重排或修改 K。
+4. 完成同一 RoboCasa data profile 的 episode cache、window index、grouped normalization、sealed runtime，并从该 runtime 训练一个 committed Stage0 DCP。ALOHA 或其他数据的 DCP 不能替代。
+5. 用 `stage1-produce` 从真实 branch RGB 重新运行当前冻结 native VGGT，candidate command 经过同一个 RoboCasa adapter 和 grouped normalizer，且精确绑定 Stage0 episode shard、window clock、current-state、runtime 和 DCP commit。
+
+真实审计命令（路径必须保持原资产，不要复制后改写）：
+
+```bash
+BASE=/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806
+CANARY=$BASE/manifests/canary_stage1p_from_s0_45k_20260808
+STAGE1_ROOT=/data/Minko/wm3d_v8_stage1_real_closure_20260813
+
+./run_v8.sh stage1-audit-rollouts \
+  --runtime-root "$CANARY/success_pool_runtime_v2" \
+  --launch-receipt "$BASE/logs/canary_stage1p_from_s0_45k_20260808/success_pool_runtime_v2/launch_rank0.json" \
+  --runtime-generator "$BASE/scripts/generate_robocasa_stage1_planner_branches.py" \
+  --replay-helper "$BASE/scripts/generate_robocasa_same_root_cf.py" \
+  --action-audit /data/Minko/world_model/wm3d_v7/manifests/audits/robocasa365_atomic_factual_action_v2.json \
+  --candidate-index "$CANARY/success_pool_candidates_valid_v1/index.jsonl" \
+  --candidate-index-seal "$CANARY/success_pool_candidates_valid_v1/index.seal.json" \
+  --source-root robocasa_stage1_real_blender=/data/Minko/datasets/robocasa365_source/pretrain/atomic/OpenBlenderLid/20250822/lerobot \
+  --source-root robocasa_stage1_real_coffee=/data/Minko/datasets/robocasa365_source/pretrain/atomic/CoffeeServeMug/20250819/lerobot \
+  --selection train=0f7bc10ffdb26aea844e26db968ca0b02501ca6f75a47239d2de97b4419a806e \
+  --selection train=00a4ce768aa20f3997801cb7267674c0f7fdc382c4ce086c304bf5fd8fc244fd \
+  --selection val=09db4a79e6c97d63908918fb1682f501d1e976f58cb4ce66f646185fa83f2e9d \
+  --selection test=8bdf49d27e4f3e66254fbe2e1e913e00f918f1a5ae8bc6c355c46b352bb810fc \
+  --output "$STAGE1_ROOT/rollout_audit.json"
+```
+
+之后的数据入口与 Stage0 主线完全相同：`schema-audit -> adapter-audit -> inventory -> data-profile -> task-bank -> cache-plan -> cache-worker -> cache-seal -> window -> normalization -> runtime -> preflight -> train`。发布验证的 OpenBlenderLid 与 CoffeeServeMug 必须作为同一 data profile 里的两个独立 source，分别使用 `configs/data/stage1_robocasa_real_blender_episode_indices.txt` 与 `configs/data/stage1_robocasa_real_coffee_episode_indices.txt`；两者都必须有各自的 schema audit、adapter audit、manifest 和 inventory receipt SHA。选定的两条 train root 是不同 task/source 中的真实 simulator root，只用于形成 world2 无放回 optimizer step；禁止把 CoffeeServeMug 伪装成 OpenBlenderLid，也禁止复制单条样本补 batch。
+
+同源 Stage0 DCP 提交后重新编码：
+
+```bash
+./run_v8.sh stage1-produce \
+  --runtime "$SEALED_ROBOCASA_STAGE0_RUNTIME" \
+  --stage0-checkpoint "$ROBOCASA_STAGE0_RUN/checkpoints/step_XXXXXXXX" \
+  --rollout-audit "$STAGE1_ROOT/rollout_audit.json" \
+  --encoder-contract configs/encoder/vggt_native_p64.yaml \
+  --output-root "$STAGE1_RAW/payloads" \
+  --output-manifest "$STAGE1_RAW/candidates.jsonl" \
+  --device cuda --batch-frames 2
+```
+
+`stage1-produce` 不接受任意近似 sample：episode cache shard、`t0` 和八个 source future row 必须同时一致；candidate action 使用 Stage0 源 action 的实际 timestamp，current-state 必须是 policy anchor 的真实精确采样。任意一个条件不满足就 fail closed。
+
 候选 manifest 每行使用 schema `wm3d_v8_unified_stage1_branch_v2`，并包含：sample identity、payload/receipt 的绝对路径与 SHA，以及上述 lineage SHA。然后运行：
 
 ```bash
@@ -102,3 +153,22 @@ Stage0 使用其自身封存的 DDP/FSDP2 topology 加载；planner 是小型 he
 - committed DCP 与 exact lineage 校验。
 
 正式发布还必须用独立 test split 产出 receipt，并保留真实 simulator candidate generator receipts。只有静态单元测试或旧 20-root 结果不能替代这个证据。
+
+## 已完成的真实 Stage1 v7 验收批次
+
+这里的 `v7` 是本次 Stage1 资产迭代后缀，不表示回退到 WM3D V7。验收根目录为 `/data/Minko/wm3d_v8_stage1_real_closure_20260813`。双 source、四 root 的实际闭包为 train 2、val 1、test 1，每个 root 都有 11 个真实 simulator candidate，八个 future observation 使用源数据中的 `0.6/1.4/2.0/2.8/3.4/4.2/4.8/5.6s` 实测时间点。
+
+| 产物 | SHA256 |
+|---|---|
+| `rollout_audit_4roots_v6.json` | `59c6af619650e2114ca280cb87b0cd1198741d3be19faae06e0871cb99aa80c3` |
+| `candidate_manifest_4roots_v7.jsonl` | `fca7e0a86023acfdfebc251ed53932ba6740dc63926a3731de69f76143dfdd07` |
+| `stage1_branch_index_4roots_v7.jsonl` | `cd09c16d2afe81bf55a485240634039e967a6b1c71ad0f7cc539df9409c8cd65` |
+| `stage1_branch_seal_4roots_v7.json` | `0cae27f603cc422edd5fae31a3bca907aa93244e0ddce7725abebdef113eca20` |
+| `stage0_training_4roots_v7/checkpoints/step_00000001/COMMITTED.json` | `06c5e92c52bbeba89ee0153db9c90d0b866547922c154c2f844663446344af64` |
+| `stage1_runtime_4roots_v7.yaml` | `ab8d5dcef62652ccfa7cdd5bfcfe1f2f825b8c6588d8cdea9e3b42ceb09c416e` |
+| Stage1 step 1 `COMMITTED.json` / train receipt | `6f87a2cff7725d8a63969780180b84f0c8b24c021a5e8edfd7f51c670b6cc5f3` / `1959b5b7773102e5b9774aae67918144dde10c0c96a415f48c651f17a10d6c73` |
+| Stage1 exact-resume step 2 `COMMITTED.json` / train receipt | `8b8e926adeeff6d93e493ccd71a57b9104a0b369111478a5f1c575a55c3834a5` / `38e4a22f0d043fd5754924c44542ce39964fa1b66e535de3fa47544945cc4977` |
+| `stage1_eval_val_4roots_v7_final.json` | `38ddd3bbfced4f817aaedcd07c4c42af91bc75c879a51457c2bdf4078fcf4575` |
+| `stage1_eval_test_4roots_v7_final.json` | `30e05f8d80432d861c27e6f0636fffd3932a439f2763da551c1a1d447d42e1bc` |
+
+val/test receipt 的 action-shuffle invariance、label-shuffle sensitivity、planner finite/nonzero gradient、Stage0 gradient absence 均为 true，证明真实 branch、冻结 Stage0、DCP exact resume 与评测门禁已经贯通。该实验只训练到 step 2：val success AUC 为 0.25，test success AUC 为约 0.0333，两个 split 的 `selected_success` 都是 0。因此它是 pipeline correctness proof，不是规划能力或效果提升证据；不得据此声称 Stage1 已经学到高质量策略。

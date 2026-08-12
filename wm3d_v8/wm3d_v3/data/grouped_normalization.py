@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import numpy as np
 from safetensors import safe_open

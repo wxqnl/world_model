@@ -20,6 +20,7 @@ WM3D V8 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_v8.sh schema-audit <inspect_source_schema.py 参数...>
   ./run_v8.sh adapter-audit <audit_adapter_contract.py 参数...>
   ./run_v8.sh inventory <materialize_source_inventory.py 参数...>
+  ./run_v8.sh legacy-residual-import <materialize_legacy_residual_inventory.py 参数...>
   ./run_v8.sh collection-inventory <materialize_collection_inventory.py 参数...>
   ./run_v8.sh data-profile <materialize_data_profile.py 参数...>
   ./run_v8.sh task-bank <build_task_embeddings.py 参数...>
@@ -34,6 +35,8 @@ WM3D V8 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_v8.sh eval <torchrun 参数...> -- <评测参数...>
   ./run_v8.sh smoke-real --work-root <空目录> --operator <姓名或工号> \
     --accept-dataset-license --confirm-adapter-semantics [--gpus 0,1]
+  ./run_v8.sh stage1-audit-rollouts <audit_robocasa_real_rollouts.py 参数...>
+  ./run_v8.sh stage1-produce <produce_wm3d_v8_robocasa_stage1_candidates.py 参数...>
   ./run_v8.sh stage1-materialize <materialize_wm3d_v8_stage1_branches.py 参数...>
   ./run_v8.sh stage1-train <torchrun 参数...> -- --runtime <stage1.yaml> [...]
   ./run_v8.sh stage1-eval <torchrun 参数...> -- --runtime <stage1.yaml> [...]
@@ -129,6 +132,7 @@ case "${command}" in
   schema-audit) exec "${PYTHON_BIN}" scripts/data/inspect_source_schema.py "$@" ;;
   adapter-audit) exec "${PYTHON_BIN}" scripts/data/audit_adapter_contract.py "$@" ;;
   inventory) exec "${PYTHON_BIN}" scripts/data/materialize_source_inventory.py "$@" ;;
+  legacy-residual-import) exec "${PYTHON_BIN}" scripts/data/materialize_legacy_residual_inventory.py "$@" ;;
   collection-inventory) exec "${PYTHON_BIN}" scripts/data/materialize_collection_inventory.py "$@" ;;
   data-profile) exec "${PYTHON_BIN}" scripts/data/materialize_data_profile.py "$@" ;;
   task-bank) exec "${PYTHON_BIN}" scripts/data/build_task_embeddings.py "$@" ;;
@@ -144,6 +148,8 @@ case "${command}" in
   smoke-real)
     exec "${SYSTEM_PYTHON:-python3.10}" scripts/run_real_smoke.py "$@"
     ;;
+  stage1-audit-rollouts) exec "${PYTHON_BIN}" scripts/data/audit_robocasa_real_rollouts.py "$@" ;;
+  stage1-produce) exec "${PYTHON_BIN}" scripts/produce_wm3d_v8_robocasa_stage1_candidates.py "$@" ;;
   stage1-materialize) exec "${PYTHON_BIN}" scripts/materialize_wm3d_v8_stage1_branches.py "$@" ;;
   stage1-train) torchrun_split wm3d_v3.stage1_planner.train "$@" ;;
   stage1-eval) torchrun_split scripts.eval_wm3d_v8_stage1 "$@" ;;

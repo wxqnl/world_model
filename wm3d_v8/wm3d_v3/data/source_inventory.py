@@ -12,7 +12,7 @@ import hashlib
 import json
 from pathlib import Path
 from string import Formatter
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import pyarrow.parquet as pq
