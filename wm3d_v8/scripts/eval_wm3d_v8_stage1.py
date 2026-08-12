@@ -6,7 +6,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import subprocess
 
 import numpy as np
 import torch
@@ -20,6 +19,7 @@ from wm3d_v3.stage1_planner.train import (
     _device,
     _expectations,
     _load_stage1,
+    _verify_runtime_checkout,
     validate_stage1_bindings,
 )
 from wm3d_v3.stage1_planner.losses import PlannerLossConfig, planner_loss
@@ -40,7 +40,7 @@ from wm3d_v3.training.runtime_contract import load_materialized_runtime
 from wm3d_v3.models.model_factory import build_world_model
 
 
-EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_eval_receipt_v1"
+EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_eval_receipt_v2"
 _ACTION_FIELDS = (
     "candidate_fine_action_values",
     "candidate_fine_action_mask",
@@ -118,11 +118,7 @@ def main() -> None:
     stage1, stage1_sha = _load_stage1(args.runtime)
     stage0, stage0_sha = load_materialized_runtime(Path(stage1["stage0_runtime"]))
     repo = Path(__file__).resolve().parents[1]
-    current_commit = subprocess.check_output(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
-    ).strip()
-    if current_commit != stage0["run"]["code_commit"]:
-        raise ValueError("Stage1 evaluation code commit differs from sealed runtime")
+    current_commit = _verify_runtime_checkout(stage0, repo)
     validate_stage1_bindings(stage1, stage0)
     if stage0_sha != stage1["branch"]["stage0_runtime_sha256"]:
         raise ValueError("Stage1 branch belongs to another Stage0 runtime")
@@ -269,6 +265,7 @@ def main() -> None:
             "stage0_checkpoint_commit_sha256": _checkpoint_commit_sha(stage0_source),
             "stage1_checkpoint_commit_sha256": sha256_file(args.checkpoint / "COMMITTED.json"),
             "branch_index_sha256": stage1["branch"]["index_sha256"], "split": args.split,
+            "rollout_audit_sha256": stage1["branch"]["rollout_audit_sha256"],
             "branch_ids": roots, "success_auc": _auc(labels, score), "imagined_success_auc": _auc(labels, imagined_score),
             "selected_success": float(labels[np.arange(len(labels)), score.argmax(1)].mean()),
             "oracle_success": float(labels.max(1).mean()), "stage0_frozen": True,

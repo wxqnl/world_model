@@ -28,11 +28,11 @@ from wm3d_v3.data.source_adapters import adapt_action_series, load_adapter_contr
 from wm3d_v3.data.unified_cache_dataset import _fuse_target_tokens, _pool_masked
 from wm3d_v3.encoders.native_vggt import NativeVGGTEncoder
 from wm3d_v3.stage1_planner.dataset import BRANCH_SCHEMA, GENERATOR_RECEIPT_SCHEMA
-from wm3d_v3.stage1_planner.train import _stage0_dataset
+from wm3d_v3.stage1_planner.train import _stage0_dataset, _verify_runtime_checkout
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
 
 
-AUDIT_SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v1"
+AUDIT_SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v2"
 
 
 class _Arrays:
@@ -43,6 +43,15 @@ class _Arrays:
         if key not in self.values:
             raise RuntimeError(f"candidate adapter requested unknown array {key!r}")
         return self.values[key]
+
+
+def _validate_rollout_audit_authority(
+    audit: dict, expected_code_commit: str
+) -> None:
+    if audit.get("schema") != AUDIT_SCHEMA or audit.get("passed") is not True:
+        raise RuntimeError("rollout audit did not pass")
+    if audit.get("code_commit") != expected_code_commit:
+        raise RuntimeError("rollout audit code commit differs from Stage0 runtime")
 
 
 def _publish(path: Path, payload: bytes) -> None:
@@ -264,14 +273,18 @@ def main() -> None:
     if args.batch_frames <= 0:
         raise RuntimeError("batch size must be positive")
     runtime, runtime_sha = load_materialized_runtime(args.runtime)
+    repo = Path(__file__).resolve().parents[1]
+    _verify_runtime_checkout(runtime, repo)
     profile = load_data_profile(Path(runtime["data_closure"]["data_profile_path"]), verify_source_manifests=False)
     sources = {source.name: source for source in profile.sources}
     if not sources or any(not name.startswith("robocasa_stage1_real") for name in sources):
         raise RuntimeError("real Stage1 producer requires sealed RoboCasa-only sources")
     audit_path = args.rollout_audit.resolve(strict=True)
     audit = json.loads(audit_path.read_text())
-    if audit.get("schema") != AUDIT_SCHEMA or audit.get("passed") is not True:
-        raise RuntimeError("rollout audit did not pass")
+    _validate_rollout_audit_authority(
+        audit, str(runtime["run"]["code_commit"])
+    )
+    rollout_audit_sha = sha256_file(audit_path)
     audited_roots = {
         name: Path(path).resolve(strict=True)
         for name, path in audit.get("source_roots", {}).items()
@@ -405,6 +418,7 @@ def main() -> None:
             "sample_index": sample_index, "sample_id": entry.sample_id,
             "source": entry.source, "split": entry.split, "embodiment": entry.embodiment,
             "payload_sha256": payload_sha, **lineage,
+            "rollout_audit_sha256": rollout_audit_sha,
             "source_manifest_sha256": source.manifest_sha256,
             "adapter_contract_sha256": source.adapter_contract_sha256,
             "simulator_revision": simulator_revision,
@@ -423,6 +437,7 @@ def main() -> None:
             "source": entry.source, "split": entry.split, "embodiment": entry.embodiment,
             "payload": str(payload_path), "payload_sha256": payload_sha,
             "generator_receipt": str(receipt_path), "generator_receipt_sha256": sha256_file(receipt_path),
+            "rollout_audit_sha256": rollout_audit_sha,
             **lineage,
         })
     if {row["split"] for row in rows} != {"train", "val", "test"}:
@@ -434,7 +449,7 @@ def main() -> None:
         "candidate_manifest": str(args.output_manifest.absolute()),
         "candidate_manifest_sha256": sha256_file(args.output_manifest.absolute()),
         "rows": len(rows), "splits": sorted(row["split"] for row in rows),
-        "rollout_audit_sha256": sha256_file(audit_path), **lineage,
+        "rollout_audit_sha256": rollout_audit_sha, **lineage,
     }, sort_keys=True))
 
 

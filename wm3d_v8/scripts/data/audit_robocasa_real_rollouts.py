@@ -18,9 +18,10 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from wm3d_v3.data.manifest_contract import canonical_sha256, sha256_file
+from wm3d_v3.training.launch_qualification import verify_clean_runtime_checkout
 
 
-SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v1"
+SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v2"
 RUNTIME_SCHEMA = "wm3d_v7_stage1_planner_same_root_runtime_v3"
 
 
@@ -127,6 +128,7 @@ def main() -> None:
     parser.add_argument("--action-audit", type=Path, required=True)
     parser.add_argument("--candidate-index", type=Path, required=True)
     parser.add_argument("--candidate-index-seal", type=Path, required=True)
+    parser.add_argument("--code-commit", required=True)
     parser.add_argument(
         "--source-root",
         action="append",
@@ -142,6 +144,9 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+
+    repo = Path(__file__).resolve().parents[2]
+    code_commit = verify_clean_runtime_checkout(repo, args.code_commit)
 
     runtime_root = args.runtime_root.resolve(strict=True)
     if runtime_root.is_symlink() or not runtime_root.is_dir():
@@ -326,6 +331,7 @@ def main() -> None:
     }
     receipt = {
         "schema": SCHEMA,
+        "code_commit": code_commit,
         "runtime_root": str(runtime_root),
         "launch_receipt_path": str(launch_path), "launch_receipt_sha256": sha256_file(launch_path),
         "runtime_generator_path": str(generator), "runtime_generator_sha256": sha256_file(generator),

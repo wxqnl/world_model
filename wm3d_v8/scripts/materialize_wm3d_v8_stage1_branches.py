@@ -22,8 +22,11 @@ from wm3d_v3.stage1_planner.dataset import (
     BRANCH_INDEX_SCHEMA,
     BRANCH_SCHEMA,
     BRANCH_SEAL_SCHEMA,
+    GENERATOR_RECEIPT_FIELDS,
     GENERATOR_RECEIPT_SCHEMA,
+    validate_rollout_audit_binding,
 )
+from wm3d_v3.stage1_planner.train import _verify_runtime_checkout
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
 
 
@@ -210,23 +213,15 @@ def _validate_generator_receipt(
     if path.is_symlink() or not path.is_file() or sha256_file(path) != expected_sha:
         raise ValueError("candidate generator receipt path/SHA mismatch")
     receipt = _load_json(path)
-    required = {
-        "schema", "sample_index", "sample_id", "source", "split", "embodiment",
-        "payload_sha256", "runtime_config_sha256", "data_profile_sha256",
-        "model_profile_sha256", "window_index_sha256",
-        "grouped_normalization_sha256", "task_bank_index_sha256",
-        "encoder_contract_sha256", "task_encoder_contract_sha256",
-        "representation_contract_sha256", "stage0_checkpoint_commit_sha256",
-        "source_manifest_sha256", "adapter_contract_sha256", "simulator_revision",
-        "simulator_seed", "real_simulator_outcomes", "future_observation_leakage",
-        "candidate_action_abi", "candidate_actions_from_adapter",
-        "candidate_actions_grouped_normalized", "native_evidence_from_frozen_encoder",
-    }
-    if set(receipt) != required or receipt.get("schema") != GENERATOR_RECEIPT_SCHEMA:
+    if (
+        set(receipt) != GENERATOR_RECEIPT_FIELDS
+        or receipt.get("schema") != GENERATOR_RECEIPT_SCHEMA
+    ):
         raise ValueError("candidate generator receipt fields/schema mismatch")
     identity = {name: raw[name] for name in ("sample_index", "sample_id", "source", "split", "embodiment", "payload_sha256")}
     if any(receipt.get(name) != value for name, value in {**identity, **expected}.items()):
         raise ValueError("candidate generator receipt lineage/identity mismatch")
+    validate_rollout_audit_binding(raw, receipt)
     if receipt["source_manifest_sha256"] != source_manifest_sha or receipt["adapter_contract_sha256"] != adapter_sha:
         raise ValueError("candidate generator receipt source/adapter mismatch")
     if not isinstance(receipt["simulator_revision"], str) or not receipt["simulator_revision"].strip():
@@ -256,6 +251,8 @@ def main() -> None:
     parser.add_argument("--output-seal", type=Path, required=True)
     args = parser.parse_args()
     runtime, runtime_sha = load_materialized_runtime(args.runtime)
+    repo = Path(__file__).resolve().parents[1]
+    _verify_runtime_checkout(runtime, repo)
     closure = runtime["data_closure"]
     profile = load_data_profile(Path(closure["data_profile_path"]), verify_source_manifests=False)
     source_by_name = {source.name: source for source in profile.sources}
@@ -297,7 +294,9 @@ def main() -> None:
         "schema", "sample_index", "sample_id", "source", "split", "embodiment",
         "payload", "payload_sha256", "generator_receipt",
         "generator_receipt_sha256",
+        "rollout_audit_sha256",
     } | set(lineage)
+    rollout_audit_shas: set[str] = set()
     for line_number, line in enumerate(args.candidate_manifest.resolve(strict=True).read_text().splitlines(), 1):
         if not line.strip():
             continue
@@ -306,6 +305,9 @@ def main() -> None:
             raise ValueError(f"candidate manifest row {line_number} fields/schema mismatch")
         if any(raw.get(name) != value for name, value in lineage.items()):
             raise ValueError(f"candidate manifest row {line_number} lineage mismatch")
+        if SHA256_RE.fullmatch(str(raw["rollout_audit_sha256"])) is None:
+            raise ValueError("candidate manifest rollout-audit SHA is invalid")
+        rollout_audit_shas.add(str(raw["rollout_audit_sha256"]))
         source_spec = source_by_name.get(str(raw["source"]))
         if source_spec is None or source_spec.embodiment != str(raw["embodiment"]):
             raise ValueError("candidate manifest source/embodiment is outside data profile")
@@ -360,11 +362,14 @@ def main() -> None:
             "adapter_contract_sha256": source_spec.adapter_contract_sha256,
             "generator_receipt_path": str(receipt),
             "generator_receipt_sha256": sha256_file(receipt),
+            "rollout_audit_sha256": str(raw["rollout_audit_sha256"]),
             "real_simulator_outcomes": True, "future_observation_leakage": False,
             "candidate_action_abi": "wm3d_v8_grouped_robot_v1",
         })
     if not rows:
         raise ValueError("candidate manifest is empty")
+    if len(rollout_audit_shas) != 1:
+        raise ValueError("candidate manifest mixes rollout audits")
     candidates = {int(row["candidates"]) for row in rows}
     horizons = {int(row["horizon"]) for row in rows}
     if len(candidates) != 1 or len(horizons) != 1:
@@ -380,6 +385,7 @@ def main() -> None:
         "branch_index_sha256": sha256_file(args.output_index.absolute()), "row_count": len(rows),
         "row_count_by_split": {name: int(split_counts[name]) for name in ("train", "val", "test")},
         "candidate_count": next(iter(candidates)), "horizon": next(iter(horizons)),
+        "rollout_audit_sha256": next(iter(rollout_audit_shas)),
         **lineage,
     }
     _publish(args.output_seal.absolute(), (json.dumps(seal, sort_keys=True, indent=2) + "\n").encode())

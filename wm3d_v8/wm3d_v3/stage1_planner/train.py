@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import random
-import subprocess
 from typing import Any, Mapping
 
 import numpy as np
@@ -35,6 +34,7 @@ from wm3d_v3.training.distributed_runtime import (
     wrap_model,
 )
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
+from wm3d_v3.training.launch_qualification import verify_clean_runtime_checkout
 
 from .dataset import Stage1BranchDataset, Stage1BranchDatasetConfig
 from .losses import PlannerLossConfig, planner_loss
@@ -42,11 +42,12 @@ from .planner_head import NativePlannerConfig
 from .system import NativePlanningSystem, Stage1SystemConfig
 
 
-STAGE1_RUNTIME_SCHEMA = "wm3d_v8_unified_stage1_runtime_v1"
-STAGE1_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_train_receipt_v2"
+STAGE1_RUNTIME_SCHEMA = "wm3d_v8_unified_stage1_runtime_v2"
+STAGE1_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_train_receipt_v3"
 _BRANCH_FIELDS = {
     "index", "index_sha256", "seal", "seal_sha256",
     "stage0_runtime_sha256", "stage0_checkpoint_commit_sha256",
+    "rollout_audit_sha256",
 }
 _PLANNER_FIELDS = {"horizon", "candidate_microbatch", "model", "loss", "score"}
 _SCORE_FIELDS = {
@@ -97,6 +98,12 @@ def _walk(value: object):
             yield from _walk(item)
     else:
         yield value
+
+
+def _verify_runtime_checkout(runtime: Mapping[str, Any], repo: Path) -> str:
+    return verify_clean_runtime_checkout(
+        repo, str(runtime["run"]["code_commit"])
+    )
 
 
 def validate_stage1_bindings(stage1: Mapping[str, Any], runtime: Mapping[str, Any]) -> None:
@@ -214,6 +221,7 @@ def _dataset(runtime: Mapping[str, Any], stage1: Mapping[str, Any], split: str) 
         task_encoder_contract_sha256=window_seal["task_encoder_contract_sha256"],
         representation_contract_sha256=window_seal["representation_contract_sha256"],
         stage0_checkpoint_commit_sha256=branch["stage0_checkpoint_commit_sha256"], split=split,
+        rollout_audit_sha256=branch["rollout_audit_sha256"],
     ), stage0)
 
 
@@ -267,11 +275,7 @@ def main() -> None:
     stage1, stage1_sha = _load_stage1(args.runtime)
     stage0_runtime, stage0_sha = load_materialized_runtime(Path(stage1["stage0_runtime"]))
     repo = Path(__file__).resolve().parents[2]
-    current_commit = subprocess.check_output(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
-    ).strip()
-    if current_commit != stage0_runtime["run"]["code_commit"]:
-        raise ValueError("Stage1 runtime code commit does not match current checkout")
+    current_commit = _verify_runtime_checkout(stage0_runtime, repo)
     validate_stage1_bindings(stage1, stage0_runtime)
     if stage0_sha != stage1["branch"]["stage0_runtime_sha256"]:
         raise ValueError("Stage1 branch belongs to another Stage0 runtime")
@@ -384,6 +388,7 @@ def main() -> None:
                         "distributed_strategy": "ddp", "global_batch_size": int(stage1["run"]["global_batch_size"]),
                         "topology_contract_sha256": _topology_sha(stage1, stage0_runtime),
                         "stage0_checkpoint_commit_sha256": source_commit_sha, "branch_index_sha256": stage1["branch"]["index_sha256"],
+                        "rollout_audit_sha256": stage1["branch"]["rollout_audit_sha256"],
                         "stage0_frozen": True, "planner_action_inputs": False, "imagined_rollout": "single_trained_K_only"},
                     rank_state={"next_optimizer_step": completed})
         if context.is_rank0:
@@ -395,6 +400,7 @@ def main() -> None:
                 "stage0_checkpoint_commit_sha256": source_commit_sha,
                 "stage1_checkpoint_commit_sha256": sha256_file(final_checkpoint / "COMMITTED.json"),
                 "branch_index_sha256": stage1["branch"]["index_sha256"], "metrics": last,
+                "rollout_audit_sha256": stage1["branch"]["rollout_audit_sha256"],
                 "resumed_from_step": start,
                 "stage0_frozen": True, "planner_action_inputs": False,
             })

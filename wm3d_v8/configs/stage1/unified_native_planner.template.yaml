@@ -1,4 +1,4 @@
-schema: wm3d_v8_unified_stage1_runtime_v1
+schema: wm3d_v8_unified_stage1_runtime_v2
 
 # 必须指向同一份已封存 Stage0 runtime 和完整编号 DCP；模板不会猜路径或 SHA。
 stage0_runtime: PENDING_ABSOLUTE_STAGE0_RUNTIME
@@ -11,6 +11,7 @@ branch:
   seal_sha256: PENDING_SHA256
   stage0_runtime_sha256: PENDING_SHA256
   stage0_checkpoint_commit_sha256: PENDING_SHA256
+  rollout_audit_sha256: PENDING_SHA256
 
 planner:
   # H 必须与 branch seal 一致且 0 < H <= Stage0 K；当前不允许多段自回归。

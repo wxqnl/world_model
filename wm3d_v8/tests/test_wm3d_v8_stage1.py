@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -16,18 +17,34 @@ from wm3d_v3.models.native_world_model import NativeWorldModel, NativeWorldModel
 from wm3d_v3.data.unified_cache_dataset import CacheDataError, _active_source_names
 from wm3d_v3.stage1_planner.candidates import deterministic_action_cost
 from wm3d_v3.stage1_planner.dataset import (
+    BRANCH_INDEX_SCHEMA,
+    BRANCH_SCHEMA,
+    BRANCH_SEAL_SCHEMA,
+    GENERATOR_RECEIPT_FIELDS,
+    GENERATOR_RECEIPT_SCHEMA,
     Stage1BranchError,
+    validate_rollout_audit_binding,
     _validate_candidate_action_shapes,
 )
 from wm3d_v3.stage1_planner.losses import planner_loss
 from wm3d_v3.stage1_planner.planner_head import NativePlannerConfig, NativePlannerHead, planning_score
 from wm3d_v3.stage1_planner.rollout import single_horizon_native_rollout
 from wm3d_v3.stage1_planner.system import NativePlanningSystem, Stage1SystemConfig
-from wm3d_v3.stage1_planner.train import _expectations, _planner_contract_sha, _topology_sha
+from wm3d_v3.stage1_planner.train import (
+    _expectations,
+    _planner_contract_sha,
+    _topology_sha,
+    _verify_runtime_checkout,
+)
 from scripts.materialize_wm3d_v8_stage1_branches import (
     _validate_candidate_payload,
     _validate_stage0_window_clock,
 )
+from scripts.produce_wm3d_v8_robocasa_stage1_candidates import (
+    AUDIT_SCHEMA,
+    _validate_rollout_audit_authority,
+)
+from wm3d_v3.training.launch_qualification import LaunchQualificationError
 
 
 def test_multisource_split_requires_all_train_sources_but_not_eval_sources() -> None:
@@ -57,6 +74,93 @@ def test_multisource_split_requires_all_train_sources_but_not_eval_sources() -> 
 
     with pytest.raises(CacheDataError, match="cache selection produced no samples"):
         _active_source_names(**kwargs, split="missing")
+
+
+def test_stage1_new_closure_requires_rollout_audit_binding() -> None:
+    assert BRANCH_SCHEMA.endswith("_v3")
+    assert BRANCH_INDEX_SCHEMA.endswith("_v3")
+    assert BRANCH_SEAL_SCHEMA.endswith("_v3")
+    assert GENERATOR_RECEIPT_SCHEMA.endswith("_v2")
+    digest = "a" * 64
+    row = {"schema": BRANCH_SCHEMA, "rollout_audit_sha256": digest}
+    receipt = {
+        name: False if name == "future_observation_leakage" else True
+        for name in GENERATOR_RECEIPT_FIELDS
+    }
+    receipt.update(
+        schema=GENERATOR_RECEIPT_SCHEMA,
+        rollout_audit_sha256=digest,
+    )
+    assert validate_rollout_audit_binding(row, receipt) == digest
+    missing = dict(row)
+    missing.pop("rollout_audit_sha256")
+    with pytest.raises(Stage1BranchError, match="binding is missing"):
+        validate_rollout_audit_binding(missing, receipt)
+    tampered = dict(receipt, rollout_audit_sha256="b" * 64)
+    with pytest.raises(Stage1BranchError, match="binding mismatch"):
+        validate_rollout_audit_binding(row, tampered)
+
+    commit = "c" * 40
+    _validate_rollout_audit_authority(
+        {"schema": AUDIT_SCHEMA, "passed": True, "code_commit": commit},
+        commit,
+    )
+    with pytest.raises(RuntimeError, match="code commit differs"):
+        _validate_rollout_audit_authority(
+            {"schema": AUDIT_SCHEMA, "passed": True}, commit
+        )
+    with pytest.raises(RuntimeError, match="code commit differs"):
+        _validate_rollout_audit_authority(
+            {
+                "schema": AUDIT_SCHEMA,
+                "passed": True,
+                "code_commit": "d" * 40,
+            },
+            commit,
+        )
+
+
+def test_stage1_checkout_uses_shared_clean_runtime_authority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    observed = {}
+
+    def fake(repo, commit):
+        observed.update(repo=repo, commit=commit)
+        return commit
+
+    monkeypatch.setattr(
+        "wm3d_v3.stage1_planner.train.verify_clean_runtime_checkout", fake
+    )
+    runtime = {"run": {"code_commit": "c" * 40}}
+    assert _verify_runtime_checkout(runtime, tmp_path) == "c" * 40
+    assert observed == {"repo": tmp_path, "commit": "c" * 40}
+
+
+def test_stage1_checkout_rejects_dirty_repository(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    (tmp_path / "code.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "code.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True
+    )
+    head = subprocess.check_output(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True
+    ).strip()
+    assert _verify_runtime_checkout(
+        {"run": {"code_commit": head}}, tmp_path
+    ) == head
+    (tmp_path / "untracked.py").write_text("value = 2\n", encoding="utf-8")
+    with pytest.raises(LaunchQualificationError, match="dirty"):
+        _verify_runtime_checkout({"run": {"code_commit": head}}, tmp_path)
 
 
 def _planner() -> NativePlannerHead:

@@ -12,15 +12,40 @@ from torch.utils.data import Dataset
 from wm3d_v3.data.manifest_contract import SHA256_RE, sha256_file
 
 
-BRANCH_SCHEMA = "wm3d_v8_unified_stage1_branch_v2"
-BRANCH_INDEX_SCHEMA = "wm3d_v8_unified_stage1_branch_index_v2"
-BRANCH_SEAL_SCHEMA = "wm3d_v8_unified_stage1_branch_seal_v2"
-GENERATOR_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_candidate_generator_receipt_v1"
-DATASET_SCHEMA = "wm3d_v8_unified_stage1_dataset_v2"
+BRANCH_SCHEMA = "wm3d_v8_unified_stage1_branch_v3"
+BRANCH_INDEX_SCHEMA = "wm3d_v8_unified_stage1_branch_index_v3"
+BRANCH_SEAL_SCHEMA = "wm3d_v8_unified_stage1_branch_seal_v3"
+GENERATOR_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_candidate_generator_receipt_v2"
+DATASET_SCHEMA = "wm3d_v8_unified_stage1_dataset_v3"
+GENERATOR_RECEIPT_FIELDS = {
+    "schema", "sample_index", "sample_id", "source", "split", "embodiment",
+    "payload_sha256", "runtime_config_sha256", "data_profile_sha256",
+    "model_profile_sha256", "window_index_sha256",
+    "grouped_normalization_sha256", "task_bank_index_sha256",
+    "encoder_contract_sha256", "task_encoder_contract_sha256",
+    "representation_contract_sha256", "stage0_checkpoint_commit_sha256",
+    "rollout_audit_sha256", "source_manifest_sha256",
+    "adapter_contract_sha256", "simulator_revision", "simulator_seed",
+    "real_simulator_outcomes", "future_observation_leakage",
+    "candidate_action_abi", "candidate_actions_from_adapter",
+    "candidate_actions_grouped_normalized",
+    "native_evidence_from_frozen_encoder",
+}
 
 
 class Stage1BranchError(ValueError):
     pass
+
+
+def validate_rollout_audit_binding(
+    row: dict[str, Any], receipt: dict[str, Any]
+) -> str:
+    if "rollout_audit_sha256" not in row or "rollout_audit_sha256" not in receipt:
+        raise Stage1BranchError("rollout-audit binding is missing")
+    observed = _sha(row["rollout_audit_sha256"], "rollout audit SHA")
+    if receipt["rollout_audit_sha256"] != observed:
+        raise Stage1BranchError("rollout-audit binding mismatch")
+    return observed
 
 
 def _sha(value: object, label: str) -> str:
@@ -57,6 +82,7 @@ class Stage1BranchDatasetConfig:
     task_encoder_contract_sha256: str
     representation_contract_sha256: str
     stage0_checkpoint_commit_sha256: str
+    rollout_audit_sha256: str
     split: str
 
 
@@ -127,6 +153,7 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             "grouped_normalization_sha256", "task_bank_index_sha256",
             "encoder_contract_sha256", "task_encoder_contract_sha256",
             "representation_contract_sha256", "stage0_checkpoint_commit_sha256",
+            "rollout_audit_sha256",
         }
         if not isinstance(seal, dict) or set(seal) != required_seal:
             raise Stage1BranchError("branch seal fields mismatch")
@@ -144,6 +171,7 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             "task_encoder_contract_sha256": cfg.task_encoder_contract_sha256,
             "representation_contract_sha256": cfg.representation_contract_sha256,
             "stage0_checkpoint_commit_sha256": cfg.stage0_checkpoint_commit_sha256,
+            "rollout_audit_sha256": cfg.rollout_audit_sha256,
         }
         for name, expected in bindings.items():
             if seal.get(name) != _sha(expected, name):
@@ -169,6 +197,7 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             "grouped_normalization_sha256", "task_bank_index_sha256",
             "encoder_contract_sha256", "task_encoder_contract_sha256",
             "representation_contract_sha256", "stage0_checkpoint_commit_sha256",
+            "rollout_audit_sha256",
             "source_manifest_sha256", "adapter_contract_sha256",
             "generator_receipt_path", "generator_receipt_sha256",
             "real_simulator_outcomes", "future_observation_leakage",
@@ -219,8 +248,13 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
                 "candidate generator receipt",
             )
             receipt_value = json.loads(receipt.read_text(encoding="utf-8"))
-            if receipt_value.get("schema") != GENERATOR_RECEIPT_SCHEMA:
+            if (
+                not isinstance(receipt_value, dict)
+                or set(receipt_value) != GENERATOR_RECEIPT_FIELDS
+                or receipt_value.get("schema") != GENERATOR_RECEIPT_SCHEMA
+            ):
                 raise Stage1BranchError("candidate generator receipt schema mismatch")
+            validate_rollout_audit_binding(row, receipt_value)
             receipt_bindings = {
                 **{name: row[name] for name in (
                     "sample_index", "sample_id", "source", "split", "embodiment",
