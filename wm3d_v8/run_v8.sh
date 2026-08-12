@@ -19,7 +19,7 @@ usage() {
 EOF
 }
 
-DEFAULT_CONFIG=configs/wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v2.yaml
+DEFAULT_CONFIG=configs/wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v3.yaml
 
 case "${1:-}" in
   check)

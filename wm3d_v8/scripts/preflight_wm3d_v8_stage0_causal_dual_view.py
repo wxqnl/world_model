@@ -241,6 +241,7 @@ def _validate_contract_and_objective(
 
     checks.equal(model.get("enable_action_policy"), True, "model.enable_action_policy")
     checks.equal(model.get("policy_flow_use_as_policy"), False, "model.flow_serving")
+    built_action_contract: dict[str, Any] | None = None
     if unified_action:
         checks.equal(model.get("policy_enable_flow_head"), False, "model.flow_head")
         checks.equal(model.get("policy_enable_grip_delta_head"), False, "model.delta_head")
@@ -276,7 +277,9 @@ def _validate_contract_and_objective(
         try:
             built_action_contract = build_v8_action_policy_contract(config)
         except (KeyError, RuntimeError, TypeError, ValueError) as exc:
-            checks.errors.append(f"action contract build failed: {exc}")
+            message = f"action contract build failed: {exc}"
+            unresolved_template = checks.mode == "static" and "PENDING_" in str(exc)
+            (checks.blockers if unresolved_template else checks.errors).append(message)
         else:
             checks.equal(
                 (built_action_contract or {}).get("schema"),
@@ -432,12 +435,13 @@ def _validate_contract_and_objective(
             except (TypeError, ValueError):
                 positive = False
             checks.expect(positive, f"train.{key} must be positive")
-        try:
-            validate_action_pretraining_preflight(config)
-        except (TypeError, ValueError, RuntimeError) as exc:
-            checks.errors.append(f"V8 unified action preflight failed: {exc}")
-        action_contract = build_v8_action_policy_contract(config)
-        checks.expect(action_contract is not None, "V8 action checkpoint contract is missing")
+        if built_action_contract is not None:
+            try:
+                validate_action_pretraining_preflight(config)
+            except (TypeError, ValueError, RuntimeError) as exc:
+                message = f"V8 unified action preflight failed: {exc}"
+                unresolved_template = checks.mode == "static" and "PENDING_" in str(exc)
+                (checks.blockers if unresolved_template else checks.errors).append(message)
     factual = train.get("factual_action_conditioning") or {}
     checks.equal(factual.get("enabled"), True, "train.factual.enabled")
     checks.equal(factual.get("start_step"), 0, "train.factual.start_step")

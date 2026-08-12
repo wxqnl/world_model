@@ -1,0 +1,176 @@
+"""Frozen V8 world model plus a trainable native-future planner."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+
+from .candidates import deterministic_action_cost
+from .planner_head import NativePlannerConfig, NativePlannerHead, planning_score
+from .rollout import NativeRollout, multichunk_native_rollout
+
+
+@dataclass(frozen=True)
+class Stage1SystemConfig:
+    planner: NativePlannerConfig = field(default_factory=NativePlannerConfig)
+    candidate_microbatch: int = 1
+    detach_between_chunks: bool = True
+    activation_checkpointing: bool = False
+    progress_weight: float = 0.5
+    success_weight: float = 1.0
+    risk_weight: float = 0.5
+    uncertainty_weight: float = 0.25
+    action_cost_weight: float = 0.05
+
+
+class NativePlanningSystem(nn.Module):
+    """Explicit V8 rollout and an action-blind planner reader.
+
+    Candidate actions are consumed only by the frozen causal world dynamics.
+    The planner itself reads predicted/observed native tokens plus explicit
+    depth, point and pose evidence.  Physical action cost is added outside the
+    learned head, preventing a hidden VLA shortcut.
+    """
+
+    def __init__(self, world: nn.Module, cfg: Stage1SystemConfig | None = None):
+        super().__init__()
+        self.world = world
+        self.cfg = cfg or Stage1SystemConfig()
+        if self.cfg.planner.token_dim != int(world.cfg.dual.state.D):
+            raise ValueError("planner/world token dimensions differ")
+        if self.cfg.planner.task_dim != int(world.cfg.dual.state.cond_dim):
+            raise ValueError("planner/world task dimensions differ")
+        if self.cfg.planner.patches != int(world.cfg.dual.state.P):
+            raise ValueError("planner/world patch counts differ")
+        if int(world.cfg.dual.state.action_cond_dim) != 36:
+            raise ValueError("V8 Stage1 requires the exact 36D causal action lane")
+        self.planner = NativePlannerHead(self.cfg.planner)
+
+    def fuse_context(
+        self,
+        context: torch.Tensor,
+        *,
+        wrist: torch.Tensor | None = None,
+        view_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.world.fuse_views(context, wrist, view_mask=view_mask)
+
+    def imagine(
+        self,
+        context: torch.Tensor,
+        task_emb: torch.Tensor,
+        candidate_actions: torch.Tensor,
+        *,
+        wrist: torch.Tensor | None = None,
+        view_mask: torch.Tensor | None = None,
+    ) -> NativeRollout:
+        fused = self.fuse_context(context, wrist=wrist, view_mask=view_mask)
+        return multichunk_native_rollout(
+            self.world,
+            fused,
+            task_emb,
+            candidate_actions,
+            include_geometry=True,
+            candidate_microbatch=self.cfg.candidate_microbatch,
+            detach_between_chunks=self.cfg.detach_between_chunks,
+            activation_checkpointing=self.cfg.activation_checkpointing,
+        )
+
+    def score_rollout(
+        self,
+        rollout: NativeRollout,
+        task_emb: torch.Tensor,
+        action_cost: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if rollout.depth is None or rollout.point is None or rollout.pose is None:
+            raise ValueError("planner requires explicit native geometry")
+        outputs = self.planner(
+            rollout.tokens,
+            task_emb,
+            depth=rollout.depth,
+            point=rollout.point,
+            pose=rollout.pose,
+        )
+        outputs["score"] = planning_score(
+            outputs,
+            action_cost,
+            progress_weight=self.cfg.progress_weight,
+            success_weight=self.cfg.success_weight,
+            risk_weight=self.cfg.risk_weight,
+            uncertainty_weight=self.cfg.uncertainty_weight,
+            action_cost_weight=self.cfg.action_cost_weight,
+        )
+        return outputs
+
+    def score_true_futures(
+        self,
+        future_codec: torch.Tensor,
+        task_emb: torch.Tensor,
+        *,
+        depth: torch.Tensor,
+        point: torch.Tensor,
+        pose: torch.Tensor,
+        action_cost: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if future_codec.ndim != 5:
+            raise ValueError("true branch futures must be [B,C,H,P,Dcodec]")
+        bsz, candidates, horizon, patches, codec_dim = future_codec.shape
+        decoded = self.world.decode_input_tokens(
+            future_codec.reshape(bsz * candidates, horizon, patches, codec_dim)
+        ).reshape(bsz, candidates, horizon, patches, -1)
+        return self.score_rollout(
+            NativeRollout(tokens=decoded, depth=depth, point=point, pose=pose),
+            task_emb,
+            action_cost,
+        )
+
+    def score_observed_batch(
+        self,
+        future_codec: torch.Tensor,
+        task_emb: torch.Tensor,
+        physical_actions: torch.Tensor,
+        *,
+        depth: torch.Tensor,
+        point: torch.Tensor,
+        pose: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        cost = deterministic_action_cost(physical_actions)
+        return self.score_true_futures(
+            future_codec,
+            task_emb,
+            depth=depth,
+            point=point,
+            pose=pose,
+            action_cost=cost,
+        )
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        task_emb: torch.Tensor,
+        candidate_actions: torch.Tensor,
+        physical_actions: torch.Tensor,
+        *,
+        wrist: torch.Tensor | None = None,
+        view_mask: torch.Tensor | None = None,
+    ) -> dict[str, object]:
+        rollout = self.imagine(
+            context,
+            task_emb,
+            candidate_actions,
+            wrist=wrist,
+            view_mask=view_mask,
+        )
+        cost = deterministic_action_cost(physical_actions)
+        detached = NativeRollout(
+            tokens=rollout.tokens.detach(),
+            depth=rollout.depth.detach() if rollout.depth is not None else None,
+            point=rollout.point.detach() if rollout.point is not None else None,
+            pose=rollout.pose.detach() if rollout.pose is not None else None,
+        )
+        return {
+            "rollout": rollout,
+            "action_cost": cost,
+            "planner": self.score_rollout(detached, task_emb, cost),
+        }

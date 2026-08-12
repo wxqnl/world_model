@@ -39,6 +39,24 @@ MIX = {
 }
 
 
+def test_v3_template_pending_proprio_is_static_blocker_not_traceback() -> None:
+    cfg = load_config(
+        ROOT
+        / "configs"
+        / "wm3d_v8_stage0_causal_dual_view_unified_action_formal100k_world16_node43_node44_v3.yaml"
+    )
+    report = validate_preflight(
+        cfg,
+        mode="static",
+        verify_training_assets=False,
+        verify_local_resources=False,
+    )
+    assert report["passed"] is True
+    assert report["launch_ready"] is False
+    assert report["errors"] == []
+    assert any("PENDING_" in blocker for blocker in report["blockers"])
+
+
 @pytest.mark.parametrize(
     "name,profile,max_steps",
     [
