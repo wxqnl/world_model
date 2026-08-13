@@ -310,6 +310,32 @@ def enter_private_mount_namespace() -> None:
             raise ExecutionSnapshotError(
                 "replay mount-namespace marker was set outside a private namespace"
             )
+        try:
+            subprocess.run(
+                ["mount", "--make-rprivate", "/"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            mountinfo = Path("/proc/self/mountinfo").read_text().splitlines()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ExecutionSnapshotError(
+                "cannot make the replay mount namespace private"
+            ) from error
+        for line in mountinfo:
+            fields = line.split()
+            try:
+                separator = fields.index("-")
+            except ValueError as error:
+                raise ExecutionSnapshotError("invalid mountinfo entry") from error
+            optional = fields[6:separator]
+            if any(
+                value.startswith(("shared:", "master:", "propagate_from:"))
+                for value in optional
+            ):
+                raise ExecutionSnapshotError(
+                    "replay mount namespace still permits propagation"
+                )
         return
     environment = dict(os.environ)
     environment[marker] = "1"

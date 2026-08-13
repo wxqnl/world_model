@@ -273,3 +273,51 @@ def test_private_mount_namespace_reexec_is_distinct() -> None:
         text=True,
     )
     assert child.returncode == 0
+
+
+def test_private_mount_namespace_rejects_forged_marker() -> None:
+    code = (
+        "from wm3d_v3.stage1_planner.execution_snapshot import "
+        "enter_private_mount_namespace; enter_private_mount_namespace()"
+    )
+    forged_environment = dict(os.environ)
+    forged_environment["WM3D_STAGE1_REPLAY_PRIVATE_MOUNT_NAMESPACE"] = "1"
+    forged = subprocess.run(
+        [sys.executable, "-c", code],
+        env=forged_environment,
+        capture_output=True,
+        text=True,
+    )
+    assert forged.returncode != 0
+    assert "marker was set outside" in forged.stderr
+
+
+def test_private_mount_namespace_removes_shared_propagation() -> None:
+    environment = dict(os.environ)
+    environment["WM3D_STAGE1_REPLAY_PRIVATE_MOUNT_NAMESPACE"] = "1"
+    code = (
+        "from wm3d_v3.stage1_planner.execution_snapshot import "
+        "enter_private_mount_namespace; enter_private_mount_namespace(); "
+        "from pathlib import Path; "
+        "assert not any(any(field.startswith(prefix) "
+        "for prefix in ('shared:', 'master:', 'propagate_from:')) "
+        "for line in Path('/proc/self/mountinfo').read_text().splitlines() "
+        "for field in line.split()[6:line.split().index('-')])"
+    )
+    child = subprocess.run(
+        [
+            "unshare",
+            "--mount",
+            "--propagation",
+            "shared",
+            "--",
+            sys.executable,
+            "-c",
+            code,
+        ],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert child.returncode == 0

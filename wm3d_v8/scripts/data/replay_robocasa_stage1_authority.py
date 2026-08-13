@@ -909,6 +909,7 @@ def main() -> None:
     immutable_inputs = ReadOnlyBindMount(
         snapshot_input_root, label="replay execution inputs"
     )
+    execution_completed = False
     try:
         immutable_inputs.__enter__()
         execution_environment = dict(simulator_environment)
@@ -1261,21 +1262,12 @@ def main() -> None:
             verify_referents=True,
         )
         receipt_payload = (json.dumps(authority, sort_keys=True, indent=2) + "\n").encode()
-        output.publish(args.output.absolute(), receipt_payload, label="replay authority")
-        output._verify_namespace()
         receipt_sha = hashlib.sha256(receipt_payload).hexdigest()
-        print(json.dumps({
-            "schema": REPLAY_AUTHORITY_SCHEMA,
-            "output": str(args.output.absolute()),
-            "sha256": receipt_sha,
-            "selection_count": counts,
-            "candidate_count": authority["candidate_count"],
-            "passed": True,
-        }, sort_keys=True))
         immutable_inputs.verify(
             target=snapshot_anchor.alias("inputs"),
             pass_fds=(snapshot_anchor.fd,),
         )
+        execution_completed = True
     finally:
         try:
             immutable_inputs.close(
@@ -1284,7 +1276,21 @@ def main() -> None:
             )
         finally:
             snapshot_anchor.close()
-            output.close()
+            if not execution_completed:
+                output.close()
+    try:
+        output.publish(args.output.absolute(), receipt_payload, label="replay authority")
+        output._verify_namespace()
+        print(json.dumps({
+            "schema": REPLAY_AUTHORITY_SCHEMA,
+            "output": str(args.output.absolute()),
+            "sha256": receipt_sha,
+            "selection_count": counts,
+            "candidate_count": authority["candidate_count"],
+            "passed": True,
+        }, sort_keys=True))
+    finally:
+        output.close()
 
 
 if __name__ == "__main__":
