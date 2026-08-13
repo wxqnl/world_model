@@ -1,10 +1,6 @@
 # WM3D 5B：从公开数据到 10K 验证训练
 
-这份手册写给第一次接触 WM3D、但负责算力和集群运行的同事。目标不是解释所有模型
-细节，而是让操作者在另一套服务器上完成数据下载、cache、5B 验证训练、断点恢复和
-结果验收，并能明确判断每一步是否正确。
-
-## 1. 先知道自己在运行什么
+## 1. 概述
 
 WM3D Stage0 是动作条件的 3D 世界模型。每个训练样本同时包含：
 
@@ -22,13 +18,6 @@ WM3D Stage0 是动作条件的 3D 世界模型。每个训练样本同时包含�
 本手册覆盖 Stage0 5B。Stage1 是冻结 Stage0 后的 simulator candidate planner，单独见
 [Stage1 手册](WM3D_STAGE1_UNIFIED.md)。
 
-## 2. 三条不可省略的规则
-
-1. 所有节点必须看到相同的 Git checkout 和相同绝对路径的共享存储。
-2. 下载 revision、source manifest、adapter、cache、runtime、checkpoint 都由 SHA/receipt
-   绑定。不要覆盖旧文件；换配置就换新的 `WORK_ROOT` 或 `RUN_ROOT`。
-3. adapter 的单位、坐标系、夹爪极性、action group 和 current-state 语义只能由项目
-   负责人确认。算力同事可以完成其余全部流程，但不能根据数组维度猜 adapter。
 
 ## 3. 数据清单与下载位置
 
@@ -48,9 +37,6 @@ WM3D Stage0 是动作条件的 3D 世界模型。每个训练样本同时包含�
 使用的是物化后的 `DATA_PROFILE`，不是表格里的预算数字；报告会打印真实 episode/window
 数量。
 
-如果要复现已经交付过的数据家庭和权重，使用
-`configs/data/public_robot_5649h_legacy_compatible.template.yaml`。不要把 5,649 h 和
-6,106 h 两种配比混进同一个 run。
 
 128×H200 profile 要求 data 和 output 所在文件系统各至少有 10 TB 空闲空间。5B DCP 的
 实测量级约 61 GB/个；10K profile 会保存 100、500 和每 1,000 step 的 checkpoint，
