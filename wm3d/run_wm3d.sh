@@ -35,6 +35,7 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_wm3d.sh eval <torchrun 参数...> -- <评测参数...>
   ./run_wm3d.sh smoke-real --work-root <空目录> --operator <姓名或工号> \
     --accept-dataset-license --confirm-adapter-semantics [--gpus 0,1]
+  ./run_wm3d.sh 5b <init|doctor|download|cache|train|status|verify...> [参数...]
   ./run_wm3d.sh stage1-seal-selection <正式四 root selection seal 参数...>
   ./run_wm3d.sh stage1-replay-authority <真实 simulator replay 参数...>
   ./run_wm3d.sh stage1-audit-rollouts <audit_robocasa_real_rollouts.py 参数...>
@@ -116,7 +117,7 @@ command=${1:-}
 [[ -n "${command}" ]] || { usage; exit 2; }
 shift || true
 need_python_unless_env() {
-  [[ "${command}" == env || "${command}" == smoke-real || \
+  [[ "${command}" == env || "${command}" == smoke-real || "${command}" == 5b || \
      "${command}" == -h || "${command}" == --help || "${command}" == help ]] || need_python
 }
 need_python_unless_env
@@ -150,6 +151,7 @@ case "${command}" in
   smoke-real)
     exec "${SYSTEM_PYTHON:-python3.10}" scripts/run_real_smoke.py "$@"
     ;;
+  5b) exec bash scripts/cluster/wm3d_5b.sh "$@" ;;
   stage1-seal-selection) exec "${PYTHON_BIN}" scripts/data/seal_robocasa_stage1_selection.py "$@" ;;
   stage1-replay-authority) exec "${PYTHON_BIN}" scripts/data/replay_robocasa_stage1_authority.py "$@" ;;
   stage1-audit-rollouts) exec "${PYTHON_BIN}" scripts/data/audit_robocasa_real_rollouts.py "$@" ;;

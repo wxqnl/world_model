@@ -41,3 +41,13 @@ def test_user_facing_entrypoints_are_unversioned() -> None:
     assert "wm3d_v8/" not in readme
     assert "run_v7.sh" not in entry
     assert "run_v8.sh" not in entry
+
+
+def test_5b_operator_handoff_is_discoverable() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    entry = (ROOT / "run_wm3d.sh").read_text(encoding="utf-8")
+    assert "docs/WM3D_5B_SCALING.md" in readme
+    assert '5b) exec bash scripts/cluster/wm3d_5b.sh' in entry
+    assert (ROOT / "configs/cluster/h200_5b.env.example").is_file()
+    assert (ROOT / "configs/runtime/h200_128_fsdp2_validation10k.yaml").is_file()
+    assert (ROOT / "scripts/tools/report_5b_run.py").is_file()

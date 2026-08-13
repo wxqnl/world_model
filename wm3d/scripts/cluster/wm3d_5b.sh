@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ENTRY="${ROOT}/run_wm3d.sh"
+TEMPLATE="${ROOT}/configs/cluster/h200_5b.env.example"
+
+usage() {
+  cat <<'EOF'
+WM3D 5B 集群操作入口：
+
+  ./run_wm3d.sh 5b init <site.env>
+  ./run_wm3d.sh 5b env <site.env>
+  ./run_wm3d.sh 5b doctor <site.env>
+  ./run_wm3d.sh 5b plan <site.env>
+  ./run_wm3d.sh 5b lock <site.env>
+  ./run_wm3d.sh 5b download <site.env>
+  ./run_wm3d.sh 5b task-bank <site.env>
+  ./run_wm3d.sh 5b cache-plan <site.env>
+  ./run_wm3d.sh 5b cache-worker <site.env> <global-worker-index> <worker-count> <local-gpu|inherited>
+  ./run_wm3d.sh 5b cache-seal <site.env>
+  ./run_wm3d.sh 5b window <site.env>
+  ./run_wm3d.sh 5b normalization <site.env>
+  ./run_wm3d.sh 5b runtime <site.env>
+  ./run_wm3d.sh 5b preflight <site.env>
+  ./run_wm3d.sh 5b train <site.env> [sealed-stop-step]
+  ./run_wm3d.sh 5b resume <site.env> <checkpoint> [sealed-stop-step]
+  ./run_wm3d.sh 5b eval <site.env> <checkpoint> [output.json]
+  ./run_wm3d.sh 5b status <site.env>
+  ./run_wm3d.sh 5b verify <site.env> <expected-step> <checkpoint> <eval.json>
+
+完整顺序和多机启动示例见 docs/WM3D_5B_SCALING.md。
+EOF
+}
+
+die() {
+  echo "5b: $*" >&2
+  exit 2
+}
+
+absolute_existing_file() {
+  local value=$1
+  [[ "${value}" == /* ]] || die "site 文件必须是绝对路径：${value}"
+  [[ -f "${value}" && ! -L "${value}" ]] || die "site 文件必须是普通文件且禁止符号链接：${value}"
+}
+
+repo_path() {
+  local value=$1
+  if [[ "${value}" == /* ]]; then
+    printf '%s\n' "${value}"
+  else
+    printf '%s\n' "${ROOT}/${value}"
+  fi
+}
+
+require_var() {
+  local name=$1
+  [[ -n "${!name:-}" ]] || die "site 文件缺少 ${name}"
+}
+
+require_file() {
+  local label=$1
+  local value=$2
+  [[ -f "${value}" && ! -L "${value}" ]] || die "${label} 不存在、不是普通文件或是符号链接：${value}"
+}
+
+load_site() {
+  local site=$1
+  absolute_existing_file "${site}"
+  # Site files are operator-owned shell configuration, as in the previous cluster handoff.
+  # They must live outside Git and are never accepted as a data/model receipt.
+  set -a
+  # shellcheck disable=SC1090
+  source "${site}"
+  set +a
+  for name in WORK_ROOT CONTROL_ROOT RAW_ROOT CACHE_ROOT RUN_ROOT ENV_DIR PYTHON_BIN \
+    HF_TOKEN_FILE SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
+    TASK_BANK_INDEX TASK_MANIFEST EPISODE_INDEX EPISODE_SEAL WINDOW_INDEX WINDOW_SEAL \
+    GROUPED_NORMALIZATION RUNTIME_YAML MODEL_PROFILE ENCODER_CONTRACT \
+    TASK_ENCODER_CONTRACT OBJECTIVE_PROFILE RUNTIME_PROFILE RUN_NAME RUN_LINEAGE NNODES \
+    GPUS_PER_NODE MASTER_ADDR PREFLIGHT_PORT TRAIN_PORT EVAL_PORT; do
+    require_var "${name}"
+  done
+  SOURCE_TEMPLATE=$(repo_path "${SOURCE_TEMPLATE}")
+  DATA_TEMPLATE=$(repo_path "${DATA_TEMPLATE}")
+  MODEL_PROFILE=$(repo_path "${MODEL_PROFILE}")
+  ENCODER_CONTRACT=$(repo_path "${ENCODER_CONTRACT}")
+  TASK_ENCODER_CONTRACT=$(repo_path "${TASK_ENCODER_CONTRACT}")
+  OBJECTIVE_PROFILE=$(repo_path "${OBJECTIVE_PROFILE}")
+  RUNTIME_PROFILE=$(repo_path "${RUNTIME_PROFILE}")
+  export PYTHON_BIN HF_HOME HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
+  export WM3D_VGGT_SOURCE_ROOT WM3D_VGGT_MODEL_SNAPSHOT QWEN3_VL_EMBEDDING_PATH
+}
+
+sha256() {
+  "${PYTHON_BIN}" - "$1" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+        digest.update(block)
+print(digest.hexdigest())
+PY
+}
+
+torch_args() {
+  printf '%s\n' \
+    "--nnodes=${NNODES}" \
+    "--nproc_per_node=${GPUS_PER_NODE}" \
+    "--node_rank=${NODE_RANK:-0}" \
+    "--master_addr=${MASTER_ADDR}" \
+    "--master_port=$1"
+}
+
+action=${1:-help}
+shift || true
+
+case "${action}" in
+  init)
+    [[ $# -eq 1 ]] || { usage; exit 2; }
+    target=$1
+    [[ "${target}" == /* ]] || die "init 目标必须是绝对路径"
+    [[ ! -e "${target}" && ! -L "${target}" ]] || die "拒绝覆盖已有 site 文件：${target}"
+    mkdir -p "$(dirname "${target}")"
+    install -m 600 "${TEMPLATE}" "${target}"
+    echo "已创建 ${target}；编辑 REQUIRED 路径后运行 doctor。"
+    exit 0
+    ;;
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+[[ $# -ge 1 ]] || { usage; exit 2; }
+site=$1
+shift
+load_site "${site}"
+
+case "${action}" in
+  doctor)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    require_file "source template" "${SOURCE_TEMPLATE}"
+    require_file "data template" "${DATA_TEMPLATE}"
+    require_file "model profile" "${MODEL_PROFILE}"
+    require_file "vision encoder contract" "${ENCODER_CONTRACT}"
+    require_file "task encoder contract" "${TASK_ENCODER_CONTRACT}"
+    require_file "objective profile" "${OBJECTIVE_PROFILE}"
+    require_file "runtime profile" "${RUNTIME_PROFILE}"
+    require_file "Hugging Face token" "${HF_TOKEN_FILE}"
+    token_mode=$(stat -c '%a' "${HF_TOKEN_FILE}")
+    (( (8#${token_mode} & 8#077) == 0 )) || die "HF token 禁止 group/world 权限；推荐 chmod 600"
+    [[ -x "${PYTHON_BIN}" ]] || die "Python 环境不存在：${PYTHON_BIN}；先运行 ENV_DIR=... ./run_wm3d.sh env"
+    "${PYTHON_BIN}" -m pip check
+    "${PYTHON_BIN}" - "${MODEL_PROFILE}" "${RUNTIME_PROFILE}" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+from wm3d.models.model_factory import validate_model_profile
+from wm3d.training.runtime_contract import validate_runtime_profile
+model = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+validate_model_profile(model)
+runtime = yaml.safe_load(Path(sys.argv[2]).read_text(encoding="utf-8"))
+validate_runtime_profile(runtime)
+print(f"model={model['name']} expected_parameters={int(model['expected_parameter_count']):,}")
+print(f"world_size={runtime['expected_world_size']} total_steps={runtime['train']['total_steps']}")
+PY
+    [[ "${MASTER_ADDR}" != REQUIRED_MASTER_ADDR ]] || die "MASTER_ADDR 仍是 REQUIRED_MASTER_ADDR"
+    [[ -d "${WM3D_VGGT_SOURCE_ROOT}" && ! -L "${WM3D_VGGT_SOURCE_ROOT}" ]] || \
+      die "VGGT source root 缺失或是符号链接：${WM3D_VGGT_SOURCE_ROOT}"
+    [[ -d "${WM3D_VGGT_MODEL_SNAPSHOT}" && ! -L "${WM3D_VGGT_MODEL_SNAPSHOT}" ]] || \
+      die "VGGT model snapshot 缺失或是符号链接：${WM3D_VGGT_MODEL_SNAPSHOT}"
+    [[ -d "${QWEN3_VL_EMBEDDING_PATH}" && ! -L "${QWEN3_VL_EMBEDDING_PATH}" ]] || \
+      die "Qwen embedding snapshot 缺失或是符号链接：${QWEN3_VL_EMBEDDING_PATH}"
+    if [[ -f "${DATA_PROFILE}" && ! -L "${DATA_PROFILE}" ]]; then
+      "${PYTHON_BIN}" - "${DATA_PROFILE}" <<'PY'
+from pathlib import Path
+import sys
+from wm3d.data.manifest_contract import load_data_profile
+profile = load_data_profile(Path(sys.argv[1]))
+print(f"data_profile={profile.name} sources={len(profile.sources)} sha256={profile.profile_sha256}")
+PY
+    else
+      echo "data_profile=WAITING (${DATA_PROFILE})"
+      echo "下载可以先做；cache/training 要等项目负责人交付已审计 data profile。"
+    fi
+    command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=index,name,memory.total,ecc.errors.uncorrected.volatile.total --format=csv,noheader || true
+    df -h "${WORK_ROOT}" 2>/dev/null || true
+    ;;
+  plan)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    cat <<EOF
+WM3D 5B site plan
+  work:       ${WORK_ROOT}
+  raw:        ${RAW_ROOT}
+  data:       ${DATA_PROFILE}
+  cache:      ${CACHE_ROOT}
+  runtime:    ${RUNTIME_YAML}
+  run:        ${RUN_ROOT}
+  topology:   ${NNODES} nodes x ${GPUS_PER_NODE} GPUs
+  model:      ${MODEL_PROFILE}
+  schedule:   ${RUNTIME_PROFILE}
+
+Order:
+  env -> doctor -> lock -> download -> adapter/inventory approval
+  -> task-bank -> cache-plan -> cache-worker[*] -> cache-seal
+  -> window -> normalization -> runtime -> preflight
+  -> train(100) -> preflight -> resume(500) -> eval
+  -> preflight -> resume(10000) -> eval -> verify
+EOF
+    ;;
+  env)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    ENV_DIR="${ENV_DIR}" SYSTEM_PYTHON="${SYSTEM_PYTHON:-python3.10}" "${ENTRY}" env
+    ;;
+  lock)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    mkdir -p "${CONTROL_ROOT}"
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${ENTRY}" lock-resolve \
+      --template "${SOURCE_TEMPLATE}" --output "${SOURCE_LOCK}" \
+      --token-file "${HF_TOKEN_FILE}" --confirm-licenses
+    ;;
+  download)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    require_file "source lock" "${SOURCE_LOCK}"
+    mkdir -p "${RAW_ROOT}"
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${ENTRY}" download \
+      --lock "${SOURCE_LOCK}" --raw-root "${RAW_ROOT}" \
+      --token-file "${HF_TOKEN_FILE}" --max-workers "${DOWNLOAD_WORKERS:-8}"
+    ;;
+  task-bank)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    require_file "data profile" "${DATA_PROFILE}"
+    mkdir -p "${TASK_BANK_ROOT}"
+    CUDA_VISIBLE_DEVICES="${TASK_GPU:-0}" "${ENTRY}" task-bank \
+      --data-profile "${DATA_PROFILE}" --encoder-contract "${TASK_ENCODER_CONTRACT}" \
+      --output-root "${TASK_BANK_ROOT}" --device "${TASK_DEVICE:-cuda:0}"
+    ;;
+  cache-plan)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    require_file "data profile" "${DATA_PROFILE}"
+    require_file "task bank index" "${TASK_BANK_INDEX}"
+    "${ENTRY}" cache-plan --data-profile "${DATA_PROFILE}" \
+      --encoder-contract "${ENCODER_CONTRACT}" \
+      --task-encoder-contract "${TASK_ENCODER_CONTRACT}" \
+      --task-bank-index "${TASK_BANK_INDEX}" --output "${TASK_MANIFEST}"
+    ;;
+  cache-worker)
+    [[ $# -eq 3 ]] || { usage; exit 2; }
+    worker_index=$1
+    worker_count=$2
+    local_gpu=$3
+    require_file "cache task manifest" "${TASK_MANIFEST}"
+    require_file "task bank index" "${TASK_BANK_INDEX}"
+    task_bank_sha=$(sha256 "${TASK_BANK_INDEX}")
+    worker_command=("${ENTRY}" cache-worker \
+      --task-manifest "${TASK_MANIFEST}" --data-profile "${DATA_PROFILE}" \
+      --encoder-contract "${ENCODER_CONTRACT}" --task-bank-root "${TASK_BANK_ROOT}" \
+      --task-bank-index-sha256 "${task_bank_sha}" --cache-root "${CACHE_ROOT}" \
+      --worker-index "${worker_index}" --worker-count "${worker_count}" \
+      --device cuda:0 --batch-frames "${CACHE_BATCH_FRAMES:-2}")
+    if [[ "${local_gpu}" == inherited ]]; then
+      [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] || die "inherited 模式要求调度器设置 CUDA_VISIBLE_DEVICES"
+      "${worker_command[@]}"
+    else
+      [[ "${local_gpu}" =~ ^[0-9]+$ ]] || die "local-gpu 必须是整数或 inherited"
+      CUDA_VISIBLE_DEVICES="${local_gpu}" "${worker_command[@]}"
+    fi
+    ;;
+  cache-seal)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    "${ENTRY}" cache-seal --task-manifest "${TASK_MANIFEST}" \
+      --receipt-root "${CACHE_ROOT}/receipts" \
+      --episode-index-fragment-root "${CACHE_ROOT}/episode_index_fragments" \
+      --output-index "${EPISODE_INDEX}" --output-seal "${EPISODE_SEAL}"
+    ;;
+  window)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    "${ENTRY}" window --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
+      --cache-root "${CACHE_ROOT}" --data-profile "${DATA_PROFILE}" \
+      --model-profile "${MODEL_PROFILE}" --output-index "${WINDOW_INDEX}" \
+      --output-seal "${WINDOW_SEAL}"
+    ;;
+  normalization)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    window_sha=$(sha256 "${WINDOW_INDEX}")
+    "${ENTRY}" normalization --data-profile "${DATA_PROFILE}" \
+      --model-profile "${MODEL_PROFILE}" --window-index "${WINDOW_INDEX}" \
+      --window-index-sha256 "${window_sha}" --cache-root "${CACHE_ROOT}" \
+      --output "${GROUPED_NORMALIZATION}"
+    ;;
+  runtime)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    require_file "environment receipt" "${ENV_DIR}/environment_receipt.json"
+    mkdir -p "${CONTROL_ROOT}" "${RUN_ROOT}"
+    "${ENTRY}" runtime --model "${MODEL_PROFILE}" --data "${DATA_PROFILE}" \
+      --runtime "${RUNTIME_PROFILE}" --objective "${OBJECTIVE_PROFILE}" \
+      --cache-root "${CACHE_ROOT}" --episode-cache-index "${EPISODE_INDEX}" \
+      --episode-cache-seal "${EPISODE_SEAL}" --cache-index "${WINDOW_INDEX}" \
+      --cache-seal "${WINDOW_SEAL}" --grouped-normalization "${GROUPED_NORMALIZATION}" \
+      --environment-lock "${ENV_DIR}/environment_receipt.json" --run-name "${RUN_NAME}" \
+      --run-lineage "${RUN_LINEAGE}" --output-root "${RUN_ROOT}" --output "${RUNTIME_YAML}"
+    ;;
+  preflight)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    mapfile -t distributed < <(torch_args "${PREFLIGHT_PORT}")
+    "${ENTRY}" preflight "${distributed[@]}" -- --runtime "${RUNTIME_YAML}"
+    ;;
+  train)
+    [[ $# -le 1 ]] || { usage; exit 2; }
+    mapfile -t distributed < <(torch_args "${TRAIN_PORT}")
+    app=(--runtime "${RUNTIME_YAML}")
+    [[ $# -eq 0 ]] || app+=(--stop-after-step "$1")
+    "${ENTRY}" train "${distributed[@]}" -- "${app[@]}"
+    ;;
+  resume)
+    [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 2; }
+    checkpoint=$1
+    mapfile -t distributed < <(torch_args "${TRAIN_PORT}")
+    app=(--runtime "${RUNTIME_YAML}" --resume "${checkpoint}")
+    [[ $# -eq 1 ]] || app+=(--stop-after-step "$2")
+    "${ENTRY}" train "${distributed[@]}" -- "${app[@]}"
+    ;;
+  eval)
+    [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 2; }
+    checkpoint=$1
+    output=${2:-${EVAL_OUTPUT}}
+    mapfile -t distributed < <(torch_args "${EVAL_PORT}")
+    "${ENTRY}" eval "${distributed[@]}" -- --runtime "${RUNTIME_YAML}" \
+      --checkpoint "${checkpoint}" --output "${output}"
+    ;;
+  status)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    args=(--allow-incomplete --data-profile "${DATA_PROFILE}" --task-manifest "${TASK_MANIFEST}" \
+      --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
+      --window-index "${WINDOW_INDEX}" --window-seal "${WINDOW_SEAL}" \
+      --runtime "${RUNTIME_YAML}" --run-root "${RUN_ROOT}")
+    [[ ! -f "${EVAL_OUTPUT}" ]] || args+=(--eval "${EVAL_OUTPUT}")
+    "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_5b_run.py" "${args[@]}"
+    ;;
+  verify)
+    [[ $# -eq 3 ]] || { usage; exit 2; }
+    expected_step=$1
+    checkpoint=$2
+    eval_receipt=$3
+    "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_5b_run.py" \
+      --data-profile "${DATA_PROFILE}" --task-manifest "${TASK_MANIFEST}" \
+      --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
+      --window-index "${WINDOW_INDEX}" --window-seal "${WINDOW_SEAL}" \
+      --runtime "${RUNTIME_YAML}" --run-root "${RUN_ROOT}" \
+      --expected-step "${expected_step}" --checkpoint "${checkpoint}" \
+      --eval "${eval_receipt}" --require-complete
+    ;;
+  *) usage; exit 2 ;;
+esac

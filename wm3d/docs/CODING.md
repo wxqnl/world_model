@@ -3,6 +3,7 @@
 - `README.md` is the short operational overview.
 - `WM3D_FROM_ZERO.md` is the authoritative data-to-checkpoint procedure.
 - `WM3D_SCALING.md` owns model sizing and distributed topology.
+- `WM3D_5B_SCALING.md` is the operator handoff for data, cache, 10K validation, and results.
 - `WM3D_STAGE1_UNIFIED.md` owns the Stage0-to-Stage1 workflow.
 - `WM3D_RELEASE_VALIDATION.md` records evidence and the boundary between pipeline correctness
   and model quality.

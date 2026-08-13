@@ -131,7 +131,9 @@ preflight，之后使用相同 rendezvous 参数启动训练：
 ```
 
 恢复必须指向含 `COMMITTED.json` 的完整编号 DCP，不接受 `latest`。128×H200 正式训练按
-canary → validation → formal 逐级提升，详见 [统一训练与扩展](docs/WM3D_SCALING.md)。
+canary → validation → formal 逐级提升。第一次接手集群运行时直接使用
+[5B 从数据到 10K 验证训练](docs/WM3D_5B_SCALING.md)；模型规模和分布式设计见
+[统一训练与扩展](docs/WM3D_SCALING.md)。
 
 ## Stage1 规划
 
