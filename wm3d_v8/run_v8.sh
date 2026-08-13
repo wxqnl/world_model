@@ -35,6 +35,8 @@ WM3D V8 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_v8.sh eval <torchrun 参数...> -- <评测参数...>
   ./run_v8.sh smoke-real --work-root <空目录> --operator <姓名或工号> \
     --accept-dataset-license --confirm-adapter-semantics [--gpus 0,1]
+  ./run_v8.sh stage1-seal-selection <正式四 root selection seal 参数...>
+  ./run_v8.sh stage1-replay-authority <真实 simulator replay 参数...>
   ./run_v8.sh stage1-audit-rollouts <audit_robocasa_real_rollouts.py 参数...>
   ./run_v8.sh stage1-produce <produce_wm3d_v8_robocasa_stage1_candidates.py 参数...>
   ./run_v8.sh stage1-materialize <materialize_wm3d_v8_stage1_branches.py 参数...>
@@ -148,6 +150,8 @@ case "${command}" in
   smoke-real)
     exec "${SYSTEM_PYTHON:-python3.10}" scripts/run_real_smoke.py "$@"
     ;;
+  stage1-seal-selection) exec "${PYTHON_BIN}" scripts/data/seal_robocasa_stage1_selection.py "$@" ;;
+  stage1-replay-authority) exec "${PYTHON_BIN}" scripts/data/replay_robocasa_stage1_authority.py "$@" ;;
   stage1-audit-rollouts) exec "${PYTHON_BIN}" scripts/data/audit_robocasa_real_rollouts.py "$@" ;;
   stage1-produce) exec "${PYTHON_BIN}" scripts/produce_wm3d_v8_robocasa_stage1_candidates.py "$@" ;;
   stage1-materialize) exec "${PYTHON_BIN}" scripts/materialize_wm3d_v8_stage1_branches.py "$@" ;;

@@ -165,7 +165,7 @@ all-reduce。缺一项即停止，不能直接跳到 600K。
 
 Stage1 不读取旧 V7 `[*,384]` codec，也不保留固定 H32/7D/单臂路径。它从同一 sealed Stage0 runtime 与 committed DCP 加载冻结世界模型，在真实 simulator 候选的显式 native 3D future evidence 上训练 action-blind planner；`H` 必须落在 Stage0 已训练的单次 `K` 内。
 
-真实 branch receipt、materialize、DCP exact resume 和 eval 门禁见 [Stage1 统一规划手册](docs/WM3D_V8_STAGE1_UNIFIED.md)。完整入口为 `stage1-audit-rollouts` → `stage1-produce` → `stage1-materialize` → `stage1-train` → `stage1-eval`。历史 quick/v7 receipt 只是旧 schema 的开发记录，与当前 branch v3、generator receipt v2 和 rollout-audit SHA 闭包不兼容，不能用作当前发布 authority。
+真实 branch receipt、materialize、DCP exact resume 和 eval 门禁见 [Stage1 统一规划手册](docs/WM3D_V8_STAGE1_UNIFIED.md)。完整入口为 `stage1-seal-selection` → `stage1-replay-authority` → `stage1-audit-rollouts` → `stage1-produce` → `stage1-materialize` → `stage1-train` → `stage1-eval`。replay 必须在封存的 RoboCasa Python/环境中重新执行全部候选；旧 runtime 自报的 gate 不能替代独立 replay authority。历史 quick/v7 receipt 只是旧 schema 的开发记录，与当前 branch v3、generator receipt v2 和 rollout-audit SHA 闭包不兼容，不能用作当前发布 authority。
 
 ## 下游继承
 

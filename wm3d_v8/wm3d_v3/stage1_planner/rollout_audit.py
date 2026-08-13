@@ -13,7 +13,7 @@ import uuid
 from wm3d_v3.data.manifest_contract import SHA256_RE, canonical_sha256
 
 
-ROLLOUT_AUDIT_SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v2"
+ROLLOUT_AUDIT_SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v3"
 ROLLOUT_AUDIT_FIELDS = {
     "schema", "code_commit", "runtime_root",
     "launch_receipt_path", "launch_receipt_sha256",
@@ -22,6 +22,8 @@ ROLLOUT_AUDIT_FIELDS = {
     "action_audit_path", "action_audit_sha256",
     "candidate_index_path", "candidate_index_sha256",
     "candidate_index_seal_path", "candidate_index_seal_sha256",
+    "replay_authority_path", "replay_authority_sha256",
+    "selection_manifest_path", "selection_manifest_sha256",
     "source_roots", "source_metadata_sha256",
     "simulator_revision", "simulator_revision_sha256", "camera_order",
     "simulator_action_order", "source_action_order",
@@ -41,6 +43,7 @@ ROLLOUT_AUDIT_ROW_FIELDS = {
     "future_observation_leakage", "outcome_indices",
     "future_offsets_seconds", "branch_rgb_indices",
     "source_future_row_offsets", "candidate_count",
+    "replay_authority_row_sha256",
 }
 _ROW_TRUE_GATES = {
     "factual_simulator_action_source_byte_exact",
@@ -354,6 +357,32 @@ class TrustedOutputRoot:
         os.close(current)
         return absolute
 
+    def pin_directory(
+        self, target: Path, *, label: str
+    ) -> tuple[tuple[str, ...], tuple[tuple[int, int], ...]]:
+        """Create and return a namespace identity that can span a subprocess."""
+        _absolute, parts = self._relative_parts(target)
+        self._verify_namespace()
+        descriptor, identities = self._open_relative_directory(
+            parts, create=True, label=label
+        )
+        os.close(descriptor)
+        return parts, identities
+
+    def verify_pinned_directory(
+        self,
+        pin: tuple[tuple[str, ...], tuple[tuple[int, int], ...]],
+        *,
+        label: str,
+    ) -> None:
+        """Fail if a pinned child directory or any ancestor was replaced."""
+        parts, identities = pin
+        self._verify_namespace()
+        descriptor = self._reopen_matching_relative_directory(
+            parts, identities, label=label
+        )
+        os.close(descriptor)
+
     def read(self, target: Path, *, label: str) -> tuple[Path, bytes, str]:
         absolute, parts = self._relative_parts(target)
         self._verify_namespace()
@@ -462,10 +491,9 @@ class TrustedOutputRoot:
 
 
 def _sha(value: object, label: str) -> str:
-    text = str(value)
-    if SHA256_RE.fullmatch(text) is None:
-        raise RolloutAuditError(f"{label} must be lowercase SHA256")
-    return text
+    if type(value) is not str or SHA256_RE.fullmatch(value) is None:
+        raise RolloutAuditError(f"{label} must be a lowercase SHA256 string")
+    return value
 
 
 def read_regular_bytes(path: Path, label: str) -> tuple[Path, bytes, str]:
@@ -530,6 +558,28 @@ def validate_rollout_audit(
         raise RolloutAuditError("rollout audit schema/pass mismatch")
     if audit["code_commit"] != expected_code_commit:
         raise RolloutAuditError("rollout audit code commit differs from Stage0 runtime")
+    from wm3d_v3.stage1_planner.replay_authority import load_replay_authority
+
+    authority_sha = _sha(
+        audit["replay_authority_sha256"], "replay authority SHA"
+    )
+    authority_rows: dict[str, dict[str, Any]] = {}
+    if verify_referents:
+        authority, observed_authority_sha = load_replay_authority(
+            Path(audit["replay_authority_path"]),
+            expected_code_commit=expected_code_commit,
+        )
+        if observed_authority_sha != authority_sha:
+            raise RolloutAuditError("replay authority SHA mismatch")
+        if (
+            audit["selection_manifest_path"]
+            != authority["selection_manifest_path"]
+            or audit["selection_manifest_sha256"]
+            != authority["selection_manifest_sha256"]
+        ):
+            raise RolloutAuditError("rollout audit selection manifest mismatch")
+        authority_rows = {row["root_id"]: row for row in authority["rows"]}
+    _sha(audit["selection_manifest_sha256"], "selection manifest SHA")
     runtime_root = Path(str(audit["runtime_root"]))
     if runtime_root.is_symlink() or not runtime_root.is_dir():
         raise RolloutAuditError("rollout audit runtime root is invalid")
@@ -593,7 +643,7 @@ def validate_rollout_audit(
     if (
         not isinstance(counts, dict)
         or set(counts) != _SPLITS
-        or any(not isinstance(counts[split], int) or counts[split] <= 0 for split in _SPLITS)
+        or any(type(counts[split]) is not int or counts[split] <= 0 for split in _SPLITS)
         or not isinstance(rows, list)
         or not rows
         or sum(counts.values()) != len(rows)
@@ -622,6 +672,7 @@ def validate_rollout_audit(
             "runtime_index_row_sha256", "root_context_sha256", "root_state_sha256",
             "model_xml_sha256", "ep_meta_sha256", "candidate_payload_sha256",
             "candidate_index_row_sha256", "source_action_slice_sha256",
+            "replay_authority_row_sha256",
         ):
             _sha(row[field], f"row {row_number} {field}")
         if any(row[field] is not True for field in _ROW_TRUE_GATES):
@@ -643,7 +694,7 @@ def validate_rollout_audit(
         if len({len(value) for value in sequences}) != 1:
             raise RolloutAuditError(f"rollout audit row {row_number} offset lengths differ")
         if any(
-            not isinstance(value, int) or value < 0
+            type(value) is not int or value < 0
             for field in ("outcome_indices", "branch_rgb_indices", "source_future_row_offsets")
             for value in row[field]
         ):
@@ -669,8 +720,44 @@ def validate_rollout_audit(
                     Path(row[f"{field}_path"]), row[f"{field}_sha256"],
                     f"row {row_number} {field}",
                 )
+        if verify_referents:
+            authority_row = authority_rows.get(root_id)
+            if authority_row is None:
+                raise RolloutAuditError(
+                    f"rollout audit row {row_number} lacks replay authority"
+                )
+            if canonical_sha256(authority_row) != row["replay_authority_row_sha256"]:
+                raise RolloutAuditError(
+                    f"rollout audit row {row_number} replay authority row mismatch"
+                )
+            authority_bindings = {
+                "split": split,
+                "root_id": root_id,
+                "episode_id": row["episode_id"],
+                "t0": row["t0"],
+                "candidate_seed": row["candidate_seed"],
+                "candidate_payload_sha256": row["candidate_payload_sha256"],
+                "root_context_sha256": row["root_context_sha256"],
+                "legacy_runtime_payload_sha256": row["runtime_payload_sha256"],
+                "legacy_runtime_index_shard_sha256": row[
+                    "runtime_index_shard_sha256"
+                ],
+                "legacy_runtime_index_row_sha256": row[
+                    "runtime_index_row_sha256"
+                ],
+                "candidate_count": row["candidate_count"],
+            }
+            if any(
+                authority_row.get(name) != expected
+                for name, expected in authority_bindings.items()
+            ):
+                raise RolloutAuditError(
+                    f"rollout audit row {row_number} differs from replay authority"
+                )
     if observed_counts != counts:
         raise RolloutAuditError("rollout audit row split counts mismatch")
+    if verify_referents and set(authority_rows) != seen_roots:
+        raise RolloutAuditError("rollout audit/replay authority coverage mismatch")
     period = audit["simulator_action_period_seconds"]
     if (
         isinstance(period, bool)

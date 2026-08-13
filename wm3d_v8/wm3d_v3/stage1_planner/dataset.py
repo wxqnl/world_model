@@ -51,10 +51,9 @@ def validate_rollout_audit_binding(
 
 
 def _sha(value: object, label: str) -> str:
-    text = str(value)
-    if SHA256_RE.fullmatch(text) is None:
-        raise Stage1BranchError(f"{label} must be lowercase SHA256")
-    return text
+    if type(value) is not str or SHA256_RE.fullmatch(value) is None:
+        raise Stage1BranchError(f"{label} must be a lowercase SHA256 string")
+    return value
 
 
 def _regular_sha(path: Path, expected: str, label: str) -> tuple[Path, bytes]:
@@ -164,6 +163,18 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             raise Stage1BranchError("branch seal fields mismatch")
         if seal["schema"] != BRANCH_SEAL_SCHEMA:
             raise Stage1BranchError("branch seal schema mismatch")
+        sealed_index = seal["branch_index_path"]
+        if type(sealed_index) is not str or not sealed_index:
+            raise Stage1BranchError("branch seal index path must be a string")
+        sealed_index_path = Path(sealed_index)
+        if sealed_index_path.is_symlink():
+            raise Stage1BranchError("branch seal index path must not be a symlink")
+        try:
+            sealed_index_path = sealed_index_path.resolve(strict=True)
+        except OSError as error:
+            raise Stage1BranchError("branch seal index path is not a regular file") from error
+        if sealed_index_path != index_path:
+            raise Stage1BranchError("branch seal index path differs from opened index")
         bindings = {
             "branch_index_sha256": cfg.branch_index_sha256,
             "runtime_config_sha256": cfg.runtime_config_sha256,
@@ -185,11 +196,17 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
         if (
             not isinstance(counts, dict)
             or set(counts) != {"train", "val", "test"}
-            or any(int(value) < 0 for value in counts.values())
-            or sum(int(value) for value in counts.values()) != int(seal["row_count"])
+            or any(type(value) is not int or value < 0 for value in counts.values())
+            or type(seal["row_count"]) is not int
+            or sum(counts.values()) != seal["row_count"]
         ):
             raise Stage1BranchError("branch seal split counts are invalid")
-        if int(seal["candidate_count"]) < 2 or int(seal["horizon"]) <= 0:
+        if (
+            type(seal["candidate_count"]) is not int
+            or seal["candidate_count"] < 2
+            or type(seal["horizon"]) is not int
+            or seal["horizon"] <= 0
+        ):
             raise Stage1BranchError("branch seal candidate/horizon contract is invalid")
 
         rows: list[dict[str, Any]] = []

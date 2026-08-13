@@ -87,3 +87,31 @@ notes:
   cadence_contract: 保留源数据和 simulator 的实测/封存时钟，不写死全局 world/action 频率
   selection_contract: 只允许显式 episode-index 文件，receipt 绑定 episode 列表与源 payload SHA
   state_contract: relative quaternion 和 gripper qpos 保持 controller_state，不猜测 6D 旋转
+  stage1_selection_policy:
+    schema: wm3d_v8_robocasa_stage1_selection_policy_v1
+    expected_split_counts: {train: 2, val: 1, test: 1}
+    expected_data_profile_sha256: 587a71d04ae9bc9085ec8c9c42ac130724a1963d79604e4180e29f54bf9847ba
+    expected_candidate_index_sha256: 1756213472aa13ef1a198dd1ad531684f3bb6dd6fd949d8cf15feaf326728907
+    expected_candidate_seal_sha256: f6515f5bac073de9ce365939fe844b90f199608bbb3dc08496ed6534706cc1f7
+    expected_stage0_checkpoint_sha256: e1514a4b8ad42c6f47f71a785a1c4402c6d2ec43de2d22062a4671ee953592f9
+    rows:
+      - split: train
+        source: robocasa_stage1_real_blender
+        root_id: 0f7bc10ffdb26aea844e26db968ca0b02501ca6f75a47239d2de97b4419a806e
+        episode_id: 81
+        t0: 110
+      - split: train
+        source: robocasa_stage1_real_coffee
+        root_id: 00a4ce768aa20f3997801cb7267674c0f7fdc382c4ce086c304bf5fd8fc244fd
+        episode_id: 9
+        t0: 141
+      - split: val
+        source: robocasa_stage1_real_blender
+        root_id: 09db4a79e6c97d63908918fb1682f501d1e976f58cb4ce66f646185fa83f2e9d
+        episode_id: 61
+        t0: 85
+      - split: test
+        source: robocasa_stage1_real_blender
+        root_id: 8bdf49d27e4f3e66254fbe2e1e913e00f918f1a5ae8bc6c355c46b352bb810fc
+        episode_id: 95
+        t0: 69

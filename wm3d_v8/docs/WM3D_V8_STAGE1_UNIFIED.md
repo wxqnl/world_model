@@ -52,7 +52,7 @@ Stage1 不可能从一条离线 demonstration 安全推导 counterfactual 成功
 
 仓库提供的是“重新审计和重新编码”入口，不把旧 V7 的 `D=384` token 当作 V8 数据。已跑通的最小发布验证使用两个独立 source：`OpenBlenderLid` 提供 train/val/test 各一个真实 same-root simulator root，`CoffeeServeMug` 再提供一个独立 train root，最终 selection 为 train 2、val 1、test 1。这样 world2 的训练 batch 不依赖复制、有放回采样或跨 source 伪装。顺序如下：
 
-1. 用 `stage1-audit-rollouts` 校验旧 runtime NPZ 的 payload SHA、root-context SHA、candidate index/seal、真实 simulator revision、执行 seed、真实 RGB/reward/done/success；factual branch 的 12D simulator command 必须重排后与源 LeRobot action 行逐字节相同。
+1. 先用 `stage1-seal-selection` 把受审的四-root profile 与 materialized data profile、两份 source manifest/episode、candidate index/seal/payload 和 root context 封成不可覆盖 selection。该入口固定要求 train 2、val 1、test 1；任意临时 CLI 自选、三-root 子集或跨 source/split 伪装都会被拒。再用 `stage1-replay-authority` 在封存的 RoboCasa Python/环境里，对 selection 中每个 root 的 11 个候选重新调用 pinned generator 真执行。新执行的 action、root state/render、RGB、reward/done/success 是 authority；旧 runtime 只保留为诊断 provenance，不决定通过与否。这里只允许 generator 自身对 t0 root RGB 使用已封存的 renderer-equivalence 合同，future RGB 不放宽。随后 `stage1-audit-rollouts` 必须消费这份独立 authority，才可校验 source action 和后续 closure。
 2. 用 `configs/adapters/robocasa_panda_omron_real_rollout.yaml` 分别对两个 source 的四个 episode 建立严格 source inventory。action 审计已封存末端平移/旋转单位、robot-base 坐标系与 gripper 极性；base、controller mode 与 current-state 字段仍由上游 `modality.json` / `embodiment.json` 的 SHA 约束。
 3. 用 `configs/model/native_1b_stage1_real_k8_5p6s.yaml` 建 Stage0 window。这里的八个 future state 是源数据中真实存在的非均匀时间点 `0.6/1.4/2.0/2.8/3.4/4.2/4.8/5.6s`；没有插值、补帧、重排或修改 K。
 4. 完成同一 RoboCasa data profile 的 episode cache、window index、grouped normalization、sealed runtime，并从该 runtime 训练一个 committed Stage0 DCP。ALOHA 或其他数据的 DCP 不能替代。
@@ -66,6 +66,35 @@ CANARY=$BASE/manifests/canary_stage1p_from_s0_45k_20260808
 STAGE1_ROOT=/data/Minko/wm3d_v8_stage1_real_closure_20260813
 CODE_COMMIT="$(git rev-parse HEAD)"
 
+./run_v8.sh stage1-seal-selection \
+  --code-commit "$CODE_COMMIT" \
+  --selection-policy configs/data/stage1_robocasa_real_4roots.template.yaml \
+  --data-profile "$STAGE1_ROOT/data_profile_4roots.yaml" \
+  --candidate-index "$CANARY/success_pool_candidates_valid_v1/index.jsonl" \
+  --candidate-index-seal "$CANARY/success_pool_candidates_valid_v1/index.seal.json" \
+  --output "$STAGE1_ROOT/selection.seal.json"
+
+./run_v8.sh stage1-replay-authority \
+  --code-commit "$CODE_COMMIT" \
+  --code-repo "$(git rev-parse --show-toplevel)" \
+  --runtime-root "$CANARY/success_pool_runtime_v2" \
+  --runtime-generator "$BASE/scripts/generate_robocasa_stage1_planner_branches.py" \
+  --replay-helper "$BASE/scripts/generate_robocasa_same_root_cf.py" \
+  --adapter-loader scripts/data/robocasa_stage1_adapter_loader.py \
+  --v7-action-contract "$BASE/wm3d_v3/data/v7_action_contract.py" \
+  --v7-contracts "$BASE/wm3d_v3/data/v7_contracts.py" \
+  --action-bridge "$BASE/wm3d_v3/stage1_planner/action_bridge.py" \
+  --simulator-python /data/Minko/.venvs/robocasa_cf/bin/python \
+  --simulator-site-packages /data/Minko/.venvs/robocasa_cf/lib/python3.10/site-packages \
+  --robocasa-source-root /data/Minko/third_party/robocasa-8f3c96ec8d1bfcd8126cad2bca887da98d30e997 \
+  --robosuite-source-root /data/Minko/third_party/robosuite-6c10ef24a4bb52f59199976125060ce793470e6e \
+  --action-audit /data/Minko/world_model/wm3d_v7/manifests/audits/robocasa365_atomic_factual_action_v2.json \
+  --candidate-index "$CANARY/success_pool_candidates_valid_v1/index.jsonl" \
+  --candidate-index-seal "$CANARY/success_pool_candidates_valid_v1/index.seal.json" \
+  --selection-manifest "$STAGE1_ROOT/selection.seal.json" \
+  --output-root "$STAGE1_ROOT/replay_authority_runtime" \
+  --output "$STAGE1_ROOT/replay_authority.json"
+
 ./run_v8.sh stage1-audit-rollouts \
   --code-commit "$CODE_COMMIT" \
   --runtime-root "$CANARY/success_pool_runtime_v2" \
@@ -75,12 +104,10 @@ CODE_COMMIT="$(git rev-parse HEAD)"
   --action-audit /data/Minko/world_model/wm3d_v7/manifests/audits/robocasa365_atomic_factual_action_v2.json \
   --candidate-index "$CANARY/success_pool_candidates_valid_v1/index.jsonl" \
   --candidate-index-seal "$CANARY/success_pool_candidates_valid_v1/index.seal.json" \
+  --replay-authority "$STAGE1_ROOT/replay_authority.json" \
+  --selection-manifest "$STAGE1_ROOT/selection.seal.json" \
   --source-root robocasa_stage1_real_blender=/data/Minko/datasets/robocasa365_source/pretrain/atomic/OpenBlenderLid/20250822/lerobot \
   --source-root robocasa_stage1_real_coffee=/data/Minko/datasets/robocasa365_source/pretrain/atomic/CoffeeServeMug/20250819/lerobot \
-  --selection train=0f7bc10ffdb26aea844e26db968ca0b02501ca6f75a47239d2de97b4419a806e \
-  --selection train=00a4ce768aa20f3997801cb7267674c0f7fdc382c4ce086c304bf5fd8fc244fd \
-  --selection val=09db4a79e6c97d63908918fb1682f501d1e976f58cb4ce66f646185fa83f2e9d \
-  --selection test=8bdf49d27e4f3e66254fbe2e1e913e00f918f1a5ae8bc6c355c46b352bb810fc \
   --output "$STAGE1_ROOT/rollout_audit.json"
 ```
 

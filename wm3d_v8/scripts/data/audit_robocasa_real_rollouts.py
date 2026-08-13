@@ -23,11 +23,192 @@ from wm3d_v3.stage1_planner.rollout_audit import (
     publish_no_clobber,
     read_regular_bytes,
 )
+from wm3d_v3.stage1_planner.replay_authority import load_replay_authority
 from wm3d_v3.training.launch_qualification import verify_clean_runtime_checkout
 
 
 SCHEMA = ROLLOUT_AUDIT_SCHEMA
 RUNTIME_SCHEMA = "wm3d_v7_stage1_planner_same_root_runtime_v3"
+LAUNCH_SCHEMA = "wm3d_v7_stage1p_success_pool_runtime_launch_world16_v2"
+CANDIDATE_SCHEMA = "wm3d_v7_stage1_planner_candidates_v2"
+CANDIDATE_SEAL_SCHEMA = "wm3d_v7_stage1_planner_index_seal_v1"
+_LAUNCH_FIELDS = {
+    "schema", "host_rank", "num_shards", "first_shard", "last_shard",
+    "gpu_ids", "pids", "runtime_generator_sha256", "replay_helper_sha256",
+    "candidate_index_sha256", "candidate_seal_sha256",
+    "stage0_checkpoint_sha256", "roots", "branches_per_root", "future_frames",
+    "same_root_simulator_state_exact", "same_root_render_state_exact",
+    "same_root_rgb_canonicalized", "root_rgb_equivalence_contract",
+    "root_rgb_canonical_source", "candidate_actions_executed_exact",
+    "counterfactual_pose_space", "simulator_bounds_exact", "pseudo_outcomes",
+    "future_observation_leakage", "success_aligned_screening",
+    "terminal_unrecorded_next_state_diagnostic_skipped", "pass",
+}
+_CANDIDATE_SEAL_FIELDS = {
+    "schema", "kind", "output", "output_sha256", "roots", "splits",
+    "payload_schema", "stage0_checkpoint_sha256", "input_indices", "passed",
+}
+_CANDIDATE_FIELDS = {
+    "schema", "root_id", "candidate_path", "payload_sha256", "split",
+    "split_group", "task", "task_text", "source_dataset", "episode_id",
+    "episode_root_index", "t0", "branch_roles", "candidate_seed",
+    "flow_sample_stream_indices", "rejected_flow_samples", "max_flow_attempts",
+    "root_context_path", "root_context_sha256", "root_context_index_sha256",
+    "stage0_checkpoint", "stage0_checkpoint_sha256", "model_config_sha256",
+    "action_audit_sha256", "action_stats_sha256", "future_frames",
+    "h32_factual_available", "counterfactual_pose_space",
+    "simulator_executable_all_candidates", "future_observation_leakage",
+    "max_candidate_roundtrip_pose_abs_error",
+}
+_RUNTIME_FIELDS = {
+    "schema", "root_id", "path", "split", "split_group", "task", "task_text",
+    "source_dataset", "root_context_path", "root_context_sha256", "episode_id",
+    "episode_root_index", "t0", "branch_roles", "branches", "context_frames",
+    "future_frames", "h32_factual_available", "same_root_current_runtime_exact",
+    "same_root_simulator_state_exact", "same_root_render_state_exact",
+    "root_rgb_equivalence_contract", "root_rgb_equivalence_all_passed",
+    "same_root_rgb_canonicalized", "root_rgb_canonical_source",
+    "simulator_bounds_exact", "candidate_actions_executed_exact",
+    "counterfactual_pose_space", "pseudo_outcomes", "future_observation_leakage",
+    "outcome_source", "terminal_positive_branches", "terminal_negative_branches",
+    "mixed_terminal_outcomes", "root_state_sha256", "model_xml_sha256",
+    "ep_meta_sha256", "root_render_state_sha256", "root_rgb_sha256",
+    "root_rgb_raw_sha256", "max_root_rgb_changed_fraction",
+    "max_root_rgb_mean_abs", "max_root_rgb_rmse", "max_root_rgb_p99_abs",
+    "min_root_rgb_psnr_db", "candidate_index_sha256", "candidate_payload_sha256",
+    "payload_sha256", "action_audit_sha256", "stage0_checkpoint_sha256",
+    "max_roundtrip_pose_abs_error",
+}
+
+
+def _exact_int(value: object, label: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise RuntimeError(f"{label} must be an integer >= {minimum}")
+    return value
+
+
+def _sha(value: object, label: str) -> str:
+    if type(value) is not str or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise RuntimeError(f"{label} must be a lowercase SHA256 string")
+    return value
+
+
+def _validate_launch(
+    launch: object,
+    *,
+    generator_sha256: str,
+    helper_sha256: str,
+    candidate_index_sha256: str,
+    candidate_seal_sha256: str,
+    candidate_seal: dict,
+) -> dict:
+    if not isinstance(launch, dict) or set(launch) != _LAUNCH_FIELDS:
+        raise RuntimeError("legacy launch receipt exact fields mismatch")
+    if launch["schema"] != LAUNCH_SCHEMA or launch["pass"] is not True:
+        raise RuntimeError("legacy launch receipt schema/pass mismatch")
+    for name in (
+        "runtime_generator_sha256", "replay_helper_sha256",
+        "candidate_index_sha256", "candidate_seal_sha256",
+        "stage0_checkpoint_sha256",
+    ):
+        _sha(launch[name], f"legacy launch {name}")
+    expected = {
+        "runtime_generator_sha256": generator_sha256,
+        "replay_helper_sha256": helper_sha256,
+        "candidate_index_sha256": candidate_index_sha256,
+        "candidate_seal_sha256": candidate_seal_sha256,
+        "stage0_checkpoint_sha256": candidate_seal["stage0_checkpoint_sha256"],
+        "roots": candidate_seal["roots"],
+        "branches_per_root": 11,
+        "future_frames": 32,
+    }
+    if any(launch[name] != value for name, value in expected.items()):
+        raise RuntimeError("legacy launch differs from candidate closure")
+    for name in (
+        "host_rank", "num_shards", "first_shard", "last_shard", "roots",
+        "branches_per_root", "future_frames",
+    ):
+        _exact_int(launch[name], f"legacy launch {name}")
+    if (
+        not isinstance(launch["gpu_ids"], list)
+        or not launch["gpu_ids"]
+        or any(type(value) is not int or value < 0 for value in launch["gpu_ids"])
+        or not isinstance(launch["pids"], list)
+        or len(launch["pids"]) != len(launch["gpu_ids"])
+        or any(type(value) is not int or value <= 0 for value in launch["pids"])
+        or launch["num_shards"] <= launch["last_shard"]
+        or launch["first_shard"] > launch["last_shard"]
+    ):
+        raise RuntimeError("legacy launch shard/process closure is invalid")
+    true_gates = {
+        "same_root_simulator_state_exact", "same_root_render_state_exact",
+        "same_root_rgb_canonicalized", "candidate_actions_executed_exact",
+        "simulator_bounds_exact", "success_aligned_screening",
+        "terminal_unrecorded_next_state_diagnostic_skipped",
+    }
+    if any(launch[name] is not True for name in true_gates):
+        raise RuntimeError("legacy launch gate failed")
+    if launch["pseudo_outcomes"] is not False or launch["future_observation_leakage"] is not False:
+        raise RuntimeError("legacy launch is not causal real supervision")
+    if (
+        launch["counterfactual_pose_space"] != "physical_canonical_6d"
+        or launch["root_rgb_canonical_source"] != "sealed_root_context"
+        or type(launch["root_rgb_equivalence_contract"]) is not str
+    ):
+        raise RuntimeError("legacy launch action/RGB contract mismatch")
+    return launch
+
+
+def _validate_candidate_seal(
+    seal: object,
+    *,
+    index_path: Path,
+    index_sha256: str,
+) -> dict:
+    if not isinstance(seal, dict) or set(seal) != _CANDIDATE_SEAL_FIELDS:
+        raise RuntimeError("candidate index seal exact fields mismatch")
+    if (
+        seal["schema"] != CANDIDATE_SEAL_SCHEMA
+        or seal["passed"] is not True
+        or seal["kind"] != "candidates"
+        or seal["payload_schema"] != CANDIDATE_SCHEMA
+    ):
+        raise RuntimeError("candidate index seal schema/pass mismatch")
+    _sha(seal["output_sha256"], "candidate seal output SHA")
+    _sha(seal["stage0_checkpoint_sha256"], "candidate seal Stage0 SHA")
+    if type(seal["output"]) is not str:
+        raise RuntimeError("candidate seal output path must be a string")
+    output = Path(seal["output"])
+    if output.is_symlink() or output.resolve(strict=True) != index_path:
+        raise RuntimeError("candidate index seal output path mismatch")
+    if seal["output_sha256"] != index_sha256:
+        raise RuntimeError("candidate index seal output SHA mismatch")
+    roots = _exact_int(seal["roots"], "candidate seal roots", minimum=1)
+    splits = seal["splits"]
+    if (
+        not isinstance(splits, dict)
+        or set(splits) != {"train", "val", "test"}
+        or any(type(value) is not int or value < 0 for value in splits.values())
+        or sum(splits.values()) != roots
+    ):
+        raise RuntimeError("candidate seal split counts mismatch")
+    inputs = seal["input_indices"]
+    if not isinstance(inputs, list) or not inputs:
+        raise RuntimeError("candidate seal input closure is empty")
+    for value in inputs:
+        if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+            raise RuntimeError("candidate seal input fields mismatch")
+        if type(value["path"]) is not str:
+            raise RuntimeError("candidate seal input path must be a string")
+        _sha(value["sha256"], "candidate seal input SHA")
+        _path, _payload, observed = read_regular_bytes(
+            Path(value["path"]), "candidate seal input"
+        )
+        if observed != value["sha256"]:
+            raise RuntimeError("candidate seal input SHA mismatch")
+    return seal
 
 
 def _publish(path: Path, value: dict) -> None:
@@ -77,10 +258,32 @@ def _candidate_rows(payload: bytes, path: Path) -> dict[str, dict]:
         root_id = str(row.get("root_id", ""))
         if not root_id or root_id in result:
             raise RuntimeError(f"invalid/duplicate candidate root at {path}:{line_number}")
-        if row.get("schema") != "wm3d_v7_stage1_planner_candidates_v2":
+        if not isinstance(row, dict) or set(row) != _CANDIDATE_FIELDS:
+            raise RuntimeError(f"candidate index fields mismatch at {path}:{line_number}")
+        if row.get("schema") != CANDIDATE_SCHEMA:
             raise RuntimeError(f"candidate index schema mismatch at {path}:{line_number}")
-        if not isinstance(row.get("candidate_seed"), int):
+        if type(row.get("candidate_seed")) is not int:
             raise RuntimeError(f"candidate seed is absent at {path}:{line_number}")
+        for field in (
+            "root_id", "payload_sha256", "root_context_sha256",
+            "root_context_index_sha256", "stage0_checkpoint_sha256",
+            "model_config_sha256", "action_audit_sha256", "action_stats_sha256",
+        ):
+            _sha(row[field], f"candidate row {field}")
+        for field in (
+            "episode_id", "episode_root_index", "t0", "candidate_seed",
+            "rejected_flow_samples", "max_flow_attempts", "future_frames",
+        ):
+            _exact_int(row[field], f"candidate row {field}")
+        if (
+            row["simulator_executable_all_candidates"] is not True
+            or row["h32_factual_available"] is not True
+            or row["future_observation_leakage"] is not False
+            or row["counterfactual_pose_space"] != "physical_canonical_6d"
+            or not isinstance(row["branch_roles"], list)
+            or len(row["branch_roles"]) != 10
+        ):
+            raise RuntimeError("candidate row executable/causal contract mismatch")
         result[root_id] = row
     if not result:
         raise RuntimeError("candidate index is empty")
@@ -123,6 +326,8 @@ def main() -> None:
     parser.add_argument("--action-audit", type=Path, required=True)
     parser.add_argument("--candidate-index", type=Path, required=True)
     parser.add_argument("--candidate-index-seal", type=Path, required=True)
+    parser.add_argument("--replay-authority", type=Path, required=True)
+    parser.add_argument("--selection-manifest", type=Path, required=True)
     parser.add_argument("--code-commit", required=True)
     parser.add_argument(
         "--source-root",
@@ -130,18 +335,25 @@ def main() -> None:
         required=True,
         help="SOURCE_NAME=/absolute/LeRobot/root; repeat for every selected source",
     )
-    parser.add_argument(
-        "--selection", action="append", required=True,
-        help=(
-            "SPLIT=ROOT_SHA256; repeat for every distinct real root. "
-            "Each split must be represented and a split may contain multiple roots."
-        ),
-    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parents[2]
     code_commit = verify_clean_runtime_checkout(repo, args.code_commit)
+    replay_authority, replay_authority_digest = load_replay_authority(
+        args.replay_authority, expected_code_commit=code_commit
+    )
+    replay_authority_rows = {
+        row["root_id"]: row for row in replay_authority["rows"]
+    }
+    selection_path, _selection_payload, selection_digest = read_regular_bytes(
+        args.selection_manifest, "selection manifest"
+    )
+    if (
+        str(selection_path) != replay_authority["selection_manifest_path"]
+        or selection_digest != replay_authority["selection_manifest_sha256"]
+    ):
+        raise RuntimeError("audit selection manifest differs from replay authority")
 
     if args.runtime_root.is_symlink():
         raise RuntimeError("runtime root must not be a symlink")
@@ -179,30 +391,25 @@ def main() -> None:
         read_regular_bytes(args.candidate_index_seal, "candidate index seal")
     )
     launch = json.loads(launch_payload)
-    if launch.get("pass") is not True:
-        raise RuntimeError("legacy real-runtime launch did not pass")
-    for digest, key in (
-        (generator_digest, "runtime_generator_sha256"),
-        (replay_digest, "replay_helper_sha256"),
-    ):
-        if digest != launch.get(key):
-            raise RuntimeError(f"{key} differs from launch receipt")
     action_audit = json.loads(action_audit_payload)
     if (
         action_audit_digest != "f0e3c99f5f5792d996473bf47035d989ebe17ff2665a3c5c07c73ea736a3c27f"
         or action_audit.get("audit", {}).get("passed") is not True
     ):
         raise RuntimeError("factual action semantics audit is invalid")
-    candidate_seal = json.loads(candidate_seal_payload)
-    sealed_output = Path(candidate_seal.get("output", ""))
-    if sealed_output.is_symlink():
-        raise RuntimeError("candidate index seal names a symlink")
-    if (
-        candidate_seal.get("passed") is not True
-        or sealed_output.resolve(strict=True) != candidate_index_path
-        or candidate_seal.get("output_sha256") != candidate_index_digest
-    ):
-        raise RuntimeError("candidate index seal/path/SHA is invalid")
+    candidate_seal = _validate_candidate_seal(
+        json.loads(candidate_seal_payload),
+        index_path=candidate_index_path,
+        index_sha256=candidate_index_digest,
+    )
+    _validate_launch(
+        launch,
+        generator_sha256=generator_digest,
+        helper_sha256=replay_digest,
+        candidate_index_sha256=candidate_index_digest,
+        candidate_seal_sha256=candidate_seal_digest,
+        candidate_seal=candidate_seal,
+    )
     candidates = _candidate_rows(candidate_index_payload, candidate_index_path)
     pinned = _constants(replay_payload, replay)
     camera_order = list(pinned["CAMERAS"])
@@ -211,21 +418,15 @@ def main() -> None:
     ]:
         raise RuntimeError("simulator camera ordering differs from V8 adapter")
 
+    selection_rows = replay_authority["rows"]
     selections: dict[str, list[str]] = {"train": [], "val": [], "test": []}
-    selected_roots: set[str] = set()
-    for raw in args.selection:
-        split, separator, root_id = raw.partition("=")
-        if (
-            not separator
-            or split not in selections
-            or len(root_id) != 64
-            or root_id in selected_roots
-        ):
-            raise RuntimeError(f"invalid/duplicate selection {raw!r}")
-        selections[split].append(root_id)
-        selected_roots.add(root_id)
-    if any(not roots for roots in selections.values()):
-        raise RuntimeError("selection must contain at least one distinct train/val/test root")
+    for row in selection_rows:
+        selections[row["split"]].append(row["root_id"])
+    selected_roots = {
+        root_id for roots in selections.values() for root_id in roots
+    }
+    if set(selected_roots) != set(replay_authority_rows):
+        raise RuntimeError("selection differs from fresh replay authority coverage")
     available = _rows(runtime_root)
     source_meta: dict[str, dict[str, str]] = {}
     source_episode_metadata: dict[str, bytes] = {}
@@ -265,11 +466,14 @@ def main() -> None:
         candidate = candidates.get(root_id)
         if candidate is None:
             raise RuntimeError(f"selected root has no sealed candidate row: {root_id}")
+        replay_row = replay_authority_rows[root_id]
         required_true = (
             "candidate_actions_executed_exact", "same_root_current_runtime_exact",
             "same_root_simulator_state_exact", "same_root_render_state_exact",
             "root_rgb_equivalence_all_passed", "simulator_bounds_exact",
         )
+        if not isinstance(row, dict) or set(row) != _RUNTIME_FIELDS:
+            raise RuntimeError(f"selected root {root_id} runtime fields mismatch")
         if row.get("schema") != RUNTIME_SCHEMA or any(row.get(name) is not True for name in required_true):
             raise RuntimeError(f"selected root {root_id} did not pass real-simulator gates")
         if row.get("pseudo_outcomes") is not False or row.get("future_observation_leakage") is not False:
@@ -284,6 +488,19 @@ def main() -> None:
             or candidate.get("root_context_sha256") != row.get("root_context_sha256")
         ):
             raise RuntimeError("candidate seed row differs from real-runtime root identity")
+        if (
+            row["candidate_index_sha256"] != candidate_index_digest
+            or row["action_audit_sha256"] != action_audit_digest
+            or row["stage0_checkpoint_sha256"] != candidate_seal[
+                "stage0_checkpoint_sha256"
+            ]
+            or row["candidate_payload_sha256"] != candidate[
+                "payload_sha256"
+            ]
+            or int(row["branches"]) != 11
+            or int(row["future_frames"]) != 32
+        ):
+            raise RuntimeError("runtime row differs from sealed candidate/launch closure")
         payload, payload_bytes, payload_digest = read_regular_bytes(
             Path(row["path"]), "runtime payload"
         )
@@ -351,6 +568,7 @@ def main() -> None:
             "branch_rgb_indices": [3, 7, 10, 14, 17, 21, 24, 28],
             "source_future_row_offsets": [12, 28, 40, 56, 68, 84, 96, 112],
             "candidate_count": int(row["branches"]),
+            "replay_authority_row_sha256": canonical_sha256(replay_row),
         })
     audited.sort(key=lambda row: (str(row["split"]), int(row["episode_id"]), int(row["t0"]), str(row["root_id"])))
     simulator_revision = {
@@ -376,6 +594,10 @@ def main() -> None:
         "candidate_index_sha256": candidate_index_digest,
         "candidate_index_seal_path": str(candidate_seal_path),
         "candidate_index_seal_sha256": candidate_seal_digest,
+        "replay_authority_path": str(args.replay_authority.absolute()),
+        "replay_authority_sha256": replay_authority_digest,
+        "selection_manifest_path": str(selection_path),
+        "selection_manifest_sha256": selection_digest,
         "source_roots": {name: str(root) for name, root in source_roots.items()},
         "source_metadata_sha256": source_meta,
         "simulator_revision": simulator_revision,
