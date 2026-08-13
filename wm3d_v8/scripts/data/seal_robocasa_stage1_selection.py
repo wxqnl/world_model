@@ -112,14 +112,25 @@ def _tracked_policy(
 ) -> tuple[Path, bytes, str]:
     resolved, payload, digest = _regular(path, "selection policy")
     try:
-        relative = resolved.relative_to(repo.resolve(strict=True)).as_posix()
-    except ValueError as error:
+        package_root = repo.resolve(strict=True)
+        repository = Path(
+            subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
+                text=True,
+            ).strip()
+        ).resolve(strict=True)
+        relative = resolved.relative_to(repository).as_posix()
+        package_relative = package_root.relative_to(repository)
+    except (ValueError, subprocess.CalledProcessError) as error:
         raise RuntimeError("selection policy must be inside the clean checkout") from error
-    if relative != "configs/data/stage1_robocasa_real_4roots.template.yaml":
+    expected_relative = (
+        package_relative / "configs/data/stage1_robocasa_real_4roots.template.yaml"
+    ).as_posix()
+    if relative != expected_relative:
         raise RuntimeError("selection policy is not the reviewed formal four-root profile")
     tracked = subprocess.run(
         ["git", "show", f"{commit}:{relative}"],
-        cwd=repo,
+        cwd=repository,
         check=True,
         capture_output=True,
     ).stdout
