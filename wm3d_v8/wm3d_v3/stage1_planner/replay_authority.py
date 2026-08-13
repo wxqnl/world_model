@@ -19,17 +19,20 @@ from wm3d_v3.stage1_planner.rollout_audit import (
     RolloutAuditError,
     read_regular_bytes,
 )
+from wm3d_v3.stage1_planner.execution_snapshot import (
+    validate_execution_snapshot,
+)
 
 
-REPLAY_AUTHORITY_SCHEMA = "wm3d_v8_robocasa_stage1_replay_authority_v2"
-REPLAY_AUTHORITY_ROW_SCHEMA = "wm3d_v8_robocasa_stage1_replay_authority_row_v2"
-REPLAY_ENVIRONMENT_SCHEMA = "wm3d_v8_robocasa_stage1_replay_environment_v2"
+REPLAY_AUTHORITY_SCHEMA = "wm3d_v8_robocasa_stage1_replay_authority_v3"
+REPLAY_AUTHORITY_ROW_SCHEMA = "wm3d_v8_robocasa_stage1_replay_authority_row_v3"
+REPLAY_ENVIRONMENT_SCHEMA = "wm3d_v8_robocasa_stage1_replay_environment_v3"
 REPLAY_SOURCE_TREE_SCHEMA = "wm3d_v8_robocasa_stage1_source_tree_v2"
 PINNED_RUNTIME_GENERATOR_SHA256 = (
     "24bfe1cf34be7813d298713efc33ca49dfc9d81e77bdea5530710fcbf2ccfdba"
 )
 PINNED_RUNTIME_GENERATOR_SNAPSHOT_SHA256 = (
-    "a51cc1b923c13cc94e1cbc8cab1ae16d6c0c53432e789b9b53d9381a1b459526"
+    "12ed0116fe73e0babc5282c4adb8dd866b64c9e159b9ad1b69d1b6788921895d"
 )
 PINNED_REPLAY_HELPER_SHA256 = (
     "cf93e5e5434fe65112a1f266b62afe0e47ccf732c61204fdd912e753ffe9d3e9"
@@ -60,6 +63,8 @@ REPLAY_AUTHORITY_FIELDS = {
     "runtime_generator_path", "runtime_generator_sha256", "replay_helper_path",
     "replay_helper_sha256", "adapter_loader_path", "adapter_loader_sha256",
     "action_audit_path", "action_audit_sha256",
+    "action_audit_snapshot_path", "action_audit_snapshot_sha256",
+    "execution_snapshot_manifest_path", "execution_snapshot_manifest_sha256",
     "candidate_index_path", "candidate_index_sha256",
     "candidate_index_seal_path", "candidate_index_seal_sha256",
     "selected_candidate_index_path", "selected_candidate_index_sha256",
@@ -93,11 +98,20 @@ REPLAY_ENVIRONMENT_FIELDS = {
     "schema", "code_commit", "simulator_python_path", "simulator_python_sha256",
     "simulator_python_device", "simulator_python_inode", "simulator_python_size",
     "simulator_python_mtime_ns", "simulator_pythonpath",
+    "simulator_pythonhome",
     "python_version", "cuda_visible_devices", "mujoco_gl",
+    "execution_snapshot_manifest_path", "execution_snapshot_manifest_sha256",
+    "simulator_python_provenance_path", "simulator_python_provenance_sha256",
+    "simulator_stdlib_provenance_root", "simulator_stdlib_snapshot_root",
     "egl_vendor_library_path", "egl_vendor_library_sha256", "pip_freeze_path",
+    "egl_vendor_library_provenance_path",
+    "egl_vendor_library_provenance_sha256",
     "pip_freeze_sha256", "simulator_site_packages_path",
+    "simulator_site_packages_provenance_path",
     "robocasa_source_root", "robocasa_source_commit",
+    "robocasa_source_provenance_root",
     "robosuite_source_root", "robosuite_source_commit", "source_trees",
+    "robosuite_source_provenance_root",
     "modules", "snapshot_modules", "runtime_generator_sha256",
     "runtime_generator_snapshot_sha256", "replay_helper_sha256",
     "adapter_loader_sha256", "v7_action_contract_sha256",
@@ -106,7 +120,17 @@ REPLAY_ENVIRONMENT_FIELDS = {
 REPLAY_AUTHORITY_ROW_FIELDS = {
     "schema", "split", "source", "root_id", "episode_id", "t0", "candidate_seed",
     "candidate_index_row_sha256", "candidate_payload_path", "candidate_payload_sha256",
+    "execution_candidate_index_row_sha256",
+    "execution_candidate_payload_path", "execution_candidate_payload_sha256",
     "root_context_path", "root_context_sha256", "source_episode_path",
+    "execution_root_context_path", "execution_root_context_sha256",
+    "execution_source_dataset_path", "execution_source_episode_path",
+    "execution_source_episode_sha256", "execution_states_path",
+    "execution_states_sha256", "execution_model_xml_gz_path",
+    "execution_model_xml_gz_sha256", "execution_ep_meta_path",
+    "execution_ep_meta_file_sha256", "execution_dataset_meta_path",
+    "execution_dataset_meta_sha256", "execution_modality_path",
+    "execution_modality_sha256",
     "source_episode_sha256", "source_manifest_path", "source_manifest_sha256",
     "source_manifest_row_sha256", "legacy_runtime_index_shard_path",
     "legacy_runtime_index_shard_sha256", "legacy_runtime_index_row_sha256",
@@ -376,17 +400,46 @@ def _validate_environment(
         if type(value[field]) is not str or not value[field]:
             raise ReplayAuthorityError(f"replay environment {field} is invalid")
     if verify_referents:
+        _manifest_path, manifest_payload = _verify_path(
+            value["execution_snapshot_manifest_path"],
+            value["execution_snapshot_manifest_sha256"],
+            "execution snapshot manifest",
+        )
+        try:
+            snapshot_manifest = json.loads(manifest_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReplayAuthorityError("execution snapshot manifest invalid") from error
+        validate_execution_snapshot(
+            snapshot_manifest, verify_provenance=True, verify_snapshots=True
+        )
+        snapshot_rows_by_path = {
+            row["snapshot_path"]: row for row in snapshot_manifest["rows"]
+        }
+        _verify_path(
+            value["simulator_python_provenance_path"],
+            value["simulator_python_provenance_sha256"],
+            "simulator Python provenance",
+        )
+        _verify_path(
+            value["egl_vendor_library_provenance_path"],
+            value["egl_vendor_library_provenance_sha256"],
+            "EGL vendor library provenance",
+        )
         _verify_path(
             value["egl_vendor_library_path"],
             value["egl_vendor_library_sha256"],
             "EGL vendor library manifest",
         )
     else:
+        snapshot_manifest = None
+        snapshot_rows_by_path = {}
         _sha(value["egl_vendor_library_sha256"], "EGL vendor manifest SHA")
     resolved_directories: dict[str, Path] = {}
     for field in (
-        "simulator_site_packages_path", "robocasa_source_root",
-        "robosuite_source_root",
+        "simulator_site_packages_path", "simulator_site_packages_provenance_path",
+        "simulator_stdlib_provenance_root", "simulator_stdlib_snapshot_root",
+        "robocasa_source_root", "robocasa_source_provenance_root",
+        "robosuite_source_root", "robosuite_source_provenance_root",
     ):
         if type(value[field]) is not str or not value[field]:
             raise ReplayAuthorityError(f"replay environment {field} is invalid")
@@ -395,6 +448,23 @@ def _validate_environment(
             raise ReplayAuthorityError(f"replay environment {field} is not a real directory")
         if verify_referents:
             resolved_directories[field] = path.resolve(strict=True)
+    if type(value["simulator_pythonhome"]) is not str or not value[
+        "simulator_pythonhome"
+    ]:
+        raise ReplayAuthorityError("replay environment simulator PYTHONHOME is invalid")
+    if verify_referents:
+        pythonhome = Path(value["simulator_pythonhome"])
+        if pythonhome.is_symlink() or not pythonhome.is_dir():
+            raise ReplayAuthorityError(
+                "replay environment simulator PYTHONHOME is not a real directory"
+            )
+        pythonhome = pythonhome.resolve(strict=True)
+        assert snapshot_manifest is not None
+        snapshot_root = Path(snapshot_manifest["root"]).resolve(strict=True)
+        if pythonhome != snapshot_root / "python":
+            raise ReplayAuthorityError(
+                "replay environment simulator PYTHONHOME is not the snapshot"
+            )
     expected_sources = {
         "robocasa": (
             "robocasa_source_root", "robocasa_source_commit", "robocasa",
@@ -417,6 +487,12 @@ def _validate_environment(
         ):
             raise ReplayAuthorityError(
                 f"replay environment {name} source root is not pinned"
+            )
+        if verify_referents and resolved_directories[root_field] != (
+            snapshot_root / "sources" / f"{name}-{expected_commit}"
+        ):
+            raise ReplayAuthorityError(
+                f"replay environment {name} source root is outside snapshot"
             )
     source_trees = value["source_trees"]
     if not isinstance(source_trees, dict) or set(source_trees) != {
@@ -468,6 +544,31 @@ def _validate_environment(
             ) != expected_python_identity
         ):
             raise ReplayAuthorityError("replay simulator Python identity mismatch")
+        if python_path != pythonhome / "bin/python3.10":
+            raise ReplayAuthorityError(
+                "replay simulator Python is outside snapshot PYTHONHOME"
+            )
+        for path, digest, kind in (
+            (
+                value["simulator_python_path"],
+                value["simulator_python_sha256"],
+                "simulator Python",
+            ),
+            (
+                value["egl_vendor_library_path"],
+                value["egl_vendor_library_sha256"],
+                "EGL vendor manifest",
+            ),
+        ):
+            manifest_row = snapshot_rows_by_path.get(path)
+            if (
+                manifest_row is None
+                or manifest_row["snapshot_sha256"] != digest
+                or manifest_row["kind"] != kind
+            ):
+                raise ReplayAuthorityError(
+                    f"replay {kind} is not bound by the execution snapshot"
+                )
     modules = value["modules"]
     if not isinstance(modules, dict) or set(modules) != _MODULES:
         raise ReplayAuthorityError("replay environment module closure mismatch")
@@ -507,6 +608,15 @@ def _validate_environment(
         ))
         if value["simulator_pythonpath"] != expected_pythonpath:
             raise ReplayAuthorityError("replay simulator PYTHONPATH is not exact")
+        if (
+            resolved_directories["simulator_site_packages_path"]
+            != pythonhome / "site-packages"
+            or resolved_directories["simulator_stdlib_snapshot_root"]
+            != pythonhome / "lib/python3.10"
+        ):
+            raise ReplayAuthorityError(
+                "replay Python library roots are not the execution snapshot"
+            )
         expected_snapshot_paths = {
             "runtime_generator": execution_root / "scripts/generate_robocasa_stage1_planner_branches.py",
             "replay_helper": execution_root / "scripts/generate_robocasa_same_root_cf.py",
@@ -605,12 +715,34 @@ def _validate_fresh_index_row(
     fresh_payload: dict[str, np.ndarray],
 ) -> None:
     """Close every fresh producer identity back to independently sealed inputs."""
+    source_dataset = Path(authority_row["execution_source_dataset_path"])
+    expected_suffix = Path("inputs/selected") / authority_row["root_id"] / "lerobot"
+    suffix_parts = expected_suffix.parts
+    if source_dataset.parts[-len(suffix_parts):] != suffix_parts:
+        raise ReplayAuthorityError(
+            "authority execution source dataset is outside selected snapshot"
+        )
+    snapshot_root = source_dataset.parents[3]
+
+    def child_path(value: str) -> str:
+        try:
+            relative = Path(value).relative_to(snapshot_root)
+        except ValueError as error:
+            raise ReplayAuthorityError(
+                "authority execution path escapes snapshot"
+            ) from error
+        return "./" + relative.as_posix()
+
     expected = {
         "schema": "wm3d_v7_stage1_planner_same_root_runtime_v3",
         "root_id": authority_row["root_id"],
         "split": selection["split"],
-        "source_dataset": selection["source_dataset_path"],
-        "root_context_path": selection["root_context_path"],
+        "source_dataset": child_path(
+            authority_row["execution_source_dataset_path"]
+        ),
+        "root_context_path": child_path(
+            authority_row["execution_root_context_path"]
+        ),
         "root_context_sha256": selection["root_context_sha256"],
         "episode_id": selection["episode_id"],
         "episode_root_index": selection["episode_root_index"],
@@ -645,13 +777,19 @@ def _validate_fresh_index_row(
     selection_candidate_expected = {
         "root_id": selection["root_id"],
         "split": selection["split"],
-        "source_dataset": selection["source_dataset_path"],
+        "source_dataset": child_path(
+            authority_row["execution_source_dataset_path"]
+        ),
         "episode_id": selection["episode_id"],
         "episode_root_index": selection["episode_root_index"],
         "t0": selection["t0"],
-        "candidate_path": selection["candidate_payload_path"],
+        "candidate_path": child_path(
+            authority_row["execution_candidate_payload_path"]
+        ),
         "payload_sha256": selection["candidate_payload_sha256"],
-        "root_context_path": selection["root_context_path"],
+        "root_context_path": child_path(
+            authority_row["execution_root_context_path"]
+        ),
         "root_context_sha256": selection["root_context_sha256"],
         "stage0_checkpoint_sha256": authority_row["stage0_checkpoint_sha256"],
         "action_audit_sha256": action_audit_sha256,
@@ -878,6 +1016,7 @@ def validate_replay_authority(
         raise ReplayAuthorityError("replay authority code commit mismatch")
     for name in (
         "runtime_generator", "replay_helper", "adapter_loader", "action_audit",
+        "action_audit_snapshot", "execution_snapshot_manifest",
         "candidate_index", "candidate_index_seal", "selected_candidate_index",
         "fresh_runtime_index",
     ):
@@ -885,6 +1024,37 @@ def validate_replay_authority(
         if verify_referents:
             _verify_path(
                 authority[f"{name}_path"], authority[f"{name}_sha256"], name
+            )
+    if authority["action_audit_snapshot_sha256"] != authority["action_audit_sha256"]:
+        raise ReplayAuthorityError("action audit snapshot differs from provenance")
+    snapshot_rows_by_path: dict[str, dict[str, Any]] = {}
+    if verify_referents:
+        _snapshot_path, snapshot_payload = _verify_path(
+            authority["execution_snapshot_manifest_path"],
+            authority["execution_snapshot_manifest_sha256"],
+            "execution snapshot manifest",
+        )
+        try:
+            snapshot_manifest = json.loads(snapshot_payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReplayAuthorityError("execution snapshot manifest invalid") from error
+        validate_execution_snapshot(
+            snapshot_manifest, verify_provenance=True, verify_snapshots=True
+        )
+        snapshot_rows_by_path = {
+            row["snapshot_path"]: row for row in snapshot_manifest["rows"]
+        }
+        action_snapshot = snapshot_rows_by_path.get(
+            authority["action_audit_snapshot_path"]
+        )
+        if (
+            action_snapshot is None
+            or action_snapshot["snapshot_sha256"]
+            != authority["action_audit_snapshot_sha256"]
+            or action_snapshot["kind"] != "action audit"
+        ):
+            raise ReplayAuthorityError(
+                "action audit execution path is not bound by snapshot"
             )
     selection_sha = _sha(
         authority["selection_manifest_sha256"], "selection manifest SHA"
@@ -997,7 +1167,7 @@ def validate_replay_authority(
             environment = json.loads(environment_payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ReplayAuthorityError("simulator environment receipt is invalid JSON") from error
-        _validate_environment(
+        environment = _validate_environment(
             environment,
             code_commit=expected_code_commit,
             generator_sha256=authority["runtime_generator_sha256"],
@@ -1011,6 +1181,15 @@ def validate_replay_authority(
             action_bridge_sha256=PINNED_ACTION_BRIDGE_SHA256,
             verify_referents=True,
         )
+        if (
+            environment["execution_snapshot_manifest_path"]
+            != authority["execution_snapshot_manifest_path"]
+            or environment["execution_snapshot_manifest_sha256"]
+            != authority["execution_snapshot_manifest_sha256"]
+        ):
+            raise ReplayAuthorityError(
+                "environment and authority execution snapshots differ"
+            )
     for field in ("runtime_root", "fresh_runtime_root"):
         value = authority[field]
         if type(value) is not str or not value:
@@ -1074,6 +1253,12 @@ def validate_replay_authority(
             raise ReplayAuthorityError("replay authority row capacities mismatch")
         for field in (
             "candidate_index_row_sha256", "candidate_payload_sha256",
+            "execution_candidate_index_row_sha256",
+            "execution_candidate_payload_sha256",
+            "execution_root_context_sha256",
+            "execution_source_episode_sha256", "execution_states_sha256",
+            "execution_model_xml_gz_sha256", "execution_ep_meta_file_sha256",
+            "execution_dataset_meta_sha256", "execution_modality_sha256",
             "root_context_sha256", "source_episode_sha256",
             "source_manifest_sha256", "source_manifest_row_sha256",
             "legacy_runtime_index_shard_sha256", "legacy_runtime_index_row_sha256",
@@ -1119,7 +1304,7 @@ def validate_replay_authority(
             selected_candidate_index_row = _runtime_index_row(
                 selected_candidate_index_payload,
                 root_id=root_id,
-                expected_sha256=row["candidate_index_row_sha256"],
+                expected_sha256=row["execution_candidate_index_row_sha256"],
                 label="selected candidate index",
             )
             _candidate_index_path, candidate_index_payload = _verify_path(
@@ -1133,14 +1318,39 @@ def validate_replay_authority(
                 expected_sha256=row["candidate_index_row_sha256"],
                 label="candidate index",
             )
-            if candidate_index_row != selected_candidate_index_row:
+            execution_expected = dict(candidate_index_row)
+            snapshot_root = Path(
+                row["execution_source_dataset_path"]
+            ).parents[3]
+            for field, authority_field in (
+                ("source_dataset", "execution_source_dataset_path"),
+                ("candidate_path", "execution_candidate_payload_path"),
+                ("root_context_path", "execution_root_context_path"),
+            ):
+                try:
+                    relative = Path(row[authority_field]).relative_to(
+                        snapshot_root
+                    )
+                except ValueError as error:
+                    raise ReplayAuthorityError(
+                        f"authority {authority_field} escapes execution snapshot"
+                    ) from error
+                execution_expected[field] = "./" + relative.as_posix()
+            if execution_expected != selected_candidate_index_row:
                 raise ReplayAuthorityError(
-                    "selected candidate row differs from full candidate index"
+                    "selected candidate row is not the exact snapshot path rewrite"
                 )
             _candidate_path, candidate_payload = _verify_path(
                 row["candidate_payload_path"], row["candidate_payload_sha256"],
                 f"authority row {number} candidate payload",
             )
+            _execution_candidate_path, execution_candidate_payload = _verify_path(
+                row["execution_candidate_payload_path"],
+                row["execution_candidate_payload_sha256"],
+                f"authority row {number} execution candidate payload",
+            )
+            if execution_candidate_payload != candidate_payload:
+                raise ReplayAuthorityError("execution candidate bytes differ from provenance")
             candidate = _load_npz(candidate_payload, "candidate payload")
             if (
                 str(candidate.get("root_id", np.asarray("")).item()) != root_id
@@ -1152,6 +1362,34 @@ def validate_replay_authority(
                 row["root_context_path"], row["root_context_sha256"],
                 f"authority row {number} root context",
             )
+            for name, provenance_digest, execution_digest in (
+                ("root_context", "root_context_sha256", "execution_root_context_sha256"),
+                ("source_episode", "source_episode_sha256", "execution_source_episode_sha256"),
+                ("states", "states_sha256", "execution_states_sha256"),
+                ("model_xml_gz", "model_xml_gz_sha256", "execution_model_xml_gz_sha256"),
+                ("ep_meta", "ep_meta_file_sha256", "execution_ep_meta_file_sha256"),
+                ("dataset_meta", "dataset_meta_sha256", "execution_dataset_meta_sha256"),
+                ("modality", "modality_sha256", "execution_modality_sha256"),
+            ):
+                _verify_path(
+                    row[f"execution_{name}_path"], row[execution_digest],
+                    f"authority row {number} execution {name}",
+                )
+                if row[execution_digest] != row[provenance_digest]:
+                    raise ReplayAuthorityError(
+                        f"execution {name} SHA differs from provenance"
+                    )
+                snapshot_row = snapshot_rows_by_path.get(
+                    row[f"execution_{name}_path"]
+                )
+                if (
+                    snapshot_row is None
+                    or snapshot_row["snapshot_sha256"] != row[execution_digest]
+                    or snapshot_row["kind"] != f"selected {name}"
+                ):
+                    raise ReplayAuthorityError(
+                        f"execution {name} is not bound by snapshot"
+                    )
             _verify_path(
                 row["source_episode_path"], row["source_episode_sha256"],
                 f"authority row {number} source episode",
@@ -1190,7 +1428,7 @@ def validate_replay_authority(
             _validate_payload_pair(
                 row,
                 selection=selection_row,
-                candidate_index_row=candidate_index_row,
+                candidate_index_row=selected_candidate_index_row,
                 fresh_index_row=fresh_index_row,
                 action_audit_sha256=authority["action_audit_sha256"],
                 selected_candidate_index_sha256=authority[

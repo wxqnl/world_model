@@ -85,6 +85,7 @@ CODE_COMMIT="$(git rev-parse HEAD)"
   --v7-contracts "$BASE/wm3d_v3/data/v7_contracts.py" \
   --action-bridge "$BASE/wm3d_v3/stage1_planner/action_bridge.py" \
   --simulator-python /data/Minko/.venvs/robocasa_cf/bin/python \
+  --simulator-stdlib /usr/lib/python3.10 \
   --simulator-site-packages /data/Minko/.venvs/robocasa_cf/lib/python3.10/site-packages \
   --robocasa-source-root /data/Minko/third_party/robocasa-8f3c96ec8d1bfcd8126cad2bca887da98d30e997 \
   --robosuite-source-root /data/Minko/third_party/robosuite-6c10ef24a4bb52f59199976125060ce793470e6e \

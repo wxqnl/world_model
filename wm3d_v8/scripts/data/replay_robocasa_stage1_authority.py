@@ -37,6 +37,13 @@ from wm3d_v3.stage1_planner.replay_authority import (
     validate_replay_authority,
     validate_replay_environment,
 )
+from wm3d_v3.stage1_planner.execution_snapshot import (
+    ExecutionSnapshotPlan,
+    PinnedExecutionPath,
+    ReadOnlyBindMount,
+    enter_private_mount_namespace,
+    scan_regular_tree,
+)
 from wm3d_v3.stage1_planner.rollout_audit import (
     TrustedOutputRoot,
     publish_no_clobber,
@@ -309,10 +316,23 @@ print(json.dumps({
 def _environment_receipt(
     *,
     simulator_command: Path,
+    simulator_execution_command: str,
     simulator_environment: dict[str, str],
+    simulator_execution_environment: dict[str, str],
     simulator_site_packages: Path,
+    simulator_site_packages_provenance: Path,
+    simulator_stdlib_provenance: Path,
+    simulator_stdlib_snapshot: Path,
     robocasa_source_root: Path,
+    robocasa_source_provenance_root: Path,
     robosuite_source_root: Path,
+    robosuite_source_provenance_root: Path,
+    simulator_python_provenance_path: Path,
+    simulator_python_provenance_sha256: str,
+    egl_vendor_library_provenance_path: Path,
+    egl_vendor_library_provenance_sha256: str,
+    execution_snapshot_manifest_path: Path,
+    execution_snapshot_manifest_sha256: str,
     source_trees: dict[str, dict[str, str]],
     code_commit: str,
     generator_sha256: str,
@@ -325,34 +345,51 @@ def _environment_receipt(
     output: Path,
     output_scope: TrustedOutputRoot,
     execution_root: Path,
+    execution_cwd: str,
+    execution_path_aliases: dict[str, Path],
+    pass_fds: tuple[int, ...],
 ) -> tuple[Path, str, dict[str, Any]]:
     python_path, _python_payload, python_sha = _regular(
         simulator_command, "simulator Python"
     )
     probe = subprocess.run(
-        [str(simulator_command), "-S", "-c", _module_probe_script()],
+        [simulator_execution_command, "-S", "-c", _module_probe_script()],
         check=True,
         capture_output=True,
         text=True,
-        env=simulator_environment,
-        cwd=execution_root,
+        env=simulator_execution_environment,
+        cwd=execution_cwd,
+        pass_fds=pass_fds,
     )
     try:
         value = json.loads(probe.stdout.strip().splitlines()[-1])
     except (IndexError, json.JSONDecodeError) as error:
         raise RuntimeError("simulator environment probe did not emit JSON") from error
+    for group in ("modules", "snapshot_modules"):
+        for module in value[group].values():
+            observed = module["path"]
+            for alias, persistent in execution_path_aliases.items():
+                if observed == alias or observed.startswith(alias + "/"):
+                    suffix = observed[len(alias):].lstrip("/")
+                    module["path"] = str(persistent / suffix)
+                    break
     freeze = subprocess.run(
-        [str(simulator_command), "-S", "-m", "pip", "freeze", "--all"],
+        [simulator_execution_command, "-S", "-m", "pip", "freeze", "--all"],
         check=True,
         capture_output=True,
-        env=simulator_environment,
-        cwd=execution_root,
+        env=simulator_execution_environment,
+        cwd=execution_cwd,
+        pass_fds=pass_fds,
     ).stdout
     freeze_path = output.parent / "pip_freeze.txt"
     output_scope.publish(freeze_path, freeze, label="replay pip freeze")
     receipt = {
         "schema": REPLAY_ENVIRONMENT_SCHEMA,
         "code_commit": code_commit,
+        "execution_snapshot_manifest_path": str(execution_snapshot_manifest_path),
+        "execution_snapshot_manifest_sha256": execution_snapshot_manifest_sha256,
+        "simulator_python_provenance_path": str(simulator_python_provenance_path),
+        "simulator_python_provenance_sha256": simulator_python_provenance_sha256,
         "simulator_python_path": str(python_path),
         "simulator_python_sha256": python_sha,
         "simulator_python_device": python_path.stat(follow_symlinks=False).st_dev,
@@ -360,6 +397,7 @@ def _environment_receipt(
         "simulator_python_size": python_path.stat(follow_symlinks=False).st_size,
         "simulator_python_mtime_ns": python_path.stat(follow_symlinks=False).st_mtime_ns,
         "simulator_pythonpath": simulator_environment["PYTHONPATH"],
+        "simulator_pythonhome": simulator_environment["PYTHONHOME"],
         "python_version": value["python_version"],
         "cuda_visible_devices": value["cuda_visible_devices"],
         "mujoco_gl": value["mujoco_gl"],
@@ -369,12 +407,25 @@ def _environment_receipt(
         "egl_vendor_library_sha256": hashlib.sha256(
             Path(simulator_environment["__EGL_VENDOR_LIBRARY_FILENAMES"]).read_bytes()
         ).hexdigest(),
+        "egl_vendor_library_provenance_path": str(
+            egl_vendor_library_provenance_path
+        ),
+        "egl_vendor_library_provenance_sha256": (
+            egl_vendor_library_provenance_sha256
+        ),
         "pip_freeze_path": str(freeze_path),
         "pip_freeze_sha256": hashlib.sha256(freeze).hexdigest(),
         "simulator_site_packages_path": str(simulator_site_packages),
+        "simulator_site_packages_provenance_path": str(
+            simulator_site_packages_provenance
+        ),
+        "simulator_stdlib_provenance_root": str(simulator_stdlib_provenance),
+        "simulator_stdlib_snapshot_root": str(simulator_stdlib_snapshot),
         "robocasa_source_root": str(robocasa_source_root),
+        "robocasa_source_provenance_root": str(robocasa_source_provenance_root),
         "robocasa_source_commit": "8f3c96ec8d1bfcd8126cad2bca887da98d30e997",
         "robosuite_source_root": str(robosuite_source_root),
+        "robosuite_source_provenance_root": str(robosuite_source_provenance_root),
         "robosuite_source_commit": "6c10ef24a4bb52f59199976125060ce793470e6e",
         "source_trees": source_trees,
         "modules": value["modules"],
@@ -463,6 +514,7 @@ def _candidate_seal(
 
 
 def main() -> None:
+    enter_private_mount_namespace()
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--runtime-generator", type=Path, required=True)
@@ -472,6 +524,7 @@ def main() -> None:
     parser.add_argument("--v7-contracts", type=Path, required=True)
     parser.add_argument("--action-bridge", type=Path, required=True)
     parser.add_argument("--simulator-python", type=Path, required=True)
+    parser.add_argument("--simulator-stdlib", type=Path, required=True)
     parser.add_argument("--simulator-site-packages", type=Path, required=True)
     parser.add_argument("--robocasa-source-root", type=Path, required=True)
     parser.add_argument("--robosuite-source-root", type=Path, required=True)
@@ -609,17 +662,14 @@ def main() -> None:
         _validate_candidate_payload(candidate, _npz(candidate_bytes, str(candidate_file)))
         chosen.append(candidate)
     chosen.sort(key=lambda row: (_SPLITS.index(row["split"]), row["root_id"]))
-    selection_payload = b"".join(
-        (json.dumps(row, sort_keys=True) + "\n").encode() for row in chosen
-    )
-
     output = TrustedOutputRoot(output_root.parent, label="replay authority parent")
     output_root_pin = output.pin_directory(
         output_root, label="fresh replay output root"
     )
-    selection_path = output_root / "selected_candidates.jsonl"
-    output.publish(selection_path, selection_payload, label="selected candidate index")
-    execution_root = output_root / "execution"
+    snapshot_root = output_root / "execution_snapshot"
+    snapshot_input_root = snapshot_root / "inputs"
+    selection_path = snapshot_input_root / "selected_candidates.jsonl"
+    execution_root = snapshot_input_root / "execution"
     scripts_root = execution_root / "scripts"
     wm3d_root = execution_root / "wm3d_v3"
     data_root = wm3d_root / "data"
@@ -640,6 +690,13 @@ def main() -> None:
         raise RuntimeError("pinned generator adapter import closure drifted")
     generator_snapshot_payload = generator_payload.replace(
         old_adapter_import, new_adapter_import
+    )
+    resolved_output_path = b'"path": str(destination.resolve()),'
+    relative_output_path = b'"path": destination.as_posix(),'
+    if generator_snapshot_payload.count(resolved_output_path) != 1:
+        raise RuntimeError("pinned generator output-path closure drifted")
+    generator_snapshot_payload = generator_snapshot_payload.replace(
+        resolved_output_path, relative_output_path
     )
     generator_snapshot_sha = hashlib.sha256(generator_snapshot_payload).hexdigest()
     output.publish(
@@ -665,16 +722,22 @@ def main() -> None:
     command_python = args.simulator_python.resolve(strict=True)
     if command_python.is_symlink() or not command_python.is_file():
         raise RuntimeError("resolved simulator Python must be a regular file")
+    provenance_python_identity = _file_identity(
+        command_python, "simulator Python provenance"
+    )
+    simulator_stdlib = args.simulator_stdlib
     simulator_site_packages = args.simulator_site_packages
     robocasa_source_root = args.robocasa_source_root
     robosuite_source_root = args.robosuite_source_root
     for path, label in (
+        (simulator_stdlib, "simulator stdlib"),
         (simulator_site_packages, "simulator site-packages"),
         (robocasa_source_root, "RoboCasa source root"),
         (robosuite_source_root, "robosuite source root"),
     ):
         if path.is_symlink() or not path.resolve(strict=True).is_dir():
             raise RuntimeError(f"{label} must be a real directory")
+    simulator_stdlib = simulator_stdlib.resolve(strict=True)
     simulator_site_packages = simulator_site_packages.resolve(strict=True)
     robocasa_source_root = robocasa_source_root.resolve(strict=True)
     robosuite_source_root = robosuite_source_root.resolve(strict=True)
@@ -687,20 +750,6 @@ def main() -> None:
     ):
         if source_root.name != f"{label.lower()}-{expected}":
             raise RuntimeError(f"{label} source root is not the pinned snapshot")
-    simulator_environment = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        "HOME": os.environ.get("HOME", "/root"),
-        "LANG": os.environ.get("LANG", "C.UTF-8"),
-        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-        "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl"),
-        "__EGL_VENDOR_LIBRARY_FILENAMES": str(egl_vendor_path),
-        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "4"),
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONPATH": os.pathsep.join((
-            str(execution_root), str(robocasa_source_root),
-            str(robosuite_source_root), str(simulator_site_packages),
-        )),
-    }
     source_tree_manifests: dict[str, dict[str, Any]] = {}
     source_tree_references: dict[str, dict[str, str]] = {}
     for name, source_root, package_name, commit in (
@@ -710,297 +759,532 @@ def main() -> None:
         manifest, manifest_payload, manifest_sha = _source_tree_manifest(
             source_root, name=name, package_name=package_name, commit=commit
         )
-        manifest_path = output_root / f"{name}_source_tree.json"
-        output.publish(
-            manifest_path, manifest_payload, label=f"{name} source-tree manifest"
-        )
         source_tree_manifests[name] = manifest
+    snapshot_plan = ExecutionSnapshotPlan(output, snapshot_input_root)
+    action_audit_snapshot, _ = snapshot_plan.add_verified_file(
+        action_audit, snapshot_input_root / "action_audit.json",
+        kind="action audit",
+    )
+    egl_vendor_snapshot, _ = snapshot_plan.add_verified_file(
+        egl_vendor_path, snapshot_input_root / "runtime/egl_vendor.json",
+        kind="EGL vendor manifest",
+    )
+    simulator_python_snapshot = snapshot_plan.add_file(
+        command_python, snapshot_input_root / "python/bin/python3.10",
+        expected_sha256=provenance_python_identity[4],
+        size=provenance_python_identity[2],
+        kind="simulator Python", mode=0o750,
+    )
+    stdlib_rows = scan_regular_tree(
+        simulator_stdlib, label="simulator stdlib",
+        exclude_python_cache=True, materialize_file_symlinks=True,
+    )
+    site_rows = scan_regular_tree(
+        simulator_site_packages, label="simulator site-packages",
+        exclude_python_cache=True, materialize_file_symlinks=True,
+    )
+    simulator_stdlib_snapshot = snapshot_input_root / "python/lib/python3.10"
+    simulator_site_packages_snapshot = snapshot_input_root / "python/site-packages"
+    snapshot_plan.add_tree(
+        simulator_stdlib, simulator_stdlib_snapshot, stdlib_rows,
+        kind="simulator stdlib",
+    )
+    snapshot_plan.add_tree(
+        simulator_site_packages, simulator_site_packages_snapshot, site_rows,
+        kind="simulator site-packages",
+    )
+    source_snapshots: dict[str, Path] = {}
+    for name, source_root, package_name, commit in (
+        ("robocasa", robocasa_source_root, "robocasa", "8f3c96ec8d1bfcd8126cad2bca887da98d30e997"),
+        ("robosuite", robosuite_source_root, "robosuite", "6c10ef24a4bb52f59199976125060ce793470e6e"),
+    ):
+        snapshot_source_root = snapshot_input_root / "sources" / f"{name}-{commit}"
+        source_snapshots[name] = snapshot_source_root
+        snapshot_plan.add_tree(
+            source_root / package_name,
+            snapshot_source_root / package_name,
+            source_tree_manifests[name]["rows"],
+            kind=f"{name} source tree",
+        )
+    execution_candidates: list[dict[str, Any]] = []
+    snapshot_inputs: dict[str, dict[str, Path]] = {}
+    selected_digest_fields = (
+        ("source_episode", "source_episode_sha256"),
+        ("states", "states_sha256"),
+        ("model_xml_gz", "model_xml_gz_sha256"),
+        ("ep_meta", "ep_meta_file_sha256"),
+        ("dataset_meta", "dataset_meta_sha256"),
+        ("modality", "modality_sha256"),
+        ("candidate_payload", "candidate_payload_sha256"),
+        ("root_context", "root_context_sha256"),
+    )
+    for candidate in chosen:
+        root_id = candidate["root_id"]
+        sealed = selected[root_id]
+        dataset_root = snapshot_input_root / "selected" / root_id / "lerobot"
+        paths: dict[str, Path] = {}
+        for name, digest_field in selected_digest_fields:
+            source_path = Path(sealed[f"{name}_path"])
+            if name in {"source_episode", "states", "model_xml_gz", "ep_meta", "dataset_meta", "modality"}:
+                relative = source_path.relative_to(Path(sealed["source_dataset_path"]))
+                target = dataset_root / relative
+            else:
+                target = snapshot_input_root / "selected" / root_id / name / source_path.name
+            _resolved, payload, observed = _regular(source_path, f"selected {name}")
+            if observed != sealed[digest_field]:
+                raise RuntimeError(f"selected {name} provenance SHA drift")
+            paths[name] = snapshot_plan.add_file(
+                source_path, target, expected_sha256=observed,
+                size=len(payload), kind=f"selected {name}",
+            )
+        execution = dict(candidate)
+        execution["source_dataset"] = "./" + dataset_root.relative_to(
+            snapshot_root
+        ).as_posix()
+        execution["candidate_path"] = "./" + paths[
+            "candidate_payload"
+        ].relative_to(snapshot_root).as_posix()
+        execution["root_context_path"] = "./" + paths[
+            "root_context"
+        ].relative_to(snapshot_root).as_posix()
+        execution_candidates.append(execution)
+        snapshot_inputs[root_id] = paths | {"source_dataset": dataset_root}
+    selection_payload = b"".join(
+        (json.dumps(row, sort_keys=True) + "\n").encode()
+        for row in execution_candidates
+    )
+    output.publish(selection_path, selection_payload, label="selected candidate index")
+    snapshot_plan.add_verified_file(
+        selection_path, selection_path, kind="selected candidate index"
+    )
+    for module_path in (
+        generator_snapshot, helper_snapshot, adapter_snapshot,
+        data_root / "v7_action_contract.py", data_root / "v7_contracts.py",
+        planner_root / "action_bridge.py",
+    ):
+        snapshot_plan.add_verified_file(
+            module_path, module_path, kind="execution module"
+        )
+    snapshot_manifest_path = output_root / "execution_snapshot_manifest.json"
+    snapshot_manifest, snapshot_manifest_sha = snapshot_plan.seal(
+        snapshot_manifest_path
+    )
+    robocasa_source_root = source_snapshots["robocasa"]
+    robosuite_source_root = source_snapshots["robosuite"]
+    for name, source_root, package_name, commit in (
+        ("robocasa", robocasa_source_root, "robocasa", "8f3c96ec8d1bfcd8126cad2bca887da98d30e997"),
+        ("robosuite", robosuite_source_root, "robosuite", "6c10ef24a4bb52f59199976125060ce793470e6e"),
+    ):
+        manifest = dict(source_tree_manifests[name], root=str(source_root))
+        manifest_payload = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
+        manifest_sha = hashlib.sha256(manifest_payload).hexdigest()
+        manifest_path = output_root / f"{name}_source_tree.json"
+        output.publish(manifest_path, manifest_payload, label=f"{name} source-tree manifest")
         source_tree_references[name] = {
             "manifest_path": str(manifest_path),
             "manifest_sha256": manifest_sha,
             "tree_sha256": manifest["rows_sha256"],
         }
-    python_identity = _file_identity(command_python, "simulator Python")
-    environment_path, environment_sha, _environment = _environment_receipt(
-        simulator_command=command_python,
-        simulator_environment=simulator_environment,
-        simulator_site_packages=simulator_site_packages,
-        robocasa_source_root=robocasa_source_root,
-        robosuite_source_root=robosuite_source_root,
-        source_trees=source_tree_references,
-        code_commit=code_commit,
-        generator_sha256=generator_sha,
-        generator_snapshot_sha256=generator_snapshot_sha,
-        helper_sha256=helper_sha,
-        adapter_loader_sha256=adapter_loader_sha,
-        v7_action_contract_sha256=v7_action_contract_sha,
-        v7_contracts_sha256=v7_contracts_sha,
-        action_bridge_sha256=action_bridge_sha,
-        output=output_root / "simulator_environment_receipt.json",
-        output_scope=output,
-        execution_root=execution_root,
-    )
-    fresh_payload_root = output_root / "payloads"
-    fresh_index_path = output_root / "index.jsonl"
-    payload_root_pin = output.pin_directory(
-        fresh_payload_root, label="fresh replay payload root"
-    )
-    split_pins = {
-        split: output.pin_directory(
-            fresh_payload_root / split, label=f"fresh replay {split} payloads"
-        )
-        for split in _SPLITS
+    command_python = simulator_python_snapshot
+    simulator_site_packages = simulator_site_packages_snapshot
+    simulator_environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/root"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl"),
+        "__EGL_VENDOR_LIBRARY_FILENAMES": str(egl_vendor_snapshot),
+        "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "4"),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHOME": str(snapshot_input_root / "python"),
+        "PYTHONPATH": os.pathsep.join((
+            str(execution_root), str(robocasa_source_root),
+            str(robosuite_source_root), str(simulator_site_packages),
+        )),
     }
-    environment = simulator_environment
-    command = [
-        str(command_python), "-S", str(generator_snapshot),
-        "--candidate-index", str(selection_path),
-        "--action-audit", str(action_audit),
-        "--output-root", str(fresh_payload_root),
-        "--output-index", str(fresh_index_path),
-        "--num-shards", "1", "--shard-index", "0", "--max-roots", "0",
-        "--height", str(args.height), "--width", str(args.width),
-    ]
-    subprocess.run(
-        command,
-        cwd=execution_root,
-        env=environment,
-        check=True,
+    snapshot_anchor = PinnedExecutionPath(
+        snapshot_root, directory=True, label="replay execution snapshot"
     )
-    if _file_identity(command_python, "simulator Python") != python_identity:
-        raise RuntimeError("simulator Python changed while replay was running")
-    for name, source_root, package_name, commit in (
-        ("robocasa", robocasa_source_root, "robocasa", "8f3c96ec8d1bfcd8126cad2bca887da98d30e997"),
-        ("robosuite", robosuite_source_root, "robosuite", "6c10ef24a4bb52f59199976125060ce793470e6e"),
-    ):
-        observed, _payload, _sha256 = _source_tree_manifest(
-            source_root, name=name, package_name=package_name, commit=commit
-        )
-        if observed != source_tree_manifests[name]:
-            raise RuntimeError(f"{name} source tree changed during replay")
-    output.verify_pinned_directory(
-        output_root_pin, label="fresh replay output root"
+    immutable_inputs = ReadOnlyBindMount(
+        snapshot_input_root, label="replay execution inputs"
     )
-    output.verify_pinned_directory(
-        payload_root_pin, label="fresh replay payload root"
-    )
-    for split, pin in split_pins.items():
-        output.verify_pinned_directory(
-            pin, label=f"fresh replay {split} payloads"
-        )
-    fresh_index, fresh_index_payload, fresh_index_sha = _regular(
-        fresh_index_path, "fresh runtime index"
-    )
-    fresh_rows = {}
-    for row in _rows(fresh_index_payload, "fresh runtime index"):
-        root_id = row.get("root_id")
-        if (
-            row.get("schema") != LEGACY_RUNTIME_SCHEMA
-            or type(root_id) is not str
-            or root_id in fresh_rows
-        ):
-            raise RuntimeError("fresh runtime row schema/identity is invalid")
-        fresh_rows[root_id] = row
-    if set(fresh_rows) != set(selected):
-        raise RuntimeError("fresh runtime root coverage differs from selection")
-
-    authority_rows = []
-    for candidate in chosen:
-        root_id = candidate["root_id"]
-        selection_row = selected[root_id]
-        split = selection_row["split"]
-        legacy, legacy_shard, legacy_shard_sha = legacy_rows[root_id]
-        fresh = fresh_rows[root_id]
-        legacy_path, legacy_payload, legacy_sha = _regular(
-            Path(legacy["path"]), "legacy runtime payload"
-        )
-        fresh_path, fresh_payload, fresh_sha = _regular(
-            Path(fresh["path"]), "fresh runtime payload"
-        )
-        if legacy_sha != _sha(legacy["payload_sha256"], "legacy payload SHA"):
-            raise RuntimeError("legacy runtime payload SHA drift")
-        if fresh_sha != _sha(fresh["payload_sha256"], "fresh payload SHA"):
-            raise RuntimeError("fresh runtime payload SHA drift")
-        legacy_npz = _npz(legacy_payload, "legacy runtime payload")
-        fresh_npz = _npz(fresh_payload, "fresh runtime payload")
-        legacy_comparison = {}
-        for name in _COMPARE_ARRAYS:
-            if name not in legacy_npz or name not in fresh_npz:
-                raise RuntimeError(f"runtime payload lacks {name}")
-            legacy_comparison[name] = bool(
-                np.array_equal(legacy_npz[name], fresh_npz[name])
-            )
-        candidate_path, _candidate_bytes, candidate_payload_sha = _regular(
-            Path(candidate["candidate_path"]), "candidate payload"
-        )
-        if candidate_payload_sha != candidate["payload_sha256"]:
-            raise RuntimeError("candidate payload SHA drift")
-        root_context, _context_bytes, root_context_sha = _regular(
-            Path(candidate["root_context_path"]), "root context"
-        )
-        if root_context_sha != candidate["root_context_sha256"]:
-            raise RuntimeError("root context SHA drift")
-        source = Path(candidate["source_dataset"])
-        if source.is_symlink():
-            raise RuntimeError("source dataset root must not be a symlink")
-        source = source.resolve(strict=True)
-        source_episode, _episode_bytes, source_episode_sha = _regular(
-            _source_episode_path(source, int(candidate["episode_id"])),
-            "source episode",
-        )
-        branches = _branch_rows(fresh_npz)
-        row = {
-            "schema": REPLAY_AUTHORITY_ROW_SCHEMA,
-            "split": split,
-            "source": selection_row["source"],
-            "root_id": root_id,
-            "episode_id": int(candidate["episode_id"]),
-            "episode_root_index": int(candidate["episode_root_index"]),
-            "t0": int(candidate["t0"]),
-            "source_dataset_path": selection_row["source_dataset_path"],
-            "states_path": selection_row["states_path"],
-            "states_sha256": selection_row["states_sha256"],
-            "model_xml_gz_path": selection_row["model_xml_gz_path"],
-            "model_xml_gz_sha256": selection_row["model_xml_gz_sha256"],
-            "ep_meta_path": selection_row["ep_meta_path"],
-            "ep_meta_file_sha256": selection_row["ep_meta_file_sha256"],
-            "dataset_meta_path": selection_row["dataset_meta_path"],
-            "dataset_meta_sha256": selection_row["dataset_meta_sha256"],
-            "modality_path": selection_row["modality_path"],
-            "modality_sha256": selection_row["modality_sha256"],
-            "candidate_seed": int(candidate["candidate_seed"]),
-            "candidate_index_row_sha256": canonical_sha256(candidate),
-            "candidate_payload_path": str(candidate_path),
-            "candidate_payload_sha256": candidate_payload_sha,
-            "root_context_path": str(root_context),
-            "root_context_sha256": root_context_sha,
-            "source_episode_path": str(source_episode),
-            "source_episode_sha256": source_episode_sha,
-            "source_manifest_path": selection_row["source_manifest_path"],
-            "source_manifest_sha256": selection_row["source_manifest_sha256"],
-            "source_manifest_row_sha256": selection_row[
-                "source_manifest_row_sha256"
-            ],
-            "legacy_runtime_index_shard_path": str(legacy_shard),
-            "legacy_runtime_index_shard_sha256": legacy_shard_sha,
-            "legacy_runtime_index_row_sha256": canonical_sha256(legacy),
-            "legacy_runtime_payload_path": str(legacy_path),
-            "legacy_runtime_payload_sha256": legacy_sha,
-            "fresh_runtime_index_row_sha256": canonical_sha256(fresh),
-            "fresh_runtime_payload_path": str(fresh_path),
-            "fresh_runtime_payload_sha256": fresh_sha,
-            "stage0_checkpoint_sha256": _sha(
-                candidate["stage0_checkpoint_sha256"], "Stage0 checkpoint SHA"
-            ),
-            "candidate_count": int(fresh["branches"]),
-            "future_frames": int(fresh["future_frames"]),
-            "root_state_sha256": array_sha256(fresh_npz["root_state"]),
-            "root_render_state_sha256": str(fresh_npz["root_render_state_sha256"].item()),
-            "root_rgb_sha256": array_sha256(fresh_npz["root_rgb"]),
-            "executed_actions_sha256": array_sha256(fresh_npz["simulator_actions"]),
-            "branch_rgb_sha256": array_sha256(fresh_npz["branch_rgb"]),
-            "branch_rewards_sha256": array_sha256(fresh_npz["branch_rewards"]),
-            "branch_dones_sha256": array_sha256(fresh_npz["branch_dones"]),
-            "branch_success_sha256": array_sha256(fresh_npz["branch_success"]),
-            "branch_roles": [str(value) for value in fresh_npz["branch_roles"].tolist()],
-            "simulator_action_low_sha256": array_sha256(fresh_npz["simulator_action_low"]),
-            "simulator_action_high_sha256": array_sha256(fresh_npz["simulator_action_high"]),
-            "model_xml_sha256": selection_row["model_xml_sha256"],
-            "ep_meta_sha256": selection_row["ep_meta_sha256"],
-            "root_rgb_equivalence_contract": str(
-                fresh_npz["root_rgb_equivalence_contract"].item()
-            ),
-            "root_rgb_changed_fraction_sha256": array_sha256(
-                fresh_npz["root_rgb_changed_fraction"]
-            ),
-            "root_rgb_mean_abs_sha256": array_sha256(fresh_npz["root_rgb_mean_abs"]),
-            "root_rgb_rmse_sha256": array_sha256(fresh_npz["root_rgb_rmse"]),
-            "root_rgb_p99_abs_sha256": array_sha256(fresh_npz["root_rgb_p99_abs"]),
-            "root_rgb_psnr_db_sha256": array_sha256(fresh_npz["root_rgb_psnr_db"]),
-            "branches": branches,
-            "branches_sha256": canonical_sha256(branches),
-            "legacy_comparison_diagnostic": {
-                "available": True,
-                "all_core_equal": all(legacy_comparison.values()),
-                "fields": legacy_comparison,
-            },
-            "candidate_actions_executed_exact": bool(
-                fresh["candidate_actions_executed_exact"]
-            ),
-            "same_root_simulator_state_exact": bool(
-                fresh_npz["same_root_simulator_state_exact"].item()
-            ),
-            "same_root_render_state_exact": bool(
-                fresh_npz["same_root_render_state_exact"].item()
-            ),
-            "same_root_rgb_exact": bool(
-                fresh_npz["root_rgb_equivalence_all_passed"].item()
-                and fresh_npz["same_root_rgb_canonicalized"].item()
-            ),
-            "real_simulator_outcomes": fresh["pseudo_outcomes"] is False,
+    try:
+        immutable_inputs.__enter__()
+        execution_environment = dict(simulator_environment)
+        execution_environment.update({
+            "__EGL_VENDOR_LIBRARY_FILENAMES": "./inputs/runtime/egl_vendor.json",
+            "PYTHONHOME": "./inputs/python",
+            "PYTHONPATH": os.pathsep.join((
+                "./inputs/execution",
+                f"./inputs/sources/{robocasa_source_root.name}",
+                f"./inputs/sources/{robosuite_source_root.name}",
+                "./inputs/python/site-packages",
+            )),
+        })
+        execution_aliases = {
+            snapshot_anchor.alias("inputs/execution"): execution_root,
+            snapshot_anchor.alias(f"inputs/sources/{robocasa_source_root.name}"):
+                robocasa_source_root,
+            snapshot_anchor.alias(f"inputs/sources/{robosuite_source_root.name}"):
+                robosuite_source_root,
+            snapshot_anchor.alias("inputs/python/site-packages"):
+                simulator_site_packages,
         }
-        if set(row) != REPLAY_AUTHORITY_ROW_FIELDS:
-            raise AssertionError("internal replay authority row fields drifted")
-        authority_rows.append(row)
-    authority_rows.sort(key=lambda row: (_SPLITS.index(row["split"]), row["root_id"]))
-    counts = {
-        split: sum(row["split"] == split for row in authority_rows)
-        for split in _SPLITS
-    }
-    authority = {
-        "schema": REPLAY_AUTHORITY_SCHEMA,
-        "code_commit": code_commit,
-        "simulator_environment_receipt_path": str(environment_path),
-        "simulator_environment_receipt_sha256": environment_sha,
-        "runtime_root": str(runtime_root),
-        "runtime_generator_path": str(generator),
-        "runtime_generator_sha256": generator_sha,
-        "replay_helper_path": str(helper),
-        "replay_helper_sha256": helper_sha,
-        "adapter_loader_path": str(adapter_loader),
-        "adapter_loader_sha256": adapter_loader_sha,
-        "action_audit_path": str(action_audit),
-        "action_audit_sha256": action_sha,
-        "candidate_index_path": str(candidate_index),
-        "candidate_index_sha256": candidate_sha,
-        "candidate_index_seal_path": str(candidate_seal),
-        "candidate_index_seal_sha256": candidate_seal_sha,
-        "selected_candidate_index_path": str(selection_path),
-        "selected_candidate_index_sha256": hashlib.sha256(
-            selection_payload
-        ).hexdigest(),
-        "selection_manifest_path": str(selection_manifest),
-        "selection_manifest_sha256": selection_manifest_sha,
-        "fresh_runtime_root": str(fresh_payload_root.absolute()),
-        "fresh_runtime_index_path": str(fresh_index),
-        "fresh_runtime_index_sha256": fresh_index_sha,
-        "selection_count": counts,
-        "candidate_count": next(iter(fresh_rows.values()))["branches"],
-        "future_frames": next(iter(fresh_rows.values()))["future_frames"],
-        "rows": authority_rows,
-        "rows_sha256": canonical_sha256(authority_rows),
-        "passed": True,
-    }
-    if set(authority) != REPLAY_AUTHORITY_FIELDS:
-        raise AssertionError("internal replay authority fields drifted")
-    validate_replay_authority(
-        authority,
-        expected_code_commit=code_commit,
-        verify_referents=True,
-    )
-    receipt_payload = (json.dumps(authority, sort_keys=True, indent=2) + "\n").encode()
-    output.publish(args.output.absolute(), receipt_payload, label="replay authority")
-    output._verify_namespace()
-    output.close()
-    receipt_sha = hashlib.sha256(receipt_payload).hexdigest()
-    print(json.dumps({
-        "schema": REPLAY_AUTHORITY_SCHEMA,
-        "output": str(args.output.absolute()),
-        "sha256": receipt_sha,
-        "selection_count": counts,
-        "candidate_count": authority["candidate_count"],
-        "passed": True,
-    }, sort_keys=True))
+        snapshot_python_identity = _file_identity(command_python, "simulator Python")
+        environment_path, environment_sha, _environment = _environment_receipt(
+            simulator_command=command_python,
+            simulator_execution_command="./inputs/python/bin/python3.10",
+            simulator_environment=simulator_environment,
+            simulator_execution_environment=execution_environment,
+            simulator_site_packages=simulator_site_packages,
+            simulator_site_packages_provenance=args.simulator_site_packages.resolve(strict=True),
+            simulator_stdlib_provenance=args.simulator_stdlib.resolve(strict=True),
+            simulator_stdlib_snapshot=simulator_stdlib_snapshot,
+            robocasa_source_root=robocasa_source_root,
+            robocasa_source_provenance_root=args.robocasa_source_root.resolve(strict=True),
+            robosuite_source_root=robosuite_source_root,
+            robosuite_source_provenance_root=args.robosuite_source_root.resolve(strict=True),
+            simulator_python_provenance_path=args.simulator_python.resolve(strict=True),
+            simulator_python_provenance_sha256=provenance_python_identity[4],
+            egl_vendor_library_provenance_path=egl_vendor_path,
+            egl_vendor_library_provenance_sha256=_egl_vendor_sha,
+            execution_snapshot_manifest_path=snapshot_manifest_path,
+            execution_snapshot_manifest_sha256=snapshot_manifest_sha,
+            source_trees=source_tree_references,
+            code_commit=code_commit,
+            generator_sha256=generator_sha,
+            generator_snapshot_sha256=generator_snapshot_sha,
+            helper_sha256=helper_sha,
+            adapter_loader_sha256=adapter_loader_sha,
+            v7_action_contract_sha256=v7_action_contract_sha,
+            v7_contracts_sha256=v7_contracts_sha,
+            action_bridge_sha256=action_bridge_sha,
+            output=output_root / "simulator_environment_receipt.json",
+            output_scope=output,
+            execution_root=execution_root,
+            execution_cwd=snapshot_anchor.alias(),
+            execution_path_aliases=execution_aliases,
+            pass_fds=(snapshot_anchor.fd,),
+        )
+        fresh_payload_root = snapshot_root / "generated/payloads"
+        fresh_index_path = snapshot_root / "generated/index.jsonl"
+        payload_root_pin = output.pin_directory(
+            fresh_payload_root, label="fresh replay payload root"
+        )
+        split_pins = {
+            split: output.pin_directory(
+                fresh_payload_root / split, label=f"fresh replay {split} payloads"
+            )
+            for split in _SPLITS
+        }
+        command = [
+            "./inputs/python/bin/python3.10", "-S",
+            "./inputs/execution/scripts/generate_robocasa_stage1_planner_branches.py",
+            "--candidate-index", "./inputs/selected_candidates.jsonl",
+            "--action-audit", "./inputs/action_audit.json",
+            "--output-root", "./generated/payloads",
+            "--output-index", "./generated/index.jsonl",
+            "--num-shards", "1", "--shard-index", "0", "--max-roots", "0",
+            "--height", str(args.height), "--width", str(args.width),
+        ]
+        subprocess.run(
+            command,
+            cwd=snapshot_anchor.alias(),
+            env=execution_environment,
+            pass_fds=(snapshot_anchor.fd,),
+            check=True,
+        )
+        if _file_identity(command_python, "simulator Python") != snapshot_python_identity:
+            raise RuntimeError("simulator Python changed while replay was running")
+        output.verify_pinned_directory(
+            output_root_pin, label="fresh replay output root"
+        )
+        output.verify_pinned_directory(
+            payload_root_pin, label="fresh replay payload root"
+        )
+        for split, pin in split_pins.items():
+            output.verify_pinned_directory(
+                pin, label=f"fresh replay {split} payloads"
+            )
+        fresh_index = fresh_index_path
+        fresh_index_payload, fresh_index_sha = snapshot_anchor.read_regular(
+            "generated/index.jsonl", label="fresh runtime index"
+        )
+        fresh_rows = {}
+        for row in _rows(fresh_index_payload, "fresh runtime index"):
+            root_id = row.get("root_id")
+            if (
+                row.get("schema") != LEGACY_RUNTIME_SCHEMA
+                or type(root_id) is not str
+                or root_id in fresh_rows
+            ):
+                raise RuntimeError("fresh runtime row schema/identity is invalid")
+            fresh_rows[root_id] = row
+        if set(fresh_rows) != set(selected):
+            raise RuntimeError("fresh runtime root coverage differs from selection")
+
+        authority_rows = []
+        for candidate, execution_candidate in zip(chosen, execution_candidates, strict=True):
+            root_id = candidate["root_id"]
+            selection_row = selected[root_id]
+            split = selection_row["split"]
+            legacy, legacy_shard, legacy_shard_sha = legacy_rows[root_id]
+            fresh = fresh_rows[root_id]
+            legacy_path, legacy_payload, legacy_sha = _regular(
+                Path(legacy["path"]), "legacy runtime payload"
+            )
+            expected_fresh_relative = (
+                Path("generated") / "payloads" / split / f"{root_id}.npz"
+            )
+            fresh_path_value = fresh.get("path")
+            if (
+                type(fresh_path_value) is not str
+                or Path(fresh_path_value) != expected_fresh_relative
+                or Path(fresh_path_value).is_absolute()
+                or ".." in Path(fresh_path_value).parts
+            ):
+                raise RuntimeError(
+                    "fresh runtime payload path is outside the anchored output"
+                )
+            fresh_payload, fresh_sha = snapshot_anchor.read_regular(
+                expected_fresh_relative, label="fresh runtime payload"
+            )
+            fresh_path = fresh_payload_root / split / f"{root_id}.npz"
+            if legacy_sha != _sha(legacy["payload_sha256"], "legacy payload SHA"):
+                raise RuntimeError("legacy runtime payload SHA drift")
+            if fresh_sha != _sha(fresh["payload_sha256"], "fresh payload SHA"):
+                raise RuntimeError("fresh runtime payload SHA drift")
+            legacy_npz = _npz(legacy_payload, "legacy runtime payload")
+            fresh_npz = _npz(fresh_payload, "fresh runtime payload")
+            legacy_comparison = {}
+            for name in _COMPARE_ARRAYS:
+                if name not in legacy_npz or name not in fresh_npz:
+                    raise RuntimeError(f"runtime payload lacks {name}")
+                legacy_comparison[name] = bool(
+                    np.array_equal(legacy_npz[name], fresh_npz[name])
+                )
+            candidate_path, _candidate_bytes, candidate_payload_sha = _regular(
+                Path(candidate["candidate_path"]), "candidate payload"
+            )
+            if candidate_payload_sha != candidate["payload_sha256"]:
+                raise RuntimeError("candidate payload SHA drift")
+            root_context, _context_bytes, root_context_sha = _regular(
+                Path(candidate["root_context_path"]), "root context"
+            )
+            if root_context_sha != candidate["root_context_sha256"]:
+                raise RuntimeError("root context SHA drift")
+            execution_source_episode = snapshot_inputs[root_id]["source_episode"]
+            execution_source_episode_relative = execution_source_episode.relative_to(
+                snapshot_root
+            )
+            _episode_bytes, execution_source_episode_sha = snapshot_anchor.read_regular(
+                execution_source_episode_relative,
+                label="execution source episode",
+            )
+            source_episode = Path(selection_row["source_episode_path"])
+            source_episode_sha = selection_row["source_episode_sha256"]
+            if execution_source_episode_sha != source_episode_sha:
+                raise RuntimeError("execution/provenance source episode SHA mismatch")
+            branches = _branch_rows(fresh_npz)
+            row = {
+                "schema": REPLAY_AUTHORITY_ROW_SCHEMA,
+                "split": split,
+                "source": selection_row["source"],
+                "root_id": root_id,
+                "episode_id": int(candidate["episode_id"]),
+                "episode_root_index": int(candidate["episode_root_index"]),
+                "t0": int(candidate["t0"]),
+                "source_dataset_path": selection_row["source_dataset_path"],
+                "states_path": selection_row["states_path"],
+                "states_sha256": selection_row["states_sha256"],
+                "model_xml_gz_path": selection_row["model_xml_gz_path"],
+                "model_xml_gz_sha256": selection_row["model_xml_gz_sha256"],
+                "ep_meta_path": selection_row["ep_meta_path"],
+                "ep_meta_file_sha256": selection_row["ep_meta_file_sha256"],
+                "dataset_meta_path": selection_row["dataset_meta_path"],
+                "dataset_meta_sha256": selection_row["dataset_meta_sha256"],
+                "modality_path": selection_row["modality_path"],
+                "modality_sha256": selection_row["modality_sha256"],
+                "candidate_seed": int(candidate["candidate_seed"]),
+                "candidate_index_row_sha256": canonical_sha256(candidate),
+                "execution_candidate_index_row_sha256": canonical_sha256(
+                    execution_candidate
+                ),
+                "candidate_payload_path": str(candidate_path),
+                "candidate_payload_sha256": candidate_payload_sha,
+                "execution_candidate_payload_path": str(
+                    snapshot_inputs[root_id]["candidate_payload"]
+                ),
+                "execution_candidate_payload_sha256": candidate_payload_sha,
+                "root_context_path": str(root_context),
+                "root_context_sha256": root_context_sha,
+                "execution_root_context_path": str(
+                    snapshot_inputs[root_id]["root_context"]
+                ),
+                "execution_root_context_sha256": root_context_sha,
+                "source_episode_path": str(source_episode),
+                "source_episode_sha256": source_episode_sha,
+                "execution_source_dataset_path": str(
+                    snapshot_inputs[root_id]["source_dataset"]
+                ),
+                "execution_source_episode_path": str(execution_source_episode),
+                "execution_source_episode_sha256": execution_source_episode_sha,
+                "execution_states_path": str(snapshot_inputs[root_id]["states"]),
+                "execution_states_sha256": selection_row["states_sha256"],
+                "execution_model_xml_gz_path": str(
+                    snapshot_inputs[root_id]["model_xml_gz"]
+                ),
+                "execution_model_xml_gz_sha256": selection_row["model_xml_gz_sha256"],
+                "execution_ep_meta_path": str(snapshot_inputs[root_id]["ep_meta"]),
+                "execution_ep_meta_file_sha256": selection_row["ep_meta_file_sha256"],
+                "execution_dataset_meta_path": str(
+                    snapshot_inputs[root_id]["dataset_meta"]
+                ),
+                "execution_dataset_meta_sha256": selection_row["dataset_meta_sha256"],
+                "execution_modality_path": str(snapshot_inputs[root_id]["modality"]),
+                "execution_modality_sha256": selection_row["modality_sha256"],
+                "source_manifest_path": selection_row["source_manifest_path"],
+                "source_manifest_sha256": selection_row["source_manifest_sha256"],
+                "source_manifest_row_sha256": selection_row[
+                    "source_manifest_row_sha256"
+                ],
+                "legacy_runtime_index_shard_path": str(legacy_shard),
+                "legacy_runtime_index_shard_sha256": legacy_shard_sha,
+                "legacy_runtime_index_row_sha256": canonical_sha256(legacy),
+                "legacy_runtime_payload_path": str(legacy_path),
+                "legacy_runtime_payload_sha256": legacy_sha,
+                "fresh_runtime_index_row_sha256": canonical_sha256(fresh),
+                "fresh_runtime_payload_path": str(fresh_path),
+                "fresh_runtime_payload_sha256": fresh_sha,
+                "stage0_checkpoint_sha256": _sha(
+                    candidate["stage0_checkpoint_sha256"], "Stage0 checkpoint SHA"
+                ),
+                "candidate_count": int(fresh["branches"]),
+                "future_frames": int(fresh["future_frames"]),
+                "root_state_sha256": array_sha256(fresh_npz["root_state"]),
+                "root_render_state_sha256": str(fresh_npz["root_render_state_sha256"].item()),
+                "root_rgb_sha256": array_sha256(fresh_npz["root_rgb"]),
+                "executed_actions_sha256": array_sha256(fresh_npz["simulator_actions"]),
+                "branch_rgb_sha256": array_sha256(fresh_npz["branch_rgb"]),
+                "branch_rewards_sha256": array_sha256(fresh_npz["branch_rewards"]),
+                "branch_dones_sha256": array_sha256(fresh_npz["branch_dones"]),
+                "branch_success_sha256": array_sha256(fresh_npz["branch_success"]),
+                "branch_roles": [str(value) for value in fresh_npz["branch_roles"].tolist()],
+                "simulator_action_low_sha256": array_sha256(fresh_npz["simulator_action_low"]),
+                "simulator_action_high_sha256": array_sha256(fresh_npz["simulator_action_high"]),
+                "model_xml_sha256": selection_row["model_xml_sha256"],
+                "ep_meta_sha256": selection_row["ep_meta_sha256"],
+                "root_rgb_equivalence_contract": str(
+                    fresh_npz["root_rgb_equivalence_contract"].item()
+                ),
+                "root_rgb_changed_fraction_sha256": array_sha256(
+                    fresh_npz["root_rgb_changed_fraction"]
+                ),
+                "root_rgb_mean_abs_sha256": array_sha256(fresh_npz["root_rgb_mean_abs"]),
+                "root_rgb_rmse_sha256": array_sha256(fresh_npz["root_rgb_rmse"]),
+                "root_rgb_p99_abs_sha256": array_sha256(fresh_npz["root_rgb_p99_abs"]),
+                "root_rgb_psnr_db_sha256": array_sha256(fresh_npz["root_rgb_psnr_db"]),
+                "branches": branches,
+                "branches_sha256": canonical_sha256(branches),
+                "legacy_comparison_diagnostic": {
+                    "available": True,
+                    "all_core_equal": all(legacy_comparison.values()),
+                    "fields": legacy_comparison,
+                },
+                "candidate_actions_executed_exact": bool(
+                    fresh["candidate_actions_executed_exact"]
+                ),
+                "same_root_simulator_state_exact": bool(
+                    fresh_npz["same_root_simulator_state_exact"].item()
+                ),
+                "same_root_render_state_exact": bool(
+                    fresh_npz["same_root_render_state_exact"].item()
+                ),
+                "same_root_rgb_exact": bool(
+                    fresh_npz["root_rgb_equivalence_all_passed"].item()
+                    and fresh_npz["same_root_rgb_canonicalized"].item()
+                ),
+                "real_simulator_outcomes": fresh["pseudo_outcomes"] is False,
+            }
+            if set(row) != REPLAY_AUTHORITY_ROW_FIELDS:
+                raise AssertionError("internal replay authority row fields drifted")
+            authority_rows.append(row)
+        authority_rows.sort(key=lambda row: (_SPLITS.index(row["split"]), row["root_id"]))
+        counts = {
+            split: sum(row["split"] == split for row in authority_rows)
+            for split in _SPLITS
+        }
+        authority = {
+            "schema": REPLAY_AUTHORITY_SCHEMA,
+            "code_commit": code_commit,
+            "simulator_environment_receipt_path": str(environment_path),
+            "simulator_environment_receipt_sha256": environment_sha,
+            "runtime_root": str(runtime_root),
+            "runtime_generator_path": str(generator),
+            "runtime_generator_sha256": generator_sha,
+            "replay_helper_path": str(helper),
+            "replay_helper_sha256": helper_sha,
+            "adapter_loader_path": str(adapter_loader),
+            "adapter_loader_sha256": adapter_loader_sha,
+            "action_audit_path": str(action_audit),
+            "action_audit_sha256": action_sha,
+            "action_audit_snapshot_path": str(action_audit_snapshot),
+            "action_audit_snapshot_sha256": action_sha,
+            "execution_snapshot_manifest_path": str(snapshot_manifest_path),
+            "execution_snapshot_manifest_sha256": snapshot_manifest_sha,
+            "candidate_index_path": str(candidate_index),
+            "candidate_index_sha256": candidate_sha,
+            "candidate_index_seal_path": str(candidate_seal),
+            "candidate_index_seal_sha256": candidate_seal_sha,
+            "selected_candidate_index_path": str(selection_path),
+            "selected_candidate_index_sha256": hashlib.sha256(
+                selection_payload
+            ).hexdigest(),
+            "selection_manifest_path": str(selection_manifest),
+            "selection_manifest_sha256": selection_manifest_sha,
+            "fresh_runtime_root": str(fresh_payload_root.absolute()),
+            "fresh_runtime_index_path": str(fresh_index),
+            "fresh_runtime_index_sha256": fresh_index_sha,
+            "selection_count": counts,
+            "candidate_count": next(iter(fresh_rows.values()))["branches"],
+            "future_frames": next(iter(fresh_rows.values()))["future_frames"],
+            "rows": authority_rows,
+            "rows_sha256": canonical_sha256(authority_rows),
+            "passed": True,
+        }
+        if set(authority) != REPLAY_AUTHORITY_FIELDS:
+            raise AssertionError("internal replay authority fields drifted")
+        validate_replay_authority(
+            authority,
+            expected_code_commit=code_commit,
+            verify_referents=True,
+        )
+        receipt_payload = (json.dumps(authority, sort_keys=True, indent=2) + "\n").encode()
+        output.publish(args.output.absolute(), receipt_payload, label="replay authority")
+        output._verify_namespace()
+        receipt_sha = hashlib.sha256(receipt_payload).hexdigest()
+        print(json.dumps({
+            "schema": REPLAY_AUTHORITY_SCHEMA,
+            "output": str(args.output.absolute()),
+            "sha256": receipt_sha,
+            "selection_count": counts,
+            "candidate_count": authority["candidate_count"],
+            "passed": True,
+        }, sort_keys=True))
+        immutable_inputs.verify(
+            target=snapshot_anchor.alias("inputs"),
+            pass_fds=(snapshot_anchor.fd,),
+        )
+    finally:
+        try:
+            immutable_inputs.close(
+                target=snapshot_anchor.alias("inputs"),
+                pass_fds=(snapshot_anchor.fd,),
+            )
+        finally:
+            snapshot_anchor.close()
+            output.close()
 
 
 if __name__ == "__main__":

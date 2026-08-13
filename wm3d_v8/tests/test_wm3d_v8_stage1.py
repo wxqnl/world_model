@@ -344,16 +344,28 @@ def _fresh_binding_fixture() -> tuple[dict, dict, dict, dict, dict[str, np.ndarr
         "root_context_path": "/root.npz",
     })
     authority = dict(selection)
+    snapshot_root = Path("/snapshot")
+    selected_root = snapshot_root / "inputs/selected" / digest
     authority.update({
         "candidate_count": 2, "future_frames": 1,
         "stage0_checkpoint_sha256": "b" * 64,
         "branch_roles": ["factual_teacher", "direct"],
+        "execution_source_dataset_path": str(selected_root / "lerobot"),
+        "execution_candidate_payload_path": str(
+            selected_root / "candidate_payload/candidate.npz"
+        ),
+        "execution_root_context_path": str(
+            selected_root / "root_context/root.npz"
+        ),
     })
     candidate = {
-        "root_id": digest, "split": "train", "source_dataset": "/source",
+        "root_id": digest, "split": "train",
+        "source_dataset": f"./inputs/selected/{digest}/lerobot",
         "episode_id": 1, "episode_root_index": 2, "t0": 2,
-        "candidate_path": "/candidate.npz", "payload_sha256": digest,
-        "root_context_path": "/root.npz", "root_context_sha256": digest,
+        "candidate_path": f"./inputs/selected/{digest}/candidate_payload/candidate.npz",
+        "payload_sha256": digest,
+        "root_context_path": f"./inputs/selected/{digest}/root_context/root.npz",
+        "root_context_sha256": digest,
         "stage0_checkpoint_sha256": "b" * 64, "action_audit_sha256": "c" * 64,
     }
     payload = {
@@ -365,8 +377,10 @@ def _fresh_binding_fixture() -> tuple[dict, dict, dict, dict, dict[str, np.ndarr
     }
     fresh = {
         "schema": "wm3d_v7_stage1_planner_same_root_runtime_v3",
-        "root_id": digest, "split": "train", "source_dataset": "/source",
-        "root_context_path": "/root.npz", "root_context_sha256": digest,
+        "root_id": digest, "split": "train",
+        "source_dataset": f"./inputs/selected/{digest}/lerobot",
+        "root_context_path": f"./inputs/selected/{digest}/root_context/root.npz",
+        "root_context_sha256": digest,
         "episode_id": 1, "episode_root_index": 2, "t0": 2,
         "candidate_index_sha256": "d" * 64, "candidate_payload_sha256": digest,
         "action_audit_sha256": "c" * 64, "stage0_checkpoint_sha256": "b" * 64,
@@ -493,7 +507,8 @@ def test_replay_environment_identity_tamper_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     field: str, value: object, match: str,
 ) -> None:
-    execution = tmp_path / "execution"
+    snapshot_root = tmp_path
+    execution = snapshot_root / "execution"
     paths = {
         "runtime_generator": execution / "scripts/generate_robocasa_stage1_planner_branches.py",
         "replay_helper": execution / "scripts/generate_robocasa_same_root_cf.py",
@@ -505,14 +520,23 @@ def test_replay_environment_identity_tamper_is_rejected(
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x")
-    python = tmp_path / "python"
+    python = snapshot_root / "python/bin/python3.10"
+    python.parent.mkdir(parents=True)
     python.write_bytes(b"x")
-    site = tmp_path / "site"
-    site.mkdir()
-    casa = tmp_path / ("robocasa-" + "8f3c96ec8d1bfcd8126cad2bca887da98d30e997")
-    suite = tmp_path / ("robosuite-" + "6c10ef24a4bb52f59199976125060ce793470e6e")
-    casa.mkdir()
-    suite.mkdir()
+    site = snapshot_root / "python/site-packages"
+    stdlib = snapshot_root / "python/lib/python3.10"
+    site.mkdir(parents=True)
+    stdlib.mkdir(parents=True)
+    casa = snapshot_root / "sources" / (
+        "robocasa-" + "8f3c96ec8d1bfcd8126cad2bca887da98d30e997"
+    )
+    suite = snapshot_root / "sources" / (
+        "robosuite-" + "6c10ef24a4bb52f59199976125060ce793470e6e"
+    )
+    casa.mkdir(parents=True)
+    suite.mkdir(parents=True)
+    egl = snapshot_root / "egl.json"
+    egl.write_bytes(b"x")
     stat = python.stat()
     helper_sha, adapter_sha, action_sha = "b" * 64, "c" * 64, "d" * 64
     contracts_sha, bridge_sha = "e" * 64, "9" * 64
@@ -531,10 +555,24 @@ def test_replay_environment_identity_tamper_is_rejected(
         "simulator_python_size": stat.st_size,
         "simulator_python_mtime_ns": stat.st_mtime_ns,
         "simulator_pythonpath": ":".join(map(str, (execution, casa, suite, site))),
+        "simulator_pythonhome": str(snapshot_root / "python"),
         "python_version": "3.10", "cuda_visible_devices": "4", "mujoco_gl": "egl",
+        "execution_snapshot_manifest_path": str(tmp_path / "snapshot.json"),
+        "execution_snapshot_manifest_sha256": "a" * 64,
+        "simulator_python_provenance_path": str(python),
+        "simulator_python_provenance_sha256": hashlib.sha256(b"x").hexdigest(),
+        "egl_vendor_library_path": str(egl),
+        "egl_vendor_library_sha256": hashlib.sha256(b"x").hexdigest(),
+        "egl_vendor_library_provenance_path": str(egl),
+        "egl_vendor_library_provenance_sha256": hashlib.sha256(b"x").hexdigest(),
+        "simulator_stdlib_provenance_root": str(site),
+        "simulator_stdlib_snapshot_root": str(stdlib),
         "simulator_site_packages_path": str(site), "robocasa_source_root": str(casa),
+        "simulator_site_packages_provenance_path": str(site),
+        "robocasa_source_provenance_root": str(casa),
         "robocasa_source_commit": "8f3c96ec8d1bfcd8126cad2bca887da98d30e997",
         "robosuite_source_root": str(suite),
+        "robosuite_source_provenance_root": str(suite),
         "robosuite_source_commit": "6c10ef24a4bb52f59199976125060ce793470e6e",
         "source_trees": {name: {
             "manifest_path": str(tmp_path / name), "manifest_sha256": "a" * 64,
@@ -553,10 +591,33 @@ def test_replay_environment_identity_tamper_is_rejected(
         "passed": True,
     })
     monkeypatch.setattr(replay_authority_contract, "_validate_source_tree", lambda *a, **k: None)
+    snapshot_manifest = {
+        "root": str(snapshot_root),
+        "rows": [
+            {
+                "snapshot_path": str(python),
+                "snapshot_sha256": hashlib.sha256(b"x").hexdigest(),
+                "kind": "simulator Python",
+            },
+            {
+                "snapshot_path": str(egl),
+                "snapshot_sha256": hashlib.sha256(b"x").hexdigest(),
+                "kind": "EGL vendor manifest",
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        replay_authority_contract, "validate_execution_snapshot",
+        lambda *a, **k: snapshot_manifest,
+    )
+    snapshot_payload = json.dumps(snapshot_manifest).encode()
     monkeypatch.setattr(
         replay_authority_contract,
         "_verify_path",
-        lambda path, *_args, **_kwargs: (Path(path), b"x"),
+        lambda path, *_args, **_kwargs: (
+            Path(path),
+            snapshot_payload if Path(path) == tmp_path / "snapshot.json" else b"x",
+        ),
     )
     if field.startswith("snapshot_"):
         if field == "snapshot_runtime_generator_path":
@@ -1046,6 +1107,7 @@ def test_stage1_release_manual_tracks_required_audit_cli_and_schemas() -> None:
     assert '--code-commit "$CODE_COMMIT"' in audit_block
     assert '--code-commit "$CODE_COMMIT"' in replay_block
     assert "--selection-manifest" in replay_block
+    assert "--simulator-stdlib" in replay_block
     assert "--simulator-site-packages" in replay_block
     assert "robocasa_stage1_adapter_loader.py" in replay_block
     assert '--replay-authority "$STAGE1_ROOT/replay_authority.json"' in audit_block

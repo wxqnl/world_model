@@ -419,7 +419,16 @@ class TrustedOutputRoot:
             os.close(current_parent)
         return absolute, payload, digest
 
-    def publish(self, target: Path, payload: bytes, *, label: str) -> Path:
+    def publish(
+        self,
+        target: Path,
+        payload: bytes,
+        *,
+        label: str,
+        mode: int = 0o640,
+    ) -> Path:
+        if type(mode) is not int or mode < 0 or mode & ~0o777:
+            raise RolloutAuditError(f"invalid publish mode for {label}")
         absolute, parts = self._relative_parts(target)
         self._verify_namespace()
         parent, parent_identities = self._open_relative_directory(
@@ -434,11 +443,10 @@ class TrustedOutputRoot:
                 | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0)
             )
-            descriptor = os.open(
-                temporary, flags, 0o640, dir_fd=parent
-            )
+            descriptor = os.open(temporary, flags, mode, dir_fd=parent)
             temporary_created = True
             try:
+                os.fchmod(descriptor, mode)
                 view = memoryview(payload)
                 while view:
                     written = os.write(descriptor, view)
