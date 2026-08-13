@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
+from pathlib import Path
+import shutil
 
 import pytest
+import torch
+import torch.distributed as dist
 
+import wm3d_v3.training.distributed_checkpoint as checkpoint_module
 from wm3d_v3.training.distributed_checkpoint import (
     CheckpointIntegrityError,
+    DistributedCheckpointManager,
     ResumeExpectations,
     _validate_metadata,
 )
@@ -177,3 +184,212 @@ def test_topology_hash_excludes_launch_shape_but_not_training_semantics() -> Non
     second = deepcopy(first)
     second["runtime_profile"]["resources"] = {"minimum_shm_bytes": 64_000_000_000}  # type: ignore[index]
     assert _topology_contract_sha256(first) != _topology_contract_sha256(second)
+
+
+def _small_dcp_metadata(*, progress: int) -> dict[str, object]:
+    return {
+        "run_lineage": "private-snapshot-regression",
+        "runtime_config_sha256": SHA_A,
+        "data_closure_sha256": SHA_B,
+        "model_contract_sha256": SHA_C,
+        "shard_degree": 1,
+        "distributed_strategy": "ddp",
+        "global_batch_size": 1,
+        "topology_contract_sha256": SHA_D,
+        "sampler_progress": {"next_optimizer_step": progress},
+        "initial_seed": 17,
+    }
+
+
+def _small_dcp_expected() -> ResumeExpectations:
+    return ResumeExpectations(
+        step=1,
+        run_lineage="private-snapshot-regression",
+        runtime_config_sha256=SHA_A,
+        data_closure_sha256=SHA_B,
+        model_contract_sha256=SHA_C,
+        world_size=1,
+        shard_degree=1,
+        distributed_strategy="ddp",
+        global_batch_size=1,
+        topology_contract_sha256=SHA_D,
+    )
+
+
+def _replace_regular_file(source: Path, destination: Path) -> None:
+    temporary = destination.with_name(destination.name + ".attacker")
+    shutil.copyfile(source, temporary)
+    os.replace(temporary, destination)
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_private_snapshot_is_the_only_dcp_load_source_after_original_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation: bool,
+) -> None:
+    """A verified snapshot must survive replacement of the original checkpoint."""
+
+    rendezvous = tmp_path / "process-group"
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1
+    )
+    try:
+        manager = DistributedCheckpointManager(tmp_path / "checkpoints")
+        model = torch.nn.Linear(1, 1, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        trusted = manager.save(
+            step=1,
+            model=model,
+            optimizer=optimizer,
+            metadata=_small_dcp_metadata(progress=1),
+            rank_state={"source": "trusted"},
+        )
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+        attacker = manager.save(
+            step=2,
+            model=model,
+            optimizer=optimizer,
+            metadata=_small_dcp_metadata(progress=2),
+            rank_state={"source": "attacker"},
+        )
+        with torch.no_grad():
+            model.weight.zero_()
+
+        original_verify = checkpoint_module._distributed_verify_payload
+        swapped = False
+
+        def verify_snapshot_then_swap_original(
+            root: Path, files: dict[str, dict[str, object]]
+        ) -> None:
+            nonlocal swapped
+            original_verify(root, files)
+            if swapped:
+                return
+            swapped = True
+            for source in sorted((attacker / "distcp").iterdir()):
+                _replace_regular_file(source, trusted / "distcp" / source.name)
+            _replace_regular_file(
+                attacker / "rank_state/rank_00000.pt",
+                trusted / "rank_state/rank_00000.pt",
+            )
+
+        monkeypatch.setattr(
+            checkpoint_module,
+            "_distributed_verify_payload",
+            verify_snapshot_then_swap_original,
+        )
+        if evaluation:
+            metadata = manager.load_model_for_evaluation(
+                path=trusted,
+                model=model,
+                expected=_small_dcp_expected(),
+            )
+            assert metadata["step"] == 1
+        else:
+            metadata, progress = manager.load(
+                path=trusted,
+                model=model,
+                optimizer=optimizer,
+                expected=_small_dcp_expected(),
+            )
+            assert metadata["step"] == 1
+            assert progress == {"source": "trusted"}
+        assert swapped is True
+        assert model.weight.detach().item() == 1.0
+        snapshot_parent = tmp_path / ".wm3d_checkpoint_load_snapshots"
+        assert snapshot_parent.is_dir()
+        assert list(snapshot_parent.iterdir()) == []
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_private_snapshot_is_removed_when_payload_verification_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendezvous = tmp_path / "process-group"
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1
+    )
+    try:
+        manager = DistributedCheckpointManager(tmp_path / "checkpoints")
+        model = torch.nn.Linear(1, 1, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        checkpoint = manager.save(
+            step=1,
+            model=model,
+            optimizer=optimizer,
+            metadata=_small_dcp_metadata(progress=1),
+            rank_state={"source": "trusted"},
+        )
+
+        def fail_verification(*_args: object, **_kwargs: object) -> None:
+            raise CheckpointIntegrityError("injected payload verification failure")
+
+        monkeypatch.setattr(
+            checkpoint_module, "_distributed_verify_payload", fail_verification
+        )
+        with pytest.raises(
+            CheckpointIntegrityError, match="injected payload verification failure"
+        ):
+            manager.load(
+                path=checkpoint,
+                model=model,
+                optimizer=optimizer,
+                expected=_small_dcp_expected(),
+            )
+        assert list((tmp_path / ".wm3d_checkpoint_load_snapshots").iterdir()) == []
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_private_snapshot_is_removed_when_dcp_load_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation: bool,
+) -> None:
+    rendezvous = tmp_path / "process-group"
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1
+    )
+    try:
+        manager = DistributedCheckpointManager(tmp_path / "checkpoints")
+        model = torch.nn.Linear(1, 1, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        checkpoint = manager.save(
+            step=1,
+            model=model,
+            optimizer=optimizer,
+            metadata=_small_dcp_metadata(progress=1),
+            rank_state={"source": "trusted"},
+        )
+
+        def fail_dcp_load(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("injected DCP load failure")
+
+        monkeypatch.setattr(checkpoint_module.dcp, "load", fail_dcp_load)
+        with pytest.raises(CheckpointIntegrityError, match="injected DCP load failure"):
+            if evaluation:
+                manager.load_model_for_evaluation(
+                    path=checkpoint,
+                    model=model,
+                    expected=_small_dcp_expected(),
+                )
+            else:
+                manager.load(
+                    path=checkpoint,
+                    model=model,
+                    optimizer=optimizer,
+                    expected=_small_dcp_expected(),
+                )
+        assert list((tmp_path / ".wm3d_checkpoint_load_snapshots").iterdir()) == []
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

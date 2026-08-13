@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shutil
 import stat
 import uuid
 from typing import Any, Mapping, Optional
@@ -33,6 +34,9 @@ from torch.distributed.checkpoint.state_dict import (
 
 CHECKPOINT_SCHEMA = "wm3d_v8_distributed_checkpoint_v2"
 COMMIT_SCHEMA = "wm3d_v8_distributed_checkpoint_commit_v2"
+_LOAD_SNAPSHOT_DIRECTORY = ".wm3d_checkpoint_load_snapshots"
+_LOAD_SNAPSHOT_FREE_RESERVE_BYTES = 1 << 30
+_COPY_CHUNK_BYTES = 16 << 20
 
 
 class CheckpointIntegrityError(RuntimeError):
@@ -166,6 +170,261 @@ def _regular_files(root: Path) -> list[Path]:
                 raise CheckpointIntegrityError(f"non-regular checkpoint file: {path}")
             result.append(path)
     return sorted(result)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _open_absolute_directory_no_symlinks(path: Path) -> int:
+    """Pin an existing absolute directory chain without following symlinks."""
+
+    absolute = Path(os.path.abspath(path))
+    if not absolute.is_absolute():
+        raise CheckpointIntegrityError("checkpoint snapshot path must be absolute")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in absolute.parts[1:]:
+            if not component or component in {".", ".."}:
+                raise CheckpointIntegrityError(
+                    "checkpoint snapshot path has an invalid component"
+                )
+            child = os.open(component, flags, dir_fd=descriptor)
+            child_info = os.fstat(child)
+            if not stat.S_ISDIR(child_info.st_mode):
+                os.close(child)
+                raise CheckpointIntegrityError(
+                    "checkpoint snapshot path has a non-directory ancestor"
+                )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _copy_regular_no_clobber(source: Path, destination: Path) -> None:
+    """Copy one regular file through pinned descriptors into a new pathname."""
+
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    destination_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+        destination_flags |= os.O_NOFOLLOW
+    source_descriptor = os.open(source, source_flags)
+    destination_descriptor: int | None = None
+    try:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CheckpointIntegrityError(
+                f"checkpoint snapshot source is not regular: {source}"
+            )
+        destination_descriptor = os.open(destination, destination_flags, 0o600)
+        digest = hashlib.sha256()
+        copied = 0
+        while True:
+            block = os.read(source_descriptor, _COPY_CHUNK_BYTES)
+            if not block:
+                break
+            digest.update(block)
+            view = memoryview(block)
+            while view:
+                written = os.write(destination_descriptor, view)
+                if written <= 0:
+                    raise OSError("checkpoint snapshot copy made no progress")
+                view = view[written:]
+                copied += written
+        os.fsync(destination_descriptor)
+        os.fchmod(destination_descriptor, 0o400)
+        after = os.fstat(source_descriptor)
+        if _stat_identity(before) != _stat_identity(after) or copied != before.st_size:
+            raise CheckpointIntegrityError(
+                f"checkpoint file changed while snapshotting: {source}"
+            )
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        os.close(source_descriptor)
+    if sha256_file(destination) != digest.hexdigest():
+        raise CheckpointIntegrityError(
+            f"checkpoint snapshot copy digest mismatch: {destination}"
+        )
+
+
+def _snapshot_parent(path: Path) -> Path:
+    """Create/open the private namespace through a pinned real parent."""
+
+    base = Path(os.path.abspath(path.parent))
+    if path.name != _LOAD_SNAPSHOT_DIRECTORY:
+        raise CheckpointIntegrityError("unexpected checkpoint snapshot parent name")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    base_descriptor = _open_absolute_directory_no_symlinks(base)
+    try:
+        try:
+            os.mkdir(path.name, mode=0o700, dir_fd=base_descriptor)
+            os.fsync(base_descriptor)
+        except FileExistsError:
+            pass
+        parent_descriptor = os.open(path.name, flags, dir_fd=base_descriptor)
+        try:
+            info = os.fstat(parent_descriptor)
+            observed = os.stat(path.name, dir_fd=base_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or _stat_identity(info) != _stat_identity(observed)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise CheckpointIntegrityError(
+                    "checkpoint snapshot parent is not private and stable"
+                )
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        os.close(base_descriptor)
+    return base / path.name
+
+
+def _new_snapshot_container(snapshot_parent: Path) -> Path:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_descriptor = os.open(snapshot_parent, flags)
+    try:
+        for _ in range(32):
+            name = f"load-{os.getpid()}-{uuid.uuid4().hex}"
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            container_descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            try:
+                info = os.fstat(container_descriptor)
+                observed = os.stat(
+                    name, dir_fd=parent_descriptor, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or _stat_identity(info) != _stat_identity(observed)
+                ):
+                    raise CheckpointIntegrityError(
+                        "checkpoint snapshot container identity changed"
+                    )
+            finally:
+                os.close(container_descriptor)
+            os.fsync(parent_descriptor)
+            return snapshot_parent / name
+    finally:
+        os.close(parent_descriptor)
+    raise CheckpointIntegrityError("could not allocate checkpoint snapshot container")
+
+
+def _fsync_tree_directories(root: Path) -> None:
+    directories = [Path(directory) for directory, _, _ in os.walk(root)]
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        _fsync_directory(directory)
+
+
+def _make_private_checkpoint_snapshot(
+    source: Path,
+    *,
+    snapshot_parent: Path,
+) -> tuple[Path, Path]:
+    """Copy a checkpoint into a no-clobber, job-private load namespace.
+
+    The copy deliberately does not use reflinks: not all formal filesystems
+    support FICLONE, and a private byte copy is the portable isolation boundary.
+    The caller must validate the copied controls and every manifest payload
+    before passing the returned path to DCP.
+    """
+
+    if source.is_symlink():
+        raise CheckpointIntegrityError("checkpoint cannot be a symlink")
+    source = source.resolve(strict=True)
+    if not source.is_dir():
+        raise CheckpointIntegrityError("checkpoint must be a real directory")
+    source_files = _regular_files(source)
+    if not source_files:
+        raise CheckpointIntegrityError("checkpoint contains no files")
+    total_bytes = sum(os.lstat(path).st_size for path in source_files)
+
+    snapshot_parent = _snapshot_parent(snapshot_parent)
+    available = shutil.disk_usage(snapshot_parent).free
+    required = total_bytes + _LOAD_SNAPSHOT_FREE_RESERVE_BYTES
+    if available < required:
+        raise CheckpointIntegrityError(
+            "insufficient free space for private checkpoint snapshot: "
+            f"available={available} required={required} payload={total_bytes}"
+        )
+
+    container = _new_snapshot_container(snapshot_parent).resolve(strict=True)
+    snapshot = container / source.name
+    try:
+        snapshot.mkdir(mode=0o700)
+        for source_file in source_files:
+            relative = _safe_relative(source_file.relative_to(source).as_posix())
+            destination = snapshot / relative
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if destination.parent.is_symlink():
+                raise CheckpointIntegrityError(
+                    f"checkpoint snapshot destination escaped: {destination}"
+                )
+            _copy_regular_no_clobber(source_file, destination)
+        _fsync_tree_directories(snapshot)
+        for directory, _, _ in os.walk(snapshot, topdown=False):
+            os.chmod(directory, 0o500, follow_symlinks=False)
+        _fsync_directory(container)
+        _fsync_directory(snapshot_parent)
+    except Exception:
+        _remove_private_checkpoint_snapshot(container)
+        raise
+    return container, snapshot
+
+
+def _remove_private_checkpoint_snapshot(container: Path) -> None:
+    """Best-effort writable transition followed by complete private cleanup."""
+
+    if not container.exists() and not container.is_symlink():
+        return
+    if container.is_symlink():
+        raise CheckpointIntegrityError("checkpoint snapshot container became a symlink")
+    for directory, dirnames, filenames in os.walk(container, topdown=False):
+        directory_path = Path(directory)
+        for filename in filenames:
+            path = directory_path / filename
+            if path.is_symlink():
+                raise CheckpointIntegrityError(
+                    f"symlink appeared in checkpoint snapshot: {path}"
+                )
+            os.chmod(path, 0o600, follow_symlinks=False)
+        for dirname in dirnames:
+            path = directory_path / dirname
+            if path.is_symlink():
+                raise CheckpointIntegrityError(
+                    f"symlink appeared in checkpoint snapshot: {path}"
+                )
+            os.chmod(path, 0o700, follow_symlinks=False)
+        os.chmod(directory_path, 0o700, follow_symlinks=False)
+    parent = container.parent
+    shutil.rmtree(container)
+    _fsync_directory(parent)
 
 
 def _safe_relative(relative: str) -> str:
@@ -638,6 +897,76 @@ class DistributedCheckpointManager:
             )
         return dict(verdict[0]["source"])
 
+    def _snapshot_for_load(
+        self,
+        *,
+        checkpoint_path: Path,
+        expected: ResumeExpectations,
+        require_exact: bool,
+    ) -> tuple[Path, Path, dict[str, Any], str]:
+        """Collectively create and validate one private load snapshot."""
+
+        verdict: list[Any] = [None]
+        if dist.get_rank() == 0:
+            container: Path | None = None
+            try:
+                snapshot_parent = self.root.parent / _LOAD_SNAPSHOT_DIRECTORY
+                container, snapshot = _make_private_checkpoint_snapshot(
+                    checkpoint_path,
+                    snapshot_parent=snapshot_parent,
+                )
+                metadata, files = self._verify_controls(snapshot)
+                resume_mode = _validate_metadata(metadata, expected)
+                if require_exact and resume_mode != "exact":
+                    raise CheckpointIntegrityError(
+                        "checkpoint load snapshot requires exact topology"
+                    )
+                verdict[0] = {
+                    "ok": True,
+                    "container": str(container),
+                    "snapshot": str(snapshot),
+                    "metadata": metadata,
+                    "files": files,
+                    "resume_mode": resume_mode,
+                }
+            except Exception as exc:
+                if container is not None:
+                    try:
+                        _remove_private_checkpoint_snapshot(container)
+                    except Exception:
+                        pass
+                verdict[0] = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+        dist.broadcast_object_list(verdict, src=0)
+        if not verdict[0]["ok"]:
+            raise CheckpointIntegrityError(
+                f"checkpoint snapshot creation failed: {verdict[0]}"
+            )
+        container = Path(verdict[0]["container"])
+        snapshot = Path(verdict[0]["snapshot"])
+        metadata = dict(verdict[0]["metadata"])
+        resume_mode = str(verdict[0]["resume_mode"])
+        try:
+            _distributed_verify_payload(snapshot, verdict[0]["files"])
+        except Exception:
+            self._cleanup_load_snapshot(container)
+            raise
+        return container, snapshot, metadata, resume_mode
+
+    @staticmethod
+    def _cleanup_load_snapshot(container: Path) -> None:
+        error: Optional[Exception] = None
+        dist.barrier()
+        if dist.get_rank() == 0:
+            try:
+                _remove_private_checkpoint_snapshot(container)
+            except Exception as exc:
+                error = exc
+        _collective_error("private snapshot cleanup", error)
+
     def load(
         self,
         *,
@@ -654,95 +983,85 @@ class DistributedCheckpointManager:
             raise CheckpointIntegrityError(
                 f"resume checkpoint escaped run root: {checkpoint_path}"
             )
-        verification: list[Any] = [None]
-        if dist.get_rank() == 0:
-            try:
-                metadata, files = self._verify_controls(checkpoint_path)
-                resume_mode = _validate_metadata(metadata, expected)
-                verification[0] = {
-                    "ok": True,
-                    "metadata": metadata,
-                    "files": files,
-                    "resume_mode": resume_mode,
-                }
-            except Exception as exc:
-                verification[0] = {
-                    "ok": False,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-        dist.broadcast_object_list(verification, src=0)
-        if not verification[0]["ok"]:
-            raise CheckpointIntegrityError(
-                f"rank0 checkpoint verification failed: {verification[0]}"
-            )
-        metadata = verification[0]["metadata"]
-        resume_mode = str(verification[0]["resume_mode"])
-        _distributed_verify_payload(checkpoint_path, verification[0]["files"])
-
-        options = StateDictOptions(full_state_dict=False, cpu_offload=False)
-        model_state, optimizer_state = get_state_dict(model, optimizer, options=options)
-        state = {"model": model_state, "optimizer": optimizer_state}
-        error: Optional[Exception] = None
-        try:
-            dcp.load(state, checkpoint_id=checkpoint_path / "distcp")
-        except Exception as exc:
-            error = exc
-        _collective_error("DCP load", error)
-        error = None
-        try:
-            set_state_dict(
-                model,
-                optimizer,
-                model_state_dict=state["model"],
-                optim_state_dict=state["optimizer"],
-                options=options,
-            )
-        except Exception as exc:
-            error = exc
-        _collective_error("model/optimizer restore", error)
-
-        rank_state_path = (
-            checkpoint_path / "rank_state" / f"rank_{dist.get_rank():05d}.pt"
+        container, snapshot, metadata, resume_mode = self._snapshot_for_load(
+            checkpoint_path=checkpoint_path,
+            expected=expected,
+            require_exact=False,
         )
-        progress: dict[str, Any] = {}
-        error = None
         try:
-            if resume_mode == "exact":
-                if not rank_state_path.is_file():
-                    raise CheckpointIntegrityError(
-                        f"missing exact per-rank state {rank_state_path}"
-                    )
-                rank_state = torch.load(
-                    rank_state_path, map_location="cpu", weights_only=False
+            options = StateDictOptions(full_state_dict=False, cpu_offload=False)
+            error: Optional[Exception] = None
+            try:
+                model_state, optimizer_state = get_state_dict(
+                    model, optimizer, options=options
                 )
-                _restore_rng_state(rank_state["rng"])
-                progress = dict(rank_state["progress"])
-            elif resume_mode == "topology_reshard":
-                # A changed rank set has no one-to-one RNG continuation.  All
-                # ranks, including reused rank numbers, start a newly bound
-                # deterministic stream; never mix old and new RNG states.
-                if "initial_seed" not in metadata:
-                    raise CheckpointIntegrityError(
-                        "topology reshard requires initial_seed metadata"
-                    )
-                seed = (
-                    int(metadata["initial_seed"])
-                    + int(expected.step) * 1_000_003
-                    + dist.get_rank()
+            except Exception as exc:
+                error = exc
+            _collective_error("state-dict preparation", error)
+            state = {"model": model_state, "optimizer": optimizer_state}
+            error = None
+            try:
+                dcp.load(state, checkpoint_id=snapshot / "distcp")
+            except Exception as exc:
+                error = exc
+            _collective_error("DCP load", error)
+            error = None
+            try:
+                set_state_dict(
+                    model,
+                    optimizer,
+                    model_state_dict=state["model"],
+                    optim_state_dict=state["optimizer"],
+                    options=options,
                 )
-                random.seed(seed)
-                np.random.seed(seed % (2**32))
-                torch.manual_seed(seed)
-                torch.cuda.manual_seed(seed)
-                progress = dict(metadata["sampler_progress"])
-            else:
-                raise CheckpointIntegrityError(f"unknown resume mode {resume_mode!r}")
-        except Exception as exc:
-            error = exc
-        _collective_error("rank state restore", error)
-        dist.barrier()
-        return metadata, progress
+            except Exception as exc:
+                error = exc
+            _collective_error("model/optimizer restore", error)
+
+            rank_state_path = (
+                snapshot / "rank_state" / f"rank_{dist.get_rank():05d}.pt"
+            )
+            progress: dict[str, Any] = {}
+            error = None
+            try:
+                if resume_mode == "exact":
+                    if not rank_state_path.is_file():
+                        raise CheckpointIntegrityError(
+                            f"missing exact per-rank state {rank_state_path}"
+                        )
+                    rank_state = torch.load(
+                        rank_state_path, map_location="cpu", weights_only=False
+                    )
+                    _restore_rng_state(rank_state["rng"])
+                    progress = dict(rank_state["progress"])
+                elif resume_mode == "topology_reshard":
+                    # A changed rank set has no one-to-one RNG continuation.  All
+                    # ranks, including reused rank numbers, start a newly bound
+                    # deterministic stream; never mix old and new RNG states.
+                    if "initial_seed" not in metadata:
+                        raise CheckpointIntegrityError(
+                            "topology reshard requires initial_seed metadata"
+                        )
+                    seed = (
+                        int(metadata["initial_seed"])
+                        + int(expected.step) * 1_000_003
+                        + dist.get_rank()
+                    )
+                    random.seed(seed)
+                    np.random.seed(seed % (2**32))
+                    torch.manual_seed(seed)
+                    torch.cuda.manual_seed(seed)
+                    progress = dict(metadata["sampler_progress"])
+                else:
+                    raise CheckpointIntegrityError(
+                        f"unknown resume mode {resume_mode!r}"
+                    )
+            except Exception as exc:
+                error = exc
+            _collective_error("rank state restore", error)
+            return metadata, progress
+        finally:
+            self._cleanup_load_snapshot(container)
 
     def load_model_for_evaluation(
         self,
@@ -772,40 +1091,26 @@ class DistributedCheckpointManager:
             raise CheckpointIntegrityError(
                 f"evaluation checkpoint escaped run root: {checkpoint_path}"
             )
-        verification: list[Any] = [None]
-        if dist.get_rank() == 0:
-            try:
-                metadata, files = self._verify_controls(checkpoint_path)
-                mode = _validate_metadata(metadata, expected)
-                if mode != "exact":
-                    raise CheckpointIntegrityError(
-                        "offline evaluation requires same-topology checkpoint"
-                    )
-                verification[0] = {
-                    "ok": True,
-                    "metadata": metadata,
-                    "files": files,
-                }
-            except Exception as exc:
-                verification[0] = {
-                    "ok": False,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                }
-        dist.broadcast_object_list(verification, src=0)
-        if not verification[0]["ok"]:
-            raise CheckpointIntegrityError(
-                f"rank0 checkpoint verification failed: {verification[0]}"
-            )
-        _distributed_verify_payload(checkpoint_path, verification[0]["files"])
-        options = StateDictOptions(full_state_dict=False, cpu_offload=False)
-        model_state = get_model_state_dict(model, options=options)
-        error: Optional[Exception] = None
+        container, snapshot, metadata, _mode = self._snapshot_for_load(
+            checkpoint_path=checkpoint_path,
+            expected=expected,
+            require_exact=True,
+        )
         try:
-            dcp.load({"model": model_state}, checkpoint_id=checkpoint_path / "distcp")
-            set_model_state_dict(model, model_state, options=options)
-        except Exception as exc:
-            error = exc
-        _collective_error("evaluation model restore", error)
-        dist.barrier()
-        return dict(verification[0]["metadata"])
+            options = StateDictOptions(full_state_dict=False, cpu_offload=False)
+            error: Optional[Exception] = None
+            try:
+                model_state = get_model_state_dict(model, options=options)
+            except Exception as exc:
+                error = exc
+            _collective_error("evaluation state-dict preparation", error)
+            error = None
+            try:
+                dcp.load({"model": model_state}, checkpoint_id=snapshot / "distcp")
+                set_model_state_dict(model, model_state, options=options)
+            except Exception as exc:
+                error = exc
+            _collective_error("evaluation model restore", error)
+            return metadata
+        finally:
+            self._cleanup_load_snapshot(container)
