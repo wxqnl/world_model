@@ -1,76 +1,45 @@
 # WM3D 5B 训练流程
 
-WM3D 5B 使用 `configs/model/native_5b.yaml`，精确参数量为
-`5,108,342,963`。默认集群由 16 个 8×H200 节点组成，world size 为 128；每个模型副本
-在节点内 8 卡 FSDP2 分片，16 个节点组成 data-parallel replicas。训练使用 BF16 参数、
-FP32 reduce、activation checkpoint、原生连续时间戳、native 3D world state 和 grouped robot
-action。
+WM3D 5B 使用 `configs/model/native_5b.yaml`，参数量约 51 亿。默认训练规模为
+8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做 8-way FSDP2
+分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 1，梯度累积
+2 次，global batch 为 128。
 
-本流程从公开数据下载开始，依次生成 source lock、data profile、task bank、episode cache、
-5B window、normalization、sealed runtime、分布式 checkpoint 和 offline-eval receipt。Stage1
-使用训练完成的 Stage0 checkpoint，见 [WM3D Stage1](WM3D_STAGE1_UNIFIED.md)。
+整个流程按数据下载、数据整理、episode cache、1K 集群验证、10K 验证性训练和正式训练
+依次进行。命令会自动记录和校验中间产物，使用者只需要指定共享存储、数据许可、模型目录
+和集群地址。中间产物由程序自动管理，不需要人工计算或填写额外标识。
 
-## 一、训练预设
+## 1. 训练预设
 
-四套 H200 预设使用相同的模型、数据和缓存格式，只改变训练日程与独立 run identity：
+| preset | optimizer steps | 用途 |
+|---|---:|---|
+| `canary1k` | 1,000 | 验证 64 卡通信、训练、保存、恢复和评测 |
+| `validation10k` | 10,000 | 验证数据质量、吞吐和训练稳定性 |
+| `validation100k` | 100,000 | 中程训练 |
+| `formal600k` | 600,000 | 正式训练 |
 
-| preset | runtime profile | optimizer steps | 主要 checkpoint | 用途 |
-|---|---|---:|---|---|
-| `canary1k` | `h200_128_fsdp2_canary1k.yaml` | 1,000 | 100、500、1,000 | 集群和训练链验收 |
-| `validation10k` | `h200_128_fsdp2_validation10k.yaml` | 10,000 | 100、500、每 1,000 step | 验证性训练 |
-| `validation100k` | `h200_128_fsdp2_validation100k.yaml` | 100,000 | 每 1,000 step | 中程稳定性验证 |
-| `formal600k` | `h200_128_fsdp2.yaml` | 600,000 | 1,000、5,000、20,000、此后每 20,000 step | 正式训练 |
+四套预设使用同一个 5B 模型和同一份 episode cache。它们各自生成独立的 runtime 和
+checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
 
-四套预设均固定为 128×H200、8-way FSDP2、global batch 128，并要求节点内完整
-NVLink、400 Gb/s InfiniBand、ECC 为 0。每个 preset 物化独立 runtime，不能跨 preset
-恢复 checkpoint。episode cache 可复用；5B 的 window index 和 normalization 也可在四套
-preset 间复用。
+## 2. 服务器与共享存储
 
-`5b init` 根据 preset 自动选择 runtime profile、最终 step、run name、run root 和 eval
-输出路径：
+默认集群配置：
 
-```bash
-./run_wm3d.sh 5b init validation10k /shared/wm3d/control/5b_validation10k.env
-```
-
-同一 preset 再开一次独立实验时，复制 site 文件并修改 `WM3D_5B_RUN_ID`。已有 runtime、
-checkpoint 和 receipt 不需要改名或覆盖。
-
-## 二、服务器和环境
-
-### 2.1 集群条件
-
-- Linux x86_64、Python 3.10；
-- 16 个 8×H200 SXM 节点，节点内 NVLink；
+- 8 个 8×H200 SXM 节点，节点内 NVLink；
 - 400 Gb/s InfiniBand；
-- 所有节点以相同绝对路径挂载代码、原始数据、cache 和 run 目录；
-- `git`、`curl`、`ffmpeg`、Slurm、CUDA 12.8 驱动环境；
-- Hugging Face 账号已经接受 AgiBotWorld 数据许可。
+- Linux x86_64、Python 3.10、CUDA 12.8；
+- 代码、原始数据、cache 和训练输出在所有节点上使用相同绝对路径；
+- cache 放在并行文件系统或本地 NVMe 汇聚存储，不要放在低吞吐 NAS；
+- 原始数据和 cache 分开计量磁盘空间，下载前先用 `df -h` 确认容量。
 
-完整公开数据建议准备约 200 TB，其中训练 cache 和 checkpoint 所在文件系统使用高速存储。
-5B DCP 实测约 61 GB；10K 预设约需 0.8 TB checkpoint 空间。正式 preflight 还要求数据和
-输出文件系统分别至少保留 10 TB。
-
-### 2.2 克隆和安装
+克隆项目：
 
 ```bash
 git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
 cd world_model/wm3d
-git status --short
 ```
 
-创建只读 Hugging Face token 文件：
-
-```bash
-install -d -m 700 /shared/secrets
-umask 077
-read -rsp "Hugging Face token: " HF_TOKEN
-printf '%s\n' "$HF_TOKEN" > /shared/secrets/huggingface_token
-unset HF_TOKEN
-chmod 600 /shared/secrets/huggingface_token
-```
-
-创建 10K site 配置并建立 Python 环境：
+创建 10K 站点配置和 Python 环境：
 
 ```bash
 SITE=/shared/wm3d/control/5b_validation10k.env
@@ -81,117 +50,161 @@ vim "$SITE"
 ./run_wm3d.sh 5b plan "$SITE"
 ```
 
-site 文件保存共享存储、token、模型资产和集群 rendezvous 路径。通常需要修改：
+站点文件至少需要修改：
 
 ```bash
 WORK_ROOT=/shared/wm3d
 HF_TOKEN_FILE=/shared/secrets/huggingface_token
 ACCEPT_DATA_LICENSES=YES
 MASTER_ADDR=TRAIN_NODE_0
-WM3D_VGGT_SOURCE_ROOT=/shared/models/vggt/a288dd0f14786c93483e45524328726ab7b1b4ce
-WM3D_VGGT_MODEL_SNAPSHOT=/shared/models/huggingface/facebook-VGGT-1B/860abec7937da0a4c03c41d3c269c366e82abdf9
-QWEN3_VL_EMBEDDING_PATH=/shared/models/huggingface/Qwen3-VL-Embedding-2B/9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
+WM3D_VGGT_SOURCE_ROOT=/shared/models/vggt
+WM3D_VGGT_MODEL_SNAPSHOT=/shared/models/facebook-VGGT-1B
+QWEN3_VL_EMBEDDING_PATH=/shared/models/Qwen3-VL-Embedding-2B
 ```
 
-VGGT 源码固定 revision 为 `a288dd0f14786c93483e45524328726ab7b1b4ce`；VGGT-1B
-模型固定 revision 为 `860abec7937da0a4c03c41d3c269c366e82abdf9`；任务编码器
-固定为 `Qwen/Qwen3-VL-Embedding-2B` revision
-`9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda`。已有镜像可直接填绝对路径；没有镜像时可用
-[真实 smoke 流程](WM3D_REAL_SMOKE.md)下载并生成资产 receipt。
+默认值已经设置为 `NNODES=8`、`GPUS_PER_NODE=8`，不需要再改 world size。
 
-## 三、数据准备
+## 3. 数据准备
 
-### 3.1 数据清单
+### 3.1 默认数据组合
 
-扩展数据配置为 `configs/data/public_robot_6106h.template.yaml`：
+默认配置为 `configs/data/public_robot_6106h.template.yaml`。它包含：
 
-| 数据源 | Hugging Face 仓库 | 规划时长 | 下载目录 |
-|---|---|---:|---|
-| DROID | [`lerobot/droid_1.0.1`](https://huggingface.co/datasets/lerobot/droid_1.0.1) | 350 h | `raw/droid` |
-| Bridge V2 | [`ember-lab-berkeley/bridge_v2`](https://huggingface.co/datasets/ember-lab-berkeley/bridge_v2) | 100 h | `raw/bridge` |
-| RoboCasa Atomic | [`ember-lab-berkeley/robocasa365-pretrain-atomic`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-atomic) | 21 h | `raw/atomic` |
-| RoboCasa Composite | [`ember-lab-berkeley/robocasa365-pretrain-composite`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-composite) | 383 h | `raw/composite` |
-| RoboCasa MG | [`ember-lab-berkeley/robocasa365-pretrain-mg`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-mg) | 1,615 h | `raw/mg` |
-| AgiBotWorld2026 | [`agibot-world/AgiBotWorld2026`](https://huggingface.co/datasets/agibot-world/AgiBotWorld2026) | 661 h | `raw/agibot_world_2026` |
-| AgiBotWorld Beta | [`agibot-world/AgiBotWorld-Beta`](https://huggingface.co/datasets/agibot-world/AgiBotWorld-Beta) | 2,976.4 h | `raw/agibot_beta` |
+- DROID；
+- Bridge V2；
+- RoboCasa Atomic、Composite、MG；
+- AgiBotWorld 2026 的 Imitation、Rich Interaction 和 Reinforcement 数据；
+- AgiBotWorld Beta。
 
-规划总量约 6,106.4 小时。实际训练统计来自 sealed data profile 中的 episode、frame 和
-window 数量，而不是表格中的预算值。
+如果磁盘或预处理算力不足，可以暂时去掉 AgiBotWorld Beta，改用
+完整的 [LeRobot Open X-Embodiment collection](https://huggingface.co/collections/lerobot/open-x-embodiment-68de658d8b544a43be4c6687)。
+它不是 OXE-only 训练：DROID、Bridge、RoboCasa 和 AgiBotWorld 2026 仍然保留，只移除
+AgiBotWorld Beta。DROID 本身已在主数据中，因此不会重复下载或重复计权；collection 中其余
+全部数据集组成一个等权 OXE 池，整体接替 Beta 原来的 30% 采样份额，其它主数据的相对权重
+保持不变。撰写本文时官方 collection 含 56 套数据，其中 DROID 已存在，因此会新增 55 个
+source；实际数量以运行生成命令时的官方清单为准。
 
-### 3.2 锁定 revision 和下载
+选择替代方案时，在 site 文件中改这五行，然后生成替代模板：
+
+```bash
+DATA_FAMILY=public_robot_oxe_no_beta
+SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe_no_beta.template.yaml
+SOURCE_LOCK=${CONTROL_ROOT}/public_sources_oxe_no_beta.lock.yaml
+DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe_no_beta.template.yaml
+DATA_PROFILE=${CONTROL_ROOT}/public_robot_oxe_no_beta.yaml
+```
+
+```bash
+./run_wm3d.sh 5b oxe-replacement "$SITE"
+```
+
+该命令读取官方 collection 当前清单和每个数据集的 `meta/info.json`，生成下载模板、data
+template 和独立 adapter 候选。随后照常执行 `lock`、`download`、schema audit、adapter audit
+和 inventory。这样上游 collection 新增或删除数据集时不会靠手工列表悄悄遗漏；如果某个数据
+的动作或状态维度超过 WM3D 容量，生成步骤会直接停止并报告数据集名称。
+
+### 3.2 下载
+
+先准备 Hugging Face token：
+
+```bash
+install -d -m 700 /shared/secrets
+umask 077
+read -rsp "Hugging Face token: " HF_TOKEN
+printf '%s\n' "$HF_TOKEN" > /shared/secrets/huggingface_token
+unset HF_TOKEN
+chmod 600 /shared/secrets/huggingface_token
+```
+
+下载命令：
 
 ```bash
 ./run_wm3d.sh 5b lock "$SITE"
 ./run_wm3d.sh 5b download "$SITE"
 ```
 
-`lock` 将每个上游 revision 固定为 40 位 commit，并保存完整 file list。`download` 支持断点
-重入；同一命令会验证已有文件并继续未完成部分。下载状态可这样检查：
+`lock` 自动固定所有数据版本，`download` 支持断点续传。确认下载是否完成：
 
 ```bash
 source "$SITE"
-test -s "$SOURCE_LOCK"
-find "$RAW_ROOT/receipts" -name '*.json' -type f | sort
+find "$RAW_ROOT/receipts" -name '*.json' -type f | wc -l
+du -sh "$RAW_ROOT"/*
 df -h "$RAW_ROOT"
 ```
 
-### 3.3 数据转换、schema 和 adapter
+### 3.3 数据整理
 
-AgiBotWorld2026 archive materialization、AgiBot Beta 官方转换器、schema audit、adapter audit、
-inventory 和 data-profile 的完整命令见 [从零数据流程](WM3D_FROM_ZERO.md)。处理顺序为：
+RoboCasa 和 AgiBotWorld 2026 先按 [WM3D 从零数据流程](WM3D_FROM_ZERO.md) 中的
+archive、schema、adapter、inventory 命令整理。OXE 数据已经是 LeRobot 格式；生成命令会为
+每套数据保留其官方相机键、action/state 维度和原始时间戳，并生成 opaque controller adapter
+候选。负责人仍需按同一数据流程完成 schema、adapter audit、inventory 和 data-profile，不能
+把候选文件直接当成已审计 adapter。默认完整配置应包含 9 个训练 source；替代配置的 source
+数量由官方 OXE collection 当前清单决定。每个 source 都必须有非空 episode 数量。
 
-```text
-download -> archive/conversion -> schema-audit -> adapter-audit
-         -> inventory -> data-profile
-```
-
-最终文件写入 site 配置的 `DATA_PROFILE`：
-
-```text
-/shared/wm3d/control/public_robot_6106h.yaml
-```
-
-该文件绑定每个 source manifest、adapter contract 和 inventory receipt。数据字段完成审计后，
-下面的命令会打印 profile 名称、source 数量和 SHA：
+完成后运行：
 
 ```bash
 ./run_wm3d.sh 5b doctor "$SITE"
+./run_wm3d.sh 5b plan "$SITE"
 ```
 
-处理后的共享目录结构如下：
+输出应显示 `native_5b`、64 个 rank，以及与所选配置一致的数据 source 数量，并且不再
+出现 `data_profile=WAITING`。
 
-```text
-/shared/wm3d/
-├── raw/                         # 固定 revision 的下载快照与下载 receipt
-├── control/                     # source lock、data profile 和 sealed runtime
-├── cache/native_p144/           # task bank、episode cache、5B window、normalization
-├── runs/5b_<run-id>/            # metrics、launch qualification、DCP 和 eval
-├── envs/wm3d-cu128/             # 固定依赖的 Python 环境
-└── huggingface/                 # Hugging Face 下载缓存
-```
+## 4. 高吞吐 episode cache
 
-### 3.4 Task bank 和 episode cache
+cache 是数据准备中最耗时的阶段。默认配置按 64 张 GPU 全量展开：每张 GPU 一个长驻 worker，
+每个 worker 使用 4 个视频解码线程、`batch_frames=16` 的 VGGT 前向和 2 个写盘线程。
+worker 会流水执行“准备下一个 episode、GPU 编码当前 episode、写盘上一个 episode”，避免
+解码和落盘期间 GPU 空转。
+
+先构建任务：
 
 ```bash
 ./run_wm3d.sh 5b task-bank "$SITE"
 ./run_wm3d.sh 5b cache-plan "$SITE"
-./run_wm3d.sh 5b status "$SITE"
 ```
 
-cache worker 在 Slurm 上按 GPU 展开：
+用 Slurm 在 64 张卡上启动 cache：
 
 ```bash
 export SITE=/shared/wm3d/control/5b_validation10k.env
-srun --nodes=16 --ntasks=128 --ntasks-per-node=8 --gpus-per-task=1 \
+srun --nodes=8 --ntasks=64 --ntasks-per-node=8 --gpus-per-task=1 \
+  --cpus-per-task=8 --cpu-bind=cores \
   --export=ALL,SITE bash -lc '
   ./run_wm3d.sh 5b cache-worker "$SITE" \
-    "$SLURM_PROCID" 128 inherited
+    "$SLURM_PROCID" 64 inherited
 '
 ```
 
-每个 worker 负责固定 task partition。中断后以相同 worker index 和 worker count 重启，已完成
-并通过 SHA 验证的 episode 会跳过。全部 worker 正常退出后生成 episode seal、5B window、
-grouped normalization 和 runtime：
+站点文件中的默认性能参数为：
+
+```bash
+CACHE_WORKER_COUNT=64
+CACHE_BATCH_FRAMES=16
+CACHE_DECODE_WORKERS=4
+CACHE_WRITER_THREADS=2
+```
+
+H200 显存足够时保持这组默认值。只有出现单卡 OOM 时，才把 `CACHE_BATCH_FRAMES` 降为 12
+或 8；不要先减少 worker 数量。共享存储写入吃不满时，先检查挂载和 striping，再考虑增加
+写线程，避免在慢盘上盲目堆线程。
+
+运行期间查看：
+
+```bash
+watch -n 2 nvidia-smi
+iostat -xz 2
+./run_wm3d.sh 5b status "$SITE"
+```
+
+正常表现是 64 张 GPU 都有一个 cache 进程，warm-up 后 GPU 周期性处于高利用率，worker
+持续输出 `prepare_seconds`、`encode_seconds`、`write_seconds`、`tasks_per_second`，且
+`failed` 始终为 0。若 `prepare_seconds` 明显高于编码时间，检查 CPU 绑定和视频盘读取；若
+`write_seconds` 持续堆积，检查 cache 文件系统带宽。
+
+worker 可重入。任务中断后用完全相同的 worker count 重跑，已经完成的 episode 会自动跳过。
+全部 worker 退出后执行：
 
 ```bash
 ./run_wm3d.sh 5b cache-seal "$SITE"
@@ -201,15 +214,10 @@ grouped normalization 和 runtime：
 ./run_wm3d.sh 5b status "$SITE"
 ```
 
-cache 正常时，task、episode、train window 和 val window 数量都大于 0；episode/window seal
-通过；runtime 报告 `native_5b`、`5,108,342,963 params` 和 `world 128`。
+## 5. 1K 集群验证
 
-## 四、1K 集群验收
-
-1K canary 与正式训练使用同一 128×H200 拓扑。它验证 5B 参数分片、forward/backward、
-gradient ownership、DCP save、独立进程 exact resume 和 offline eval。
-
-创建独立 site 并物化 runtime：
+1K canary 使用与正式训练相同的 64 卡拓扑，验证通信、5B 参数分片、前向、反向、梯度、
+checkpoint、独立进程恢复和离线评测。
 
 ```bash
 SITE=/shared/wm3d/control/5b_canary1k.env
@@ -219,214 +227,134 @@ vim "$SITE"
 ./run_wm3d.sh 5b runtime "$SITE"
 ```
 
-如果数据 cache 已由 10K site 生成，只需让两个 site 指向同一 `CACHE_ROOT`、`DATA_PROFILE`
-和模型资产。
-
-## 五、多节点启动
-
-每个 Slurm task 对应一个节点 launcher；launcher 再启动本机 8 个训练进程。site 文件会从
-`SLURM_PROCID` 读取 node rank。
+多节点启动函数：
 
 ```bash
-export SITE=/shared/wm3d/control/5b_canary1k.env
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b preflight "$SITE"
-'
-
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b train "$SITE" 100
-'
+run_5b () {
+  srun --nodes=8 --ntasks=8 --ntasks-per-node=1 \
+    --export=ALL,SITE,MASTER_ADDR bash -lc \
+    "./run_wm3d.sh 5b $1 \"$SITE\" ${2:-} ${3:-}"
+}
 ```
 
-`preflight` 验证 128 个 rank、GPU 型号和 UUID、显存、ECC、空闲状态、NVLink、IB、
-memlock、共享内存、磁盘空间和真实 all-reduce。resource receipt 有效期为 30 分钟；每次
-fresh、resume 或 eval 启动前重新执行 preflight。
-
-step 100 checkpoint 完成后，以新进程恢复到 step 500：
+按三个独立进程完成 canary：
 
 ```bash
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b preflight "$SITE"
-'
+run_5b preflight
+run_5b train 100
 
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b resume "$SITE" 100 500
-'
-```
+run_5b preflight
+run_5b resume 100 500
 
-继续恢复并评测 canary：
+run_5b preflight
+run_5b resume 500 1000
 
-```bash
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b preflight "$SITE"
-'
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b resume "$SITE" 500 1000
-'
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b preflight "$SITE"
-'
-srun --nodes=16 --ntasks=16 --ntasks-per-node=1 \
-  --export=ALL,SITE,MASTER_ADDR bash -lc '
-  ./run_wm3d.sh 5b eval "$SITE" 1000
-'
+run_5b preflight
+run_5b eval 1000
 ./run_wm3d.sh 5b verify "$SITE" 1000
 ```
 
-数字 step 会自动解析为当前 run 下的 `checkpoints/step_XXXXXXXX`；也可以传完整 checkpoint
-绝对路径。
+`verify` 通过后再开始 10K。不要跳过独立进程 resume，因为它能发现只在恢复时出现的模型、
+optimizer、sampler 或分布式状态问题。
 
-## 六、10K 验证性训练
+## 6. 10K 验证性训练
 
-10K 是 10,000 个 optimizer steps，global batch 为 128，共消费约 128 万个确定性采样位置。
-它使用独立的 `validation10k` runtime，从 step 0 开始：
+10K 使用约 128 万个全局采样位置，主要验证数据分布、吞吐、loss、梯度和长期资源稳定性。
 
 ```bash
 SITE=/shared/wm3d/control/5b_validation10k.env
-./run_wm3d.sh 5b init validation10k "$SITE"
-vim "$SITE"
-./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b runtime "$SITE"
-```
 
-启动命令与 1K 相同，训练日程为：
+run_5b preflight
+run_5b train 100
 
-```bash
-./run_wm3d.sh 5b preflight "$SITE"
-./run_wm3d.sh 5b train "$SITE" 100
+run_5b preflight
+run_5b resume 100 500
 
-./run_wm3d.sh 5b preflight "$SITE"
-./run_wm3d.sh 5b resume "$SITE" 100 500
+run_5b preflight
+run_5b resume 500 10000
 
-./run_wm3d.sh 5b preflight "$SITE"
-./run_wm3d.sh 5b resume "$SITE" 500 10000
-
-./run_wm3d.sh 5b preflight "$SITE"
-./run_wm3d.sh 5b eval "$SITE" 10000
+run_5b preflight
+run_5b eval 10000
 ./run_wm3d.sh 5b verify "$SITE" 10000
 ```
 
-多节点环境中，每一行 `preflight`、`train`、`resume` 和 `eval` 均放入第五节的 16-task
-`srun`；`verify` 在一个节点执行。
+训练期间查看：
 
-## 七、100K 和 600K 训练
+```bash
+tail -f /shared/wm3d/runs/5b_validation10k/train_metrics.jsonl
+watch -n 2 nvidia-smi
+./run_wm3d.sh 5b status "$SITE"
+```
 
-10K 结果通过后，分别创建 100K 与正式 600K site：
+需要重点确认：
+
+- 64 个 rank 全部在线，8 张 GPU/节点都参与计算；
+- step 连续增加，`total`、`token_mse`、`rgb`、`depth`、`point`、`pose` 均为有限数；
+- `action_fine` 或数据声明的 action lane 有有效监督；
+- required gradient owners 非零，nonfinite 数量为 0；
+- 吞吐稳定，没有周期性长时间 GPU 空闲；
+- step 100、500 和 10,000 的 checkpoint 都完整；
+- offline eval 的 supervision coverage 非零。
+
+## 7. 正式训练
+
+10K 通过后再创建 100K 或 600K site。它们复用 data profile、episode cache、window 和
+normalization，但从自己的 step 0 开始训练。
 
 ```bash
 ./run_wm3d.sh 5b init validation100k /shared/wm3d/control/5b_validation100k.env
 ./run_wm3d.sh 5b init formal600k /shared/wm3d/control/5b_formal600k.env
-SITE100K=/shared/wm3d/control/5b_validation100k.env
-SITE600K=/shared/wm3d/control/5b_formal600k.env
 ```
 
-两套 site 使用同一个 sealed data profile、episode cache、5B window 和 normalization，但各自
-运行 `runtime` 并从 step 0 训练。100K 默认每 1,000 step 保存和验证；600K 在 1,000、
-5,000、20,000 step 保存早期 checkpoint，此后每 20,000 step 保存，validation 每 5,000
-step 运行 100 个 batch。
-
-100K 的首段和最终验收：
+100K：
 
 ```bash
-./run_wm3d.sh 5b runtime "$SITE100K"
-./run_wm3d.sh 5b preflight "$SITE100K"
-./run_wm3d.sh 5b train "$SITE100K" 1000
-./run_wm3d.sh 5b preflight "$SITE100K"
-./run_wm3d.sh 5b resume "$SITE100K" 1000 100000
-./run_wm3d.sh 5b preflight "$SITE100K"
-./run_wm3d.sh 5b eval "$SITE100K" 100000
-./run_wm3d.sh 5b verify "$SITE100K" 100000
+SITE=/shared/wm3d/control/5b_validation100k.env
+./run_wm3d.sh 5b runtime "$SITE"
+run_5b preflight
+run_5b train 1000
+run_5b preflight
+run_5b resume 1000 100000
+run_5b preflight
+run_5b eval 100000
+./run_wm3d.sh 5b verify "$SITE" 100000
 ```
 
-600K 的首段、恢复和最终验收：
+600K：
 
 ```bash
-./run_wm3d.sh 5b runtime "$SITE600K"
-./run_wm3d.sh 5b preflight "$SITE600K"
-./run_wm3d.sh 5b train "$SITE600K" 1000
-./run_wm3d.sh 5b preflight "$SITE600K"
-./run_wm3d.sh 5b resume "$SITE600K" 1000 5000
-./run_wm3d.sh 5b preflight "$SITE600K"
-./run_wm3d.sh 5b resume "$SITE600K" 5000 20000
-./run_wm3d.sh 5b preflight "$SITE600K"
-./run_wm3d.sh 5b resume "$SITE600K" 20000 600000
-./run_wm3d.sh 5b preflight "$SITE600K"
-./run_wm3d.sh 5b eval "$SITE600K" 600000
-./run_wm3d.sh 5b verify "$SITE600K" 600000
+SITE=/shared/wm3d/control/5b_formal600k.env
+./run_wm3d.sh 5b runtime "$SITE"
+run_5b preflight
+run_5b train 1000
+run_5b preflight
+run_5b resume 1000 5000
+run_5b preflight
+run_5b resume 5000 20000
+run_5b preflight
+run_5b resume 20000 600000
+run_5b preflight
+run_5b eval 600000
+./run_wm3d.sh 5b verify "$SITE" 600000
 ```
 
-## 八、状态和结果
+## 8. 常见问题
 
-训练期间查看汇总：
-
-```bash
-./run_wm3d.sh 5b status "$SITE"
-tail -f /shared/wm3d/runs/5b_validation10k/train_metrics.jsonl
-watch -n 2 nvidia-smi
-```
-
-`status` 和 `verify` 汇总以下内容：
-
-| 范围 | 输出 |
+| 现象 | 处理 |
 |---|---|
-| data/cache | source、episode、window 数量及 seal 状态 |
-| model/runtime | `native_5b`、精确参数量、world size、runtime SHA |
-| training | 当前 step、loss、learning rate、grad norm、samples/s |
-| gradients | required owner 非零、nonfinite 为 0 |
-| checkpoint | step、COMMITTED/MANIFEST、payload SHA 和大小 |
-| evaluation | 全部指标有限、每条声明 supervision lane coverage 大于 0 |
+| `data_profile=WAITING` | 数据尚未完成 schema、inventory 和 profile 物化 |
+| 下载 401/403 | 先在上游页面接受许可，再检查 token 文件 |
+| cache 中 GPU 经常为 0% | 检查是否启动了 64 个 worker、CPU 绑定、原始视频盘吞吐和 batch size |
+| cache 写盘积压 | 检查并行文件系统带宽、striping 和小文件性能 |
+| cache OOM | 先将 `CACHE_BATCH_FRAMES` 从 16 降到 12 或 8 |
+| 训练 OOM | 检查 8-way FSDP2、BF16、activation checkpoint 和 64 卡 topology |
+| GPU busy、ECC、NVLink、IB 失败 | 更换节点或修复资源后重新运行 preflight |
+| 恢复失败 | 只从完整编号 checkpoint 恢复，并重新运行 preflight |
+| eval coverage 为 0 | 检查验证集和对应 action/视觉 supervision 是否真实存在 |
 
-主要训练指标：
-
-| 指标 | 含义 |
-|---|---|
-| `token_mse` | native future token 预测误差 |
-| `rgb` | 未来 RGB 重建误差 |
-| `depth`、`point`、`pose` | 未来 3D 几何与相机误差 |
-| `action_fine`、`action_coarse` | data profile 声明的 grouped-action lane |
-| `grad_norm` | 全模型梯度范数 |
-| `samples/s` | 全局训练吞吐 |
-
-正常运行时，step 单调增加，loss 和 grad norm 为有限数，required gradient owners 全部非零，
-eval expected coverage 全部大于 0。稳定训练阶段每个节点的 8 张 GPU 都有训练进程；长时间低
-利用率通常对应数据读取、共享存储或 DataLoader 吞吐不足，可结合 `samples/s`、GPU util 和
-I/O 延迟定位。
-
-`verify` 的 PASS 表示数据闭包、训练数值、梯度、checkpoint、resume 和 offline eval 工作
-正常。模型能力使用固定下游任务和机器人闭环 benchmark 单独评估。
-
-## 九、恢复和常见错误
-
-完整 checkpoint 目录包含 `COMMITTED.json`。恢复时传编号 step 或完整目录：
-
-```bash
-./run_wm3d.sh 5b preflight "$SITE"
-./run_wm3d.sh 5b resume "$SITE" 500 10000
-```
-
-常见错误及处理方式：
-
-| 错误 | 处理 |
-|---|---|
-| `data_profile=WAITING` | 完成 schema、adapter、inventory 和 data-profile |
-| gated dataset 401/403 | 接受上游许可并检查 token 权限 |
-| source revision mismatch | 重新运行 `lock`，不使用 `main` 或 `latest` |
-| cache worker `failed > 0` | 修复第一个失败 episode，以相同 partition 重跑 |
-| resource receipt stale | 重新运行 preflight |
-| GPU busy、ECC、NVLink、IB 失败 | 更换空闲节点或修复集群资源 |
-| `COMMITTED.json` 缺失 | 等待 checkpoint 完成，或从上一个 committed step 恢复 |
-| zero coverage | 检查 val split 与 adapter supervision lane |
-| OOM | 检查 8-way FSDP2、BF16 和 activation checkpoint 配置 |
-
-底层数据物化命令见 [WM3D 从零数据、训练与评测](WM3D_FROM_ZERO.md)，模型与分布式设计见
-[WM3D 统一训练与扩展](WM3D_SCALING.md)，发布验收边界见
-[WM3D 发布验证](WM3D_RELEASE_VALIDATION.md)。
+模型与分布式原理见 [WM3D 统一训练与扩展](WM3D_SCALING.md)，数据底层命令见
+[WM3D 从零数据流程](WM3D_FROM_ZERO.md)，Stage1 见
+[WM3D Stage1](WM3D_STAGE1_UNIFIED.md)。

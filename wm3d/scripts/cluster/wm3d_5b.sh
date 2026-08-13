@@ -14,6 +14,7 @@ WM3D 5B 集群操作入口：
   ./run_wm3d.sh 5b doctor <site.env>
   ./run_wm3d.sh 5b plan <site.env>
   ./run_wm3d.sh 5b lock <site.env>
+  ./run_wm3d.sh 5b oxe-replacement <site.env>
   ./run_wm3d.sh 5b download <site.env>
   ./run_wm3d.sh 5b task-bank <site.env>
   ./run_wm3d.sh 5b cache-plan <site.env>
@@ -75,22 +76,22 @@ apply_preset() {
   validate_preset "${WM3D_5B_PRESET}"
   case "${WM3D_5B_PRESET}" in
     canary1k)
-      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_canary1k.yaml
+      RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_canary1k.yaml
       TOTAL_STEPS=1000
       MILESTONES="100 -> 500 -> 1000"
       ;;
     validation10k)
-      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_validation10k.yaml
+      RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_validation10k.yaml
       TOTAL_STEPS=10000
       MILESTONES="100 -> 500 -> 10000"
       ;;
     validation100k)
-      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_validation100k.yaml
+      RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_validation100k.yaml
       TOTAL_STEPS=100000
       MILESTONES="1000 -> 100000"
       ;;
     formal600k)
-      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2.yaml
+      RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2.yaml
       TOTAL_STEPS=600000
       MILESTONES="1000 -> 5000 -> 20000 -> 600000"
       ;;
@@ -257,7 +258,7 @@ from pathlib import Path
 import sys
 from wm3d.data.manifest_contract import load_data_profile
 profile = load_data_profile(Path(sys.argv[1]))
-print(f"data_profile={profile.name} sources={len(profile.sources)} sha256={profile.profile_sha256}")
+print(f"data_profile={profile.name} sources={len(profile.sources)}")
 PY
     else
       echo "data_profile=WAITING (${DATA_PROFILE})"
@@ -304,13 +305,26 @@ EOF
       --token-file "${HF_TOKEN_FILE}" \
       --confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES
     ;;
+  oxe-replacement)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ "${DATA_FAMILY}" == public_robot_oxe_no_beta ]] || \
+      die "oxe-replacement 只用于 DATA_FAMILY=public_robot_oxe_no_beta"
+    mkdir -p "${CONTROL_ROOT}/adapters"
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${PYTHON_BIN}" \
+      "${ROOT}/scripts/data/materialize_oxe_replacement.py" \
+      --base-source-template "${ROOT}/configs/sources/public_sources.template.yaml" \
+      --base-data-template "${ROOT}/configs/data/public_robot_6106h.template.yaml" \
+      --output-source-template "${SOURCE_TEMPLATE}" \
+      --output-data-template "${DATA_TEMPLATE}" \
+      --output-adapter-root "${CONTROL_ROOT}/adapters"
+    ;;
   download)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     require_file "source lock" "${SOURCE_LOCK}"
     mkdir -p "${RAW_ROOT}"
     HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${ENTRY}" download \
       --lock "${SOURCE_LOCK}" --raw-root "${RAW_ROOT}" \
-      --token-file "${HF_TOKEN_FILE}" --max-workers "${DOWNLOAD_WORKERS:-8}"
+      --token-file "${HF_TOKEN_FILE}" --max-workers "${DOWNLOAD_WORKERS:-32}"
     ;;
   task-bank)
     [[ $# -eq 0 ]] || { usage; exit 2; }
@@ -342,7 +356,9 @@ EOF
       --encoder-contract "${ENCODER_CONTRACT}" --task-bank-root "${TASK_BANK_ROOT}" \
       --task-bank-index-sha256 "${task_bank_sha}" --cache-root "${CACHE_ROOT}" \
       --worker-index "${worker_index}" --worker-count "${worker_count}" \
-      --device cuda:0 --batch-frames "${CACHE_BATCH_FRAMES:-2}")
+      --device cuda:0 --batch-frames "${CACHE_BATCH_FRAMES:-16}" \
+      --decode-workers "${CACHE_DECODE_WORKERS:-4}" \
+      --writer-threads "${CACHE_WRITER_THREADS:-2}" --fail-fast)
     if [[ "${local_gpu}" == inherited ]]; then
       [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]] || die "inherited 模式要求调度器设置 CUDA_VISIBLE_DEVICES"
       "${worker_command[@]}"

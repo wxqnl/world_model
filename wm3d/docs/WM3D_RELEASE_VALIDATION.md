@@ -145,12 +145,12 @@ SHA256 为 `3d3584c8c63ed245cf10068789f9e6986e5a0d940c803e9a0c91f4efbd7e8244`，
 `COMMITTED.json` 的 SHA256 为
 `aba8cb7a501d9491008432558a88624c0e4a349014a9421081bf2b05126388b8`。
 
-正式 128×H200 配置使用同一模型、dataset、trainer 和 DCP manager，只更换
+默认正式 64×H200 配置使用同一模型、dataset、trainer 和 DCP manager，只更换
 model/runtime profile。集群交付前仍需在目标环境执行 NCCL、吞吐、checkpoint 带宽和
-128-rank preflight；本地双卡结果不能代替目标集群通信验收。
+64-rank preflight；本地双卡结果不能代替目标集群通信验收。
 
 目标集群配置分为同拓扑的 1K canary、100K validation 和 600K formal。每个进程边界都
-必须先消费 30 分钟内生成的 resource receipt；receipt 绑定 128 rank 的 hostname、GPU
+必须先消费 30 分钟内生成的 resource receipt；receipt 绑定 64 rank 的 hostname、GPU
 UUID、H200/HBM/ECC/空闲状态、节点内 NVLink、IB、ulimit、`/dev/shm`、磁盘和真实
 all-reduce。复制旧 receipt 或更换 rank/GPU 会被当前身份复核拒绝。
 
@@ -172,5 +172,5 @@ val/test 的四项 action-blind、label sensitivity 与梯度 ownership 门禁�
 6. 独立空白 Agent 按本文逐项审查，P0/P1/P2 为 0/0/0；
 7. README、配置和实际命令一致，发布树中没有旧 trainer 旁路。
 
-目标集群仍需完成两项环境相关验收：公开全集 revision/许可下载和 128-rank 通信/吞吐
+目标集群仍需完成两项环境相关验收：公开全集 revision/许可下载和 64-rank 通信/吞吐
 canary。仓库会在缺少这些证据时停止，不会把模板或小样本 receipt 当成正式全集结果。

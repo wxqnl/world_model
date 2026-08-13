@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import wm3d.data.episode_io as episode_io
@@ -56,3 +58,53 @@ def test_verified_asset_store_rejects_escape(tmp_path: Path) -> None:
     outside.write_bytes(b"outside")
     with pytest.raises(EpisodeIOError, match="escapes source root"):
         VerifiedAssetStore().verify(root, "../outside.bin", _sha(outside))
+
+
+def test_decode_episode_views_parallelizes_real_cameras_without_reordering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assets = []
+    views = []
+    for name in ("head", "left_wrist", "right_wrist"):
+        path = tmp_path / f"{name}.mp4"
+        path.write_bytes(name.encode())
+        role = f"rgb/{name}"
+        assets.append((role, path.name, _sha(path)))
+        views.append((name, role, "entire_file", None, None))
+    task = SimpleNamespace(
+        assets=tuple(assets),
+        views=tuple(views),
+        observation_samples=4,
+    )
+    calls: list[str] = []
+
+    def fake_decode(path: Path, **_kwargs):
+        calls.append(path.stem)
+        value = ("head", "left_wrist", "right_wrist").index(path.stem)
+        frames = np.full((4, 2, 2, 3), value, dtype=np.uint8)
+        return frames, np.arange(4, dtype=np.float64)
+
+    monkeypatch.setattr(episode_io, "_decode_segment", fake_decode)
+    decoded, evidence = episode_io.decode_episode_views(
+        task=task,
+        source_root=tmp_path,
+        canonical_view_slots=("head", "left_wrist", "right_wrist"),
+        selected_observation_rows=[0, 2, 3],
+        decode_workers=3,
+    )
+    assert set(calls) == {"head", "left_wrist", "right_wrist"}
+    assert list(decoded) == ["head", "left_wrist", "right_wrist"]
+    assert list(evidence) == ["head", "left_wrist", "right_wrist"]
+    assert decoded["right_wrist"].frames.shape == (3, 2, 2, 3)
+
+
+def test_decode_episode_views_rejects_nonpositive_worker_count(tmp_path: Path) -> None:
+    task = SimpleNamespace(assets=(), views=(), observation_samples=2)
+    with pytest.raises(EpisodeIOError, match="decode_workers"):
+        episode_io.decode_episode_views(
+            task=task,
+            source_root=tmp_path,
+            canonical_view_slots=("head",),
+            selected_observation_rows=[0, 1],
+            decode_workers=0,
+        )
