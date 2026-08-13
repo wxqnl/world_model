@@ -1,0 +1,57 @@
+schema: wm3d_v8_model_profile_v1
+name: native_1b
+architecture: native_world_model
+expected_parameter_count: 1194740883
+sampling:
+  mode: observed_monotonic_subsequence
+  history_action_leading_boundary: observed_previous_state
+  context_horizon_seconds: 3.2
+  future_horizon_seconds: 1.6
+  minimum_horizon_coverage: 0.9
+  minimum_anchor_separation_seconds: 0.2
+  policy_target_horizon_seconds: 1.6
+  policy_training_times: observed_action_timestamps
+  interpolation: forbidden
+model:
+  schema: wm3d_native_world_model_v1
+  T: 16
+  P: 64
+  K: 8
+  token_dim: 2048
+  task_dim: 2048
+  num_views: 3
+  state_hidden: 1600
+  state_layers: 18
+  state_heads: 16
+  state_ff_mult: 2.5
+  action_hidden: 1280
+  action_layers: 14
+  action_heads: 16
+  action_ff_mult: 2.6666666666666665
+  bridge_layers_state: [2, 5, 8, 11, 14, 17]
+  bridge_heads: 16
+  dynamics_layers: 1
+  view_hidden: 768
+  view_heads: 12
+  view_ff_mult: 2.5
+  max_action_groups: 8
+  max_action_dim: 16
+  max_state_dim: 32
+  max_action_substeps: 128
+  max_policy_queries: 256
+  max_group_id: 128
+  max_embodiments: 512
+  max_action_semantic_id: 64
+  max_state_semantic_id: 64
+  time_fourier_dim: 128
+  time_min_period_s: 0.01
+  time_max_period_s: 120.0
+  max_aux_tokens: 16
+  aux_dim: 256
+  max_aux_type_id: 128
+  rgb_hidden: 384
+  rgb_size: 256
+  rgb_decode_indices: [1, 3, 5, 7]
+  geom_hidden: 512
+  dropout: 0.0
+  activation_checkpointing: true

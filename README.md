@@ -1,13 +1,20 @@
-# WM3D V8
+# WM3D
 
-V8 的预训练由两个连续阶段组成：
+WM3D 是动作条件的原生 3D 世界模型。模型使用真实时间戳，在显式 3D lattice 上联合
+预测未来 native token、RGB、depth、point、camera pose 和 grouped robot action。
 
-1. **Stage0：原生 3D 世界动力学与可迁移 action policy 联合预训练**
-2. **Stage1-P：冻结执行 action owner 后，训练多候选原生 3D 推演与选择**
+正式项目位于 [`wm3d/`](wm3d/README.md)，包含公开数据准备、缓存、Stage0 预训练、
+Stage1 规划、分布式 checkpoint、离线评测和真实双卡验收。仓库不再携带上一代模型的
+训练代码；需要复用旧数据时，只能通过当前项目的 legacy importer 转换到 WM3D ABI。
 
-模型始终在显式 3D lattice 上预测未来 token、RGB、depth、point 和 pose。Stage1-P
-不会把模型改成 VLA，也不会用 latent 3D 取代显式几何输出。
+快速开始：
 
-当前实现、配置、启动脚本和测试位于 [`wm3d_v8/`](wm3d_v8/README.md)。
-`wm3d_v7/` 保留上一版本的公开数据与 5B 配方，便于核对数据合同和版本差异；V8
-训练入口以 `wm3d_v8/` 为准。
+```bash
+git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
+cd world_model/wm3d
+./run_wm3d.sh env
+source .venv/bin/activate
+PYTHON_BIN=.venv/bin/python ./run_wm3d.sh check
+```
+
+完整的数据、训练和评测流程见 [WM3D README](wm3d/README.md)。

@@ -1,0 +1,12 @@
+schema: wm3d_native_vggt_encoder_v1
+model_name: facebook/VGGT-1B
+model_revision: 860abec7937da0a4c03c41d3c269c366e82abdf9
+token_grid: 8
+input_rgb_size: 518
+input_preprocess: aspect_pad_white
+target_rgb_size: 256
+token_dim: 2048
+max_views: 3
+dtype: bf16
+time_isolation: fold_time_into_batch
+missing_view_policy: exclude_from_geometry

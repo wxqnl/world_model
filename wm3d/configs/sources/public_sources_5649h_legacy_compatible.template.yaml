@@ -1,0 +1,34 @@
+schema: wm3d_v8_raw_source_lock_v1
+
+# legacy-compatible 5649.4h 的远端部分。legacy_v7_formal 397h 是已有本地
+# residual，不从远端重复下载；它由 legacy-residual-import 严格导入。
+# 每个 revision 在正式下载前必须解析成 40 位 commit SHA。
+sources:
+  - name: robocasa_full
+    transport: huggingface_dataset
+    repo_id: ember-lab-berkeley/robocasa365-pretrain-mg
+    revision: __MATERIALIZE_REQUIRED_40_HEX_COMMIT__
+    include: ["**"]
+    destination: robocasa_full
+    gated: false
+  - name: agibot_world_2026
+    transport: huggingface_dataset
+    repo_id: agibot-world/AgiBotWorld2026
+    revision: __MATERIALIZE_REQUIRED_40_HEX_COMMIT__
+    include: ["README.md", "scripts/**", "ImitationLearning/**", "RichInteraction/**", "ReinforcementLearning/**"]
+    destination: agibot_world_2026
+    gated: false
+  - name: agibot_beta
+    transport: huggingface_dataset
+    repo_id: agibot-world/AgiBotWorld-Beta
+    revision: __MATERIALIZE_REQUIRED_40_HEX_COMMIT__
+    include: ["**"]
+    destination: agibot_beta
+    gated: true
+  - name: agibot_alpha_converter
+    transport: huggingface_dataset
+    repo_id: agibot-world/AgiBotWorld-Alpha
+    revision: __MATERIALIZE_REQUIRED_40_HEX_COMMIT__
+    include: ["README.md", "scripts/convert_to_lerobot.py"]
+    destination: agibot_alpha_converter
+    gated: true
