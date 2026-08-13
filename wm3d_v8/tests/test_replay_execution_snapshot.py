@@ -16,6 +16,7 @@ from wm3d_v3.stage1_planner.execution_snapshot import (
     ExecutionSnapshotPlan,
     PinnedExecutionPath,
     ReadOnlyBindMount,
+    WritableBindMount,
     scan_regular_tree,
     validate_execution_snapshot,
 )
@@ -352,3 +353,47 @@ def test_private_mount_namespace_removes_shared_propagation() -> None:
         text=True,
     )
     assert child.returncode == 0
+
+
+def test_exact_writable_bind_restores_sealed_directory(tmp_path: Path) -> None:
+    inputs = tmp_path / "inputs"
+    model = inputs / "objects/mug"
+    model.mkdir(parents=True)
+    (model / "model.xml").write_bytes(b"sealed")
+    immutable = ReadOnlyBindMount(inputs, label="test inputs")
+    writable = WritableBindMount(model, label="test transient directory")
+    immutable.__enter__()
+    try:
+        writable.__enter__()
+        try:
+            transient = model / "123_456.xml"
+            transient.write_bytes(b"derived")
+            transient.unlink()
+            writable.verify()
+        finally:
+            writable.close()
+        assert (model / "model.xml").read_bytes() == b"sealed"
+        with pytest.raises(OSError):
+            (inputs / "outside.txt").write_bytes(b"rejected")
+    finally:
+        immutable.close()
+
+
+def test_exact_writable_bind_rejects_leaked_file_and_unmounts(
+    tmp_path: Path,
+) -> None:
+    inputs = tmp_path / "inputs"
+    model = inputs / "objects/mug"
+    model.mkdir(parents=True)
+    (model / "model.xml").write_bytes(b"sealed")
+    immutable = ReadOnlyBindMount(inputs, label="test inputs")
+    writable = WritableBindMount(model, label="test transient directory")
+    immutable.__enter__()
+    try:
+        writable.__enter__()
+        (model / "leaked.xml").write_bytes(b"leaked")
+        with pytest.raises(ExecutionSnapshotError, match="not restored"):
+            writable.close()
+        assert not writable._mounted
+    finally:
+        immutable.close()

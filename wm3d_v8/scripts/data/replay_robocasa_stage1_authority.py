@@ -41,6 +41,7 @@ from wm3d_v3.stage1_planner.execution_snapshot import (
     ExecutionSnapshotPlan,
     PinnedExecutionPath,
     ReadOnlyBindMount,
+    WritableBindMount,
     enter_private_mount_namespace,
     scan_regular_tree,
 )
@@ -78,6 +79,35 @@ def _json(payload: bytes, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError(f"{label} must be a JSON object")
     return value
+
+
+def _runtime_mjcf_directories(
+    *, selected: dict[str, dict[str, Any]], robocasa_package_root: Path
+) -> list[Path]:
+    assets = robocasa_package_root / "models/assets/objects"
+    directories: set[Path] = set()
+    for root_id, row in selected.items():
+        _path, payload, observed = _regular(
+            Path(row["ep_meta_path"]), f"selected ep_meta {root_id}"
+        )
+        if observed != row["ep_meta_file_sha256"]:
+            raise RuntimeError("selection ep_meta SHA drift")
+        object_cfgs = _json(payload, f"selected ep_meta {root_id}").get("object_cfgs")
+        if not isinstance(object_cfgs, list):
+            raise RuntimeError("selected ep_meta object_cfgs must be a list")
+        for config in object_cfgs:
+            info = config.get("info") if isinstance(config, dict) else None
+            value = info.get("mjcf_path") if isinstance(info, dict) else None
+            if type(value) is not str or "/objects/" not in value.replace("\\", "/"):
+                raise RuntimeError("selected object config lacks a valid mjcf_path")
+            relative = Path(value.replace("\\", "/").split("/objects/", 1)[1])
+            if relative.is_absolute() or ".." in relative.parts or relative.suffix != ".xml":
+                raise RuntimeError("selected mjcf_path is invalid")
+            model = assets / relative
+            if model.is_symlink() or not model.is_file():
+                raise RuntimeError("selected MJCF model must be a regular file")
+            directories.add(model.parent)
+    return sorted(directories, key=lambda path: path.as_posix())
 
 
 def _publish_json(path: Path, value: dict[str, Any], label: str) -> str:
@@ -918,9 +948,20 @@ def main() -> None:
     immutable_inputs = ReadOnlyBindMount(
         snapshot_input_root, label="replay execution inputs"
     )
+    writable_directories = [
+        WritableBindMount(path, label=f"RoboCasa transient MJCF directory {index}")
+        for index, path in enumerate(_runtime_mjcf_directories(
+            selected=selected,
+            robocasa_package_root=robocasa_source_root / "robocasa",
+        ))
+    ]
     execution_completed = False
+    active_writable: list[WritableBindMount] = []
     try:
         immutable_inputs.__enter__()
+        for mount in writable_directories:
+            mount.__enter__()
+            active_writable.append(mount)
         execution_environment = dict(simulator_environment)
         execution_environment.update({
             "__EGL_VENDOR_LIBRARY_FILENAMES": "./inputs/runtime/egl_vendor.json",
@@ -1276,9 +1317,21 @@ def main() -> None:
             target=snapshot_anchor.alias("inputs"),
             pass_fds=(snapshot_anchor.fd,),
         )
+        for mount in active_writable:
+            mount.verify()
         execution_completed = True
     finally:
         try:
+            cleanup_error: BaseException | None = None
+            for mount in reversed(active_writable):
+                try:
+                    mount.close()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if cleanup_error is not None:
+                output.close()
+                raise cleanup_error
             immutable_inputs.close(
                 target=snapshot_anchor.alias("inputs"),
                 pass_fds=(snapshot_anchor.fd,),

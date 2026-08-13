@@ -225,7 +225,10 @@ class ReadOnlyBindMount:
     ) -> tuple[int, set[str]]:
         try:
             result = subprocess.run(
-                ["findmnt", "-J", "-o", "ID,OPTIONS", "--target", target],
+                [
+                    "findmnt", "--first-only", "-J", "-o", "ID,OPTIONS",
+                    "--target", target,
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -298,6 +301,125 @@ class ReadOnlyBindMount:
         self._mounted = False
         self._mount_identity = None
         self._mount_id = None
+
+
+class WritableBindMount:
+    """Temporarily re-enable writes for one directory inside sealed inputs."""
+
+    def __init__(self, path: Path, *, label: str):
+        self.path = _absolute(path)
+        self.label = label
+        self._mounted = False
+        self._source: PinnedExecutionPath | None = None
+        self._mount_id: int | None = None
+        self._baseline: dict[str, str] | None = None
+        if self.path.is_symlink() or not self.path.is_dir():
+            raise ExecutionSnapshotError(f"{label} must be a real directory")
+
+    @staticmethod
+    def _files(path: Path) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for item in sorted(
+            path.rglob("*"), key=lambda value: value.relative_to(path).as_posix()
+        ):
+            metadata = item.lstat()
+            relative = item.relative_to(path).as_posix()
+            if stat.S_ISDIR(metadata.st_mode):
+                result[relative + "/"] = "directory"
+                continue
+            if item.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                raise ExecutionSnapshotError(
+                    "writable replay directory contains a non-regular entry"
+                )
+            payload = item.read_bytes()
+            result[relative] = hashlib.sha256(payload).hexdigest()
+        return result
+
+    def __enter__(self) -> WritableBindMount:
+        self._baseline = self._files(self.path)
+        self._source = PinnedExecutionPath(
+            self.path, directory=True, label=f"{self.label} source"
+        )
+        target = self._source.alias()
+        try:
+            subprocess.run(
+                ["mount", "--bind", target, target],
+                check=True,
+                capture_output=True,
+                text=True,
+                pass_fds=(self._source.fd,),
+            )
+            self._mounted = True
+            subprocess.run(
+                ["mount", "-o", "remount,bind,rw,nodev,nosuid,noexec", target],
+                check=True,
+                capture_output=True,
+                text=True,
+                pass_fds=(self._source.fd,),
+            )
+            self._mount_id, options = ReadOnlyBindMount._mount_info(
+                self, target, pass_fds=(self._source.fd,)
+            )
+            if not {"rw", "nodev", "nosuid", "noexec"}.issubset(options):
+                raise ExecutionSnapshotError(f"{self.label} writable mount is unsafe")
+        except BaseException:
+            if self._mounted:
+                subprocess.run(
+                    ["umount", target],
+                    capture_output=True,
+                    text=True,
+                    pass_fds=(self._source.fd,),
+                )
+            self._mounted = False
+            self._source.close()
+            self._source = None
+            raise
+        return self
+
+    def verify(self) -> None:
+        if not self._mounted or self._source is None or self._mount_id is None:
+            raise ExecutionSnapshotError(f"{self.label} writable mount is not active")
+        mount_id, options = ReadOnlyBindMount._mount_info(
+            self, self._source.alias(), pass_fds=(self._source.fd,)
+        )
+        if (
+            mount_id != self._mount_id
+            or not {"rw", "nodev", "nosuid", "noexec"}.issubset(options)
+        ):
+            raise ExecutionSnapshotError(f"{self.label} writable mount changed")
+
+    def close(self) -> None:
+        if not self._mounted:
+            return
+        validation_error: BaseException | None = None
+        try:
+            self.verify()
+            if self._files(self.path) != self._baseline:
+                raise ExecutionSnapshotError(
+                    f"{self.label} was not restored after replay"
+                )
+        except BaseException as error:
+            validation_error = error
+        assert self._source is not None
+        result = subprocess.run(
+            ["umount", self._source.alias()],
+            capture_output=True,
+            text=True,
+            pass_fds=(self._source.fd,),
+        )
+        if result.returncode != 0:
+            raise ExecutionSnapshotError(
+                f"cannot unmount {self.label}: {result.stderr.strip()}"
+            )
+        self._mounted = False
+        self._mount_id = None
+        self._source.close()
+        self._source = None
+        if validation_error is not None:
+            raise validation_error
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 def enter_private_mount_namespace() -> None:
