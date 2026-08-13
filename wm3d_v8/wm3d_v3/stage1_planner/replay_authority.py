@@ -214,6 +214,31 @@ def _verify_path(path: object, expected: object, label: str) -> tuple[Path, byte
     return resolved, payload
 
 
+def _verify_selection_row_referents(row: dict[str, Any]) -> None:
+    """Verify selection inputs against their raw-file digests.
+
+    ``ep_meta_sha256`` is the canonical JSON semantic digest consumed by the
+    simulator contract, while ``ep_meta_file_sha256`` seals the bytes at
+    ``ep_meta_path``.  Path verification must use the latter.
+    """
+
+    digest_fields = {
+        "source_manifest": "source_manifest_sha256",
+        "source_episode": "source_episode_sha256",
+        "states": "states_sha256",
+        "model_xml_gz": "model_xml_gz_sha256",
+        "ep_meta": "ep_meta_file_sha256",
+        "dataset_meta": "dataset_meta_sha256",
+        "modality": "modality_sha256",
+        "candidate_payload": "candidate_payload_sha256",
+        "root_context": "root_context_sha256",
+    }
+    for name, digest_field in digest_fields.items():
+        _verify_path(
+            row[f"{name}_path"], row[digest_field], f"selection row {name}"
+        )
+
+
 def _validate_source_tree(
     reference: object,
     *,
@@ -945,15 +970,7 @@ def validate_replay_authority(
                 or row["t0"] < 0
             ):
                 raise ReplayAuthorityError("selection manifest row identity invalid")
-            for name in (
-                "source_manifest", "source_episode", "states", "model_xml_gz",
-                "ep_meta", "dataset_meta", "modality", "candidate_payload",
-                "root_context",
-            ):
-                _verify_path(
-                    row[f"{name}_path"], row[f"{name}_sha256"],
-                    f"selection row {name}",
-                )
+            _verify_selection_row_referents(row)
             for field in (
                 "source_manifest_row_sha256", "model_xml_sha256",
                 "ep_meta_sha256", "candidate_index_row_sha256",

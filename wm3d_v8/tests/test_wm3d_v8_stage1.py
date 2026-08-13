@@ -87,6 +87,7 @@ from wm3d_v3.stage1_planner.replay_authority import (
     PINNED_RUNTIME_GENERATOR_SNAPSHOT_SHA256,
     _validate_environment,
     _validate_fresh_index_row,
+    _verify_selection_row_referents,
     _validate_source_tree,
     array_sha256,
     validate_replay_authority,
@@ -309,6 +310,28 @@ def test_replay_authority_array_digest_is_dtype_and_shape_bound() -> None:
     value = np.arange(8, dtype=np.float32)
     assert array_sha256(value) != array_sha256(value.astype(np.float64))
     assert array_sha256(value) != array_sha256(value.reshape(2, 4))
+
+
+def test_selection_ep_meta_path_uses_raw_file_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest = "a" * 64
+    raw_digest = "b" * 64
+    row = {field: digest for field in REPLAY_SELECTION_ROW_FIELDS}
+    row.update({
+        "ep_meta_path": "/source/extras/episode_000001/ep_meta.json",
+        "ep_meta_file_sha256": raw_digest,
+        "ep_meta_sha256": "c" * 64,
+    })
+    observed: dict[str, str] = {}
+
+    def record(path: object, expected: object, label: str) -> tuple[Path, bytes]:
+        observed[label] = str(expected)
+        return Path(str(path)), b""
+
+    monkeypatch.setattr(replay_authority_contract, "_verify_path", record)
+    _verify_selection_row_referents(row)
+    assert observed["selection row ep_meta"] == raw_digest
 
 
 def _fresh_binding_fixture() -> tuple[dict, dict, dict, dict, dict[str, np.ndarray]]:
