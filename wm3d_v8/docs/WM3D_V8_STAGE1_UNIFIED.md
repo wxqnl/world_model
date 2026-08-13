@@ -69,7 +69,7 @@ CODE_COMMIT="$(git rev-parse HEAD)"
 ./run_v8.sh stage1-seal-selection \
   --code-commit "$CODE_COMMIT" \
   --selection-policy configs/data/stage1_robocasa_real_4roots.template.yaml \
-  --data-profile "$STAGE1_ROOT/data_profile_4roots.yaml" \
+  --data-profile "$STAGE1_ROOT/data_profile_4roots_v7.yaml" \
   --candidate-index "$CANARY/success_pool_candidates_valid_v1/index.jsonl" \
   --candidate-index-seal "$CANARY/success_pool_candidates_valid_v1/index.seal.json" \
   --output "$STAGE1_ROOT/selection.seal.json"
