@@ -88,6 +88,7 @@ CODE_COMMIT="$(git rev-parse HEAD)"
   --simulator-site-packages /data/Minko/.venvs/robocasa_cf/lib/python3.10/site-packages \
   --robocasa-source-root /data/Minko/third_party/robocasa-8f3c96ec8d1bfcd8126cad2bca887da98d30e997 \
   --robosuite-source-root /data/Minko/third_party/robosuite-6c10ef24a4bb52f59199976125060ce793470e6e \
+  --egl-vendor-library /data/Minko/egl/10_nvidia.json \
   --action-audit /data/Minko/world_model/wm3d_v7/manifests/audits/robocasa365_atomic_factual_action_v2.json \
   --candidate-index "$CANARY/success_pool_candidates_valid_v1/index.jsonl" \
   --candidate-index-seal "$CANARY/success_pool_candidates_valid_v1/index.seal.json" \

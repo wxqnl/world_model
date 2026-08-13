@@ -363,6 +363,12 @@ def _environment_receipt(
         "python_version": value["python_version"],
         "cuda_visible_devices": value["cuda_visible_devices"],
         "mujoco_gl": value["mujoco_gl"],
+        "egl_vendor_library_path": simulator_environment[
+            "__EGL_VENDOR_LIBRARY_FILENAMES"
+        ],
+        "egl_vendor_library_sha256": hashlib.sha256(
+            Path(simulator_environment["__EGL_VENDOR_LIBRARY_FILENAMES"]).read_bytes()
+        ).hexdigest(),
         "pip_freeze_path": str(freeze_path),
         "pip_freeze_sha256": hashlib.sha256(freeze).hexdigest(),
         "simulator_site_packages_path": str(simulator_site_packages),
@@ -469,6 +475,7 @@ def main() -> None:
     parser.add_argument("--simulator-site-packages", type=Path, required=True)
     parser.add_argument("--robocasa-source-root", type=Path, required=True)
     parser.add_argument("--robosuite-source-root", type=Path, required=True)
+    parser.add_argument("--egl-vendor-library", type=Path, required=True)
     parser.add_argument("--action-audit", type=Path, required=True)
     parser.add_argument("--candidate-index", type=Path, required=True)
     parser.add_argument("--candidate-index-seal", type=Path, required=True)
@@ -671,6 +678,9 @@ def main() -> None:
     simulator_site_packages = simulator_site_packages.resolve(strict=True)
     robocasa_source_root = robocasa_source_root.resolve(strict=True)
     robosuite_source_root = robosuite_source_root.resolve(strict=True)
+    egl_vendor_path, _egl_vendor_payload, _egl_vendor_sha = _regular(
+        args.egl_vendor_library, "EGL vendor library manifest"
+    )
     for source_root, expected, label in (
         (robocasa_source_root, "8f3c96ec8d1bfcd8126cad2bca887da98d30e997", "RoboCasa"),
         (robosuite_source_root, "6c10ef24a4bb52f59199976125060ce793470e6e", "robosuite"),
@@ -683,6 +693,7 @@ def main() -> None:
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
         "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl"),
+        "__EGL_VENDOR_LIBRARY_FILENAMES": str(egl_vendor_path),
         "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "4"),
         "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": os.pathsep.join((

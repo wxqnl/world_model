@@ -93,7 +93,8 @@ REPLAY_ENVIRONMENT_FIELDS = {
     "schema", "code_commit", "simulator_python_path", "simulator_python_sha256",
     "simulator_python_device", "simulator_python_inode", "simulator_python_size",
     "simulator_python_mtime_ns", "simulator_pythonpath",
-    "python_version", "cuda_visible_devices", "mujoco_gl", "pip_freeze_path",
+    "python_version", "cuda_visible_devices", "mujoco_gl",
+    "egl_vendor_library_path", "egl_vendor_library_sha256", "pip_freeze_path",
     "pip_freeze_sha256", "simulator_site_packages_path",
     "robocasa_source_root", "robocasa_source_commit",
     "robosuite_source_root", "robosuite_source_commit", "source_trees",
@@ -349,6 +350,14 @@ def _validate_environment(
     for field in ("python_version", "cuda_visible_devices", "mujoco_gl"):
         if type(value[field]) is not str or not value[field]:
             raise ReplayAuthorityError(f"replay environment {field} is invalid")
+    if verify_referents:
+        _verify_path(
+            value["egl_vendor_library_path"],
+            value["egl_vendor_library_sha256"],
+            "EGL vendor library manifest",
+        )
+    else:
+        _sha(value["egl_vendor_library_sha256"], "EGL vendor manifest SHA")
     resolved_directories: dict[str, Path] = {}
     for field in (
         "simulator_site_packages_path", "robocasa_source_root",
