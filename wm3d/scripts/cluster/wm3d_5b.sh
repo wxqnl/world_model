@@ -9,7 +9,7 @@ usage() {
   cat <<'EOF'
 WM3D 5B 集群操作入口：
 
-  ./run_wm3d.sh 5b init <site.env>
+  ./run_wm3d.sh 5b init <canary1k|validation10k|validation100k|formal600k> <site.env>
   ./run_wm3d.sh 5b env <site.env>
   ./run_wm3d.sh 5b doctor <site.env>
   ./run_wm3d.sh 5b plan <site.env>
@@ -24,10 +24,10 @@ WM3D 5B 集群操作入口：
   ./run_wm3d.sh 5b runtime <site.env>
   ./run_wm3d.sh 5b preflight <site.env>
   ./run_wm3d.sh 5b train <site.env> [sealed-stop-step]
-  ./run_wm3d.sh 5b resume <site.env> <checkpoint> [sealed-stop-step]
-  ./run_wm3d.sh 5b eval <site.env> <checkpoint> [output.json]
+  ./run_wm3d.sh 5b resume <site.env> <step|checkpoint> [sealed-stop-step]
+  ./run_wm3d.sh 5b eval <site.env> [step|checkpoint] [output.json]
   ./run_wm3d.sh 5b status <site.env>
-  ./run_wm3d.sh 5b verify <site.env> <expected-step> <checkpoint> <eval.json>
+  ./run_wm3d.sh 5b verify <site.env> [step|checkpoint] [eval.json]
 
 完整顺序和多机启动示例见 docs/WM3D_5B_SCALING.md。
 EOF
@@ -64,6 +64,45 @@ require_file() {
   [[ -f "${value}" && ! -L "${value}" ]] || die "${label} 不存在、不是普通文件或是符号链接：${value}"
 }
 
+validate_preset() {
+  case "$1" in
+    canary1k|validation10k|validation100k|formal600k) ;;
+    *) die "未知 5B preset：$1（可选 canary1k、validation10k、validation100k、formal600k）" ;;
+  esac
+}
+
+apply_preset() {
+  validate_preset "${WM3D_5B_PRESET}"
+  case "${WM3D_5B_PRESET}" in
+    canary1k)
+      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_canary1k.yaml
+      TOTAL_STEPS=1000
+      MILESTONES="100 -> 500 -> 1000"
+      ;;
+    validation10k)
+      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_validation10k.yaml
+      TOTAL_STEPS=10000
+      MILESTONES="100 -> 500 -> 10000"
+      ;;
+    validation100k)
+      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_validation100k.yaml
+      TOTAL_STEPS=100000
+      MILESTONES="1000 -> 100000"
+      ;;
+    formal600k)
+      RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2.yaml
+      TOTAL_STEPS=600000
+      MILESTONES="1000 -> 5000 -> 20000 -> 600000"
+      ;;
+  esac
+  RUN_ROOT="${WORK_ROOT}/runs/5b_${WM3D_5B_RUN_ID}"
+  RUNTIME_YAML="${CONTROL_ROOT}/runtime_5b_${WM3D_5B_RUN_ID}.yaml"
+  RUN_NAME="wm3d_5b_${WM3D_5B_RUN_ID}"
+  RUN_LINEAGE="wm3d_5b_${DATA_FAMILY}_${WM3D_5B_RUN_ID}_v1"
+  printf -v FINAL_STEP_PADDED '%08d' "${TOTAL_STEPS}"
+  EVAL_OUTPUT="${RUN_ROOT}/eval_step_${FINAL_STEP_PADDED}.json"
+}
+
 load_site() {
   local site=$1
   absolute_existing_file "${site}"
@@ -73,14 +112,16 @@ load_site() {
   # shellcheck disable=SC1090
   source "${site}"
   set +a
-  for name in WORK_ROOT CONTROL_ROOT RAW_ROOT CACHE_ROOT RUN_ROOT ENV_DIR PYTHON_BIN \
-    HF_TOKEN_FILE SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
+  for name in WM3D_5B_PRESET WM3D_5B_RUN_ID DATA_FAMILY WORK_ROOT CONTROL_ROOT RAW_ROOT \
+    CACHE_ROOT ENV_DIR PYTHON_BIN \
+    HF_TOKEN_FILE ACCEPT_DATA_LICENSES SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
     TASK_BANK_INDEX TASK_MANIFEST EPISODE_INDEX EPISODE_SEAL WINDOW_INDEX WINDOW_SEAL \
-    GROUPED_NORMALIZATION RUNTIME_YAML MODEL_PROFILE ENCODER_CONTRACT \
-    TASK_ENCODER_CONTRACT OBJECTIVE_PROFILE RUNTIME_PROFILE RUN_NAME RUN_LINEAGE NNODES \
+    GROUPED_NORMALIZATION MODEL_PROFILE ENCODER_CONTRACT \
+    TASK_ENCODER_CONTRACT OBJECTIVE_PROFILE NNODES \
     GPUS_PER_NODE MASTER_ADDR PREFLIGHT_PORT TRAIN_PORT EVAL_PORT; do
     require_var "${name}"
   done
+  apply_preset
   SOURCE_TEMPLATE=$(repo_path "${SOURCE_TEMPLATE}")
   DATA_TEMPLATE=$(repo_path "${DATA_TEMPLATE}")
   MODEL_PROFILE=$(repo_path "${MODEL_PROFILE}")
@@ -90,6 +131,38 @@ load_site() {
   RUNTIME_PROFILE=$(repo_path "${RUNTIME_PROFILE}")
   export PYTHON_BIN HF_HOME HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
   export WM3D_VGGT_SOURCE_ROOT WM3D_VGGT_MODEL_SNAPSHOT QWEN3_VL_EMBEDDING_PATH
+}
+
+checkpoint_for_step() {
+  local raw=$1
+  [[ "${raw}" =~ ^[0-9]+$ ]] || die "step 必须是非负整数：${raw}"
+  local step=$((10#${raw}))
+  (( step > 0 && step <= TOTAL_STEPS )) || \
+    die "step 必须位于 1..${TOTAL_STEPS}：${raw}"
+  printf '%s/checkpoints/step_%08d\n' "${RUN_ROOT}" "${step}"
+}
+
+resolve_checkpoint() {
+  local value=$1
+  if [[ "${value}" =~ ^[0-9]+$ ]]; then
+    checkpoint_for_step "${value}"
+  else
+    printf '%s\n' "${value}"
+  fi
+}
+
+step_from_checkpoint() {
+  local value=$1
+  local name=${value##*/}
+  [[ "${name}" =~ ^step_([0-9]{8})$ ]] || \
+    die "checkpoint 目录名必须为 step_XXXXXXXX：${value}"
+  printf '%d\n' "$((10#${BASH_REMATCH[1]}))"
+}
+
+eval_output_for_step() {
+  local raw=$1
+  local step=$((10#${raw}))
+  printf '%s/eval_step_%08d.json\n' "${RUN_ROOT}" "${step}"
 }
 
 sha256() {
@@ -120,13 +193,16 @@ shift || true
 
 case "${action}" in
   init)
-    [[ $# -eq 1 ]] || { usage; exit 2; }
-    target=$1
+    [[ $# -eq 2 ]] || { usage; exit 2; }
+    preset=$1
+    target=$2
+    validate_preset "${preset}"
     [[ "${target}" == /* ]] || die "init 目标必须是绝对路径"
     [[ ! -e "${target}" && ! -L "${target}" ]] || die "拒绝覆盖已有 site 文件：${target}"
     mkdir -p "$(dirname "${target}")"
     install -m 600 "${TEMPLATE}" "${target}"
-    echo "已创建 ${target}；编辑 REQUIRED 路径后运行 doctor。"
+    sed -i "s/^WM3D_5B_PRESET=.*/WM3D_5B_PRESET=${preset}/" "${target}"
+    echo "已创建 ${target}（preset=${preset}）；编辑站点路径后运行 doctor。"
     exit 0
     ;;
   -h|--help|help)
@@ -194,6 +270,7 @@ PY
     [[ $# -eq 0 ]] || { usage; exit 2; }
     cat <<EOF
 WM3D 5B site plan
+  preset:     ${WM3D_5B_PRESET}
   work:       ${WORK_ROOT}
   raw:        ${RAW_ROOT}
   data:       ${DATA_PROFILE}
@@ -203,13 +280,14 @@ WM3D 5B site plan
   topology:   ${NNODES} nodes x ${GPUS_PER_NODE} GPUs
   model:      ${MODEL_PROFILE}
   schedule:   ${RUNTIME_PROFILE}
+  final step: ${TOTAL_STEPS}
 
 Order:
   env -> doctor -> lock -> download -> adapter/inventory approval
   -> task-bank -> cache-plan -> cache-worker[*] -> cache-seal
   -> window -> normalization -> runtime -> preflight
-  -> train(100) -> preflight -> resume(500) -> eval
-  -> preflight -> resume(10000) -> eval -> verify
+  -> train/resume milestones: ${MILESTONES}
+  -> eval -> verify
 EOF
     ;;
   env)
@@ -218,10 +296,13 @@ EOF
     ;;
   lock)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ "${ACCEPT_DATA_LICENSES}" == YES ]] || \
+      die "先接受全部上游数据许可，并在 site 文件设置 ACCEPT_DATA_LICENSES=YES"
     mkdir -p "${CONTROL_ROOT}"
     HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${ENTRY}" lock-resolve \
       --template "${SOURCE_TEMPLATE}" --output "${SOURCE_LOCK}" \
-      --token-file "${HF_TOKEN_FILE}" --confirm-licenses
+      --token-file "${HF_TOKEN_FILE}" \
+      --confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES
     ;;
   download)
     [[ $# -eq 0 ]] || { usage; exit 2; }
@@ -318,16 +399,17 @@ EOF
     ;;
   resume)
     [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 2; }
-    checkpoint=$1
+    checkpoint=$(resolve_checkpoint "$1")
     mapfile -t distributed < <(torch_args "${TRAIN_PORT}")
     app=(--runtime "${RUNTIME_YAML}" --resume "${checkpoint}")
     [[ $# -eq 1 ]] || app+=(--stop-after-step "$2")
     "${ENTRY}" train "${distributed[@]}" -- "${app[@]}"
     ;;
   eval)
-    [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 2; }
-    checkpoint=$1
-    output=${2:-${EVAL_OUTPUT}}
+    [[ $# -le 2 ]] || { usage; exit 2; }
+    checkpoint=$(resolve_checkpoint "${1:-${TOTAL_STEPS}}")
+    checkpoint_step=$(step_from_checkpoint "${checkpoint}")
+    output=${2:-$(eval_output_for_step "${checkpoint_step}")}
     mapfile -t distributed < <(torch_args "${EVAL_PORT}")
     "${ENTRY}" eval "${distributed[@]}" -- --runtime "${RUNTIME_YAML}" \
       --checkpoint "${checkpoint}" --output "${output}"
@@ -342,10 +424,16 @@ EOF
     "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_5b_run.py" "${args[@]}"
     ;;
   verify)
-    [[ $# -eq 3 ]] || { usage; exit 2; }
-    expected_step=$1
-    checkpoint=$2
-    eval_receipt=$3
+    [[ $# -le 3 ]] || { usage; exit 2; }
+    if [[ $# -eq 3 ]]; then
+      expected_step=$1
+      checkpoint=$2
+      eval_receipt=$3
+    else
+      checkpoint=$(resolve_checkpoint "${1:-${TOTAL_STEPS}}")
+      expected_step=$(step_from_checkpoint "${checkpoint}")
+      eval_receipt=${2:-$(eval_output_for_step "${expected_step}")}
+    fi
     "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_5b_run.py" \
       --data-profile "${DATA_PROFILE}" --task-manifest "${TASK_MANIFEST}" \
       --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \

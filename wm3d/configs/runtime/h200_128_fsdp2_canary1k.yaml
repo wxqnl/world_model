@@ -18,7 +18,7 @@ resources:
   require_zero_uncorrected_ecc: true
   require_idle_gpu: true
   require_full_local_nvlink_clique: true
-  minimum_ib_rate_gbps: 200.0
+  minimum_ib_rate_gbps: 400.0
   forbid_nccl_ib_disable: true
   minimum_memlock_bytes: 1073741824
   minimum_nofile: 1048576
