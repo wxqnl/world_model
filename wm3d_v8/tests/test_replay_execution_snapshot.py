@@ -282,6 +282,7 @@ def test_private_mount_namespace_rejects_forged_marker() -> None:
     )
     forged_environment = dict(os.environ)
     forged_environment["WM3D_STAGE1_REPLAY_PRIVATE_MOUNT_NAMESPACE"] = "1"
+    forged_environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     forged = subprocess.run(
         [sys.executable, "-c", code],
         env=forged_environment,
@@ -295,6 +296,7 @@ def test_private_mount_namespace_rejects_forged_marker() -> None:
 def test_private_mount_namespace_removes_shared_propagation() -> None:
     environment = dict(os.environ)
     environment["WM3D_STAGE1_REPLAY_PRIVATE_MOUNT_NAMESPACE"] = "1"
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     code = (
         "from wm3d_v3.stage1_planner.execution_snapshot import "
         "enter_private_mount_namespace; enter_private_mount_namespace(); "
