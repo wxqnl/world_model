@@ -378,8 +378,8 @@ def _fresh_binding_fixture() -> tuple[dict, dict, dict, dict, dict[str, np.ndarr
     fresh = {
         "schema": "wm3d_v7_stage1_planner_same_root_runtime_v3",
         "root_id": digest, "split": "train",
-        "source_dataset": f"./inputs/selected/{digest}/lerobot",
-        "root_context_path": f"./inputs/selected/{digest}/root_context/root.npz",
+        "source_dataset": str(selected_root / "lerobot"),
+        "root_context_path": str(selected_root / "root_context/root.npz"),
         "root_context_sha256": digest,
         "episode_id": 1, "episode_root_index": 2, "t0": 2,
         "candidate_index_sha256": "d" * 64, "candidate_payload_sha256": digest,

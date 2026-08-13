@@ -737,12 +737,8 @@ def _validate_fresh_index_row(
         "schema": "wm3d_v7_stage1_planner_same_root_runtime_v3",
         "root_id": authority_row["root_id"],
         "split": selection["split"],
-        "source_dataset": child_path(
-            authority_row["execution_source_dataset_path"]
-        ),
-        "root_context_path": child_path(
-            authority_row["execution_root_context_path"]
-        ),
+        "source_dataset": authority_row["execution_source_dataset_path"],
+        "root_context_path": authority_row["execution_root_context_path"],
         "root_context_sha256": selection["root_context_sha256"],
         "episode_id": selection["episode_id"],
         "episode_root_index": selection["episode_root_index"],
@@ -767,8 +763,7 @@ def _validate_fresh_index_row(
             )
     for field in (
         "split_group", "task", "task_text",
-        "source_dataset", "root_context_path", "episode_id",
-        "episode_root_index", "t0", "stage0_checkpoint_sha256",
+        "episode_id", "episode_root_index", "t0", "stage0_checkpoint_sha256",
     ):
         if field in candidate and fresh.get(field) != candidate[field]:
             raise ReplayAuthorityError(
