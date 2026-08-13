@@ -380,6 +380,107 @@ def test_stage1_publish_fsyncs_parent_directory(
     assert len(observed) >= 2
 
 
+def test_stage1_stable_read_and_publish_reject_ancestor_symlink(
+    tmp_path,
+) -> None:
+    real = tmp_path / "real" / "nested"
+    real.mkdir(parents=True)
+    source = real / "source.bin"
+    source.write_bytes(b"sealed")
+    linked = tmp_path / "linked"
+    linked.symlink_to(tmp_path / "real", target_is_directory=True)
+    with pytest.raises(RolloutAuditError, match="symlink"):
+        rollout_audit_contract.read_regular_bytes(
+            linked / "nested" / "source.bin", "ancestor-symlink input"
+        )
+    with pytest.raises(RolloutAuditError, match="symlink"):
+        publish_candidate_output(
+            linked / "nested" / "published.bin", b"payload"
+        )
+    assert not (real / "published.bin").exists()
+
+
+def test_stage1_publish_parent_replacement_is_pinned_and_rejected(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "trusted"
+    parent.mkdir()
+    moved = tmp_path / "trusted-pinned"
+    original_link = rollout_audit_contract.os.link
+    replaced = False
+
+    def replacing_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+        follow_symlinks: bool,
+    ) -> None:
+        nonlocal replaced
+        if not replaced:
+            parent.rename(moved)
+            parent.mkdir()
+            replaced = True
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(rollout_audit_contract.os, "link", replacing_link)
+    with pytest.raises(RolloutAuditError, match="ancestor was replaced"):
+        publish_candidate_output(parent / "published.bin", b"payload")
+    assert not (parent / "published.bin").exists()
+    assert (moved / "published.bin").read_bytes() == b"payload"
+
+
+def test_trusted_output_root_rejects_nested_parent_replacement(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scope = tmp_path / "scope"
+    nested = scope / "payloads" / "train"
+    nested.mkdir(parents=True)
+    moved = scope / "payloads-pinned"
+    output = rollout_audit_contract.TrustedOutputRoot(scope)
+    original_link = rollout_audit_contract.os.link
+    replaced = False
+
+    def replacing_link(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+        follow_symlinks: bool,
+    ) -> None:
+        nonlocal replaced
+        if not replaced:
+            (scope / "payloads").rename(moved)
+            (scope / "payloads" / "train").mkdir(parents=True)
+            replaced = True
+        original_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(rollout_audit_contract.os, "link", replacing_link)
+    try:
+        with pytest.raises(RolloutAuditError, match="ancestor was replaced"):
+            output.publish(
+                nested / "branch.pt", b"payload", label="nested branch"
+            )
+    finally:
+        output.close()
+    assert not (scope / "payloads" / "train" / "branch.pt").exists()
+    assert (moved / "train" / "branch.pt").read_bytes() == b"payload"
+
+
 def test_materializer_json_rejects_symlink(tmp_path) -> None:
     referent = tmp_path / "receipt.json"
     referent.write_text("{}", encoding="utf-8")

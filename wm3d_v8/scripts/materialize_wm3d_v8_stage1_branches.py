@@ -6,6 +6,7 @@ import argparse
 from collections import Counter
 import io
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -25,6 +26,8 @@ from wm3d_v3.stage1_planner.dataset import (
     validate_rollout_audit_binding,
 )
 from wm3d_v3.stage1_planner.rollout_audit import (
+    RolloutAuditError,
+    TrustedOutputRoot,
     publish_no_clobber,
     read_regular_bytes,
 )
@@ -32,22 +35,25 @@ from wm3d_v3.stage1_planner.train import _verify_runtime_checkout
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
 
 
-def _publish(path: Path, payload: bytes) -> None:
-    publish_no_clobber(path, payload, "Stage1 materializer output")
+def _publish(
+    path: Path,
+    payload: bytes,
+    *,
+    output: TrustedOutputRoot | None = None,
+) -> None:
+    if output is None:
+        publish_no_clobber(path, payload, "Stage1 materializer output")
+    else:
+        output.publish(path, payload, label="Stage1 materializer output")
 
 
 def _output_directory(path: Path, label: str) -> Path:
-    path = path.absolute()
-    if path.is_symlink() or path.parent.is_symlink():
-        raise ValueError(f"{label} must not be a symlink or use a symlink parent")
-    if path.exists():
-        if not path.is_dir():
-            raise ValueError(f"{label} must be a directory: {path}")
-    else:
-        path.mkdir(parents=True)
-    if path.is_symlink() or not path.is_dir():
-        raise ValueError(f"{label} was replaced while it was prepared: {path}")
-    return path
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    try:
+        with TrustedOutputRoot(absolute.parent, label=f"{label} parent") as output:
+            return output.mkdir(absolute, label=label)
+    except RolloutAuditError as error:
+        raise ValueError(str(error)) from error
 
 
 def _load_json(path: Path) -> dict:
@@ -59,11 +65,7 @@ def _load_json(path: Path) -> dict:
 
 
 def _commit_sha(path: Path) -> str:
-    if path.is_symlink():
-        raise ValueError("Stage0 checkpoint directory must not be a symlink")
-    commit = path.resolve(strict=True) / "COMMITTED.json"
-    if commit.is_symlink() or not commit.is_file():
-        raise ValueError("Stage0 source must be a committed DCP checkpoint directory")
+    commit = Path(os.path.abspath(os.fspath(path))) / "COMMITTED.json"
     _resolved, _payload, digest = read_regular_bytes(commit, "Stage0 DCP commit")
     return digest
 
@@ -294,9 +296,21 @@ def main() -> None:
     if any(SHA256_RE.fullmatch(str(value)) is None for value in lineage.values()):
         raise ValueError("Stage0 runtime/checkpoint lineage contains invalid SHA values")
     rows = []
-    output_root = _output_directory(args.output_root, "branch output root")
-    _output_directory(args.output_index.absolute().parent, "branch index parent")
-    _output_directory(args.output_seal.absolute().parent, "branch seal parent")
+    requested_output_root = Path(os.path.abspath(os.fspath(args.output_root)))
+    output_index = Path(os.path.abspath(os.fspath(args.output_index)))
+    output_seal = Path(os.path.abspath(os.fspath(args.output_seal)))
+    if not (
+        requested_output_root.parent == output_index.parent == output_seal.parent
+    ):
+        raise ValueError(
+            "branch output root, index, and seal must share one trusted parent"
+        )
+    output = TrustedOutputRoot(
+        requested_output_root.parent, label="branch trusted output parent"
+    )
+    output_root = output.mkdir(
+        requested_output_root, label="branch output root"
+    )
     required_manifest = {
         "schema", "sample_index", "sample_id", "source", "split", "embodiment",
         "payload", "payload_sha256", "generator_receipt",
@@ -361,7 +375,7 @@ def main() -> None:
             "adapter_contract_sha256": source_spec.adapter_contract_sha256,
         })
         target = output_root / str(raw["split"]) / f"{branch_id}.pt"
-        _publish(target, source_payload)
+        _publish(target, source_payload, output=output)
         rows.append({
             "schema": BRANCH_INDEX_SCHEMA, "branch_id": branch_id,
             "sample_index": int(raw["sample_index"]), "sample_id": str(raw["sample_id"]),
@@ -388,9 +402,9 @@ def main() -> None:
         raise ValueError("sealed Stage1 closure requires one candidate count and horizon")
     rows.sort(key=lambda item: (item["split"], item["source"], item["sample_id"]))
     index_payload = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows).encode()
-    _publish(args.output_index.absolute(), index_payload)
-    index_path, _verified_index_payload, index_sha = read_regular_bytes(
-        args.output_index.absolute(), "Stage1 branch index"
+    _publish(output_index, index_payload, output=output)
+    index_path, _verified_index_payload, index_sha = output.read(
+        output_index, label="Stage1 branch index"
     )
     split_counts = Counter(row["split"] for row in rows)
     if any(split_counts[name] <= 0 for name in ("train", "val", "test")):
@@ -403,7 +417,12 @@ def main() -> None:
         "rollout_audit_sha256": next(iter(rollout_audit_shas)),
         **lineage,
     }
-    _publish(args.output_seal.absolute(), (json.dumps(seal, sort_keys=True, indent=2) + "\n").encode())
+    _publish(
+        output_seal,
+        (json.dumps(seal, sort_keys=True, indent=2) + "\n").encode(),
+        output=output,
+    )
+    output.close()
     print(json.dumps(seal, sort_keys=True))
 
 

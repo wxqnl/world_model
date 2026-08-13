@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
-import uuid
 
 import numpy as np
 import torch
@@ -31,6 +30,8 @@ from wm3d_v3.data.unified_cache_dataset import _fuse_target_tokens, _pool_masked
 from wm3d_v3.encoders.native_vggt import NativeVGGTConfig, NativeVGGTEncoder
 from wm3d_v3.stage1_planner.dataset import BRANCH_SCHEMA, GENERATOR_RECEIPT_SCHEMA
 from wm3d_v3.stage1_planner.rollout_audit import (
+    RolloutAuditError,
+    TrustedOutputRoot,
     load_rollout_audit,
     publish_no_clobber,
     read_regular_bytes,
@@ -49,22 +50,25 @@ class _Arrays:
         return self.values[key]
 
 
-def _publish(path: Path, payload: bytes) -> None:
-    publish_no_clobber(path, payload, "Stage1 producer output")
+def _publish(
+    path: Path,
+    payload: bytes,
+    *,
+    output: TrustedOutputRoot | None = None,
+) -> None:
+    if output is None:
+        publish_no_clobber(path, payload, "Stage1 producer output")
+    else:
+        output.publish(path, payload, label="Stage1 producer output")
 
 
 def _output_directory(path: Path, label: str) -> Path:
-    path = path.absolute()
-    if path.is_symlink() or path.parent.is_symlink():
-        raise RuntimeError(f"{label} must not be a symlink or use a symlink parent")
-    if path.exists():
-        if not path.is_dir():
-            raise RuntimeError(f"{label} must be a directory: {path}")
-    else:
-        path.mkdir(parents=True)
-    if path.is_symlink() or not path.is_dir():
-        raise RuntimeError(f"{label} was replaced while it was prepared: {path}")
-    return path
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    try:
+        with TrustedOutputRoot(absolute.parent, label=f"{label} parent") as output:
+            return output.mkdir(absolute, label=label)
+    except RolloutAuditError as error:
+        raise RuntimeError(str(error)) from error
 
 
 def _sha256(payload: bytes) -> str:
@@ -93,28 +97,20 @@ def _strict_encoder_payload(payload: bytes) -> NativeVGGTConfig:
     return config
 
 
-def _torch_bytes(value: dict[str, torch.Tensor], path: Path) -> bytes:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.encode.{os.getpid()}.{uuid.uuid4().hex}")
-    try:
-        with temporary.open("xb") as handle:
-            torch.save({key: tensor.detach().cpu().contiguous() for key, tensor in value.items()}, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _resolved, payload, _digest = read_regular_bytes(
-            temporary, "temporary Stage1 payload"
-        )
-        return payload
-    finally:
-        temporary.unlink(missing_ok=True)
+def _torch_bytes(value: dict[str, torch.Tensor]) -> bytes:
+    handle = io.BytesIO()
+    torch.save(
+        {
+            key: tensor.detach().cpu().contiguous()
+            for key, tensor in value.items()
+        },
+        handle,
+    )
+    return handle.getvalue()
 
 
 def _checkpoint_commit_sha(path: Path) -> str:
-    if path.is_symlink():
-        raise RuntimeError("Stage0 checkpoint directory must not be a symlink")
-    commit = path.resolve(strict=True) / "COMMITTED.json"
-    if commit.is_symlink() or not commit.is_file():
-        raise RuntimeError("Stage0 checkpoint must be a committed DCP directory")
+    commit = Path(os.path.abspath(os.fspath(path))) / "COMMITTED.json"
     _resolved, _payload, digest = read_regular_bytes(commit, "Stage0 DCP commit")
     return digest
 
@@ -356,9 +352,17 @@ def main() -> None:
     if model_grid * model_grid != int(model["P"]):
         raise RuntimeError("Stage0 P is not a square grid")
     rows = []
-    output_root = _output_directory(args.output_root, "candidate output root")
-    _output_directory(
-        args.output_manifest.absolute().parent, "candidate manifest parent"
+    requested_output_root = Path(os.path.abspath(os.fspath(args.output_root)))
+    output_manifest = Path(os.path.abspath(os.fspath(args.output_manifest)))
+    if requested_output_root.parent != output_manifest.parent:
+        raise RuntimeError(
+            "candidate output root and manifest must share one trusted parent"
+        )
+    output = TrustedOutputRoot(
+        requested_output_root.parent, label="candidate trusted output parent"
+    )
+    output_root = output.mkdir(
+        requested_output_root, label="candidate output root"
     )
     simulator_revision = json.dumps(audit["simulator_revision"], sort_keys=True, separators=(",", ":"))
     episode_entries = load_cache_episode_index(
@@ -465,9 +469,9 @@ def main() -> None:
             "branch_valid": torch.ones(candidates, dtype=torch.bool),
         }
         payload_path = output_root / split / f"{entry.sample_id}.pt"
-        payload_bytes = _torch_bytes(payload, payload_path)
+        payload_bytes = _torch_bytes(payload)
         payload_sha = _sha256(payload_bytes)
-        _publish(payload_path, payload_bytes)
+        _publish(payload_path, payload_bytes, output=output)
         receipt = {
             "schema": GENERATOR_RECEIPT_SCHEMA,
             "sample_index": sample_index, "sample_id": entry.sample_id,
@@ -489,7 +493,7 @@ def main() -> None:
             json.dumps(receipt, sort_keys=True, indent=2) + "\n"
         ).encode()
         receipt_sha = _sha256(receipt_bytes)
-        _publish(receipt_path, receipt_bytes)
+        _publish(receipt_path, receipt_bytes, output=output)
         rows.append({
             "schema": BRANCH_SCHEMA,
             "sample_index": sample_index, "sample_id": entry.sample_id,
@@ -505,9 +509,10 @@ def main() -> None:
     rows.sort(key=lambda row: row["split"])
     manifest = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows).encode()
     manifest_sha = _sha256(manifest)
-    _publish(args.output_manifest, manifest)
+    _publish(output_manifest, manifest, output=output)
+    output.close()
     print(json.dumps({
-        "candidate_manifest": str(args.output_manifest.absolute()),
+        "candidate_manifest": str(output_manifest),
         "candidate_manifest_sha256": manifest_sha,
         "rows": len(rows), "splits": sorted(row["split"] for row in rows),
         "rollout_audit_sha256": rollout_audit_sha, **lineage,
