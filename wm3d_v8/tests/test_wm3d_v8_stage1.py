@@ -8,8 +8,10 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+import numpy as np
 import torch
 import wm3d_v3.stage1_planner.rollout_audit as rollout_audit_contract
+import wm3d_v3.stage1_planner.replay_authority as replay_authority_contract
 import wm3d_v3.stage1_planner.train as stage1_train
 
 from scripts.eval_wm3d_v8_stage1 import (
@@ -60,6 +62,8 @@ from scripts.produce_wm3d_v8_robocasa_stage1_candidates import (
 from scripts.data.audit_robocasa_real_rollouts import (
     _rows as load_audit_runtime_rows,
 )
+from scripts.data.robocasa_stage1_adapter_loader import _load_adapter
+from scripts.data.seal_robocasa_stage1_selection import _policy
 from wm3d_v3.data.manifest_contract import canonical_sha256
 from wm3d_v3.stage1_planner.rollout_audit import (
     ROLLOUT_AUDIT_FIELDS,
@@ -68,6 +72,24 @@ from wm3d_v3.stage1_planner.rollout_audit import (
     RolloutAuditError,
     load_rollout_audit,
     validate_rollout_audit,
+)
+from wm3d_v3.stage1_planner.replay_authority import (
+    REPLAY_AUTHORITY_FIELDS,
+    REPLAY_AUTHORITY_ROW_FIELDS,
+    REPLAY_AUTHORITY_ROW_SCHEMA,
+    REPLAY_AUTHORITY_SCHEMA,
+    REPLAY_BRANCH_FIELDS,
+    ReplayAuthorityError,
+    REPLAY_ENVIRONMENT_FIELDS,
+    REPLAY_ENVIRONMENT_SCHEMA,
+    REPLAY_SELECTION_ROW_FIELDS,
+    REPLAY_SOURCE_TREE_SCHEMA,
+    PINNED_RUNTIME_GENERATOR_SNAPSHOT_SHA256,
+    _validate_environment,
+    _validate_fresh_index_row,
+    _validate_source_tree,
+    array_sha256,
+    validate_replay_authority,
 )
 from wm3d_v3.training.launch_qualification import LaunchQualificationError
 from wm3d_v3.training.distributed_checkpoint import (
@@ -143,6 +165,7 @@ def _audit_fixture(tmp_path: Path) -> dict:
         "future_observation_leakage": False,
         "outcome_indices": [2], "future_offsets_seconds": [0.6],
         "branch_rgb_indices": [3], "source_future_row_offsets": [12],
+        "replay_authority_row_sha256": digest,
     })
     rows = []
     for split, suffix in (("train", "a"), ("val", "b"), ("test", "c")):
@@ -173,11 +196,460 @@ def _audit_fixture(tmp_path: Path) -> dict:
         ],
         "simulator_action_period_seconds": 0.05,
         "selection_count": {"train": 1, "val": 1, "test": 1},
+        "replay_authority_path": str(tmp_path / "replay-authority.json"),
+        "replay_authority_sha256": digest,
         "rows": rows, "passed": True,
     })
     audit["simulator_revision_sha256"] = canonical_sha256(audit["simulator_revision"])
     audit["rows_sha256"] = canonical_sha256(rows)
     return audit
+
+
+def _authority_fixture(tmp_path: Path) -> dict:
+    digest = "a" * 64
+    rows = []
+    for split, suffix in (("train", "a"), ("val", "b"), ("test", "c")):
+        branches = []
+        for index in range(2):
+            branch = {field: digest for field in REPLAY_BRANCH_FIELDS}
+            branch.update({
+                "index": index,
+                "role": f"role_{index}",
+                "terminal_success": bool(index),
+                "max_reward": float(index),
+            })
+            branches.append(branch)
+        row = {field: digest for field in REPLAY_AUTHORITY_ROW_FIELDS}
+        row.update({
+            "schema": REPLAY_AUTHORITY_ROW_SCHEMA,
+            "split": split,
+            "source": "source",
+            "root_id": suffix * 64,
+            "episode_id": 1,
+            "episode_root_index": 2,
+            "t0": 2,
+            "candidate_seed": 3,
+            "candidate_count": 2,
+            "future_frames": 1,
+            "legacy_comparison_diagnostic": {
+                "available": True,
+                "all_core_equal": True,
+                "fields": {
+                    name: True for name in (
+                        "simulator_actions",
+                        "root_state",
+                        "root_rgb",
+                        "branch_rgb",
+                        "branch_rewards",
+                        "branch_dones",
+                        "branch_success",
+                    )
+                },
+            },
+            "branch_roles": ["role_0", "role_1"],
+            "root_rgb_equivalence_contract": "exact",
+            "branches": branches,
+            "branches_sha256": canonical_sha256(branches),
+            "candidate_actions_executed_exact": True,
+            "same_root_simulator_state_exact": True,
+            "same_root_render_state_exact": True,
+            "same_root_rgb_exact": True,
+            "real_simulator_outcomes": True,
+        })
+        rows.append(row)
+    authority = {field: digest for field in REPLAY_AUTHORITY_FIELDS}
+    authority.update({
+        "schema": REPLAY_AUTHORITY_SCHEMA,
+        "code_commit": "c" * 40,
+        "runtime_root": str(tmp_path),
+        "fresh_runtime_root": str(tmp_path),
+        "selection_count": {"train": 1, "val": 1, "test": 1},
+        "candidate_count": 2,
+        "future_frames": 1,
+        "rows": rows,
+        "rows_sha256": canonical_sha256(rows),
+        "passed": True,
+    })
+    return authority
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    (
+        (lambda value: value.update(candidate_count=True), "candidate count"),
+        (lambda value: value.update(selection_count={"train": True, "val": 1, "test": 1}), "selection closure"),
+        (lambda value: value["rows"][0].update(candidate_seed=True), "candidate_seed"),
+        (
+            lambda value: value["rows"][0].update(episode_root_index=True),
+            "episode_root_index",
+        ),
+        (
+            lambda value: value.update(selected_candidate_index_sha256=1),
+            "selected_candidate_index SHA",
+        ),
+        (lambda value: value["rows"][0].update(root_id=1), "root id"),
+        (lambda value: value["rows"][0].update(same_root_rgb_exact=False), "gate failed"),
+    ),
+)
+def test_replay_authority_rejects_exact_type_and_gate_tamper(
+    tmp_path: Path, mutate, match: str
+) -> None:
+    authority = _authority_fixture(tmp_path)
+    mutate(authority)
+    authority["rows_sha256"] = canonical_sha256(authority["rows"])
+    with pytest.raises(ReplayAuthorityError, match=match):
+        validate_replay_authority(
+            authority,
+            expected_code_commit="c" * 40,
+            verify_referents=False,
+        )
+
+
+def test_replay_authority_array_digest_is_dtype_and_shape_bound() -> None:
+    value = np.arange(8, dtype=np.float32)
+    assert array_sha256(value) != array_sha256(value.astype(np.float64))
+    assert array_sha256(value) != array_sha256(value.reshape(2, 4))
+
+
+def _fresh_binding_fixture() -> tuple[dict, dict, dict, dict, dict[str, np.ndarray]]:
+    digest = "a" * 64
+    selection = {field: digest for field in REPLAY_SELECTION_ROW_FIELDS}
+    selection.update({
+        "split": "train", "source": "source", "root_id": digest,
+        "episode_id": 1, "episode_root_index": 2, "t0": 2,
+        "source_dataset_path": "/source", "candidate_payload_path": "/candidate.npz",
+        "root_context_path": "/root.npz",
+    })
+    authority = dict(selection)
+    authority.update({
+        "candidate_count": 2, "future_frames": 1,
+        "stage0_checkpoint_sha256": "b" * 64,
+        "branch_roles": ["factual_teacher", "direct"],
+    })
+    candidate = {
+        "root_id": digest, "split": "train", "source_dataset": "/source",
+        "episode_id": 1, "episode_root_index": 2, "t0": 2,
+        "candidate_path": "/candidate.npz", "payload_sha256": digest,
+        "root_context_path": "/root.npz", "root_context_sha256": digest,
+        "stage0_checkpoint_sha256": "b" * 64, "action_audit_sha256": "c" * 64,
+    }
+    payload = {
+        "root_id": np.asarray(digest), "root_context_sha256": np.asarray(digest),
+        "stage0_checkpoint_sha256": np.asarray("b" * 64),
+        "model_xml_sha256": np.asarray(digest), "ep_meta_sha256": np.asarray(digest),
+        "root_state": np.zeros((1,), dtype=np.float32),
+        "root_rgb": np.zeros((1,), dtype=np.uint8),
+    }
+    fresh = {
+        "schema": "wm3d_v7_stage1_planner_same_root_runtime_v3",
+        "root_id": digest, "split": "train", "source_dataset": "/source",
+        "root_context_path": "/root.npz", "root_context_sha256": digest,
+        "episode_id": 1, "episode_root_index": 2, "t0": 2,
+        "candidate_index_sha256": "d" * 64, "candidate_payload_sha256": digest,
+        "action_audit_sha256": "c" * 64, "stage0_checkpoint_sha256": "b" * 64,
+        "model_xml_sha256": digest, "ep_meta_sha256": digest,
+        "branches": 2, "future_frames": 1,
+        "branch_roles": ["factual_teacher", "direct"],
+        "candidate_actions_executed_exact": True, "pseudo_outcomes": False,
+        "future_observation_leakage": False,
+        "root_state_sha256": array_sha256(payload["root_state"]),
+        "root_rgb_sha256": array_sha256(payload["root_rgb"]),
+    }
+    return selection, authority, candidate, fresh, payload
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "source_dataset_path", "source_episode_path", "source_episode_sha256",
+        "states_path", "states_sha256", "model_xml_gz_path",
+        "model_xml_gz_sha256", "model_xml_sha256", "ep_meta_path",
+        "ep_meta_file_sha256", "ep_meta_sha256", "dataset_meta_path",
+        "dataset_meta_sha256", "modality_path", "modality_sha256",
+    ),
+)
+def test_replay_selection_extra_tamper_is_rejected(field: str) -> None:
+    selection, authority, candidate, fresh, payload = _fresh_binding_fixture()
+    selection[field] = "e" * 64
+    with pytest.raises(ReplayAuthorityError, match="source closure|sealed inputs"):
+        _validate_fresh_index_row(
+            fresh, selection=selection, candidate=candidate,
+            authority_row=authority, action_audit_sha256="c" * 64,
+            selected_candidate_index_sha256="d" * 64, fresh_payload=payload,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "source_dataset", "split", "episode_id", "episode_root_index", "t0",
+        "candidate_index_sha256", "root_context_path", "root_context_sha256",
+        "action_audit_sha256", "stage0_checkpoint_sha256", "model_xml_sha256",
+        "ep_meta_sha256", "candidate_payload_sha256",
+    ),
+)
+def test_fresh_runtime_index_identity_tamper_is_rejected(field: str) -> None:
+    selection, authority, candidate, fresh, payload = _fresh_binding_fixture()
+    fresh[field] = "tampered"
+    with pytest.raises(ReplayAuthorityError, match="fresh runtime index"):
+        _validate_fresh_index_row(
+            fresh, selection=selection, candidate=candidate,
+            authority_row=authority, action_audit_sha256="c" * 64,
+            selected_candidate_index_sha256="d" * 64, fresh_payload=payload,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("root", "/self/reported/root"),
+        ("package", "self_reported_package"),
+        ("commit", "0" * 40),
+        ("tree_sha256", "f" * 64),
+    ),
+)
+def test_replay_source_tree_self_report_tamper_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: str
+) -> None:
+    root = tmp_path / "robocasa-pinned"
+    package = root / "robocasa"
+    package.mkdir(parents=True)
+    source = package / "source.py"
+    source.write_bytes(b"source")
+    rows = [{
+        "path": "source.py", "size": len(b"source"),
+        "sha256": hashlib.sha256(b"source").hexdigest(),
+    }]
+    tree_sha = canonical_sha256(rows)
+    monkeypatch.setitem(
+        replay_authority_contract.PINNED_SOURCE_TREE_SHA256,
+        "robocasa", tree_sha,
+    )
+    manifest = {
+        "schema": REPLAY_SOURCE_TREE_SCHEMA, "root": str(root),
+        "package": "robocasa", "commit": "1" * 40, "rows": rows,
+        "rows_sha256": tree_sha, "file_count": 1,
+        "total_bytes": len(b"source"), "passed": True,
+    }
+    reference = {
+        "manifest_path": str(tmp_path / "tree.json"),
+        "manifest_sha256": "a" * 64, "tree_sha256": tree_sha,
+    }
+    if field == "tree_sha256":
+        reference[field] = value
+    else:
+        manifest[field] = value
+    payload = json.dumps(manifest).encode()
+    monkeypatch.setattr(
+        replay_authority_contract, "_verify_path",
+        lambda *_args, **_kwargs: (tmp_path / "tree.json", payload),
+    )
+    with pytest.raises(ReplayAuthorityError, match="source-tree"):
+        _validate_source_tree(
+            reference, name="robocasa", expected_root=root,
+            expected_package="robocasa", expected_commit="1" * 40,
+            verify_referents=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("robocasa_source_commit", "0" * 40, "commit"),
+        ("simulator_python_inode", 99, "identity"),
+        ("simulator_pythonpath", "/ambient", "PYTHONPATH"),
+        ("snapshot_runtime_generator_path", "/self/reported.py", "path/SHA"),
+        ("snapshot_replay_helper_sha256", "f" * 64, "path/SHA"),
+    ),
+)
+def test_replay_environment_identity_tamper_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    field: str, value: object, match: str,
+) -> None:
+    execution = tmp_path / "execution"
+    paths = {
+        "runtime_generator": execution / "scripts/generate_robocasa_stage1_planner_branches.py",
+        "replay_helper": execution / "scripts/generate_robocasa_same_root_cf.py",
+        "adapter_loader": execution / "scripts/robocasa_stage1_adapter_loader.py",
+        "v7_action_contract": execution / "wm3d_v3/data/v7_action_contract.py",
+        "v7_contracts": execution / "wm3d_v3/data/v7_contracts.py",
+        "action_bridge": execution / "wm3d_v3/stage1_planner/action_bridge.py",
+    }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    python = tmp_path / "python"
+    python.write_bytes(b"x")
+    site = tmp_path / "site"
+    site.mkdir()
+    casa = tmp_path / ("robocasa-" + "8f3c96ec8d1bfcd8126cad2bca887da98d30e997")
+    suite = tmp_path / ("robosuite-" + "6c10ef24a4bb52f59199976125060ce793470e6e")
+    casa.mkdir()
+    suite.mkdir()
+    stat = python.stat()
+    helper_sha, adapter_sha, action_sha = "b" * 64, "c" * 64, "d" * 64
+    contracts_sha, bridge_sha = "e" * 64, "9" * 64
+    snapshot_shas = {
+        "runtime_generator": PINNED_RUNTIME_GENERATOR_SNAPSHOT_SHA256,
+        "replay_helper": helper_sha, "adapter_loader": adapter_sha,
+        "v7_action_contract": action_sha, "v7_contracts": contracts_sha,
+        "action_bridge": bridge_sha,
+    }
+    environment = {field: "a" * 64 for field in REPLAY_ENVIRONMENT_FIELDS}
+    environment.update({
+        "schema": REPLAY_ENVIRONMENT_SCHEMA, "code_commit": "1" * 40,
+        "simulator_python_path": str(python),
+        "simulator_python_sha256": hashlib.sha256(b"x").hexdigest(),
+        "simulator_python_device": stat.st_dev, "simulator_python_inode": stat.st_ino,
+        "simulator_python_size": stat.st_size,
+        "simulator_python_mtime_ns": stat.st_mtime_ns,
+        "simulator_pythonpath": ":".join(map(str, (execution, casa, suite, site))),
+        "python_version": "3.10", "cuda_visible_devices": "4", "mujoco_gl": "egl",
+        "simulator_site_packages_path": str(site), "robocasa_source_root": str(casa),
+        "robocasa_source_commit": "8f3c96ec8d1bfcd8126cad2bca887da98d30e997",
+        "robosuite_source_root": str(suite),
+        "robosuite_source_commit": "6c10ef24a4bb52f59199976125060ce793470e6e",
+        "source_trees": {name: {
+            "manifest_path": str(tmp_path / name), "manifest_sha256": "a" * 64,
+            "tree_sha256": replay_authority_contract.PINNED_SOURCE_TREE_SHA256[name],
+        } for name in ("robocasa", "robosuite")},
+        "modules": {name: {"version": "1", "path": str(python),
+                            "sha256": hashlib.sha256(b"x").hexdigest()}
+                    for name in ("numpy", "mujoco", "robosuite", "robocasa")},
+        "snapshot_modules": {name: {"path": str(paths[name]), "sha256": snapshot_shas[name]}
+                             for name in paths},
+        "runtime_generator_sha256": "a" * 64,
+        "runtime_generator_snapshot_sha256": PINNED_RUNTIME_GENERATOR_SNAPSHOT_SHA256,
+        "replay_helper_sha256": helper_sha, "adapter_loader_sha256": adapter_sha,
+        "v7_action_contract_sha256": action_sha,
+        "v7_contracts_sha256": contracts_sha, "action_bridge_sha256": bridge_sha,
+        "passed": True,
+    })
+    monkeypatch.setattr(replay_authority_contract, "_validate_source_tree", lambda *a, **k: None)
+    monkeypatch.setattr(
+        replay_authority_contract,
+        "_verify_path",
+        lambda path, *_args, **_kwargs: (Path(path), b"x"),
+    )
+    if field.startswith("snapshot_"):
+        if field == "snapshot_runtime_generator_path":
+            environment["snapshot_modules"]["runtime_generator"]["path"] = value
+        else:
+            environment["snapshot_modules"]["replay_helper"]["sha256"] = value
+    else:
+        environment[field] = value
+    with pytest.raises(ReplayAuthorityError, match=match):
+        _validate_environment(
+            environment, code_commit="1" * 40, generator_sha256="a" * 64,
+            generator_snapshot_sha256=PINNED_RUNTIME_GENERATOR_SNAPSHOT_SHA256,
+            helper_sha256=helper_sha, adapter_loader_sha256=adapter_sha,
+            v7_action_contract_sha256=action_sha,
+            v7_contracts_sha256=contracts_sha, action_bridge_sha256=bridge_sha,
+            verify_referents=True,
+        )
+
+
+def test_stage1_selection_policy_rejects_three_root_self_selection() -> None:
+    value = {
+        "notes": {
+            "stage1_selection_policy": {
+                "schema": "wm3d_v8_robocasa_stage1_selection_policy_v1",
+                "expected_split_counts": {"train": 1, "val": 1, "test": 1},
+                "expected_data_profile_sha256": "d" * 64,
+                "expected_candidate_index_sha256": "e" * 64,
+                "expected_candidate_seal_sha256": "f" * 64,
+                "expected_stage0_checkpoint_sha256": "0" * 64,
+                "rows": [
+                    {
+                        "split": split,
+                        "source": "source",
+                        "root_id": character * 64,
+                        "episode_id": index,
+                        "t0": index,
+                    }
+                    for index, (split, character) in enumerate(
+                        (("train", "a"), ("val", "b"), ("test", "c"))
+                    )
+                ],
+            }
+        }
+    }
+    with pytest.raises(RuntimeError, match="train2/val1/test1"):
+        _policy(value)
+
+
+def test_stage1_formal_selection_policy_pins_external_authorities() -> None:
+    import yaml
+
+    profile = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs/data/stage1_robocasa_real_4roots.template.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    policy = profile["notes"]["stage1_selection_policy"]
+    assert policy["expected_split_counts"] == {
+        "train": 2,
+        "val": 1,
+        "test": 1,
+    }
+    for field in (
+        "expected_data_profile_sha256",
+        "expected_candidate_index_sha256",
+        "expected_candidate_seal_sha256",
+        "expected_stage0_checkpoint_sha256",
+    ):
+        assert isinstance(policy[field], str)
+        assert len(policy[field]) == 64
+        assert policy[field] != "0" * 64
+
+
+def test_minimal_replay_adapter_loader_is_strict(tmp_path: Path) -> None:
+    adapter = {
+        "source": "robocasa",
+        "source_frame": "robot_base",
+        "translation_unit_scale": 1.0,
+        "rotation_unit_scale": 1.0,
+        "rotation_repr": "axis_angle",
+    }
+    audit = tmp_path / "audit.json"
+    audit.write_text(
+        json.dumps({
+            "factual_action_audit": {"passed": True},
+            "adapter": adapter,
+        }),
+        encoding="utf-8",
+    )
+    assert _load_adapter(
+        audit, allow_legacy_proof_audit=False
+    ).source == "robocasa"
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"adapter": adapter}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="factual_action_audit"):
+        _load_adapter(bad, allow_legacy_proof_audit=False)
+    symlink = tmp_path / "audit-link.json"
+    symlink.symlink_to(audit)
+    with pytest.raises(RuntimeError, match="symlink"):
+        _load_adapter(symlink, allow_legacy_proof_audit=False)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    (
+        ("replay_authority_sha256", 1, "replay authority SHA"),
+        ("selection_count", {"train": True, "val": 1, "test": 1}, "selection counts"),
+        ("simulator_action_period_seconds", True, "cadence"),
+    ),
+)
+def test_rollout_audit_rejects_bool_as_number_and_nonstring_sha(
+    tmp_path: Path, field: str, value: object, match: str
+) -> None:
+    audit = _audit_fixture(tmp_path)
+    audit[field] = value
+    with pytest.raises(RolloutAuditError, match=match):
+        validate_rollout_audit(
+            audit, expected_code_commit="c" * 40, verify_referents=False
+        )
 
 
 @pytest.mark.parametrize(
@@ -220,7 +692,7 @@ def test_rollout_audit_contract_accepts_exact_authority(tmp_path) -> None:
 
 
 def test_rollout_audit_loader_rejects_symlink_and_referent_tamper(
-    tmp_path
+    tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     audit = _audit_fixture(tmp_path)
     referent_fields = (
@@ -247,6 +719,36 @@ def test_rollout_audit_loader_rejects_symlink_and_referent_tamper(
             row[f"{name}_sha256"] = hashlib.sha256(
                 f"{index}_{name}".encode()
             ).hexdigest()
+    authority_rows = []
+    for row in audit["rows"]:
+        authority_row = {
+            "split": row["split"],
+            "root_id": row["root_id"],
+            "episode_id": row["episode_id"],
+            "t0": row["t0"],
+            "candidate_seed": row["candidate_seed"],
+            "candidate_payload_sha256": row["candidate_payload_sha256"],
+            "root_context_sha256": row["root_context_sha256"],
+            "legacy_runtime_payload_sha256": row["runtime_payload_sha256"],
+            "legacy_runtime_index_shard_sha256": row[
+                "runtime_index_shard_sha256"
+            ],
+            "legacy_runtime_index_row_sha256": row["runtime_index_row_sha256"],
+            "candidate_count": row["candidate_count"],
+        }
+        row["replay_authority_row_sha256"] = canonical_sha256(authority_row)
+        authority_rows.append(authority_row)
+    monkeypatch.setattr(
+        "wm3d_v3.stage1_planner.replay_authority.load_replay_authority",
+        lambda *_args, **_kwargs: (
+            {
+                "selection_manifest_path": audit["selection_manifest_path"],
+                "selection_manifest_sha256": audit["selection_manifest_sha256"],
+                "rows": authority_rows,
+            },
+            audit["replay_authority_sha256"],
+        ),
+    )
     audit["rows_sha256"] = canonical_sha256(audit["rows"])
     audit_path = tmp_path / "audit.json"
     audit_path.write_text(json.dumps(audit), encoding="utf-8")
@@ -481,6 +983,18 @@ def test_trusted_output_root_rejects_nested_parent_replacement(
     assert (moved / "train" / "branch.pt").read_bytes() == b"payload"
 
 
+def test_trusted_output_root_directory_pin_rejects_replacement(tmp_path) -> None:
+    scope_path = tmp_path / "scope"
+    child = scope_path / "payloads"
+    with rollout_audit_contract.TrustedOutputRoot(scope_path) as scope:
+        pin = scope.pin_directory(child, label="payload directory")
+        moved = scope_path / "payloads-original"
+        child.rename(moved)
+        child.mkdir()
+        with pytest.raises(RolloutAuditError, match="ancestor was replaced"):
+            scope.verify_pinned_directory(pin, label="payload directory")
+
+
 def test_materializer_json_rejects_symlink(tmp_path) -> None:
     referent = tmp_path / "receipt.json"
     referent.write_text("{}", encoding="utf-8")
@@ -499,7 +1013,15 @@ def test_stage1_release_manual_tracks_required_audit_cli_and_schemas() -> None:
     audit_block = manual.split(
         "./run_v8.sh stage1-audit-rollouts \\", 1
     )[1].split("```", 1)[0]
+    replay_block = manual.split(
+        "./run_v8.sh stage1-replay-authority \\", 1
+    )[1].split("```", 1)[0]
     assert '--code-commit "$CODE_COMMIT"' in audit_block
+    assert '--code-commit "$CODE_COMMIT"' in replay_block
+    assert "--selection-manifest" in replay_block
+    assert "--simulator-site-packages" in replay_block
+    assert "robocasa_stage1_adapter_loader.py" in replay_block
+    assert '--replay-authority "$STAGE1_ROOT/replay_authority.json"' in audit_block
     assert BRANCH_SCHEMA in manual
     assert GENERATOR_RECEIPT_SCHEMA in manual
     assert "rollout_audit_sha256" in manual
@@ -509,6 +1031,8 @@ def test_stage1_release_manual_tracks_required_audit_cli_and_schemas() -> None:
         encoding="utf-8"
     )
     assert "stage1-audit-rollouts" in readme
+    assert "stage1-replay-authority" in readme
+    assert "stage1-seal-selection" in readme
     assert "stage1-produce" in readme
     validation = (
         Path(__file__).resolve().parents[1]
