@@ -125,6 +125,35 @@ def test_execution_snapshot_manifest_tamper_is_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_precreated_snapshot_file_must_be_registered(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"sealed")
+    output_parent = tmp_path / "output"
+    with TrustedOutputRoot(output_parent) as output:
+        root = output_parent / "snapshot"
+        plan = ExecutionSnapshotPlan(output, root)
+        plan.add_verified_file(source, root / "source", kind="input")
+        output.publish(root / "package/__init__.py", b"", label="package marker")
+        manifest, _sha = plan.seal(output_parent / "manifest.json")
+    with pytest.raises(ExecutionSnapshotError, match="membership mismatch"):
+        validate_execution_snapshot(
+            manifest, verify_provenance=False, verify_snapshots=True
+        )
+
+    output_parent_registered = tmp_path / "output-registered"
+    with TrustedOutputRoot(output_parent_registered) as output:
+        root = output_parent_registered / "snapshot"
+        plan = ExecutionSnapshotPlan(output, root)
+        plan.add_verified_file(source, root / "source", kind="input")
+        marker = root / "package/__init__.py"
+        output.publish(marker, b"", label="package marker")
+        plan.add_verified_file(marker, marker, kind="package marker")
+        manifest, _sha = plan.seal(output_parent_registered / "manifest.json")
+    validate_execution_snapshot(
+        manifest, verify_provenance=False, verify_snapshots=True
+    )
+
+
 def test_materialized_symlink_tree_is_regular_and_swap_independent(
     tmp_path: Path,
 ) -> None:

@@ -857,6 +857,15 @@ def main() -> None:
     snapshot_plan.add_verified_file(
         selection_path, selection_path, kind="selected candidate index"
     )
+    for marker_path in (
+        scripts_root / "__init__.py",
+        wm3d_root / "__init__.py",
+        data_root / "__init__.py",
+        planner_root / "__init__.py",
+    ):
+        snapshot_plan.add_verified_file(
+            marker_path, marker_path, kind="execution package marker"
+        )
     for module_path in (
         generator_snapshot, helper_snapshot, adapter_snapshot,
         data_root / "v7_action_contract.py", data_root / "v7_contracts.py",
