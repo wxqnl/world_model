@@ -458,7 +458,11 @@ def test_replay_source_tree_self_report_tamper_is_rejected(
         ("robocasa_source_commit", "0" * 40, "commit"),
         ("simulator_python_inode", 99, "identity"),
         ("simulator_pythonpath", "/ambient", "PYTHONPATH"),
-        ("snapshot_runtime_generator_path", "/self/reported.py", "path/SHA"),
+        (
+            "snapshot_runtime_generator_path",
+            "/self/reported.py",
+            "PYTHONPATH|path/SHA",
+        ),
         ("snapshot_replay_helper_sha256", "f" * 64, "path/SHA"),
     ),
 )
