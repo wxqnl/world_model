@@ -24,6 +24,7 @@ def _expected(
     shard_degree: int = 8,
     allow: bool = False,
     runtime_sha: str = SHA_A,
+    extra_immutable_metadata: dict[str, object] | None = None,
 ) -> ResumeExpectations:
     return ResumeExpectations(
         step=1000,
@@ -37,6 +38,7 @@ def _expected(
         global_batch_size=128,
         topology_contract_sha256=SHA_D,
         allow_topology_reshard=allow,
+        extra_immutable_metadata=extra_immutable_metadata,
     )
 
 
@@ -60,6 +62,32 @@ def test_same_topology_is_always_exact_and_runtime_bound() -> None:
     assert _validate_metadata(_metadata(), _expected(allow=True)) == "exact"
     with pytest.raises(CheckpointIntegrityError, match="runtime_config_sha256"):
         _validate_metadata(_metadata(), _expected(allow=True, runtime_sha="e" * 64))
+
+
+def test_extra_immutable_metadata_is_optional_and_exact() -> None:
+    metadata = _metadata()
+    assert _validate_metadata(metadata, _expected()) == "exact"
+
+    metadata["rollout_audit_sha256"] = SHA_D
+    expected = _expected(
+        extra_immutable_metadata={"rollout_audit_sha256": SHA_D},
+    )
+    assert _validate_metadata(metadata, expected) == "exact"
+
+    missing = dict(metadata)
+    del missing["rollout_audit_sha256"]
+    with pytest.raises(CheckpointIntegrityError, match="rollout_audit_sha256"):
+        _validate_metadata(missing, expected)
+
+    wrong = dict(metadata, rollout_audit_sha256="e" * 64)
+    with pytest.raises(CheckpointIntegrityError, match="rollout_audit_sha256"):
+        _validate_metadata(wrong, expected)
+
+
+def test_extra_immutable_metadata_rejects_invalid_expectation_keys() -> None:
+    expected = _expected(extra_immutable_metadata={"": SHA_D})
+    with pytest.raises(CheckpointIntegrityError, match="non-empty strings"):
+        _validate_metadata(_metadata(), expected)
 
 
 def test_world_size_change_is_fail_closed_by_default() -> None:

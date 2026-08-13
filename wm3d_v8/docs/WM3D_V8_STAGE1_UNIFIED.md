@@ -35,7 +35,7 @@ flowchart LR
 - 旧资产前 `K=8` 个 step 的 rewards 全为零、success 全为 false，没有当前 Stage0 horizon 内的候选排序监督。
 - 旧资产固定 7D action、固定 H32，未绑定 grouped normalization、current-state、task bank、encoder 和 unified window index。
 
-因此旧配置和旧 payload SHA 清单已从发布入口移除。加载器只接受 `wm3d_v8_unified_stage1_branch_v2`；旧 codec 会在 schema/shape/lineage 门禁处 fail closed。
+因此旧配置和旧 payload SHA 清单已从发布入口移除。加载器只接受 `wm3d_v8_unified_stage1_branch_v3`；旧 codec 或旧 closure schema 会在 schema/shape/lineage 门禁处 fail closed。
 
 ## 真实 branch 产物
 
@@ -44,9 +44,9 @@ Stage1 不可能从一条离线 demonstration 安全推导 counterfactual 成功
 1. grouped candidate action：fine/coarse lane、mask、真实 timestamp，按 data profile adapter 生成并用封存 grouped normalization 归一化；
 2. 每个候选的真实 observation timestamps、reward、done、success；
 3. 候选 observation 经同一冻结 encoder/representation 得到的 native token、depth、point、pose、confidence 和显式 mask；
-4. `wm3d_v8_unified_stage1_candidate_generator_receipt_v1`，绑定 simulator revision/seed、source manifest、adapter、data/model/window、normalizer、task bank、encoder、representation、Stage0 runtime 与 DCP commit SHA。
+4. `wm3d_v8_unified_stage1_candidate_generator_receipt_v2`，绑定 simulator revision/seed、source manifest、adapter、data/model/window、normalizer、task bank、encoder、representation、Stage0 runtime、DCP commit 与通过审核的 rollout-audit SHA。
 
-没有 simulator revision、真实 outcome、同源 adapter receipt 或统一 encoder evidence 时，materializer 会拒绝发布；不会生成猜测标签或用旧 codec 占位。
+没有 simulator revision、真实 outcome、同源 adapter receipt 或统一 encoder evidence 时，materializer 会拒绝发布；不会生成猜测标签或用旧 codec 占位。rollout audit 本身使用 exact schema，绑定 clean `code_commit`、train/val/test selection、逐 root 行、所有外部 referent 路径/SHA 与 `rows_sha256`；producer 会从同一文件描述符读取并哈希 audit，随后把 `rollout_audit_sha256` 持久写入 candidate receipt、manifest、branch index/seal、Stage1 runtime 以及 train/eval receipt。缺字段、多字段、软链接、替换或 SHA 漂移都会 fail closed。
 
 ### 已审计的 RoboCasa 双 source、四 root 真实闭环
 
@@ -64,8 +64,10 @@ Stage1 不可能从一条离线 demonstration 安全推导 counterfactual 成功
 BASE=/data/Minko/world_model/wm3d_v7_actionrepair1b_20260806
 CANARY=$BASE/manifests/canary_stage1p_from_s0_45k_20260808
 STAGE1_ROOT=/data/Minko/wm3d_v8_stage1_real_closure_20260813
+CODE_COMMIT="$(git rev-parse HEAD)"
 
 ./run_v8.sh stage1-audit-rollouts \
+  --code-commit "$CODE_COMMIT" \
   --runtime-root "$CANARY/success_pool_runtime_v2" \
   --launch-receipt "$BASE/logs/canary_stage1p_from_s0_45k_20260808/success_pool_runtime_v2/launch_rank0.json" \
   --runtime-generator "$BASE/scripts/generate_robocasa_stage1_planner_branches.py" \
@@ -99,7 +101,7 @@ STAGE1_ROOT=/data/Minko/wm3d_v8_stage1_real_closure_20260813
 
 `stage1-produce` 不接受任意近似 sample：episode cache shard、`t0` 和八个 source future row 必须同时一致；candidate action 使用 Stage0 源 action 的实际 timestamp，current-state 必须是 policy anchor 的真实精确采样。任意一个条件不满足就 fail closed。
 
-候选 manifest 每行使用 schema `wm3d_v8_unified_stage1_branch_v2`，并包含：sample identity、payload/receipt 的绝对路径与 SHA，以及上述 lineage SHA。然后运行：
+候选 manifest 每行使用 schema `wm3d_v8_unified_stage1_branch_v3`，并包含：sample identity、payload/receipt 的绝对路径与 SHA，以及上述 lineage SHA（包括 `rollout_audit_sha256`）。然后运行：
 
 ```bash
 ./run_v8.sh stage1-materialize \
@@ -154,21 +156,8 @@ Stage0 使用其自身封存的 DDP/FSDP2 topology 加载；planner 是小型 he
 
 正式发布还必须用独立 test split 产出 receipt，并保留真实 simulator candidate generator receipts。只有静态单元测试或旧 20-root 结果不能替代这个证据。
 
-## 已完成的真实 Stage1 v7 验收批次
+## 历史开发批次（不是当前发布 authority）
 
-这里的 `v7` 是本次 Stage1 资产迭代后缀，不表示回退到 WM3D V7。验收根目录为 `/data/Minko/wm3d_v8_stage1_real_closure_20260813`。双 source、四 root 的实际闭包为 train 2、val 1、test 1，每个 root 都有 11 个真实 simulator candidate，八个 future observation 使用源数据中的 `0.6/1.4/2.0/2.8/3.4/4.2/4.8/5.6s` 实测时间点。
-
-| 产物 | SHA256 |
-|---|---|
-| `rollout_audit_4roots_v6.json` | `59c6af619650e2114ca280cb87b0cd1198741d3be19faae06e0871cb99aa80c3` |
-| `candidate_manifest_4roots_v7.jsonl` | `fca7e0a86023acfdfebc251ed53932ba6740dc63926a3731de69f76143dfdd07` |
-| `stage1_branch_index_4roots_v7.jsonl` | `cd09c16d2afe81bf55a485240634039e967a6b1c71ad0f7cc539df9409c8cd65` |
-| `stage1_branch_seal_4roots_v7.json` | `0cae27f603cc422edd5fae31a3bca907aa93244e0ddce7725abebdef113eca20` |
-| `stage0_training_4roots_v7/checkpoints/step_00000001/COMMITTED.json` | `06c5e92c52bbeba89ee0153db9c90d0b866547922c154c2f844663446344af64` |
-| `stage1_runtime_4roots_v7.yaml` | `ab8d5dcef62652ccfa7cdd5bfcfe1f2f825b8c6588d8cdea9e3b42ceb09c416e` |
-| Stage1 step 1 `COMMITTED.json` / train receipt | `6f87a2cff7725d8a63969780180b84f0c8b24c021a5e8edfd7f51c670b6cc5f3` / `1959b5b7773102e5b9774aae67918144dde10c0c96a415f48c651f17a10d6c73` |
-| Stage1 exact-resume step 2 `COMMITTED.json` / train receipt | `8b8e926adeeff6d93e493ccd71a57b9104a0b369111478a5f1c575a55c3834a5` / `38e4a22f0d043fd5754924c44542ce39964fa1b66e535de3fa47544945cc4977` |
-| `stage1_eval_val_4roots_v7_final.json` | `38ddd3bbfced4f817aaedcd07c4c42af91bc75c879a51457c2bdf4078fcf4575` |
-| `stage1_eval_test_4roots_v7_final.json` | `30e05f8d80432d861c27e6f0636fffd3932a439f2763da551c1a1d447d42e1bc` |
+这里的 `v7` 只是旧 Stage1 资产迭代后缀，不表示回退到 WM3D V7。当时双 source、四 root 的实际闭包为 train 2、val 1、test 1，每个 root 有 11 个真实 simulator candidate，八个 future observation 使用源数据中的 `0.6/1.4/2.0/2.8/3.4/4.2/4.8/5.6s` 实测时间点。该批次使用旧 audit/branch/receipt schema，没有当前 branch v3、generator receipt v2 和持久 `rollout_audit_sha256` 闭包；因此旧路径与 SHA 不再列为发布证据，不得用它们提升或恢复当前运行。
 
 val/test receipt 的 action-shuffle invariance、label-shuffle sensitivity、planner finite/nonzero gradient、Stage0 gradient absence 均为 true，证明真实 branch、冻结 Stage0、DCP exact resume 与评测门禁已经贯通。该实验只训练到 step 2：val success AUC 为 0.25，test success AUC 为约 0.0333，两个 split 的 `selected_success` 都是 0。因此它是 pipeline correctness proof，不是规划能力或效果提升证据；不得据此声称 Stage1 已经学到高质量策略。

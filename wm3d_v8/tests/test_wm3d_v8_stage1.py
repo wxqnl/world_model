@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 import torch
+import wm3d_v3.stage1_planner.rollout_audit as rollout_audit_contract
+import wm3d_v3.stage1_planner.train as stage1_train
 
 from scripts.eval_wm3d_v8_stage1 import (
     _ACTION_FIELDS,
     _LEARNED_FIELDS,
     _action_shuffle_invariant,
     _auc,
+    _require_authority_coverage,
 )
 from wm3d_v3.models.native_world_model import NativeWorldModel, NativeWorldModelConfig
 from wm3d_v3.data.unified_cache_dataset import CacheDataError, _active_source_names
@@ -32,19 +38,42 @@ from wm3d_v3.stage1_planner.rollout import single_horizon_native_rollout
 from wm3d_v3.stage1_planner.system import NativePlanningSystem, Stage1SystemConfig
 from wm3d_v3.stage1_planner.train import (
     _expectations,
+    _load_stage1,
+    _prepare_stage1_launch,
     _planner_contract_sha,
+    _stage1_run_contract,
     _topology_sha,
     _verify_runtime_checkout,
 )
 from scripts.materialize_wm3d_v8_stage1_branches import (
+    _load_json as load_materializer_json,
+    _output_directory as materializer_output_directory,
+    _publish as publish_materialized_branch,
     _validate_candidate_payload,
     _validate_stage0_window_clock,
 )
 from scripts.produce_wm3d_v8_robocasa_stage1_candidates import (
-    AUDIT_SCHEMA,
-    _validate_rollout_audit_authority,
+    _output_directory as producer_output_directory,
+    _publish as publish_candidate_output,
+    _verified_payload as verified_producer_payload,
+)
+from scripts.data.audit_robocasa_real_rollouts import (
+    _rows as load_audit_runtime_rows,
+)
+from wm3d_v3.data.manifest_contract import canonical_sha256
+from wm3d_v3.stage1_planner.rollout_audit import (
+    ROLLOUT_AUDIT_FIELDS,
+    ROLLOUT_AUDIT_ROW_FIELDS,
+    ROLLOUT_AUDIT_SCHEMA,
+    RolloutAuditError,
+    load_rollout_audit,
+    validate_rollout_audit,
 )
 from wm3d_v3.training.launch_qualification import LaunchQualificationError
+from wm3d_v3.training.distributed_checkpoint import (
+    CheckpointIntegrityError,
+    _validate_metadata,
+)
 
 
 def test_multisource_split_requires_all_train_sources_but_not_eval_sources() -> None:
@@ -100,24 +129,293 @@ def test_stage1_new_closure_requires_rollout_audit_binding() -> None:
     with pytest.raises(Stage1BranchError, match="binding mismatch"):
         validate_rollout_audit_binding(row, tampered)
 
-    commit = "c" * 40
-    _validate_rollout_audit_authority(
-        {"schema": AUDIT_SCHEMA, "passed": True, "code_commit": commit},
-        commit,
+def _audit_fixture(tmp_path: Path) -> dict:
+    digest = "a" * 64
+    row = {
+        field: digest for field in ROLLOUT_AUDIT_ROW_FIELDS
+    }
+    row.update({
+        "split": "train", "source": "source", "episode_id": 1, "t0": 2,
+        "task_text": "task", "candidate_seed": 3, "candidate_count": 11,
+        "factual_simulator_action_source_byte_exact": True,
+        "candidate_actions_executed_exact": True,
+        "real_simulator_outcomes": True,
+        "future_observation_leakage": False,
+        "outcome_indices": [2], "future_offsets_seconds": [0.6],
+        "branch_rgb_indices": [3], "source_future_row_offsets": [12],
+    })
+    rows = []
+    for split, suffix in (("train", "a"), ("val", "b"), ("test", "c")):
+        rows.append(dict(row, split=split, root_id=suffix * 64))
+    audit = {field: digest for field in ROLLOUT_AUDIT_FIELDS}
+    audit.update({
+        "schema": ROLLOUT_AUDIT_SCHEMA, "code_commit": "c" * 40,
+        "runtime_root": str(tmp_path), "source_roots": {"source": str(tmp_path)},
+        "source_metadata_sha256": {"source": {
+            name: digest for name in (
+                "info.json", "modality.json", "embodiment.json", "episodes.jsonl"
+            )
+        }},
+        "simulator_revision": {
+            "source_repo": "repo", "source_revision": "revision",
+            "robocasa_commit": "robocasa", "robocasa_dataset_version": "dataset",
+            "robosuite_version": "version", "robosuite_commit": "robosuite",
+            "mujoco_version": "mujoco",
+        },
+        "camera_order": ["left", "right", "wrist"],
+        "simulator_action_order": [
+            "eef_position3", "eef_rotation3", "gripper_close1", "base_motion4",
+            "control_mode1",
+        ],
+        "source_action_order": [
+            "base_motion4", "control_mode1", "eef_position3", "eef_rotation3",
+            "gripper_close1",
+        ],
+        "simulator_action_period_seconds": 0.05,
+        "selection_count": {"train": 1, "val": 1, "test": 1},
+        "rows": rows, "passed": True,
+    })
+    audit["simulator_revision_sha256"] = canonical_sha256(audit["simulator_revision"])
+    audit["rows_sha256"] = canonical_sha256(rows)
+    return audit
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    (
+        (lambda value: value.update(extra=True), "top-level fields"),
+        (lambda value: value.pop("rows_sha256"), "top-level fields"),
+        (lambda value: value.update(rows=[]), "selection counts"),
+        (lambda value: value.update(rows_sha256="b" * 64), "rows SHA mismatch"),
+        (lambda value: value["rows"][0].update(split="invalid"), "split/source"),
+        (lambda value: value["rows"][0].update(real_simulator_outcomes=False), "gate failed"),
+        (lambda value: value["rows"][0].update(extra=True), "row 1 fields"),
+    ),
+)
+def test_rollout_audit_contract_rejects_malformed_authority(
+    tmp_path, mutation, match
+) -> None:
+    audit = _audit_fixture(tmp_path)
+    mutation(audit)
+    if "rows_sha256" in audit and audit.get("rows"):
+        if match not in {"rows SHA mismatch", "gate failed", "split/source", "row 1 fields"}:
+            audit["rows_sha256"] = canonical_sha256(audit["rows"])
+        elif match in {"gate failed", "split/source", "row 1 fields"}:
+            audit["rows_sha256"] = canonical_sha256(audit["rows"])
+    with pytest.raises(RolloutAuditError, match=match):
+        validate_rollout_audit(
+            audit, expected_code_commit="c" * 40, verify_referents=False
+        )
+
+
+def test_rollout_audit_contract_accepts_exact_authority(tmp_path) -> None:
+    audit = _audit_fixture(tmp_path)
+    assert validate_rollout_audit(
+        audit, expected_code_commit="c" * 40, verify_referents=False
+    ) is audit
+    with pytest.raises(RolloutAuditError, match="code commit differs"):
+        validate_rollout_audit(
+            audit, expected_code_commit="d" * 40, verify_referents=False
+        )
+
+
+def test_rollout_audit_loader_rejects_symlink_and_referent_tamper(
+    tmp_path
+) -> None:
+    audit = _audit_fixture(tmp_path)
+    referent_fields = (
+        "launch_receipt", "runtime_generator", "replay_helper", "action_audit",
+        "candidate_index", "candidate_index_seal",
     )
-    with pytest.raises(RuntimeError, match="code commit differs"):
-        _validate_rollout_audit_authority(
-            {"schema": AUDIT_SCHEMA, "passed": True}, commit
-        )
-    with pytest.raises(RuntimeError, match="code commit differs"):
-        _validate_rollout_audit_authority(
-            {
-                "schema": AUDIT_SCHEMA,
-                "passed": True,
-                "code_commit": "d" * 40,
-            },
-            commit,
-        )
+    for name in referent_fields:
+        path = tmp_path / f"{name}.json"
+        path.write_bytes(name.encode())
+        audit[f"{name}_path"] = str(path)
+        audit[f"{name}_sha256"] = hashlib.sha256(name.encode()).hexdigest()
+    (tmp_path / "meta").mkdir()
+    for filename in ("info.json", "modality.json", "embodiment.json", "episodes.jsonl"):
+        path = tmp_path / "meta" / filename
+        path.write_bytes(filename.encode())
+        audit["source_metadata_sha256"]["source"][filename] = hashlib.sha256(
+            filename.encode()
+        ).hexdigest()
+    for index, row in enumerate(audit["rows"]):
+        for name in ("runtime_payload", "runtime_index_shard", "root_context"):
+            path = tmp_path / f"{index}_{name}.bin"
+            path.write_bytes(f"{index}_{name}".encode())
+            row[f"{name}_path"] = str(path)
+            row[f"{name}_sha256"] = hashlib.sha256(
+                f"{index}_{name}".encode()
+            ).hexdigest()
+    audit["rows_sha256"] = canonical_sha256(audit["rows"])
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    loaded, _digest = load_rollout_audit(
+        audit_path, expected_code_commit="c" * 40
+    )
+    assert loaded["passed"] is True
+    symlink = tmp_path / "audit-link.json"
+    symlink.symlink_to(audit_path)
+    with pytest.raises(RolloutAuditError, match="must not be a symlink"):
+        load_rollout_audit(symlink, expected_code_commit="c" * 40)
+    (tmp_path / "0_runtime_payload.bin").write_bytes(b"tampered")
+    with pytest.raises(RolloutAuditError, match="runtime_payload SHA mismatch"):
+        load_rollout_audit(audit_path, expected_code_commit="c" * 40)
+
+
+def test_rollout_audit_loader_rejects_path_replacement(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audit_path = tmp_path / "audit.json"
+    replacement = tmp_path / "replacement.json"
+    audit_path.write_text("{}", encoding="utf-8")
+    replacement.write_text("{}", encoding="utf-8")
+    original_read = rollout_audit_contract.os.read
+    replaced = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        payload = original_read(descriptor, size)
+        if payload and not replaced:
+            replacement.replace(audit_path)
+            replaced = True
+        return payload
+
+    monkeypatch.setattr(rollout_audit_contract.os, "read", replacing_read)
+    with pytest.raises(RolloutAuditError, match="replaced while it was read"):
+        load_rollout_audit(audit_path, expected_code_commit="c" * 40)
+
+
+def test_rollout_audit_runtime_index_rejects_path_replacement(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shard = tmp_path / "index.shard-00000.jsonl"
+    replacement = tmp_path / "replacement.jsonl"
+    shard.write_text(json.dumps({"root_id": "a" * 64}) + "\n", encoding="utf-8")
+    replacement.write_text(
+        json.dumps({"root_id": "b" * 64}) + "\n", encoding="utf-8"
+    )
+    original_read = rollout_audit_contract.os.read
+    replaced = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        payload = original_read(descriptor, size)
+        if payload and not replaced:
+            replacement.replace(shard)
+            replaced = True
+        return payload
+
+    monkeypatch.setattr(rollout_audit_contract.os, "read", replacing_read)
+    with pytest.raises(RolloutAuditError, match="replaced while it was read"):
+        load_audit_runtime_rows(tmp_path)
+
+
+def test_stage1_producer_uses_one_verified_payload_snapshot(tmp_path) -> None:
+    path = tmp_path / "runtime.npz"
+    payload = b"sealed runtime snapshot"
+    path.write_bytes(payload)
+    expected = hashlib.sha256(payload).hexdigest()
+    resolved, observed, digest = verified_producer_payload(
+        path, expected, "runtime payload"
+    )
+    assert resolved == path.resolve()
+    assert observed == payload
+    assert digest == expected
+    path.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="SHA mismatch"):
+        verified_producer_payload(path, expected, "runtime payload")
+
+
+@pytest.mark.parametrize(
+    "publisher",
+    (publish_candidate_output, publish_materialized_branch),
+)
+def test_stage1_publish_rejects_existing_symlink_even_for_same_bytes(
+    tmp_path, publisher
+) -> None:
+    referent = tmp_path / "referent"
+    referent.write_bytes(b"same")
+    target = tmp_path / "published"
+    target.symlink_to(referent)
+    with pytest.raises(FileExistsError, match="symlink"):
+        publisher(target, b"same")
+    assert target.is_symlink()
+    assert referent.read_bytes() == b"same"
+
+
+@pytest.mark.parametrize(
+    ("guard", "error"),
+    (
+        (producer_output_directory, RuntimeError),
+        (materializer_output_directory, ValueError),
+    ),
+)
+def test_stage1_output_root_rejects_directory_symlink(
+    tmp_path, guard, error
+) -> None:
+    real = tmp_path / "real-output"
+    real.mkdir()
+    link = tmp_path / "output-root"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(error, match="must not be a symlink"):
+        guard(link, "output root")
+    assert not list(real.iterdir())
+
+
+def test_stage1_publish_fsyncs_parent_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: list[int] = []
+    original_fsync = rollout_audit_contract.os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        observed.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(rollout_audit_contract.os, "fsync", recording_fsync)
+    target = tmp_path / "published"
+    publish_candidate_output(target, b"payload")
+    assert target.read_bytes() == b"payload"
+    assert len(observed) >= 2
+
+
+def test_materializer_json_rejects_symlink(tmp_path) -> None:
+    referent = tmp_path / "receipt.json"
+    referent.write_text("{}", encoding="utf-8")
+    link = tmp_path / "receipt-link.json"
+    link.symlink_to(referent)
+    with pytest.raises(ValueError, match="symlink"):
+        load_materializer_json(link)
+
+
+def test_stage1_release_manual_tracks_required_audit_cli_and_schemas() -> None:
+    manual = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "WM3D_V8_STAGE1_UNIFIED.md"
+    ).read_text(encoding="utf-8")
+    audit_block = manual.split(
+        "./run_v8.sh stage1-audit-rollouts \\", 1
+    )[1].split("```", 1)[0]
+    assert '--code-commit "$CODE_COMMIT"' in audit_block
+    assert BRANCH_SCHEMA in manual
+    assert GENERATOR_RECEIPT_SCHEMA in manual
+    assert "rollout_audit_sha256" in manual
+    assert "wm3d_v8_unified_stage1_branch_v2`" not in manual
+    assert "wm3d_v8_unified_stage1_candidate_generator_receipt_v1`" not in manual
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "stage1-audit-rollouts" in readme
+    assert "stage1-produce" in readme
+    validation = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "WM3D_V8_RELEASE_VALIDATION.md"
+    ).read_text(encoding="utf-8")
+    assert "旧 SHA 因此仅是开发记录" in validation
+    assert "59c6af619650e2114ca280cb87b0cd1198741d3be19faae06e0871cb99aa80c3" not in validation
 
 
 def test_stage1_checkout_uses_shared_clean_runtime_authority(
@@ -436,7 +734,10 @@ def test_stage1_dataset_accepts_ckgsa_and_rejects_extra_or_missing_axis() -> Non
 def test_stage1_dcp_exact_resume_contract_is_planner_ddp_and_branch_bound() -> None:
     planner=NativePlannerConfig(token_dim=0,task_dim=0,patches=0,num_views=0,max_horizon=0,
         time_fourier_dim=0,time_min_period_s=0,time_max_period_s=0)
-    stage1={"run":{"lineage":"s1","global_batch_size":8},"branch":{"index_sha256":"a"*64},
+    rollout_audit_sha256 = "d" * 64
+    stage1={"run":{"lineage":"s1","global_batch_size":8},"branch":{
+        "index_sha256":"a"*64, "rollout_audit_sha256": rollout_audit_sha256,
+        "stage0_checkpoint_commit_sha256": "e" * 64},
         "planner":{"horizon":4,"model":planner.__dict__,"score":{
             "progress_weight":.5,"success_weight":1.,"risk_weight":.5,
             "uncertainty_weight":.25,"action_cost_weight":.05}}}
@@ -449,6 +750,444 @@ def test_stage1_dcp_exact_resume_contract_is_planner_ddp_and_branch_bound() -> N
     assert expected.allow_topology_reshard is False
     assert expected.topology_contract_sha256 == _topology_sha(stage1,runtime)
     assert expected.model_contract_sha256 == _planner_contract_sha(stage1,runtime)
+    assert expected.extra_immutable_metadata == {
+        "rollout_audit_sha256": rollout_audit_sha256,
+        "stage0_checkpoint_commit_sha256": "e" * 64,
+        "branch_index_sha256": "a" * 64,
+        "stage0_frozen": True,
+        "planner_action_inputs": False,
+        "imagined_rollout": "single_trained_K_only",
+    }
+
+    metadata = {
+        "step": expected.step,
+        "run_lineage": expected.run_lineage,
+        "runtime_config_sha256": expected.runtime_config_sha256,
+        "data_closure_sha256": expected.data_closure_sha256,
+        "model_contract_sha256": expected.model_contract_sha256,
+        "world_size": expected.world_size,
+        "shard_degree": expected.shard_degree,
+        "distributed_strategy": expected.distributed_strategy,
+        "global_batch_size": expected.global_batch_size,
+        "topology_contract_sha256": expected.topology_contract_sha256,
+        "rollout_audit_sha256": rollout_audit_sha256,
+        "stage0_checkpoint_commit_sha256": "e" * 64,
+        "branch_index_sha256": "a" * 64,
+        "stage0_frozen": True,
+        "planner_action_inputs": False,
+        "imagined_rollout": "single_trained_K_only",
+    }
+    assert _validate_metadata(metadata, expected) == "exact"
+
+    missing = dict(metadata)
+    del missing["rollout_audit_sha256"]
+    with pytest.raises(CheckpointIntegrityError, match="rollout_audit_sha256"):
+        _validate_metadata(missing, expected)
+
+    wrong = dict(metadata, rollout_audit_sha256="e" * 64)
+    with pytest.raises(CheckpointIntegrityError, match="rollout_audit_sha256"):
+        _validate_metadata(wrong, expected)
+
+    for name, expected_value in expected.extra_immutable_metadata.items():
+        missing = dict(metadata)
+        del missing[name]
+        with pytest.raises(CheckpointIntegrityError, match=name):
+            _validate_metadata(missing, expected)
+        wrong_value = not expected_value if isinstance(expected_value, bool) else "f" * 64
+        wrong = dict(metadata, **{name: wrong_value})
+        with pytest.raises(CheckpointIntegrityError, match=name):
+            _validate_metadata(wrong, expected)
+
+
+def test_stage1_authority_coverage_is_full_split_only() -> None:
+    assert _require_authority_coverage(
+        evaluated_count=7, sealed_split_count=7, gate_count=7
+    ) == {
+        "evaluated_branch_count": 7,
+        "sealed_split_count": 7,
+        "gated_branch_count": 7,
+    }
+    for evaluated, gated in ((6, 7), (7, 6), (0, 0)):
+        with pytest.raises(ValueError, match="does not cover"):
+            _require_authority_coverage(
+                evaluated_count=evaluated,
+                sealed_split_count=7,
+                gate_count=gated,
+            )
+
+
+def test_stage1_runtime_loader_uses_one_regular_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml
+
+    planner = NativePlannerConfig(
+        token_dim=0,
+        task_dim=0,
+        patches=0,
+        num_views=0,
+        max_horizon=0,
+        time_fourier_dim=0,
+        time_min_period_s=0,
+        time_max_period_s=0,
+    )
+    runtime = {
+        "schema": "wm3d_v8_unified_stage1_runtime_v2",
+        "stage0_runtime": "/sealed/stage0.yaml",
+        "stage0_checkpoint": "/sealed/step_00000001",
+        "branch": {
+            "index": "/sealed/index.jsonl",
+            "index_sha256": "a" * 64,
+            "seal": "/sealed/seal.json",
+            "seal_sha256": "b" * 64,
+            "stage0_runtime_sha256": "c" * 64,
+            "stage0_checkpoint_commit_sha256": "d" * 64,
+            "rollout_audit_sha256": "e" * 64,
+        },
+        "planner": {
+            "horizon": 4,
+            "candidate_microbatch": 1,
+            "model": planner.__dict__,
+            "loss": {
+                "progress_weight": 0.5,
+                "success_weight": 1.0,
+                "risk_weight": 0.5,
+                "uncertainty_weight": 0.25,
+                "ranking_weight": 1.0,
+                "ranking_margin": 0.05,
+            },
+            "score": {
+                "progress_weight": 0.5,
+                "success_weight": 1.0,
+                "risk_weight": 0.5,
+                "uncertainty_weight": 0.25,
+                "action_cost_weight": 0.05,
+            },
+        },
+        "run": {
+            "lineage": "s1",
+            "output_root": "/sealed/output",
+            "seed": 1,
+            "total_steps": 2,
+            "checkpoint_interval": 1,
+            "micro_batch_size": 1,
+            "gradient_accumulation": 1,
+            "global_batch_size": 1,
+            "num_workers": 0,
+            "lr": 0.001,
+            "weight_decay": 0.01,
+            "gradient_clip": 1.0,
+        },
+    }
+    path = tmp_path / "stage1.yaml"
+    payload = yaml.safe_dump(runtime, sort_keys=True).encode()
+    path.write_bytes(payload)
+    loaded, digest = _load_stage1(path)
+    assert loaded == runtime
+    assert digest == hashlib.sha256(payload).hexdigest()
+    symlink = tmp_path / "stage1-link.yaml"
+    symlink.symlink_to(path)
+    with pytest.raises(ValueError, match="stable Stage1 runtime"):
+        _load_stage1(symlink)
+
+    replacement = tmp_path / "replacement.yaml"
+    replacement.write_bytes(payload)
+    original_read = rollout_audit_contract.os.read
+    replaced = False
+
+    def replacing_read(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, size)
+        if chunk and not replaced:
+            replaced = True
+            moved = tmp_path / "replacement-old.yaml"
+            replacement.rename(moved)
+            replacement.write_bytes(payload)
+        return chunk
+
+    monkeypatch.setattr(rollout_audit_contract.os, "read", replacing_read)
+    with pytest.raises(ValueError, match="stable Stage1 runtime"):
+        _load_stage1(replacement)
+
+
+def test_stage1_run_contract_binds_sealed_stage0_resources() -> None:
+    planner = NativePlannerConfig(
+        token_dim=0, task_dim=0, patches=0, num_views=0, max_horizon=0,
+        time_fourier_dim=0, time_min_period_s=0, time_max_period_s=0,
+    )
+    stage1 = {
+        "run": {"lineage": "s1", "global_batch_size": 8},
+        "branch": {
+            "index_sha256": "a" * 64,
+            "seal_sha256": "b" * 64,
+            "rollout_audit_sha256": "c" * 64,
+            "stage0_checkpoint_commit_sha256": "d" * 64,
+        },
+        "planner": {"horizon": 4, "model": planner.__dict__, "score": {
+            "progress_weight": .5, "success_weight": 1., "risk_weight": .5,
+            "uncertainty_weight": .25, "action_cost_weight": .05,
+        }},
+    }
+    stage0 = {
+        "run": {"code_commit": "1" * 40, "environment_lock_sha256": "e" * 64},
+        "bindings": {"model_contract_sha256": "f" * 64},
+        "runtime_profile": {"expected_world_size": 8, "resources": {"gpu": "H200"}},
+        "model_profile": {"model": {"token_dim": 16, "task_dim": 12, "P": 4,
+            "num_views": 2, "time_fourier_dim": 8, "time_min_period_s": .01,
+            "time_max_period_s": 10.0}},
+    }
+    contract = _stage1_run_contract(
+        stage1=stage1, stage1_sha="0" * 64, stage0=stage0,
+        stage0_sha="9" * 64, planner_parameter_count=123,
+    )
+    assert contract["expected_world_size"] == 8
+    assert contract["resource_contract_sha256"] == canonical_sha256({"gpu": "H200"})
+    assert contract["stage0_frozen"] is True
+    assert contract["planner_action_inputs"] is False
+
+
+@pytest.mark.parametrize("launch_kind", ("fresh", "exact_resume", "eval"))
+def test_stage1_launch_qualification_separates_stage1_and_resource_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_kind: str,
+) -> None:
+    planner = NativePlannerConfig(
+        token_dim=0,
+        task_dim=0,
+        patches=0,
+        num_views=0,
+        max_horizon=0,
+        time_fourier_dim=0,
+        time_min_period_s=0,
+        time_max_period_s=0,
+    )
+    stage1 = {
+        "run": {
+            "lineage": "s1",
+            "output_root": str(tmp_path / "output"),
+            "global_batch_size": 8,
+        },
+        "branch": {
+            "index_sha256": "a" * 64,
+            "seal_sha256": "b" * 64,
+            "rollout_audit_sha256": "c" * 64,
+            "stage0_checkpoint_commit_sha256": "d" * 64,
+        },
+        "planner": {
+            "horizon": 4,
+            "model": planner.__dict__,
+            "score": {
+                "progress_weight": 0.5,
+                "success_weight": 1.0,
+                "risk_weight": 0.5,
+                "uncertainty_weight": 0.25,
+                "action_cost_weight": 0.05,
+            },
+        },
+    }
+    stage0 = {
+        "run": {
+            "code_commit": "1" * 40,
+            "environment_lock_sha256": "e" * 64,
+        },
+        "bindings": {"model_contract_sha256": "f" * 64},
+        "runtime_profile": {
+            "expected_world_size": 2,
+            "resources": {"gpu": "H200"},
+        },
+        "model_profile": {
+            "model": {
+                "token_dim": 16,
+                "task_dim": 12,
+                "P": 4,
+                "num_views": 2,
+                "time_fourier_dim": 8,
+                "time_min_period_s": 0.01,
+                "time_max_period_s": 10.0,
+            }
+        },
+        "data_closure": {"cache_root": str(tmp_path / "cache")},
+    }
+    context = SimpleNamespace(is_rank0=True, world_size=2)
+    receipt = {
+        "path": str(tmp_path / "resource.json"),
+        "sha256": "9" * 64,
+        "created_unix_ns": 1,
+    }
+    source = None if launch_kind == "fresh" else {"resume_mode": "exact"}
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        stage1_train,
+        "_require_recent_resource_preflight",
+        lambda config, config_sha, observed_context: (
+            calls.update(
+                receipt_runtime_sha=config_sha,
+                receipt_context=observed_context,
+            )
+            or receipt
+        ),
+    )
+    monkeypatch.setattr(
+        stage1_train,
+        "_atomic_json_no_clobber",
+        lambda path, value: calls.update(contract_mode="fresh", contract=value),
+    )
+    monkeypatch.setattr(
+        stage1_train,
+        "_require_stable_run_contract",
+        lambda path, value: calls.update(contract_mode="existing", contract=value),
+    )
+    monkeypatch.setattr(
+        stage1_train.torch.distributed,
+        "broadcast_object_list",
+        lambda values, src: calls.update(broadcast_src=src),
+    )
+
+    def publish(**kwargs: object) -> tuple[str, str]:
+        calls.update(kwargs)
+        return str(tmp_path / "qualification.json"), "8" * 64
+
+    monkeypatch.setattr(stage1_train, "_publish_and_validate_launch", publish)
+    path, digest, contract = _prepare_stage1_launch(
+        stage1=stage1,
+        stage1_sha="2" * 64,
+        stage0=stage0,
+        stage0_sha="3" * 64,
+        context=context,
+        planner_parameter_count=123,
+        source_checkpoint=source,
+        launch_kind=launch_kind,
+    )
+    assert path.endswith("qualification.json") and digest == "8" * 64
+    assert calls["receipt_runtime_sha"] == "3" * 64
+    assert calls["config_sha"] == "2" * 64
+    assert calls["resource_runtime_config_sha256"] == "3" * 64
+    assert calls["source_checkpoint"] == source
+    assert calls["launch_kind"] == launch_kind
+    assert calls["contract_mode"] == (
+        "fresh" if launch_kind == "fresh" else "existing"
+    )
+    assert contract["runtime_config_sha256"] == "2" * 64
+    assert contract["stage0_runtime_sha256"] == "3" * 64
+
+
+def test_stage1_run_contract_failure_is_collective_before_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage1 = {
+        "run": {
+            "lineage": "s1",
+            "output_root": str(tmp_path / "output"),
+            "global_batch_size": 1,
+        },
+        "branch": {
+            "index_sha256": "a" * 64,
+            "seal_sha256": "b" * 64,
+            "rollout_audit_sha256": "c" * 64,
+            "stage0_checkpoint_commit_sha256": "d" * 64,
+        },
+        "planner": {
+            "horizon": 1,
+            "model": NativePlannerConfig(
+                token_dim=0,
+                task_dim=0,
+                patches=0,
+                num_views=0,
+                max_horizon=0,
+                time_fourier_dim=0,
+                time_min_period_s=0,
+                time_max_period_s=0,
+            ).__dict__,
+            "score": {
+                "progress_weight": 0.5,
+                "success_weight": 1.0,
+                "risk_weight": 0.5,
+                "uncertainty_weight": 0.25,
+                "action_cost_weight": 0.05,
+            },
+        },
+    }
+    stage0 = {
+        "run": {
+            "code_commit": "1" * 40,
+            "environment_lock_sha256": "e" * 64,
+        },
+        "bindings": {"model_contract_sha256": "f" * 64},
+        "runtime_profile": {"expected_world_size": 1, "resources": None},
+        "model_profile": {
+            "model": {
+                "token_dim": 16,
+                "task_dim": 12,
+                "P": 4,
+                "num_views": 2,
+                "time_fourier_dim": 8,
+                "time_min_period_s": 0.01,
+                "time_max_period_s": 10.0,
+            }
+        },
+        "data_closure": {"cache_root": str(tmp_path / "cache")},
+    }
+    context = SimpleNamespace(is_rank0=True, world_size=1)
+    monkeypatch.setattr(
+        stage1_train,
+        "_require_recent_resource_preflight",
+        lambda config, config_sha, observed_context: None,
+    )
+    monkeypatch.setattr(
+        stage1_train,
+        "_atomic_json_no_clobber",
+        lambda path, value: (_ for _ in ()).throw(ValueError("sealed mismatch")),
+    )
+    broadcasted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        stage1_train.torch.distributed,
+        "broadcast_object_list",
+        lambda values, src: broadcasted.append(dict(values[0])),
+    )
+    monkeypatch.setattr(
+        stage1_train,
+        "_publish_and_validate_launch",
+        lambda **kwargs: pytest.fail("qualification must not be published"),
+    )
+    with pytest.raises(ValueError, match="run-contract publication failed"):
+        _prepare_stage1_launch(
+            stage1=stage1,
+            stage1_sha="2" * 64,
+            stage0=stage0,
+            stage0_sha="3" * 64,
+            context=context,
+            planner_parameter_count=1,
+            source_checkpoint=None,
+            launch_kind="fresh",
+        )
+    assert broadcasted and broadcasted[0]["ok"] is False
+
+
+def test_stage1_checkpoint_payload_loads_follow_launch_qualification() -> None:
+    train_source = Path(stage1_train.__file__).read_text(encoding="utf-8")
+    train_qualification = train_source.index(
+        "launch_path, launch_sha, _run_contract = _prepare_stage1_launch("
+    )
+    train_stage0_load = train_source.index(
+        "source_manager.load_model_for_evaluation("
+    )
+    train_resume_load = train_source.index("_metadata, progress = manager.load(")
+    assert train_qualification < train_stage0_load < train_resume_load
+
+    eval_source = Path(__file__).parents[1] / "scripts" / "eval_wm3d_v8_stage1.py"
+    eval_text = eval_source.read_text(encoding="utf-8")
+    eval_qualification = eval_text.index(
+        "launch_path, launch_sha, _run_contract = _prepare_stage1_launch("
+    )
+    eval_stage0_load = eval_text.index(
+        "stage0_manager.load_model_for_evaluation("
+    )
+    eval_stage1_load = eval_text.index(
+        "stage1_manager.load_model_for_evaluation("
+    )
+    assert eval_qualification < eval_stage0_load < eval_stage1_load
 
 
 def _tiny_world() -> NativeWorldModel:

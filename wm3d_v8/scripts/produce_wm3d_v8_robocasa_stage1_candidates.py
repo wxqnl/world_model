@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,8 +13,9 @@ import uuid
 
 import numpy as np
 import torch
+import yaml
 
-from scripts.data.run_cache_worker import _encode, _strict_encoder, _view_batch
+from scripts.data.run_cache_worker import CacheWorkerError, _encode, _view_batch
 from wm3d_v3.data.grouped_normalization import (
     GroupedRobotNormalizer,
     normalize_grouped_masked,
@@ -21,18 +24,19 @@ from wm3d_v3.data.grouped_robot import GroupedRobotLimits, pack_grouped_robot_wi
 from wm3d_v3.data.manifest_contract import (
     load_cache_episode_index,
     load_data_profile,
-    sha256_file,
 )
 from wm3d_v3.data.episode_robot import _exact_current_states
 from wm3d_v3.data.source_adapters import adapt_action_series, load_adapter_contract
 from wm3d_v3.data.unified_cache_dataset import _fuse_target_tokens, _pool_masked
-from wm3d_v3.encoders.native_vggt import NativeVGGTEncoder
+from wm3d_v3.encoders.native_vggt import NativeVGGTConfig, NativeVGGTEncoder
 from wm3d_v3.stage1_planner.dataset import BRANCH_SCHEMA, GENERATOR_RECEIPT_SCHEMA
+from wm3d_v3.stage1_planner.rollout_audit import (
+    load_rollout_audit,
+    publish_no_clobber,
+    read_regular_bytes,
+)
 from wm3d_v3.stage1_planner.train import _stage0_dataset, _verify_runtime_checkout
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
-
-
-AUDIT_SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v2"
 
 
 class _Arrays:
@@ -45,31 +49,48 @@ class _Arrays:
         return self.values[key]
 
 
-def _validate_rollout_audit_authority(
-    audit: dict, expected_code_commit: str
-) -> None:
-    if audit.get("schema") != AUDIT_SCHEMA or audit.get("passed") is not True:
-        raise RuntimeError("rollout audit did not pass")
-    if audit.get("code_commit") != expected_code_commit:
-        raise RuntimeError("rollout audit code commit differs from Stage0 runtime")
-
-
 def _publish(path: Path, payload: bytes) -> None:
+    publish_no_clobber(path, payload, "Stage1 producer output")
+
+
+def _output_directory(path: Path, label: str) -> Path:
     path = path.absolute()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() or path.is_symlink():
-        if path.is_file() and path.read_bytes() == payload:
-            return
-        raise FileExistsError(f"refusing to overwrite non-identical output: {path}")
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    with temporary.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise RuntimeError(f"{label} must not be a symlink or use a symlink parent")
+    if path.exists():
+        if not path.is_dir():
+            raise RuntimeError(f"{label} must be a directory: {path}")
+    else:
+        path.mkdir(parents=True)
+    if path.is_symlink() or not path.is_dir():
+        raise RuntimeError(f"{label} was replaced while it was prepared: {path}")
+    return path
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _verified_payload(
+    path: Path, expected_sha256: object, label: str
+) -> tuple[Path, bytes, str]:
+    resolved, payload, digest = read_regular_bytes(path, label)
+    if digest != str(expected_sha256):
+        raise RuntimeError(f"{label} SHA mismatch")
+    return resolved, payload, digest
+
+
+def _strict_encoder_payload(payload: bytes) -> NativeVGGTConfig:
+    value = yaml.safe_load(payload.decode("utf-8"))
+    required = set(NativeVGGTConfig.__dataclass_fields__)
+    if not isinstance(value, dict) or set(value) != required:
+        raise CacheWorkerError(
+            f"VGGT contract fields mismatch: missing={sorted(required-set(value or {}))} "
+            f"unknown={sorted(set(value or {})-required)}"
+        )
+    config = NativeVGGTConfig(**value)
+    config.validate()
+    return config
 
 
 def _torch_bytes(value: dict[str, torch.Tensor], path: Path) -> bytes:
@@ -80,21 +101,32 @@ def _torch_bytes(value: dict[str, torch.Tensor], path: Path) -> bytes:
             torch.save({key: tensor.detach().cpu().contiguous() for key, tensor in value.items()}, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        return temporary.read_bytes()
+        _resolved, payload, _digest = read_regular_bytes(
+            temporary, "temporary Stage1 payload"
+        )
+        return payload
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def _checkpoint_commit_sha(path: Path) -> str:
+    if path.is_symlink():
+        raise RuntimeError("Stage0 checkpoint directory must not be a symlink")
     commit = path.resolve(strict=True) / "COMMITTED.json"
     if commit.is_symlink() or not commit.is_file():
         raise RuntimeError("Stage0 checkpoint must be a committed DCP directory")
-    return sha256_file(commit)
+    _resolved, _payload, digest = read_regular_bytes(commit, "Stage0 DCP commit")
+    return digest
 
 
 def _runtime_lineage(runtime: dict, runtime_sha: str, checkpoint: Path) -> dict[str, str]:
     closure = runtime["data_closure"]
-    window_seal = json.loads(Path(closure["cache_seal_path"]).read_text())
+    _seal_path, seal_payload, _seal_digest = _verified_payload(
+        Path(closure["cache_seal_path"]),
+        closure["cache_seal_sha256"],
+        "Stage0 window seal",
+    )
+    window_seal = json.loads(seal_payload)
     return {
         "runtime_config_sha256": runtime_sha,
         "data_profile_sha256": closure["data_profile_sha256"],
@@ -279,12 +311,10 @@ def main() -> None:
     sources = {source.name: source for source in profile.sources}
     if not sources or any(not name.startswith("robocasa_stage1_real") for name in sources):
         raise RuntimeError("real Stage1 producer requires sealed RoboCasa-only sources")
-    audit_path = args.rollout_audit.resolve(strict=True)
-    audit = json.loads(audit_path.read_text())
-    _validate_rollout_audit_authority(
-        audit, str(runtime["run"]["code_commit"])
+    audit, rollout_audit_sha = load_rollout_audit(
+        args.rollout_audit,
+        expected_code_commit=str(runtime["run"]["code_commit"]),
     )
-    rollout_audit_sha = sha256_file(audit_path)
     audited_roots = {
         name: Path(path).resolve(strict=True)
         for name, path in audit.get("source_roots", {}).items()
@@ -309,8 +339,11 @@ def main() -> None:
         expected_model_profile_sha256=lineage["model_profile_sha256"],
         expected_window_index_sha256=lineage["window_index_sha256"], data_profile=profile,
     )
-    encoder_config = _strict_encoder(args.encoder_contract)
-    if sha256_file(args.encoder_contract.resolve(strict=True)) != lineage["encoder_contract_sha256"]:
+    _encoder_path, encoder_payload, encoder_digest = read_regular_bytes(
+        args.encoder_contract, "encoder contract"
+    )
+    encoder_config = _strict_encoder_payload(encoder_payload)
+    if encoder_digest != lineage["encoder_contract_sha256"]:
         raise RuntimeError("encoder contract differs from Stage0 cache closure")
     device = torch.device(args.device)
     encoder = NativeVGGTEncoder(encoder_config, device=str(device), local_files_only=True).eval().to(device)
@@ -323,7 +356,10 @@ def main() -> None:
     if model_grid * model_grid != int(model["P"]):
         raise RuntimeError("Stage0 P is not a square grid")
     rows = []
-    output_root = args.output_root.absolute()
+    output_root = _output_directory(args.output_root, "candidate output root")
+    _output_directory(
+        args.output_manifest.absolute().parent, "candidate manifest parent"
+    )
     simulator_revision = json.dumps(audit["simulator_revision"], sort_keys=True, separators=(",", ":"))
     episode_entries = load_cache_episode_index(
         Path(runtime["data_closure"]["episode_cache_index_path"]),
@@ -355,7 +391,25 @@ def main() -> None:
             expected_robot_shard=cache_episode.robot_shard,
         )
         entry = dataset.entries[sample_index]
-        with np.load(Path(audited["runtime_payload_path"]), allow_pickle=False) as npz:
+        _runtime_payload, runtime_payload_bytes, _runtime_payload_digest = (
+            _verified_payload(
+                Path(audited["runtime_payload_path"]),
+                audited["runtime_payload_sha256"],
+                "audited runtime payload",
+            )
+        )
+        for path_key, digest_key, label in (
+            (
+                "runtime_index_shard_path",
+                "runtime_index_shard_sha256",
+                "audited runtime index shard",
+            ),
+            ("root_context_path", "root_context_sha256", "audited root context"),
+        ):
+            _path, _payload, _digest = _verified_payload(
+                Path(audited[path_key]), audited[digest_key], label
+            )
+        with np.load(io.BytesIO(runtime_payload_bytes), allow_pickle=False) as npz:
             simulator = np.asarray(npz["simulator_actions"], dtype=np.float32)
             rewards = torch.from_numpy(np.asarray(npz["branch_rewards"][:, audited["outcome_indices"]], dtype=np.float32))
             dones = torch.from_numpy(np.asarray(npz["branch_dones"][:, audited["outcome_indices"]], dtype=np.bool_))
@@ -411,8 +465,9 @@ def main() -> None:
             "branch_valid": torch.ones(candidates, dtype=torch.bool),
         }
         payload_path = output_root / split / f"{entry.sample_id}.pt"
-        _publish(payload_path, _torch_bytes(payload, payload_path))
-        payload_sha = sha256_file(payload_path)
+        payload_bytes = _torch_bytes(payload, payload_path)
+        payload_sha = _sha256(payload_bytes)
+        _publish(payload_path, payload_bytes)
         receipt = {
             "schema": GENERATOR_RECEIPT_SCHEMA,
             "sample_index": sample_index, "sample_id": entry.sample_id,
@@ -430,13 +485,18 @@ def main() -> None:
             "native_evidence_from_frozen_encoder": True,
         }
         receipt_path = output_root / "receipts" / f"{entry.sample_id}.json"
-        _publish(receipt_path, (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode())
+        receipt_bytes = (
+            json.dumps(receipt, sort_keys=True, indent=2) + "\n"
+        ).encode()
+        receipt_sha = _sha256(receipt_bytes)
+        _publish(receipt_path, receipt_bytes)
         rows.append({
             "schema": BRANCH_SCHEMA,
             "sample_index": sample_index, "sample_id": entry.sample_id,
             "source": entry.source, "split": entry.split, "embodiment": entry.embodiment,
             "payload": str(payload_path), "payload_sha256": payload_sha,
-            "generator_receipt": str(receipt_path), "generator_receipt_sha256": sha256_file(receipt_path),
+            "generator_receipt": str(receipt_path),
+            "generator_receipt_sha256": receipt_sha,
             "rollout_audit_sha256": rollout_audit_sha,
             **lineage,
         })
@@ -444,10 +504,11 @@ def main() -> None:
         raise RuntimeError("candidate generation did not close train/val/test")
     rows.sort(key=lambda row: row["split"])
     manifest = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows).encode()
+    manifest_sha = _sha256(manifest)
     _publish(args.output_manifest, manifest)
     print(json.dumps({
         "candidate_manifest": str(args.output_manifest.absolute()),
-        "candidate_manifest_sha256": sha256_file(args.output_manifest.absolute()),
+        "candidate_manifest_sha256": manifest_sha,
         "rows": len(rows), "splits": sorted(row["split"] for row in rows),
         "rollout_audit_sha256": rollout_audit_sha, **lineage,
     }, sort_keys=True))

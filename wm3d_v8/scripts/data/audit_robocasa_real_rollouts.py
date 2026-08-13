@@ -9,49 +9,34 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
-import os
 from pathlib import Path
-import uuid
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
-from wm3d_v3.data.manifest_contract import canonical_sha256, sha256_file
+from wm3d_v3.data.manifest_contract import canonical_sha256
+from wm3d_v3.stage1_planner.rollout_audit import (
+    ROLLOUT_AUDIT_SCHEMA,
+    publish_no_clobber,
+    read_regular_bytes,
+)
 from wm3d_v3.training.launch_qualification import verify_clean_runtime_checkout
 
 
-SCHEMA = "wm3d_v8_robocasa_real_rollout_audit_v2"
+SCHEMA = ROLLOUT_AUDIT_SCHEMA
 RUNTIME_SCHEMA = "wm3d_v7_stage1_planner_same_root_runtime_v3"
-
-
-def _regular(path: Path, label: str) -> Path:
-    if path.is_symlink() or not path.is_file():
-        raise RuntimeError(f"{label} must be a regular file: {path}")
-    return path.resolve(strict=True)
 
 
 def _publish(path: Path, value: dict) -> None:
     payload = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
-    path = path.absolute()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() or path.is_symlink():
-        if path.is_file() and path.read_bytes() == payload:
-            return
-        raise FileExistsError(f"refusing to overwrite non-identical audit: {path}")
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    with temporary.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    publish_no_clobber(path, payload, "rollout audit")
 
 
-def _constants(path: Path) -> dict[str, object]:
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+def _constants(payload: bytes, path: Path) -> dict[str, object]:
+    tree = ast.parse(payload.decode("utf-8"), filename=str(path))
     names = {
         "ROBOSUITE_VERSION", "ROBOSUITE_COMMIT", "MUJOCO_VERSION",
         "ROBOCASA_COMMIT", "ROBOCASA_DATASET_VERSION", "SOURCE_REVISION",
@@ -68,24 +53,24 @@ def _constants(path: Path) -> dict[str, object]:
     return result
 
 
-def _rows(runtime_root: Path) -> dict[str, tuple[dict, Path]]:
-    result: dict[str, tuple[dict, Path]] = {}
+def _rows(runtime_root: Path) -> dict[str, tuple[dict, Path, str]]:
+    result: dict[str, tuple[dict, Path, str]] = {}
     for shard in sorted(runtime_root.glob("index.shard-*.jsonl")):
-        if shard.name.endswith(".partial") or shard.is_symlink() or not shard.is_file():
+        if shard.name.endswith(".partial"):
             continue
-        for line_number, line in enumerate(shard.read_text(encoding="utf-8").splitlines(), 1):
+        shard_path, payload, digest = read_regular_bytes(shard, "runtime index shard")
+        for line_number, line in enumerate(payload.decode("utf-8").splitlines(), 1):
             raw = json.loads(line)
             root_id = str(raw.get("root_id", ""))
             if not root_id or root_id in result:
                 raise RuntimeError(f"invalid/duplicate root in {shard}:{line_number}")
-            result[root_id] = (raw, shard.resolve(strict=True))
+            result[root_id] = (raw, shard_path, digest)
     return result
 
 
-def _candidate_rows(path: Path) -> dict[str, dict]:
-    path = _regular(path, "candidate index")
+def _candidate_rows(payload: bytes, path: Path) -> dict[str, dict]:
     result: dict[str, dict] = {}
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(payload.decode("utf-8").splitlines(), 1):
         if not line.strip():
             continue
         row = json.loads(line)
@@ -102,9 +87,14 @@ def _candidate_rows(path: Path) -> dict[str, dict]:
     return result
 
 
-def _episode_action(root: Path, episode_id: int) -> np.ndarray:
+def _episode_action(
+    root: Path,
+    episode_id: int,
+    *,
+    episodes_payload: bytes,
+) -> np.ndarray:
     metadata = None
-    for line in _regular(root / "meta" / "episodes.jsonl", "episode metadata").read_text().splitlines():
+    for line in episodes_payload.decode("utf-8").splitlines():
         row = json.loads(line)
         if int(row["episode_index"]) == episode_id:
             metadata = row
@@ -112,8 +102,13 @@ def _episode_action(root: Path, episode_id: int) -> np.ndarray:
     if metadata is None:
         raise RuntimeError(f"source episode {episode_id} is absent")
     relative = f"data/chunk-{episode_id // 1000:03d}/episode_{episode_id:06d}.parquet"
-    payload = _regular(root / relative, "source episode payload")
-    action = np.asarray(pq.read_table(payload, columns=["action"]).column(0).to_pylist(), dtype=np.float32)
+    _path, payload, _digest = read_regular_bytes(
+        root / relative, "source episode payload"
+    )
+    action = np.asarray(
+        pq.read_table(pa.BufferReader(payload), columns=["action"]).column(0).to_pylist(),
+        dtype=np.float32,
+    )
     if action.shape != (int(metadata["length"]), 12) or not np.isfinite(action).all():
         raise RuntimeError("source action payload shape/values are invalid")
     return action
@@ -148,45 +143,68 @@ def main() -> None:
     repo = Path(__file__).resolve().parents[2]
     code_commit = verify_clean_runtime_checkout(repo, args.code_commit)
 
+    if args.runtime_root.is_symlink():
+        raise RuntimeError("runtime root must not be a symlink")
     runtime_root = args.runtime_root.resolve(strict=True)
-    if runtime_root.is_symlink() or not runtime_root.is_dir():
+    if not runtime_root.is_dir():
         raise RuntimeError("runtime root must be a real directory")
     source_roots: dict[str, Path] = {}
     for raw in args.source_root:
         source_name, separator, raw_path = raw.partition("=")
         if not separator or not source_name or source_name in source_roots:
             raise RuntimeError(f"invalid/duplicate source root {raw!r}")
-        source_root = Path(raw_path).resolve(strict=True)
-        if source_root.is_symlink() or not source_root.is_dir():
+        raw_root = Path(raw_path)
+        if raw_root.is_symlink():
+            raise RuntimeError("source root must not be a symlink")
+        source_root = raw_root.resolve(strict=True)
+        if not source_root.is_dir():
             raise RuntimeError("source root must be a real directory")
         source_roots[source_name] = source_root
-    launch_path = _regular(args.launch_receipt, "launch receipt")
-    generator = _regular(args.runtime_generator, "runtime generator")
-    replay = _regular(args.replay_helper, "replay helper")
-    action_audit_path = _regular(args.action_audit, "action audit")
-    candidate_index_path = _regular(args.candidate_index, "candidate index")
-    candidate_seal_path = _regular(args.candidate_index_seal, "candidate index seal")
-    launch = json.loads(launch_path.read_text())
+    launch_path, launch_payload, launch_digest = read_regular_bytes(
+        args.launch_receipt, "launch receipt"
+    )
+    generator, generator_payload, generator_digest = read_regular_bytes(
+        args.runtime_generator, "runtime generator"
+    )
+    replay, replay_payload, replay_digest = read_regular_bytes(
+        args.replay_helper, "replay helper"
+    )
+    action_audit_path, action_audit_payload, action_audit_digest = read_regular_bytes(
+        args.action_audit, "action audit"
+    )
+    candidate_index_path, candidate_index_payload, candidate_index_digest = (
+        read_regular_bytes(args.candidate_index, "candidate index")
+    )
+    candidate_seal_path, candidate_seal_payload, candidate_seal_digest = (
+        read_regular_bytes(args.candidate_index_seal, "candidate index seal")
+    )
+    launch = json.loads(launch_payload)
     if launch.get("pass") is not True:
         raise RuntimeError("legacy real-runtime launch did not pass")
-    for path, key in ((generator, "runtime_generator_sha256"), (replay, "replay_helper_sha256")):
-        if sha256_file(path) != launch.get(key):
+    for digest, key in (
+        (generator_digest, "runtime_generator_sha256"),
+        (replay_digest, "replay_helper_sha256"),
+    ):
+        if digest != launch.get(key):
             raise RuntimeError(f"{key} differs from launch receipt")
-    action_audit = json.loads(action_audit_path.read_text())
+    action_audit = json.loads(action_audit_payload)
     if (
-        sha256_file(action_audit_path) != "f0e3c99f5f5792d996473bf47035d989ebe17ff2665a3c5c07c73ea736a3c27f"
+        action_audit_digest != "f0e3c99f5f5792d996473bf47035d989ebe17ff2665a3c5c07c73ea736a3c27f"
         or action_audit.get("audit", {}).get("passed") is not True
     ):
         raise RuntimeError("factual action semantics audit is invalid")
-    candidate_seal = json.loads(candidate_seal_path.read_text())
+    candidate_seal = json.loads(candidate_seal_payload)
+    sealed_output = Path(candidate_seal.get("output", ""))
+    if sealed_output.is_symlink():
+        raise RuntimeError("candidate index seal names a symlink")
     if (
         candidate_seal.get("passed") is not True
-        or Path(candidate_seal.get("output", "")).resolve(strict=True) != candidate_index_path
-        or candidate_seal.get("output_sha256") != sha256_file(candidate_index_path)
+        or sealed_output.resolve(strict=True) != candidate_index_path
+        or candidate_seal.get("output_sha256") != candidate_index_digest
     ):
         raise RuntimeError("candidate index seal/path/SHA is invalid")
-    candidates = _candidate_rows(candidate_index_path)
-    pinned = _constants(replay)
+    candidates = _candidate_rows(candidate_index_payload, candidate_index_path)
+    pinned = _constants(replay_payload, replay)
     camera_order = list(pinned["CAMERAS"])
     if camera_order != [
         "robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand"
@@ -209,15 +227,18 @@ def main() -> None:
     if any(not roots for roots in selections.values()):
         raise RuntimeError("selection must contain at least one distinct train/val/test root")
     available = _rows(runtime_root)
-    source_meta = {
-        source_name: {
-            name: sha256_file(
-                _regular(source_root / "meta" / name, f"{source_name} {name}")
+    source_meta: dict[str, dict[str, str]] = {}
+    source_episode_metadata: dict[str, bytes] = {}
+    for source_name, source_root in source_roots.items():
+        digests: dict[str, str] = {}
+        for name in ("info.json", "modality.json", "embodiment.json", "episodes.jsonl"):
+            _path, payload, digest = read_regular_bytes(
+                source_root / "meta" / name, f"{source_name} {name}"
             )
-            for name in ("info.json", "modality.json", "embodiment.json", "episodes.jsonl")
-        }
-        for source_name, source_root in source_roots.items()
-    }
+            digests[name] = digest
+            if name == "episodes.jsonl":
+                source_episode_metadata[source_name] = payload
+        source_meta[source_name] = digests
     observed_hz = float(action_audit["audit"]["observed_hz"])
     if not np.isfinite(observed_hz) or observed_hz <= 0:
         raise RuntimeError("action audit does not seal a valid observed cadence")
@@ -227,8 +248,11 @@ def main() -> None:
       for root_id in selections[split]:
         if root_id not in available:
             raise RuntimeError(f"selected root is absent: {root_id}")
-        row, shard = available[root_id]
-        row_source_root = Path(row.get("source_dataset", "")).resolve(strict=True)
+        row, shard, shard_digest = available[root_id]
+        row_source_path = Path(row.get("source_dataset", ""))
+        if row_source_path.is_symlink():
+            raise RuntimeError("runtime row source root must not be a symlink")
+        row_source_root = row_source_path.resolve(strict=True)
         matching_sources = [
             name for name, root in source_roots.items() if root == row_source_root
         ]
@@ -260,15 +284,19 @@ def main() -> None:
             or candidate.get("root_context_sha256") != row.get("root_context_sha256")
         ):
             raise RuntimeError("candidate seed row differs from real-runtime root identity")
-        payload = _regular(Path(row["path"]), "runtime payload")
-        if sha256_file(payload) != row["payload_sha256"]:
+        payload, payload_bytes, payload_digest = read_regular_bytes(
+            Path(row["path"]), "runtime payload"
+        )
+        if payload_digest != row["payload_sha256"]:
             raise RuntimeError("runtime payload SHA drift")
-        root_context = _regular(Path(row["root_context_path"]), "root context")
-        if sha256_file(root_context) != row["root_context_sha256"]:
+        root_context, _root_context_bytes, root_context_digest = read_regular_bytes(
+            Path(row["root_context_path"]), "root context"
+        )
+        if root_context_digest != row["root_context_sha256"]:
             raise RuntimeError("root context SHA drift")
         episode = int(row["episode_id"])
         t0 = int(row["t0"])
-        with np.load(payload, allow_pickle=False) as npz:
+        with np.load(io.BytesIO(payload_bytes), allow_pickle=False) as npz:
             simulator = np.asarray(npz["simulator_actions"], dtype=np.float32)
             branch_rgb = np.asarray(npz["branch_rgb"])
             reward = np.asarray(npz["branch_rewards"])
@@ -286,7 +314,11 @@ def main() -> None:
                 (simulator[0, :, 7:11], simulator[0, :, 11:12], simulator[0, :, 0:7]),
                 axis=-1,
             )
-            source = _episode_action(source_root, episode)
+            source = _episode_action(
+                source_root,
+                episode,
+                episodes_payload=source_episode_metadata[source_name],
+            )
             source_slice = source[t0 : t0 + 128]
             if source_slice.shape != factual_source_order.shape or not np.array_equal(source_slice, factual_source_order):
                 raise RuntimeError("factual simulator actions are not byte-exact source rows")
@@ -300,7 +332,8 @@ def main() -> None:
             "root_id": root_id, "episode_id": episode, "t0": t0,
             "task_text": row["task_text"], "runtime_payload_path": str(payload),
             "runtime_payload_sha256": row["payload_sha256"],
-            "runtime_index_shard_path": str(shard), "runtime_index_shard_sha256": sha256_file(shard),
+            "runtime_index_shard_path": str(shard),
+            "runtime_index_shard_sha256": shard_digest,
             "runtime_index_row_sha256": canonical_sha256(row),
             "root_context_path": str(root_context), "root_context_sha256": row["root_context_sha256"],
             "root_state_sha256": row["root_state_sha256"],
@@ -333,14 +366,16 @@ def main() -> None:
         "schema": SCHEMA,
         "code_commit": code_commit,
         "runtime_root": str(runtime_root),
-        "launch_receipt_path": str(launch_path), "launch_receipt_sha256": sha256_file(launch_path),
-        "runtime_generator_path": str(generator), "runtime_generator_sha256": sha256_file(generator),
-        "replay_helper_path": str(replay), "replay_helper_sha256": sha256_file(replay),
-        "action_audit_path": str(action_audit_path), "action_audit_sha256": sha256_file(action_audit_path),
+        "launch_receipt_path": str(launch_path), "launch_receipt_sha256": launch_digest,
+        "runtime_generator_path": str(generator),
+        "runtime_generator_sha256": generator_digest,
+        "replay_helper_path": str(replay), "replay_helper_sha256": replay_digest,
+        "action_audit_path": str(action_audit_path),
+        "action_audit_sha256": action_audit_digest,
         "candidate_index_path": str(candidate_index_path),
-        "candidate_index_sha256": sha256_file(candidate_index_path),
+        "candidate_index_sha256": candidate_index_digest,
         "candidate_index_seal_path": str(candidate_seal_path),
-        "candidate_index_seal_sha256": sha256_file(candidate_seal_path),
+        "candidate_index_seal_sha256": candidate_seal_digest,
         "source_roots": {name: str(root) for name, root in source_roots.items()},
         "source_metadata_sha256": source_meta,
         "simulator_revision": simulator_revision,

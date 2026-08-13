@@ -175,6 +175,7 @@ def validate_launch_qualification(
     distributed_strategy: str,
     shard_degree: int,
     source_checkpoint: Mapping[str, Any] | None,
+    resource_runtime_config_sha256: str | None = None,
     now_unix_ns: int | None = None,
 ) -> None:
     required = {
@@ -234,7 +235,11 @@ def validate_launch_qualification(
             observed_created = validate_resource_receipt(
                 receipt,
                 resources=resources,
-                runtime_config_sha256=runtime_config_sha256,
+                runtime_config_sha256=(
+                    runtime_config_sha256
+                    if resource_runtime_config_sha256 is None
+                    else resource_runtime_config_sha256
+                ),
                 world_size=world_size,
                 now_unix_ns=now_unix_ns,
             )

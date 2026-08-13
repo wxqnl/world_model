@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import random
 import re
+import stat
 import time
 from typing import Any, Mapping
 
@@ -124,10 +125,10 @@ def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
 def _atomic_json_no_clobber(path: Path, value: Mapping[str, Any]) -> None:
     payload = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise PretrainError("run contract cannot be a symlink")
     if path.exists():
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if existing != value:
-            raise PretrainError(f"existing run contract differs: {path}")
+        _require_stable_run_contract(path, value)
         return
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
     with temporary.open("xb") as handle:
@@ -138,6 +139,59 @@ def _atomic_json_no_clobber(path: Path, value: Mapping[str, Any]) -> None:
         os.link(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _require_stable_run_contract(
+    path: Path, expected: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Read one immutable run-contract snapshot and require exact equality."""
+
+    path = Path(path)
+    if path.is_symlink():
+        raise PretrainError("run contract cannot be a symlink")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise PretrainError("stable run contract is missing") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise PretrainError("run contract must be a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise PretrainError("run contract changed while it was read")
+    finally:
+        os.close(descriptor)
+    try:
+        current = os.lstat(path)
+    except OSError as exc:
+        raise PretrainError("run contract changed after it was read") from exc
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_size,
+        current.st_mtime_ns,
+    ) != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+        raise PretrainError("run contract changed after it was read")
+    try:
+        value = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PretrainError("run contract is not valid JSON") from exc
+    if value != expected:
+        raise PretrainError("stable run contract is missing or differs")
+    return dict(value)
 
 
 def _resource_preflight(
@@ -578,6 +632,7 @@ def _publish_and_validate_launch(
     resource_preflight: Mapping[str, Any] | None,
     source_checkpoint: Mapping[str, Any] | None,
     launch_kind: str,
+    resource_runtime_config_sha256: str | None = None,
 ) -> tuple[str, str]:
     identities = _rank_identities(context)
     resources = config["runtime_profile"].get("resources")
@@ -629,6 +684,7 @@ def _publish_and_validate_launch(
             distributed_strategy=strategy.strategy,
             shard_degree=strategy.shard_degree,
             source_checkpoint=source_checkpoint,
+            resource_runtime_config_sha256=resource_runtime_config_sha256,
         )
     except LaunchQualificationError as exc:
         raise PretrainError("launch qualification validation failed") from exc

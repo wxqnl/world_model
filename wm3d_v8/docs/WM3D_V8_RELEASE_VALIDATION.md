@@ -156,18 +156,7 @@ all-reduce。复制旧 receipt 或更换 rank/GPU 会被当前身份复核拒绝
 
 ## 5. 真实 Stage1 双 source、四 root 证据
 
-真实 Stage1 v7 验收批次使用两个独立 RoboCasa source：`OpenBlenderLid` 提供 train/val/test 各一个 root，`CoffeeServeMug` 提供第二个 train root；selection 为 train 2、val 1、test 1，没有复制、有放回采样或跨 source 伪装。rollout audit、candidate manifest、统一 branch index/seal、同 lineage Stage0 DCP、Stage1 0→1、换新进程 exact resume 1→2 以及独立 val/test eval 都已完成。
-
-关键 receipt：
-
-| 证据 | SHA256 |
-|---|---|
-| 四 root rollout audit | `59c6af619650e2114ca280cb87b0cd1198741d3be19faae06e0871cb99aa80c3` |
-| candidate manifest | `fca7e0a86023acfdfebc251ed53932ba6740dc63926a3731de69f76143dfdd07` |
-| branch index / seal | `cd09c16d2afe81bf55a485240634039e967a6b1c71ad0f7cc539df9409c8cd65` / `0cae27f603cc422edd5fae31a3bca907aa93244e0ddce7725abebdef113eca20` |
-| Stage1 step 1 DCP / train receipt | `6f87a2cff7725d8a63969780180b84f0c8b24c021a5e8edfd7f51c670b6cc5f3` / `1959b5b7773102e5b9774aae67918144dde10c0c96a415f48c651f17a10d6c73` |
-| Stage1 exact-resume step 2 DCP / train receipt | `8b8e926adeeff6d93e493ccd71a57b9104a0b369111478a5f1c575a55c3834a5` / `38e4a22f0d043fd5754924c44542ce39964fa1b66e535de3fa47544945cc4977` |
-| final val / test eval receipt | `38ddd3bbfced4f817aaedcd07c4c42af91bc75c879a51457c2bdf4078fcf4575` / `30e05f8d80432d861c27e6f0636fffd3932a439f2763da551c1a1d447d42e1bc` |
+历史 Stage1 v7 开发批次使用两个独立 RoboCasa source：`OpenBlenderLid` 提供 train/val/test 各一个 root，`CoffeeServeMug` 提供第二个 train root；selection 为 train 2、val 1、test 1，没有复制、有放回采样或跨 source 伪装。它证明过真实 simulator 主线的可行性，但其 audit、branch 和 receipt 都是旧 schema，不包含当前要求的 branch v3、generator receipt v2 和持久 `rollout_audit_sha256` 闭包。旧 SHA 因此仅是开发记录，已从当前发布 authority 清单移除；不得用于当前恢复、评测或发布提升。
 
 val/test 的四项 action-blind、label sensitivity 与梯度 ownership 门禁全部通过，但这个 correctness canary 只训练了两个 optimizer step。val/test 的 `selected_success` 都是 0，success AUC 分别为 0.25 和约 0.0333。结论只能是 Stage1 真实 pipeline 已闭合，不能声称规划质量提升或策略已经可用。
 

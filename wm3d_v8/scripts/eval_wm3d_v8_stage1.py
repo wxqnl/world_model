@@ -19,6 +19,8 @@ from wm3d_v3.stage1_planner.train import (
     _device,
     _expectations,
     _load_stage1,
+    _prepare_stage1_launch,
+    _stage0_expectations,
     _verify_runtime_checkout,
     validate_stage1_bindings,
 )
@@ -27,7 +29,6 @@ from wm3d_v3.stage1_planner.planner_head import NativePlannerConfig
 from wm3d_v3.stage1_planner.system import NativePlanningSystem, Stage1SystemConfig
 from wm3d_v3.training.distributed_checkpoint import (
     DistributedCheckpointManager,
-    ResumeExpectations,
     sha256_file,
 )
 from wm3d_v3.training.distributed_runtime import (
@@ -40,7 +41,7 @@ from wm3d_v3.training.runtime_contract import load_materialized_runtime
 from wm3d_v3.models.model_factory import build_world_model
 
 
-EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_eval_receipt_v2"
+EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_eval_receipt_v3"
 _ACTION_FIELDS = (
     "candidate_fine_action_values",
     "candidate_fine_action_mask",
@@ -107,12 +108,28 @@ def _publish(path: Path, value: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _require_authority_coverage(
+    *, evaluated_count: int, sealed_split_count: int, gate_count: int
+) -> dict[str, int]:
+    coverage = {
+        "evaluated_branch_count": int(evaluated_count),
+        "sealed_split_count": int(sealed_split_count),
+        "gated_branch_count": int(gate_count),
+    }
+    if (
+        evaluated_count <= 0
+        or evaluated_count != sealed_split_count
+        or gate_count != sealed_split_count
+    ):
+        raise ValueError("Stage1 authority eval does not cover the sealed split")
+    return coverage
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--split", choices=("val", "test"), default="val")
-    parser.add_argument("--max-branches", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     stage1, stage1_sha = _load_stage1(args.runtime)
@@ -134,15 +151,17 @@ def main() -> None:
             world = build_world_model(stage0["model_profile"])
         world = wrap_model(world, context, strategy, initialization_seed=seed if strategy.initialization == "meta_sharded" else None).model
         source_step = int(stage0_source.name.split("_")[1])
-        run_contract = json.loads((Path(stage0["run"]["output_root"]) / "run_contract.json").read_text())
-        DistributedCheckpointManager(stage0_source.parent).load_model_for_evaluation(
-            path=stage0_source, model=world, expected=ResumeExpectations(
-                step=source_step, run_lineage=stage0["run"]["lineage"], runtime_config_sha256=stage0_sha,
-                data_closure_sha256=stage0["bindings"]["data_closure_sha256"],
-                model_contract_sha256=stage0["bindings"]["model_contract_sha256"], world_size=context.world_size,
-                shard_degree=int(stage0["runtime_profile"]["distributed"]["shard_degree"]), distributed_strategy=strategy.strategy,
-                global_batch_size=int(stage0["runtime_profile"]["train"]["global_batch_size"]),
-                topology_contract_sha256=run_contract["topology_contract_sha256"]),
+        stage0_expectations = _stage0_expectations(
+            step=source_step,
+            runtime=stage0,
+            runtime_sha=stage0_sha,
+            world_size=context.world_size,
+        )
+        stage0_manager = DistributedCheckpointManager(stage0_source.parent)
+        stage0_inspection = stage0_manager.inspect_committed_collective(
+            path=stage0_source,
+            expected=stage0_expectations,
+            require_exact=True,
         )
         for parameter in world.parameters():
             parameter.requires_grad_(False)
@@ -157,59 +176,111 @@ def main() -> None:
             )
             system.planner = planner
         step = int(args.checkpoint.name.split("_")[1])
-        DistributedCheckpointManager(args.checkpoint.parent).load_model_for_evaluation(
+        stage1_manager = DistributedCheckpointManager(args.checkpoint.parent)
+        expectations = _expectations(
+            step=step,
+            stage1=stage1,
+            stage1_sha=stage1_sha,
+            runtime=stage0,
+            world_size=context.world_size,
+        )
+        stage1_inspection = stage1_manager.inspect_committed_collective(
+            path=args.checkpoint, expected=expectations, require_exact=True
+        )
+        launch_path, launch_sha, _run_contract = _prepare_stage1_launch(
+            stage1=stage1,
+            stage1_sha=stage1_sha,
+            stage0=stage0,
+            stage0_sha=stage0_sha,
+            context=context,
+            planner_parameter_count=sum(
+                int(parameter.numel()) for parameter in planner.parameters()
+            ),
+            source_checkpoint=stage1_inspection,
+            launch_kind="eval",
+        )
+        stage0_manager.load_model_for_evaluation(
+            path=stage0_source, model=world, expected=stage0_expectations
+        )
+        stage1_manager.load_model_for_evaluation(
             path=args.checkpoint, model=planner,
-            expected=_expectations(step=step, stage1=stage1, stage1_sha=stage1_sha, runtime=stage0, world_size=context.world_size))
+            expected=expectations)
         system.eval()
         dataset = _dataset(stage0, stage1, args.split)
-        limit = len(dataset) if args.max_branches <= 0 else min(len(dataset), args.max_branches)
-        if limit <= 0:
+        sealed_split_count = len(dataset)
+        if sealed_split_count <= 0:
             raise ValueError("Stage1 evaluation selected no sealed branches")
         scores = []
         success = []
         imagined = []
         roots = []
-        gate_batch = _device(next(iter(DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0))), context.device)
         planner.eval()
-        planner.zero_grad(set_to_none=True)
-        gate_output = system.score_observed_batch(gate_batch)
         horizon = system.cfg.horizon
         loss_cfg = PlannerLossConfig(**stage1["planner"]["loss"])
-        gate_loss = planner_loss(
-            gate_output,
-            branch_rewards=gate_batch["branch_rewards"][:, :, :horizon],
-            branch_dones=gate_batch["branch_dones"][:, :, :horizon],
-            branch_success=gate_batch["branch_success"][:, :, :horizon],
-            branch_valid=gate_batch["branch_valid"],
-            uncertainty_target=torch.zeros_like(gate_batch["branch_valid"], dtype=torch.float32),
-            cfg=loss_cfg,
-        )["loss"]
-        # A one-slot cyclic permutation changes every non-constant candidate
-        # target vector; the branch seal already rejects constant utility.
-        permutation = torch.roll(
-            torch.arange(gate_batch["branch_success"].shape[1], device=context.device),
-            shifts=1,
-        )
-        shuffled_loss = planner_loss(
-            gate_output,
-            branch_rewards=gate_batch["branch_rewards"][:, permutation, :horizon],
-            branch_dones=gate_batch["branch_dones"][:, permutation, :horizon],
-            branch_success=gate_batch["branch_success"][:, permutation, :horizon],
-            branch_valid=gate_batch["branch_valid"],
-            uncertainty_target=torch.zeros_like(gate_batch["branch_valid"], dtype=torch.float32),
-            cfg=loss_cfg,
-        )["loss"]
-        gate_loss.backward()
-        planner_grads = [parameter.grad for parameter in planner.parameters() if parameter.grad is not None]
-        planner_grad_finite_nonzero = bool(planner_grads) and all(bool(torch.isfinite(value).all()) for value in planner_grads) and sum(float(value.abs().sum()) for value in planner_grads) > 0
-        stage0_grad_owned = any(parameter.grad is not None for parameter in world.parameters())
-        label_shuffle_sensitive = not bool(torch.isclose(gate_loss.detach(), shuffled_loss.detach(), atol=1e-8, rtol=1e-6))
-        # Shuffle every grouped action lane while holding evidence fixed.  The
-        # learned fields must remain bitwise identical; only the deterministic
-        # external action-cost component is allowed to change.
-        action_shuffle_invariant = _action_shuffle_invariant(
-            system, gate_batch, permutation
-        )
+        gate_count = 0
+        planner_grad_finite_nonzero = True
+        stage0_grad_owned = False
+        label_shuffle_sensitive = True
+        action_shuffle_invariant = True
+        for raw_gate in DataLoader(
+            dataset, batch_size=1, shuffle=False, num_workers=0
+        ):
+            gate_batch = _device(raw_gate, context.device)
+            planner.zero_grad(set_to_none=True)
+            gate_output = system.score_observed_batch(gate_batch)
+            gate_loss = planner_loss(
+                gate_output,
+                branch_rewards=gate_batch["branch_rewards"][:, :, :horizon],
+                branch_dones=gate_batch["branch_dones"][:, :, :horizon],
+                branch_success=gate_batch["branch_success"][:, :, :horizon],
+                branch_valid=gate_batch["branch_valid"],
+                uncertainty_target=torch.zeros_like(
+                    gate_batch["branch_valid"], dtype=torch.float32
+                ),
+                cfg=loss_cfg,
+            )["loss"]
+            permutation = torch.roll(
+                torch.arange(
+                    gate_batch["branch_success"].shape[1],
+                    device=context.device,
+                ),
+                shifts=1,
+            )
+            shuffled_loss = planner_loss(
+                gate_output,
+                branch_rewards=gate_batch["branch_rewards"][:, permutation, :horizon],
+                branch_dones=gate_batch["branch_dones"][:, permutation, :horizon],
+                branch_success=gate_batch["branch_success"][:, permutation, :horizon],
+                branch_valid=gate_batch["branch_valid"],
+                uncertainty_target=torch.zeros_like(
+                    gate_batch["branch_valid"], dtype=torch.float32
+                ),
+                cfg=loss_cfg,
+            )["loss"]
+            gate_loss.backward()
+            planner_grads = [
+                parameter.grad
+                for parameter in planner.parameters()
+                if parameter.grad is not None
+            ]
+            planner_grad_finite_nonzero &= bool(planner_grads) and all(
+                bool(torch.isfinite(value).all()) for value in planner_grads
+            ) and sum(float(value.abs().sum()) for value in planner_grads) > 0
+            stage0_grad_owned |= any(
+                parameter.grad is not None for parameter in world.parameters()
+            )
+            label_shuffle_sensitive &= not bool(
+                torch.isclose(
+                    gate_loss.detach(),
+                    shuffled_loss.detach(),
+                    atol=1e-8,
+                    rtol=1e-6,
+                )
+            )
+            action_shuffle_invariant &= _action_shuffle_invariant(
+                system, gate_batch, permutation
+            )
+            gate_count += 1
         if context.world_size > 1:
             pass_gates = torch.tensor(
                 [planner_grad_finite_nonzero, label_shuffle_sensitive, action_shuffle_invariant],
@@ -240,8 +311,6 @@ def main() -> None:
         system.eval()
         with torch.inference_mode():
             for index, raw in enumerate(DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)):
-                if index >= limit:
-                    break
                 batch = _device(raw, context.device)
                 observed = system.score_observed_batch(batch)
                 costs = deterministic_action_cost(
@@ -260,6 +329,11 @@ def main() -> None:
         score = np.stack(scores)
         imagined_score = np.stack(imagined)
         labels = np.stack(success)
+        coverage = _require_authority_coverage(
+            evaluated_count=len(roots),
+            sealed_split_count=sealed_split_count,
+            gate_count=gate_count,
+        )
         receipt={"schema": EVAL_RECEIPT_SCHEMA, "passed": True, "runtime_sha256": stage1_sha,
             "code_commit": current_commit,
             "stage0_checkpoint_commit_sha256": _checkpoint_commit_sha(stage0_source),
@@ -270,7 +344,11 @@ def main() -> None:
             "selected_success": float(labels[np.arange(len(labels)), score.argmax(1)].mean()),
             "oracle_success": float(labels.max(1).mean()), "stage0_frozen": True,
             "planner_action_inputs": False, "imagined_rollout": "single_trained_K_only",
-            "gates": gate_status}
+            "gates": gate_status, "coverage": coverage,
+            "stage0_source_checkpoint": stage0_inspection,
+            "stage1_source_checkpoint": stage1_inspection,
+            "launch_qualification_path": launch_path,
+            "launch_qualification_sha256": launch_sha}
         if context.rank == 0:
             _publish(args.output, receipt)
             print(json.dumps(receipt, sort_keys=True))

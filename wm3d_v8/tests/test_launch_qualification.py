@@ -17,7 +17,11 @@ from wm3d_v3.training.launch_qualification import (
     verify_clean_runtime_checkout,
 )
 from wm3d_v3.training.pretrain import _run_contract
-from wm3d_v3.training.pretrain import PretrainError, _atomic_json_no_clobber
+from wm3d_v3.training.pretrain import (
+    PretrainError,
+    _atomic_json_no_clobber,
+    _require_stable_run_contract,
+)
 from wm3d_v3.training.resource_preflight import RESOURCE_PREFLIGHT_SCHEMA
 
 
@@ -69,11 +73,17 @@ def _report() -> dict[str, object]:
     }
 
 
-def _receipt(path: Path, resources: dict[str, object], created: int) -> dict[str, object]:
+def _receipt(
+    path: Path,
+    resources: dict[str, object],
+    created: int,
+    *,
+    runtime_config_sha256: str = "a" * 64,
+) -> dict[str, object]:
     value = {
         "schema": RESOURCE_PREFLIGHT_SCHEMA,
         "created_unix_ns": created,
-        "runtime_config_sha256": "a" * 64,
+        "runtime_config_sha256": runtime_config_sha256,
         "world_size": 1,
         "local_world_size": 1,
         "hostnames": ["node0"],
@@ -233,7 +243,84 @@ def test_launch_qualification_is_strict_fresh_and_no_clobber(tmp_path: Path) -> 
         )
 
 
-def test_resume_qualification_binds_committed_source(tmp_path: Path) -> None:
+def test_qualification_can_bind_runtime_and_sealed_resource_runtime_separately(
+    tmp_path: Path,
+) -> None:
+    resources = _resources()
+    now = time.time_ns()
+    resource_runtime_sha = "a" * 64
+    launch_runtime_sha = "b" * 64
+    evidence = _receipt(
+        tmp_path / "resource.json",
+        resources,
+        now,
+        runtime_config_sha256=resource_runtime_sha,
+    )
+    contract = _contract(resources)
+    value = build_launch_qualification(
+        launch_kind="fresh",
+        runtime_config_sha256=launch_runtime_sha,
+        run_contract=contract,
+        resources=resources,
+        resource_preflight=evidence,
+        rank_identities=_identity(),
+        world_size=1,
+        local_world_size=1,
+        distributed_strategy="ddp",
+        shard_degree=1,
+        source_checkpoint=None,
+        created_unix_ns=now + 1,
+    )
+    with pytest.raises(LaunchQualificationError, match="resource receipt is invalid"):
+        validate_launch_qualification(
+            value,
+            launch_kind="fresh",
+            runtime_config_sha256=launch_runtime_sha,
+            run_contract=contract,
+            resources=resources,
+            rank_identities=_identity(),
+            world_size=1,
+            local_world_size=1,
+            distributed_strategy="ddp",
+            shard_degree=1,
+            source_checkpoint=None,
+            now_unix_ns=now + 10,
+        )
+    validate_launch_qualification(
+        value,
+        launch_kind="fresh",
+        runtime_config_sha256=launch_runtime_sha,
+        run_contract=contract,
+        resources=resources,
+        rank_identities=_identity(),
+        world_size=1,
+        local_world_size=1,
+        distributed_strategy="ddp",
+        shard_degree=1,
+        source_checkpoint=None,
+        resource_runtime_config_sha256=resource_runtime_sha,
+        now_unix_ns=now + 10,
+    )
+
+
+def test_run_contract_requires_regular_stable_no_clobber_file(tmp_path: Path) -> None:
+    expected = _contract(_resources())
+    path = tmp_path / "run_contract.json"
+    _atomic_json_no_clobber(path, expected)
+    assert _require_stable_run_contract(path, expected) == expected
+
+    link = tmp_path / "run_contract_link.json"
+    link.symlink_to(path)
+    with pytest.raises(PretrainError, match="symlink"):
+        _require_stable_run_contract(link, expected)
+    with pytest.raises(PretrainError, match="symlink"):
+        _atomic_json_no_clobber(link, expected)
+
+
+@pytest.mark.parametrize("launch_kind", ("exact_resume", "eval"))
+def test_resume_and_eval_qualification_bind_committed_source(
+    tmp_path: Path, launch_kind: str
+) -> None:
     checkpoint = tmp_path / "step_00000001"
     checkpoint.mkdir()
     commit = checkpoint / "COMMITTED.json"
@@ -248,7 +335,7 @@ def test_resume_qualification_binds_committed_source(tmp_path: Path) -> None:
     }
     contract = _contract({})
     value = build_launch_qualification(
-        launch_kind="exact_resume",
+        launch_kind=launch_kind,
         runtime_config_sha256="a" * 64,
         run_contract=contract,
         resources=None,
@@ -262,7 +349,7 @@ def test_resume_qualification_binds_committed_source(tmp_path: Path) -> None:
     )
     validate_launch_qualification(
         value,
-        launch_kind="exact_resume",
+        launch_kind=launch_kind,
         runtime_config_sha256="a" * 64,
         run_contract=contract,
         resources=None,
@@ -277,7 +364,7 @@ def test_resume_qualification_binds_committed_source(tmp_path: Path) -> None:
     with pytest.raises(LaunchQualificationError, match="COMMITTED SHA"):
         validate_launch_qualification(
             value,
-            launch_kind="exact_resume",
+            launch_kind=launch_kind,
             runtime_config_sha256="a" * 64,
             run_contract=contract,
             resources=None,

@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import io
 import json
-import os
 from pathlib import Path
-import uuid
 
 import torch
 
@@ -16,7 +15,6 @@ from wm3d_v3.data.manifest_contract import (
     canonical_sha256,
     load_data_profile,
     load_cache_index,
-    sha256_file,
 )
 from wm3d_v3.stage1_planner.dataset import (
     BRANCH_INDEX_SCHEMA,
@@ -26,41 +24,48 @@ from wm3d_v3.stage1_planner.dataset import (
     GENERATOR_RECEIPT_SCHEMA,
     validate_rollout_audit_binding,
 )
+from wm3d_v3.stage1_planner.rollout_audit import (
+    publish_no_clobber,
+    read_regular_bytes,
+)
 from wm3d_v3.stage1_planner.train import _verify_runtime_checkout
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
 
 
 def _publish(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    with temporary.open("xb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    try:
-        os.link(temporary, path)
-    except FileExistsError:
-        if path.read_bytes() != payload:
-            raise
-    finally:
-        temporary.unlink(missing_ok=True)
+    publish_no_clobber(path, payload, "Stage1 materializer output")
+
+
+def _output_directory(path: Path, label: str) -> Path:
+    path = path.absolute()
+    if path.is_symlink() or path.parent.is_symlink():
+        raise ValueError(f"{label} must not be a symlink or use a symlink parent")
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError(f"{label} must be a directory: {path}")
+    else:
+        path.mkdir(parents=True)
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError(f"{label} was replaced while it was prepared: {path}")
+    return path
 
 
 def _load_json(path: Path) -> dict:
-    path = path.resolve(strict=True)
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"expected regular JSON file: {path}")
-    value = json.loads(path.read_text(encoding="utf-8"))
+    _resolved, payload, _digest = read_regular_bytes(path, "Stage1 JSON")
+    value = json.loads(payload)
     if not isinstance(value, dict):
         raise ValueError(f"JSON root must be a mapping: {path}")
     return value
 
 
 def _commit_sha(path: Path) -> str:
+    if path.is_symlink():
+        raise ValueError("Stage0 checkpoint directory must not be a symlink")
     commit = path.resolve(strict=True) / "COMMITTED.json"
     if commit.is_symlink() or not commit.is_file():
         raise ValueError("Stage0 source must be a committed DCP checkpoint directory")
-    return sha256_file(commit)
+    _resolved, _payload, digest = read_regular_bytes(commit, "Stage0 DCP commit")
+    return digest
 
 
 def _validate_candidate_payload(value: dict, *, model: dict, horizon: int) -> None:
@@ -206,13 +211,13 @@ def _validate_generator_receipt(
     expected: dict,
     source_manifest_sha: str,
     adapter_sha: str,
-) -> Path:
+) -> tuple[Path, str]:
     if SHA256_RE.fullmatch(expected_sha) is None:
         raise ValueError("candidate generator receipt SHA is invalid")
-    path = path.resolve(strict=True)
-    if path.is_symlink() or not path.is_file() or sha256_file(path) != expected_sha:
+    path, payload, observed = read_regular_bytes(path, "candidate generator receipt")
+    if observed != expected_sha:
         raise ValueError("candidate generator receipt path/SHA mismatch")
-    receipt = _load_json(path)
+    receipt = json.loads(payload)
     if (
         set(receipt) != GENERATOR_RECEIPT_FIELDS
         or receipt.get("schema") != GENERATOR_RECEIPT_SCHEMA
@@ -238,7 +243,7 @@ def _validate_generator_receipt(
         raise ValueError("candidate generator receipt did not pass causal unified gates")
     if receipt["candidate_action_abi"] != "wm3d_v8_grouped_robot_v1":
         raise ValueError("candidate generator receipt action ABI mismatch")
-    return path
+    return path, observed
 
 
 def main() -> None:
@@ -289,7 +294,9 @@ def main() -> None:
     if any(SHA256_RE.fullmatch(str(value)) is None for value in lineage.values()):
         raise ValueError("Stage0 runtime/checkpoint lineage contains invalid SHA values")
     rows = []
-    output_root = args.output_root.absolute()
+    output_root = _output_directory(args.output_root, "branch output root")
+    _output_directory(args.output_index.absolute().parent, "branch index parent")
+    _output_directory(args.output_seal.absolute().parent, "branch seal parent")
     required_manifest = {
         "schema", "sample_index", "sample_id", "source", "split", "embodiment",
         "payload", "payload_sha256", "generator_receipt",
@@ -297,7 +304,10 @@ def main() -> None:
         "rollout_audit_sha256",
     } | set(lineage)
     rollout_audit_shas: set[str] = set()
-    for line_number, line in enumerate(args.candidate_manifest.resolve(strict=True).read_text().splitlines(), 1):
+    _manifest_path, manifest_payload, _manifest_sha = read_regular_bytes(
+        args.candidate_manifest, "candidate manifest"
+    )
+    for line_number, line in enumerate(manifest_payload.decode("utf-8").splitlines(), 1):
         if not line.strip():
             continue
         raw = json.loads(line)
@@ -319,16 +329,18 @@ def main() -> None:
             for name in ("sample_id", "source", "split", "embodiment")
         ):
             raise ValueError("candidate manifest does not identify its Stage0 window")
-        source = Path(raw["payload"])
-        if source.is_symlink() or not source.is_file() or sha256_file(source) != raw["payload_sha256"]:
+        source, source_payload, source_sha = read_regular_bytes(
+            Path(raw["payload"]), "candidate payload"
+        )
+        if source_sha != raw["payload_sha256"]:
             raise ValueError("candidate payload SHA/path mismatch")
-        receipt = _validate_generator_receipt(
+        receipt, receipt_sha = _validate_generator_receipt(
             Path(raw["generator_receipt"]), str(raw["generator_receipt_sha256"]),
             raw=raw, expected=lineage,
             source_manifest_sha=source_spec.manifest_sha256,
             adapter_sha=source_spec.adapter_contract_sha256,
         )
-        value = torch.load(source, map_location="cpu", weights_only=True)
+        value = torch.load(io.BytesIO(source_payload), map_location="cpu", weights_only=True)
         model = runtime["model_profile"]["model"]
         horizon = int(value["branch_rewards"].shape[1])
         _validate_candidate_payload(value, model=model, horizon=horizon)
@@ -349,19 +361,19 @@ def main() -> None:
             "adapter_contract_sha256": source_spec.adapter_contract_sha256,
         })
         target = output_root / str(raw["split"]) / f"{branch_id}.pt"
-        _publish(target, source.read_bytes())
+        _publish(target, source_payload)
         rows.append({
             "schema": BRANCH_INDEX_SCHEMA, "branch_id": branch_id,
             "sample_index": int(raw["sample_index"]), "sample_id": str(raw["sample_id"]),
             "source": str(raw["source"]), "split": str(raw["split"]),
             "embodiment": str(raw["embodiment"]), "path": str(target.absolute()),
-            "payload_sha256": sha256_file(target), "candidates": int(value["branch_rewards"].shape[0]),
+            "payload_sha256": source_sha, "candidates": int(value["branch_rewards"].shape[0]),
             "horizon": horizon, "K": int(model["K"]), "P": int(model["P"]),
             "token_dim": int(model["token_dim"]), "num_views": int(model["num_views"]),
             **lineage, "source_manifest_sha256": source_spec.manifest_sha256,
             "adapter_contract_sha256": source_spec.adapter_contract_sha256,
             "generator_receipt_path": str(receipt),
-            "generator_receipt_sha256": sha256_file(receipt),
+            "generator_receipt_sha256": receipt_sha,
             "rollout_audit_sha256": str(raw["rollout_audit_sha256"]),
             "real_simulator_outcomes": True, "future_observation_leakage": False,
             "candidate_action_abi": "wm3d_v8_grouped_robot_v1",
@@ -377,12 +389,15 @@ def main() -> None:
     rows.sort(key=lambda item: (item["split"], item["source"], item["sample_id"]))
     index_payload = "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows).encode()
     _publish(args.output_index.absolute(), index_payload)
+    index_path, _verified_index_payload, index_sha = read_regular_bytes(
+        args.output_index.absolute(), "Stage1 branch index"
+    )
     split_counts = Counter(row["split"] for row in rows)
     if any(split_counts[name] <= 0 for name in ("train", "val", "test")):
         raise ValueError("Stage1 release closure requires non-empty train/val/test branches")
     seal = {
-        "schema": BRANCH_SEAL_SCHEMA, "branch_index_path": str(args.output_index.absolute()),
-        "branch_index_sha256": sha256_file(args.output_index.absolute()), "row_count": len(rows),
+        "schema": BRANCH_SEAL_SCHEMA, "branch_index_path": str(index_path),
+        "branch_index_sha256": index_sha, "row_count": len(rows),
         "row_count_by_split": {name: int(split_counts[name]) for name in ("train", "val", "test")},
         "candidate_count": next(iter(candidates)), "horizon": next(iter(horizons)),
         "rollout_audit_sha256": next(iter(rollout_audit_shas)),

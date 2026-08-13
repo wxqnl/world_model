@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 from typing import Any, Mapping
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -34,16 +35,29 @@ from wm3d_v3.training.distributed_runtime import (
     wrap_model,
 )
 from wm3d_v3.training.runtime_contract import load_materialized_runtime
-from wm3d_v3.training.launch_qualification import verify_clean_runtime_checkout
+from wm3d_v3.training.launch_qualification import (
+    resource_contract_sha256,
+    verify_clean_runtime_checkout,
+)
+from wm3d_v3.training.pretrain import (
+    _atomic_json_no_clobber,
+    _publish_and_validate_launch,
+    _require_stable_run_contract,
+    _require_recent_resource_preflight,
+    _resource_preflight,
+    _topology_contract_sha256,
+)
 
 from .dataset import Stage1BranchDataset, Stage1BranchDatasetConfig
 from .losses import PlannerLossConfig, planner_loss
 from .planner_head import NativePlannerConfig
+from .rollout_audit import RolloutAuditError, read_regular_bytes
 from .system import NativePlanningSystem, Stage1SystemConfig
 
 
 STAGE1_RUNTIME_SCHEMA = "wm3d_v8_unified_stage1_runtime_v2"
 STAGE1_RECEIPT_SCHEMA = "wm3d_v8_unified_stage1_train_receipt_v3"
+STAGE1_RUN_CONTRACT_SCHEMA = "wm3d_v8_unified_stage1_run_contract_v1"
 _BRANCH_FIELDS = {
     "index", "index_sha256", "seal", "seal_sha256",
     "stage0_runtime_sha256", "stage0_checkpoint_commit_sha256",
@@ -62,9 +76,12 @@ _RUN_FIELDS = {
 
 
 def _load_stage1(path: Path) -> tuple[dict[str, Any], str]:
-    path = path.resolve(strict=True)
     import yaml
-    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        _path, payload, digest = read_regular_bytes(path, "Stage1 runtime")
+        value = yaml.safe_load(payload.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, RolloutAuditError, yaml.YAMLError) as exc:
+        raise ValueError("cannot read a stable Stage1 runtime snapshot") from exc
     required = {"schema", "stage0_runtime", "stage0_checkpoint", "branch", "planner", "run"}
     if not isinstance(value, dict) or set(value) != required or value["schema"] != STAGE1_RUNTIME_SCHEMA:
         raise ValueError("Stage1 runtime fields/schema mismatch")
@@ -85,7 +102,7 @@ def _load_stage1(path: Path) -> tuple[dict[str, Any], str]:
     for name in ("total_steps", "checkpoint_interval", "micro_batch_size", "gradient_accumulation", "global_batch_size"):
         if int(value["run"][name]) <= 0:
             raise ValueError(f"Stage1 run.{name} must be positive")
-    return value, sha256_file(path)
+    return value, digest
 
 
 def _walk(value: object):
@@ -182,7 +199,161 @@ def _expectations(*, step: int, stage1: Mapping[str, Any], stage1_sha: str,
         distributed_strategy="ddp",
         global_batch_size=int(run["global_batch_size"]),
         topology_contract_sha256=_topology_sha(stage1, runtime), allow_topology_reshard=False,
+        extra_immutable_metadata={
+            "rollout_audit_sha256": str(branch["rollout_audit_sha256"]),
+            "stage0_checkpoint_commit_sha256": str(
+                branch["stage0_checkpoint_commit_sha256"]
+            ),
+            "branch_index_sha256": str(branch["index_sha256"]),
+            "stage0_frozen": True,
+            "planner_action_inputs": False,
+            "imagined_rollout": "single_trained_K_only",
+        },
     )
+
+
+def _stage0_expectations(
+    *,
+    step: int,
+    runtime: Mapping[str, Any],
+    runtime_sha: str,
+    world_size: int,
+) -> ResumeExpectations:
+    distributed = runtime["runtime_profile"]["distributed"]
+    return ResumeExpectations(
+        step=step,
+        run_lineage=str(runtime["run"]["lineage"]),
+        runtime_config_sha256=runtime_sha,
+        data_closure_sha256=str(runtime["bindings"]["data_closure_sha256"]),
+        model_contract_sha256=str(runtime["bindings"]["model_contract_sha256"]),
+        world_size=world_size,
+        shard_degree=int(distributed["shard_degree"]),
+        distributed_strategy=str(distributed["strategy"]),
+        global_batch_size=int(
+            runtime["runtime_profile"]["train"]["global_batch_size"]
+        ),
+        topology_contract_sha256=_topology_contract_sha256(runtime),
+        allow_topology_reshard=False,
+    )
+
+
+def _launch_config(
+    stage1: Mapping[str, Any], stage0: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Project the sealed Stage0 resource policy onto a Stage1 launch."""
+
+    return {
+        "run": {"output_root": str(stage1["run"]["output_root"])},
+        "runtime_profile": {
+            "expected_world_size": int(
+                stage0["runtime_profile"]["expected_world_size"]
+            ),
+            "resources": stage0["runtime_profile"].get("resources"),
+        },
+        "data_closure": {
+            "cache_root": str(stage0["data_closure"]["cache_root"]),
+        },
+    }
+
+
+def _stage1_run_contract(
+    *,
+    stage1: Mapping[str, Any],
+    stage1_sha: str,
+    stage0: Mapping[str, Any],
+    stage0_sha: str,
+    planner_parameter_count: int,
+) -> dict[str, Any]:
+    branch = stage1["branch"]
+    return {
+        "schema": STAGE1_RUN_CONTRACT_SCHEMA,
+        "lineage": str(stage1["run"]["lineage"]),
+        "runtime_config_sha256": stage1_sha,
+        "stage0_runtime_sha256": stage0_sha,
+        "stage0_checkpoint_commit_sha256": str(
+            branch["stage0_checkpoint_commit_sha256"]
+        ),
+        "branch_index_sha256": str(branch["index_sha256"]),
+        "branch_seal_sha256": str(branch["seal_sha256"]),
+        "rollout_audit_sha256": str(branch["rollout_audit_sha256"]),
+        "planner_model_contract_sha256": _planner_contract_sha(stage1, stage0),
+        "topology_contract_sha256": _topology_sha(stage1, stage0),
+        "resource_contract_sha256": resource_contract_sha256(
+            stage0["runtime_profile"].get("resources")
+        ),
+        "code_commit": str(stage0["run"]["code_commit"]),
+        "environment_lock_sha256": str(
+            stage0["run"]["environment_lock_sha256"]
+        ),
+        "expected_world_size": int(
+            stage0["runtime_profile"]["expected_world_size"]
+        ),
+        "planner_parameter_count": int(planner_parameter_count),
+        "stage0_frozen": True,
+        "planner_action_inputs": False,
+        "imagined_rollout": "single_trained_K_only",
+    }
+
+
+def _prepare_stage1_launch(
+    *,
+    stage1: Mapping[str, Any],
+    stage1_sha: str,
+    stage0: Mapping[str, Any],
+    stage0_sha: str,
+    context: Any,
+    planner_parameter_count: int,
+    source_checkpoint: Mapping[str, Any] | None,
+    launch_kind: str,
+    output_root: Path | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    if context.world_size != int(stage0["runtime_profile"]["expected_world_size"]):
+        raise ValueError("Stage1 world size differs from sealed Stage0 runtime")
+    launch_config = _launch_config(stage1, stage0)
+    if output_root is not None:
+        launch_config["run"]["output_root"] = str(output_root)
+    resource_preflight = _require_recent_resource_preflight(
+        launch_config, stage0_sha, context
+    )
+    run_contract = _stage1_run_contract(
+        stage1=stage1,
+        stage1_sha=stage1_sha,
+        stage0=stage0,
+        stage0_sha=stage0_sha,
+        planner_parameter_count=planner_parameter_count,
+    )
+    publication: list[Any] = [None]
+    if context.is_rank0:
+        try:
+            contract_path = (
+                Path(launch_config["run"]["output_root"]) / "run_contract.json"
+            )
+            if launch_kind == "fresh":
+                _atomic_json_no_clobber(contract_path, run_contract)
+            else:
+                _require_stable_run_contract(contract_path, run_contract)
+            publication[0] = {"ok": True}
+        except Exception as exc:
+            publication[0] = {
+                "ok": False,
+                "type": type(exc).__name__,
+                "error": str(exc),
+            }
+    torch.distributed.broadcast_object_list(publication, src=0)
+    if not publication[0]["ok"]:
+        raise ValueError(f"Stage1 run-contract publication failed: {publication[0]}")
+    path, digest = _publish_and_validate_launch(
+        config=launch_config,
+        config_sha=stage1_sha,
+        context=context,
+        strategy=SimpleNamespace(strategy="ddp", shard_degree=1),
+        run_contract=run_contract,
+        resource_preflight=resource_preflight,
+        source_checkpoint=source_checkpoint,
+        launch_kind=launch_kind,
+        resource_runtime_config_sha256=stage0_sha,
+    )
+    return path, digest, run_contract
 
 
 def _stage0_dataset(
@@ -271,6 +442,7 @@ def main() -> None:
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--stop-after-step", type=int)
+    parser.add_argument("--preflight-only", action="store_true")
     args = parser.parse_args()
     stage1, stage1_sha = _load_stage1(args.runtime)
     stage0_runtime, stage0_sha = load_materialized_runtime(Path(stage1["stage0_runtime"]))
@@ -286,6 +458,27 @@ def main() -> None:
     strategy = strategy_from_mapping(stage0_runtime["runtime_profile"]["distributed"])
     context = initialize_distributed(strategy)
     try:
+        if context.world_size != int(
+            stage0_runtime["runtime_profile"]["expected_world_size"]
+        ):
+            raise ValueError("Stage1 world size differs from sealed Stage0 runtime")
+        launch_config = _launch_config(stage1, stage0_runtime)
+        if args.preflight_only:
+            receipt_sha = _resource_preflight(launch_config, stage0_sha, context)
+            if context.is_rank0:
+                print(
+                    json.dumps(
+                        {
+                            "passed": True,
+                            "runtime_sha256": stage1_sha,
+                            "world_size": context.world_size,
+                            "resource_preflight_sha256": receipt_sha,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+            return
         seed = int(stage1["run"]["seed"])
         random.seed(seed + context.rank)
         np.random.seed((seed + context.rank) % 2**32)
@@ -295,19 +488,15 @@ def main() -> None:
             world = build_world_model(stage0_runtime["model_profile"])
         wrapped_world = wrap_model(world, context, strategy, initialization_seed=seed if strategy.initialization == "meta_sharded" else None).model
         source_step = int(source.name.split("_")[1])
-        DistributedCheckpointManager(source.parent).load_model_for_evaluation(
-            path=source, model=wrapped_world,
-            expected=ResumeExpectations(
-                step=source_step, run_lineage=stage0_runtime["run"]["lineage"],
-                runtime_config_sha256=stage0_sha,
-                data_closure_sha256=stage0_runtime["bindings"]["data_closure_sha256"],
-                model_contract_sha256=stage0_runtime["bindings"]["model_contract_sha256"],
-                world_size=context.world_size,
-                shard_degree=int(stage0_runtime["runtime_profile"]["distributed"]["shard_degree"]),
-                distributed_strategy=strategy.strategy,
-                global_batch_size=int(stage0_runtime["runtime_profile"]["train"]["global_batch_size"]),
-                topology_contract_sha256=str(json.loads((Path(stage0_runtime["run"]["output_root"]) / "run_contract.json").read_text())["topology_contract_sha256"]),
-            ),
+        source_manager = DistributedCheckpointManager(source.parent)
+        source_expectations = _stage0_expectations(
+            step=source_step,
+            runtime=stage0_runtime,
+            runtime_sha=stage0_sha,
+            world_size=context.world_size,
+        )
+        source_inspection = source_manager.inspect_committed_collective(
+            path=source, expected=source_expectations, require_exact=True
         )
         for parameter in wrapped_world.parameters():
             parameter.requires_grad_(False)
@@ -328,10 +517,42 @@ def main() -> None:
         output_root = Path(stage1["run"]["output_root"])
         manager = DistributedCheckpointManager(output_root / "checkpoints")
         start = 0
+        resume_expectations = None
+        stage1_source = None
         if args.resume:
             start = int(args.resume.name.split("_")[1])
+            resume_expectations = _expectations(
+                step=start,
+                stage1=stage1,
+                stage1_sha=stage1_sha,
+                runtime=stage0_runtime,
+                world_size=context.world_size,
+            )
+            stage1_source = manager.inspect_committed_collective(
+                path=args.resume,
+                expected=resume_expectations,
+                require_exact=True,
+            )
+        planner_parameter_count = sum(
+            int(parameter.numel()) for parameter in planner.parameters()
+        )
+        launch_path, launch_sha, _run_contract = _prepare_stage1_launch(
+            stage1=stage1,
+            stage1_sha=stage1_sha,
+            stage0=stage0_runtime,
+            stage0_sha=stage0_sha,
+            context=context,
+            planner_parameter_count=planner_parameter_count,
+            source_checkpoint=stage1_source,
+            launch_kind="fresh" if stage1_source is None else "exact_resume",
+        )
+        source_manager.load_model_for_evaluation(
+            path=source, model=wrapped_world, expected=source_expectations
+        )
+        if args.resume:
+            assert resume_expectations is not None
             _metadata, progress = manager.load(path=args.resume, model=planner, optimizer=optimizer,
-                expected=_expectations(step=start, stage1=stage1, stage1_sha=stage1_sha, runtime=stage0_runtime, world_size=context.world_size))
+                expected=resume_expectations)
             if int(progress.get("next_optimizer_step", -1)) != start:
                 raise ValueError("Stage1 exact resume sampler progress mismatch")
         total = int(stage1["run"]["total_steps"])
@@ -389,7 +610,9 @@ def main() -> None:
                         "topology_contract_sha256": _topology_sha(stage1, stage0_runtime),
                         "stage0_checkpoint_commit_sha256": source_commit_sha, "branch_index_sha256": stage1["branch"]["index_sha256"],
                         "rollout_audit_sha256": stage1["branch"]["rollout_audit_sha256"],
-                        "stage0_frozen": True, "planner_action_inputs": False, "imagined_rollout": "single_trained_K_only"},
+                        "stage0_frozen": True, "planner_action_inputs": False, "imagined_rollout": "single_trained_K_only",
+                        "launch_qualification_path": launch_path,
+                        "launch_qualification_sha256": launch_sha},
                     rank_state={"next_optimizer_step": completed})
         if context.is_rank0:
             final_checkpoint = output_root / "checkpoints" / checkpoint_name(stop)
@@ -403,6 +626,10 @@ def main() -> None:
                 "rollout_audit_sha256": stage1["branch"]["rollout_audit_sha256"],
                 "resumed_from_step": start,
                 "stage0_frozen": True, "planner_action_inputs": False,
+                "imagined_rollout": "single_trained_K_only",
+                "source_checkpoint": source_inspection,
+                "launch_qualification_path": launch_path,
+                "launch_qualification_sha256": launch_sha,
             })
     finally:
         destroy_distributed()

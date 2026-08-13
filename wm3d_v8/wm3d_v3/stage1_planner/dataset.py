@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import io
 import json
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,8 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-from wm3d_v3.data.manifest_contract import SHA256_RE, sha256_file
+from wm3d_v3.data.manifest_contract import SHA256_RE
+from wm3d_v3.stage1_planner.rollout_audit import read_regular_bytes
 
 
 BRANCH_SCHEMA = "wm3d_v8_unified_stage1_branch_v3"
@@ -55,15 +57,14 @@ def _sha(value: object, label: str) -> str:
     return text
 
 
-def _regular_sha(path: Path, expected: str, label: str) -> Path:
-    path = Path(path)
-    if path.is_symlink() or not path.is_file():
-        raise Stage1BranchError(f"{label} is not a regular file: {path}")
-    path = path.resolve(strict=True)
-    observed = sha256_file(path)
+def _regular_sha(path: Path, expected: str, label: str) -> tuple[Path, bytes]:
+    try:
+        path, payload, observed = read_regular_bytes(path, label)
+    except (OSError, ValueError) as error:
+        raise Stage1BranchError(str(error)) from error
     if observed != _sha(expected, f"{label} SHA"):
         raise Stage1BranchError(f"{label} SHA mismatch: {observed} != {expected}")
-    return path
+    return path, payload
 
 
 @dataclass(frozen=True)
@@ -142,9 +143,13 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
         self.cfg = cfg
         if cfg.split not in {"train", "val", "test"}:
             raise Stage1BranchError("Stage1 split is invalid")
-        index_path = _regular_sha(cfg.branch_index, cfg.branch_index_sha256, "branch index")
-        seal_path = _regular_sha(cfg.branch_seal, cfg.branch_seal_sha256, "branch seal")
-        seal = json.loads(seal_path.read_text(encoding="utf-8"))
+        index_path, index_payload = _regular_sha(
+            cfg.branch_index, cfg.branch_index_sha256, "branch index"
+        )
+        _seal_path, seal_payload = _regular_sha(
+            cfg.branch_seal, cfg.branch_seal_sha256, "branch seal"
+        )
+        seal = json.loads(seal_payload)
         required_seal = {
             "schema", "branch_index_path", "branch_index_sha256", "row_count",
             "row_count_by_split", "candidate_count", "horizon",
@@ -203,7 +208,7 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             "real_simulator_outcomes", "future_observation_leakage",
             "candidate_action_abi",
         }
-        for line_number, line in enumerate(index_path.read_text(encoding="utf-8").splitlines(), 1):
+        for line_number, line in enumerate(index_payload.decode("utf-8").splitlines(), 1):
             if not line.strip():
                 continue
             row = json.loads(line)
@@ -242,12 +247,12 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
                 raise Stage1BranchError("branch source-manifest binding mismatch")
             if row["adapter_contract_sha256"] != source_spec.adapter_contract_sha256:
                 raise Stage1BranchError("branch adapter binding mismatch")
-            receipt = _regular_sha(
+            receipt, receipt_payload = _regular_sha(
                 Path(row["generator_receipt_path"]),
                 row["generator_receipt_sha256"],
                 "candidate generator receipt",
             )
-            receipt_value = json.loads(receipt.read_text(encoding="utf-8"))
+            receipt_value = json.loads(receipt_payload)
             if (
                 not isinstance(receipt_value, dict)
                 or set(receipt_value) != GENERATOR_RECEIPT_FIELDS
@@ -272,8 +277,10 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
             )
             if any(value is not True for value in receipt_gates) or receipt_value.get("future_observation_leakage") is not False:
                 raise Stage1BranchError("candidate generator receipt gates did not pass")
-            payload = _regular_sha(Path(row["path"]), row["payload_sha256"], "branch payload")
-            row["path"] = str(payload)
+            payload_path, payload = _regular_sha(
+                Path(row["path"]), row["payload_sha256"], "branch payload"
+            )
+            row["path"] = str(payload_path)
             rows.append(row)
         if len(rows) != int(counts[cfg.split]):
             raise Stage1BranchError("branch seal row count differs from selected split")
@@ -294,7 +301,14 @@ class Stage1BranchDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[index]
         sample = dict(self.stage0_dataset[int(row["sample_index"])])
-        payload = torch.load(row["path"], map_location="cpu", weights_only=True)
+        payload_path, payload_bytes = _regular_sha(
+            Path(row["path"]), row["payload_sha256"], "branch payload"
+        )
+        if str(payload_path) != row["path"]:
+            raise Stage1BranchError("branch payload resolved path changed")
+        payload = torch.load(
+            io.BytesIO(payload_bytes), map_location="cpu", weights_only=True
+        )
         if not isinstance(payload, dict) or set(payload) != _BRANCH_KEYS:
             raise Stage1BranchError("branch payload tensor fields mismatch")
         if any(not isinstance(value, torch.Tensor) for value in payload.values()):

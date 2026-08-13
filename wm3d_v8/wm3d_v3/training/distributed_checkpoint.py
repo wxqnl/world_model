@@ -52,6 +52,7 @@ class ResumeExpectations:
     global_batch_size: int
     topology_contract_sha256: str
     allow_topology_reshard: bool = False
+    extra_immutable_metadata: Mapping[str, Any] | None = None
 
 
 def checkpoint_name(step: int) -> str:
@@ -307,6 +308,21 @@ def _validate_metadata(
         for name, value in exact.items()
         if metadata.get(name) != value
     ]
+    extra = expected.extra_immutable_metadata
+    if extra is not None:
+        if not isinstance(extra, Mapping):
+            errors.append("extra_immutable_metadata expectation must be a mapping")
+        else:
+            for name, value in extra.items():
+                if not isinstance(name, str) or not name:
+                    errors.append(
+                        "extra_immutable_metadata expectation keys must be "
+                        "non-empty strings"
+                    )
+                elif name not in metadata:
+                    errors.append(f"{name}: missing != {value!r}")
+                elif metadata[name] != value:
+                    errors.append(f"{name}: {metadata[name]!r} != {value!r}")
     saved_world_size = int(metadata.get("world_size", -1))
     saved_shard_degree = int(metadata.get("shard_degree", -1))
     topology_changed = saved_world_size != int(expected.world_size)
@@ -586,6 +602,41 @@ class DistributedCheckpointManager:
             "saved_shard_degree": int(metadata["shard_degree"]),
             "resume_mode": resume_mode,
         }
+
+    def inspect_committed_collective(
+        self,
+        *,
+        path: Path,
+        expected: ResumeExpectations,
+        require_exact: bool = False,
+    ) -> dict[str, Any]:
+        """Broadcast one rank-0 committed-control inspection verdict."""
+
+        if not dist.is_initialized():
+            raise CheckpointIntegrityError(
+                "distributed checkpoint inspection requires process group"
+            )
+        verdict: list[Any] = [None]
+        if dist.get_rank() == 0:
+            try:
+                source = self.inspect_committed(path=path, expected=expected)
+                if require_exact and source["resume_mode"] != "exact":
+                    raise CheckpointIntegrityError(
+                        "checkpoint inspection requires exact topology"
+                    )
+                verdict[0] = {"ok": True, "source": source}
+            except Exception as exc:
+                verdict[0] = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+        dist.broadcast_object_list(verdict, src=0)
+        if not verdict[0]["ok"]:
+            raise CheckpointIntegrityError(
+                f"checkpoint inspection failed: {verdict[0]}"
+            )
+        return dict(verdict[0]["source"])
 
     def load(
         self,
