@@ -206,6 +206,7 @@ class _StreamingEpisodeCache:
         self.evicted_episodes = 0
         self.prepare_seconds = 0.0
         self.encode_seconds = 0.0
+        self._bootstrap_existing()
 
     def task_for_episode(self, source: str, episode_id: str) -> CacheTask:
         try:
@@ -224,6 +225,27 @@ class _StreamingEpisodeCache:
                 raise StreamingRawError(f"streaming LRU payload is missing: {path}")
             total += int(path.stat().st_size)
         return total
+
+    def _bootstrap_existing(self) -> None:
+        fragments = self.root / "episode_index_fragments"
+        if not fragments.is_dir() or fragments.is_symlink():
+            return
+        discovered: list[tuple[int, str, CacheEpisodeEntry, int]] = []
+        for fragment in fragments.glob("*.jsonl"):
+            task = self.tasks.get(fragment.stem)
+            if task is None:
+                raise StreamingRawError(
+                    "streaming LRU contains an episode outside the sealed task manifest"
+                )
+            entry = _episode_row(fragment)
+            if entry.episode_id != task.episode_id or entry.source != task.source:
+                raise StreamingRawError("streaming LRU fragment/task identity mismatch")
+            size = self._entry_bytes(self.root, entry)
+            discovered.append((fragment.stat().st_mtime_ns, task.task_id, entry, size))
+        for _mtime, task_id, entry, size in sorted(discovered):
+            self._entries[task_id] = (entry, size)
+        if self._entries:
+            self._trim(protected="")
 
     def _load_existing(self, task: CacheTask) -> CacheEpisodeEntry | None:
         fragment = self.root / "episode_index_fragments" / f"{task.task_id}.jsonl"
@@ -343,9 +365,12 @@ class _StreamingEpisodeCache:
     def ensure(self, task: CacheTask) -> CacheEpisodeEntry:
         cached = self._entries.pop(task.task_id, None)
         if cached is not None:
+            entry = self._load_existing(task)
+            if entry is None:
+                raise StreamingRawError("streaming LRU entry disappeared")
             self.cache_hits += 1
-            self._entries[task.task_id] = cached
-            return cached[0]
+            self._entries[task.task_id] = (entry, cached[1])
+            return entry
         started = time.perf_counter()
         entry = self._load_existing(task)
         if entry is None:
