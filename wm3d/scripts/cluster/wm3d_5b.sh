@@ -479,9 +479,11 @@ EOF
   status)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     args=(--allow-incomplete --data-profile "${DATA_PROFILE}" --task-manifest "${TASK_MANIFEST}" \
-      --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
-      --window-index "${WINDOW_INDEX}" --window-seal "${WINDOW_SEAL}" \
+      --episode-index "${EPISODE_INDEX}" --window-index "${WINDOW_INDEX}" \
       --runtime "${RUNTIME_YAML}" --run-root "${RUN_ROOT}")
+    if [[ "${WM3D_DATA_MODE}" == episode_cache ]]; then
+      args+=(--episode-seal "${EPISODE_SEAL}" --window-seal "${WINDOW_SEAL}")
+    fi
     [[ ! -f "${EVAL_OUTPUT}" ]] || args+=(--eval "${EVAL_OUTPUT}")
     "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_5b_run.py" "${args[@]}"
     ;;
@@ -496,13 +498,16 @@ EOF
       expected_step=$(step_from_checkpoint "${checkpoint}")
       eval_receipt=${2:-$(eval_output_for_step "${expected_step}")}
     fi
-    "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_5b_run.py" \
-      --data-profile "${DATA_PROFILE}" --task-manifest "${TASK_MANIFEST}" \
-      --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
-      --window-index "${WINDOW_INDEX}" --window-seal "${WINDOW_SEAL}" \
+    report_args=(--data-profile "${DATA_PROFILE}" --task-manifest "${TASK_MANIFEST}" \
+      --episode-index "${EPISODE_INDEX}" --window-index "${WINDOW_INDEX}" \
       --runtime "${RUNTIME_YAML}" --run-root "${RUN_ROOT}" \
       --expected-step "${expected_step}" --checkpoint "${checkpoint}" \
-      --eval "${eval_receipt}" --require-complete
+      --eval "${eval_receipt}" --require-complete)
+    if [[ "${WM3D_DATA_MODE}" == episode_cache ]]; then
+      report_args+=(--episode-seal "${EPISODE_SEAL}" --window-seal "${WINDOW_SEAL}")
+    fi
+    "${PYTHON_BIN}" "${ROOT}/scripts/tools/report_5b_run.py" \
+      "${report_args[@]}"
     ;;
   *) usage; exit 2 ;;
 esac

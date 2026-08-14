@@ -370,6 +370,31 @@ class _StreamingEpisodeCache:
         }
 
 
+_MANAGER_REGISTRY: dict[tuple[str, str, str, int], _StreamingEpisodeCache] = {}
+
+
+def _shared_manager(
+    *,
+    closure: Mapping[str, Any],
+    profile: DataProfile,
+    device: torch.device,
+    rank: int,
+) -> _StreamingEpisodeCache:
+    key = (
+        str(closure["metadata_seal_sha256"]),
+        str(closure["lru_root"]),
+        str(torch.device(device)),
+        int(rank),
+    )
+    manager = _MANAGER_REGISTRY.get(key)
+    if manager is None:
+        manager = _StreamingEpisodeCache(
+            closure=closure, profile=profile, device=device, rank=rank
+        )
+        _MANAGER_REGISTRY[key] = manager
+    return manager
+
+
 class StreamingRawDataset(UnifiedCacheDataset):
     """Window dataset backed by a bounded rank-local just-in-time cache."""
 
@@ -407,11 +432,8 @@ class StreamingRawDataset(UnifiedCacheDataset):
         }
         if len(by_thin_feature) != len(episode_index):
             raise CacheDataError("streaming metadata feature shards are not unique")
-        self._manager = _StreamingEpisodeCache(
-            closure=closure,
-            profile=data_profile,
-            device=device,
-            rank=rank,
+        self._manager = _shared_manager(
+            closure=closure, profile=data_profile, device=device, rank=rank
         )
         self._task_id_by_feature: dict[str, str] = {}
         for relative, (source, episode_id) in by_thin_feature.items():
@@ -482,7 +504,7 @@ class StreamingRawDataset(UnifiedCacheDataset):
             (episode.robot_shard, episode.robot_sha256),
             (episode.rgb_pack, episode.rgb_pack_sha256),
         ):
-            self.shards.register(relative, digest)
+            self.shards.register(relative, digest, verified=True)
         entry = CacheIndexEntry(
             sample_id=thin.sample_id,
             source=thin.source,

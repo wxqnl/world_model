@@ -244,6 +244,53 @@ worker 可重入。任务中断后用完全相同的 worker count 重跑，已�
 ./run_wm3d.sh 5b status "$SITE"
 ```
 
+### 4.1 磁盘不足时直接从原始数据训练
+
+如果无法为 OXE 替代组合准备约 108 TB 的完整视觉 cache，可以把 site 文件切换为：
+
+```bash
+WM3D_DATA_MODE=streaming_raw
+STREAMING_METADATA_ROOT=/shared/wm3d/streaming_metadata/native_p144
+STREAMING_LRU_ROOT=/local_nvme/wm3d_streaming_lru
+STREAMING_LRU_GIB_PER_RANK=64
+STREAMING_METADATA_WORKERS=32
+STREAMING_ENCODE_BATCH_FRAMES=16
+STREAMING_DECODE_WORKERS=4
+```
+
+`STREAMING_METADATA_ROOT` 放共享存储，保存时间戳、动作、状态、任务向量和窗口索引；它不保存
+VGGT 视觉 token、depth、point 或 RGB pack。`STREAMING_LRU_ROOT` 必须放每个节点的本地 NVMe，
+每个 rank 最多使用 64 GiB，因此默认上限为每节点 512 GiB、8 节点约 4 TiB。实际占用不会超过
+正在使用的 episode 数量；空间更紧时可降到 32 GiB/rank，但 episode 切换会更频繁。
+
+下载、adapter audit、inventory、data profile 和 task bank 与完整 cache 模式相同。生成任务后执行：
+
+```bash
+./run_wm3d.sh 5b task-bank "$SITE"
+./run_wm3d.sh 5b cache-plan "$SITE"
+./run_wm3d.sh 5b streaming-prepare "$SITE"
+./run_wm3d.sh 5b runtime "$SITE"
+```
+
+此模式不再运行 `cache-worker`、`cache-seal`、`window` 和 `normalization`；
+`streaming-prepare` 一次性生成这些步骤所需的轻量 metadata、窗口和归一化统计。训练首次访问
+一个 episode 时，从原始视频解码并用冻结 VGGT 生成与普通 cache 完全相同的量化张量；同一
+episode 的后续窗口直接命中本地 LRU。采样器按 episode 连续取窗口，避免每个 batch 都重复
+解码。训练、checkpoint、恢复和评测命令不变。
+
+训练日志中会增加 `streaming_raw` 字段：
+
+- `generated_episodes`：本进程从原始数据生成的 episode 数；
+- `cache_hits`：命中本地 LRU 的次数；
+- `evicted_episodes`：因容量上限被删除的 episode 数；
+- `prepare_seconds`、`encode_seconds`：累计解码准备和 VGGT 编码时间；
+- `resident_bytes`、`resident_episodes`：当前 LRU 占用。
+
+性能优先级依次是：本地 NVMe、足够大的 episode LRU、每 GPU 4 个解码线程和
+`batch_frames=16`。如果 `prepare_seconds` 高于 `encode_seconds`，增加 CPU 与视频读取带宽；
+如果 VGGT OOM，先把 `STREAMING_ENCODE_BATCH_FRAMES` 调到 12 或 8。raw 模式会比预计算
+cache 慢，但不会因缺少 100 TB 级视觉 cache 而无法开训。
+
 ## 5. 1K 集群验证
 
 1K canary 使用与正式训练相同的 64 卡拓扑，验证通信、5B 参数分片、前向、反向、梯度、

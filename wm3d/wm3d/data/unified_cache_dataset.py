@@ -76,7 +76,9 @@ class _ShardStore:
         self._resolved: dict[str, Path] = {}
         self._verified: set[str] = set()
 
-    def register(self, relative: str, expected_sha256: str) -> None:
+    def register(
+        self, relative: str, expected_sha256: str, *, verified: bool = False
+    ) -> None:
         """Register a lazily materialized shard without weakening SHA checks."""
 
         previous = self.expected_sha.get(relative)
@@ -85,6 +87,8 @@ class _ShardStore:
                 f"cache shard {relative} changed digest within one dataset process"
             )
         self.expected_sha[relative] = expected_sha256
+        if verified:
+            self._verified.add(relative)
 
     def path(self, relative: str) -> Path:
         path = self._resolved.get(relative)
