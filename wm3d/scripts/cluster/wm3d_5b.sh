@@ -282,6 +282,11 @@ PY
     ;;
   plan)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    if [[ "${WM3D_DATA_MODE}" == streaming_raw ]]; then
+      data_steps="task-bank -> cache-plan -> streaming-prepare"
+    else
+      data_steps="task-bank -> cache-plan -> cache-worker[*] -> cache-seal -> window -> normalization"
+    fi
     cat <<EOF
 WM3D 5B site plan
   preset:     ${WM3D_5B_PRESET}
@@ -300,8 +305,7 @@ WM3D 5B site plan
 
 Order:
   env -> doctor -> lock -> download -> adapter/inventory approval
-  -> task-bank -> cache-plan -> cache-worker[*] -> cache-seal
-  -> window -> normalization -> runtime -> preflight
+  -> ${data_steps} -> runtime -> preflight
   -> train/resume milestones: ${MILESTONES}
   -> eval -> verify
 EOF
@@ -360,6 +364,8 @@ EOF
     ;;
   cache-worker)
     [[ $# -eq 3 ]] || { usage; exit 2; }
+    [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
+      die "streaming_raw 不运行 cache-worker；请运行 streaming-prepare"
     worker_index=$1
     worker_count=$2
     local_gpu=$3
@@ -384,6 +390,8 @@ EOF
     ;;
   cache-seal)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
+      die "streaming_raw 不运行 cache-seal；请运行 streaming-prepare"
     "${ENTRY}" cache-seal --task-manifest "${TASK_MANIFEST}" \
       --receipt-root "${CACHE_ROOT}/receipts" \
       --episode-index-fragment-root "${CACHE_ROOT}/episode_index_fragments" \
@@ -410,6 +418,8 @@ EOF
     ;;
   window)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
+      die "streaming_raw 的 window 已由 streaming-prepare 生成"
     "${ENTRY}" window --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
       --cache-root "${CACHE_ROOT}" --data-profile "${DATA_PROFILE}" \
       --model-profile "${MODEL_PROFILE}" --output-index "${WINDOW_INDEX}" \
@@ -417,6 +427,8 @@ EOF
     ;;
   normalization)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
+      die "streaming_raw 的 normalization 已由 streaming-prepare 生成"
     window_sha=$(sha256 "${WINDOW_INDEX}")
     "${ENTRY}" normalization --data-profile "${DATA_PROFILE}" \
       --model-profile "${MODEL_PROFILE}" --window-index "${WINDOW_INDEX}" \
