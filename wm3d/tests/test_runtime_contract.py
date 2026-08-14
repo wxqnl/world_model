@@ -36,6 +36,9 @@ def _load_source_lock(name: str) -> dict:
     [
         ("smoke_2gpu_fsdp2.yaml", 2, 2),
         ("h100_8_fsdp2.yaml", 8, 8),
+        ("h200_64_fsdp2.yaml", 64, 8),
+        ("h200_64_fsdp2_canary1k.yaml", 64, 8),
+        ("h200_64_fsdp2_validation100k.yaml", 64, 8),
         ("h200_128_fsdp2.yaml", 128, 8),
         ("h200_128_fsdp2_canary1k.yaml", 128, 8),
         ("h200_128_fsdp2_validation100k.yaml", 128, 8),
@@ -65,14 +68,15 @@ def test_runtime_does_not_contain_model_or_dataset_branch() -> None:
     assert "robocasa" not in serialized.lower()
 
 
-def test_h200_formal_profile_preserves_v7_scaling_budget() -> None:
-    value = _load("h200_128_fsdp2.yaml")
+def test_h200_64_formal_profile_preserves_scaling_budget() -> None:
+    value = _load("h200_64_fsdp2.yaml")
     train = value["train"]
     optimizer = value["optimizer"]
     schedule = value["schedule"]
-    assert value["name"] == "h200_128_fsdp2_formal600k"
+    assert value["name"] == "h200_64_fsdp2_formal600k"
     assert train["total_steps"] == 600000
     assert train["global_batch_size"] == 128
+    assert train["gradient_accumulation"] == 2
     assert train["seed"] == 271828
     assert train["validation_seed"] == 314159
     assert train["validate_every"] == 5000
@@ -93,11 +97,11 @@ def test_h200_formal_profile_preserves_v7_scaling_budget() -> None:
     assert resources["minimum_allreduce_gbps"] == pytest.approx(4.0)
 
 
-def test_h200_canary1k_preserves_v7_cluster_gate_without_a_trainer_fork() -> None:
-    value = _load("h200_128_fsdp2_canary1k.yaml")
+def test_h200_64_canary1k_uses_the_same_cluster_gate() -> None:
+    value = _load("h200_64_fsdp2_canary1k.yaml")
     validate_runtime_profile(value)
     train = value["train"]
-    assert value["name"] == "h200_128_fsdp2_canary1k"
+    assert value["name"] == "h200_64_fsdp2_canary1k"
     assert train["total_steps"] == 1000
     assert train["global_batch_size"] == 128
     assert train["seed"] == 271828
@@ -114,18 +118,18 @@ def test_resource_contract_is_strict_and_optional_for_smaller_topologies() -> No
     smoke = _load("smoke_2gpu_fsdp2.yaml")
     assert "resources" not in smoke
     validate_runtime_profile(smoke)
-    formal = copy.deepcopy(_load("h200_128_fsdp2.yaml"))
+    formal = copy.deepcopy(_load("h200_64_fsdp2.yaml"))
     formal["resources"]["minimum_shm_bytes"] = 0
     with pytest.raises(RuntimeContractError, match="minimum_shm_bytes"):
         validate_runtime_profile(formal)
-    formal = copy.deepcopy(_load("h200_128_fsdp2.yaml"))
+    formal = copy.deepcopy(_load("h200_64_fsdp2.yaml"))
     formal["resources"]["unexpected"] = 1
     with pytest.raises(RuntimeContractError, match="resource fields mismatch"):
         validate_runtime_profile(formal)
 
 
 def test_h200_validation_profile_is_explicitly_not_formal() -> None:
-    value = _load("h200_128_fsdp2_validation100k.yaml")
+    value = _load("h200_64_fsdp2_validation100k.yaml")
     assert value["name"].endswith("validation100k")
     assert value["train"]["total_steps"] == 100000
     assert value["resources"]["minimum_ib_rate_gbps"] == pytest.approx(400.0)

@@ -210,7 +210,8 @@ distributed:
 
 - 1B 小规模验证可使用 DDP。
 - 1B 或 5B 都可使用 FSDP2；策略不由模型名字决定。
-- 5B/128×H200 正式配置使用 FSDP2/HSDP、BF16、逐层 activation checkpoint。
+- 5B 默认 64×H200 正式配置使用 FSDP2/HSDP、BF16、逐层 activation checkpoint；
+  128 卡 profile 保留为资源充足时的可选扩展。
 - optimizer 与 model 通过 Distributed Checkpoint 分片保存，不在 rank0 聚合完整 state dict。
 - checkpoint 使用临时目录、分片写入、全局 barrier、manifest、`COMMITTED.json` 原子提交。
 - exact resume 恢复 model、optimizer、scheduler、step、RNG、sampler epoch/cursor、数据 closure 和配置 SHA。
@@ -298,7 +299,7 @@ WM3D 可以交付 5B 集群前，至少完成以下验收：
 4. 粗频数据不能产生任何 fine policy label，突变测试必须失败。
 5. 1B 两卡 FSDP2 完成真实 optimizer step、分片 checkpoint 和独立进程 exact resume；5B 完成真实 optimizer step、committed DCP 和独立进程重载 eval。
 6. DDP 与 FSDP2 的分布式 owner、梯度归约、DCP exact-resume 回归通过；目标集群另做同批次短程数值对齐。
-7. 128 卡拓扑、通信 canary、checkpoint 带宽和 dataloader 吞吐在目标集群达到预算。
+7. 默认 64 卡拓扑、通信 canary、checkpoint 带宽和 dataloader 吞吐在目标集群达到预算。
 8. Stage0 的 RGB/depth/point/native/action/proprio 梯度均 finite 且非零。
 9. Stage1 能消费同一 Stage0 checkpoint，并保持 action-blind rollout 合同。
 10. 从空服务器按中文 README 执行 `smoke-real`，无需修改源码或手工补路径，且总 receipt 绑定代码 commit 与全部输入/输出 SHA。

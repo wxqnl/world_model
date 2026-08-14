@@ -23,6 +23,10 @@ from wm3d.data.manifest_contract import load_data_profile
 from wm3d.data.step_sampler import StepAddressedBatchSampler
 from wm3d.data.unified_cache_dataset import UnifiedCacheDataset
 from wm3d.data.grouped_normalization import GroupedRobotNormalizer
+from wm3d.data.formal_cache_adapter import (
+    FORMAL_CACHE_CLOSURE_SCHEMA,
+    build_formal_cache_dataset,
+)
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.native_world_model import NativeWorldModel
 from wm3d.training.distributed_checkpoint import (
@@ -410,8 +414,10 @@ def _forward(model: torch.nn.Module, batch: Mapping[str, torch.Tensor]) -> Mappi
 
 def _build_mixed_dataset(
     runtime: Mapping[str, Any], *, split: str, profile: Any | None = None
-) -> tuple[UnifiedCacheDataset, Any]:
+) -> tuple[Any, Any]:
     closure = runtime["data_closure"]
+    if closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
+        return build_formal_cache_dataset(runtime, split=split, profile=profile)
     if profile is None:
         profile = load_data_profile(
             Path(closure["data_profile_path"]), verify_source_manifests=True
@@ -486,7 +492,7 @@ def _collate_and_trim(samples: list[Mapping[str, Any]]) -> dict[str, Any]:
 
 
 def _make_loader(
-    dataset: UnifiedCacheDataset,
+    dataset: Any,
     profile: Any,
     runtime_profile: Mapping[str, Any],
     *,
@@ -529,7 +535,7 @@ def _make_loader(
 @torch.no_grad()
 def _validate(
     model: torch.nn.Module,
-    dataset: UnifiedCacheDataset,
+    dataset: Any,
     profile: Any,
     runtime_profile: Mapping[str, Any],
     objective: Any,

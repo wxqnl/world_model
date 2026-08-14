@@ -263,7 +263,7 @@ grouped normalization 只读 train split 的真实 window，按 embodiment/group
 ## 9. Runtime、canary、恢复和 eval
 
 ```bash
-RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_canary1k.yaml
+RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_canary1k.yaml
 ./run_wm3d.sh runtime \
   --model "$MODEL_PROFILE" --data "$WORK/public_robot_6106h.yaml" \
   --runtime "$RUNTIME_PROFILE" --objective configs/objective/stage0_native.yaml \
@@ -283,10 +283,10 @@ RUNTIME_PROFILE=configs/runtime/h200_128_fsdp2_canary1k.yaml
 
 正式大作业前，用相同链路配 `native_1b + smoke_2gpu_fsdp2` 跑真实两卡 canary：0→编号 checkpoint，退出进程，再从该目录 exact resume；随后运行统一 offline eval。训练/eval 的 torchrun 命令见根 README。checkpoint authority 只能是原子提交的 `step_XXXXXXXX/`。
 
-目标 128×H200 集群不能从模板直接启动 600K。先用
-`h200_128_fsdp2_canary1k.yaml` 完成 1K、编号 DCP、独立进程 exact resume 和固定验证；
-再用 `h200_128_fsdp2_validation100k.yaml` 做 100K 扩展验证；两者通过后才物化
-`h200_128_fsdp2.yaml` 的 600K 正式 runtime。三个 profile 都要求新鲜 resource receipt：
+默认 64×H200 集群不能从模板直接启动 600K。先用
+`h200_64_fsdp2_canary1k.yaml` 完成 1K、编号 DCP、独立进程 exact resume 和固定验证；
+再用 `h200_64_fsdp2_validation100k.yaml` 做 100K 扩展验证；两者通过后才物化
+`h200_64_fsdp2.yaml` 的 600K 正式 runtime。三个 profile 都要求新鲜 resource receipt：
 GPU 型号/HBM、ECC、GPU 空闲、节点内 NVLink clique、IB、ulimit、`/dev/shm`、数据/输出
 磁盘余量和真实 all-reduce 带宽任一不达标即拒绝启动。
 

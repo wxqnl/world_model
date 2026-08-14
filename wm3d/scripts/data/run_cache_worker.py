@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any, Mapping
 
 import numpy as np
@@ -41,6 +45,18 @@ from wm3d.encoders.native_vggt import NativeVGGTConfig, NativeVGGTEncoder
 
 class CacheWorkerError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class PreparedTask:
+    task: Any
+    frames: UnifiedFrameCache | None
+    robot_tensors: Mapping[str, torch.Tensor]
+    source_evidence: Mapping[str, Any]
+    images: torch.Tensor
+    view_mask: torch.Tensor
+    prepare_seconds: float
+    encode_seconds: float
 
 
 def _strict_encoder(path: Path) -> NativeVGGTConfig:
@@ -138,21 +154,19 @@ def _encode(
     return {name: torch.cat(parts, dim=0) for name, parts in output.items()}
 
 
-def _process_task(
+def _prepare_task(
     *,
     task: Any,
     source: Any,
     adapter: Any,
     profile: Any,
-    encoder: NativeVGGTEncoder,
     task_store: TaskEmbeddingStore,
-    device: torch.device,
-    batch_frames: int,
-    cache_root: Path,
     asset_verifier: VerifiedAssetStore,
     encoder_input_size: int,
     task_bank_index_sha256: str,
-) -> dict[str, Any]:
+    decode_workers: int,
+) -> PreparedTask:
+    started = time.perf_counter()
     accessor = open_episode_accessor(
         task=task,
         source_root=source.raw_root,
@@ -180,40 +194,10 @@ def _process_task(
         canonical_view_slots=slots,
         selected_observation_rows=selected_rows,
         asset_verifier=asset_verifier,
+        decode_workers=decode_workers,
     )
     images, view_mask = _view_batch(
         decoded=decoded, slots=slots, input_size=encoder_input_size
-    )
-    encoded = _encode(
-        encoder=encoder,
-        images=images,
-        view_mask=view_mask,
-        device=device,
-        batch_frames=batch_frames,
-    )
-    confidence = encoded["geometry_confidence"].float()
-    depth = encoded["depth"]
-    point = encoded["point"]
-    real_patch = encoded["view_mask"][..., None]
-    geometry_valid = confidence > 0
-    depth_mask = real_patch & geometry_valid & torch.isfinite(depth) & (depth > 0)
-    point_mask = real_patch & geometry_valid & torch.isfinite(point).all(dim=-1)
-    world_mask = (real_patch & geometry_valid).any(dim=1)
-    camera_mask = encoded["view_mask"] & torch.isfinite(encoded["camera_pose"]).all(dim=-1)
-    frames = UnifiedFrameCache(
-        source_observation_rows=torch.from_numpy(selected_rows),
-        frame_times_s=torch.from_numpy(observation_clock[selected_rows].copy()),
-        view_tokens=encoded["view_tokens"],
-        rgb=encoded["rgb"],
-        view_mask=encoded["view_mask"],
-        world_token_mask=world_mask,
-        depth=depth,
-        depth_mask=depth_mask,
-        point=point,
-        point_mask=point_mask,
-        camera_pose=encoded["camera_pose"],
-        camera_pose_mask=camera_mask,
-        geometry_confidence=encoded["geometry_confidence"],
     )
     embodiment = profile.embodiments[task.embodiment]
     robot = build_episode_robot_cache(
@@ -237,10 +221,9 @@ def _process_task(
             for item in profile.embodiments.values()
         ),
     )
-    return write_cache_task(
+    return PreparedTask(
         task=task,
-        cache_root=cache_root,
-        frames=frames,
+        frames=None,
         robot_tensors=robot.as_tensors(),
         source_evidence={
             "observation_clock_sha256": canonical_timestamp_sha256(observation_clock),
@@ -248,6 +231,120 @@ def _process_task(
             "videos": video_evidence,
             "task_bank_index_sha256": task_bank_index_sha256,
         },
+        images=images,
+        view_mask=view_mask,
+        prepare_seconds=time.perf_counter() - started,
+        encode_seconds=0.0,
+    )
+
+
+def _encode_task(
+    prepared: PreparedTask,
+    *,
+    encoder: NativeVGGTEncoder,
+    device: torch.device,
+    batch_frames: int,
+) -> PreparedTask:
+    started = time.perf_counter()
+    encoded = _encode(
+        encoder=encoder,
+        images=prepared.images,
+        view_mask=prepared.view_mask,
+        device=device,
+        batch_frames=batch_frames,
+    )
+    confidence = encoded["geometry_confidence"].float()
+    depth = encoded["depth"]
+    point = encoded["point"]
+    real_patch = encoded["view_mask"][..., None]
+    geometry_valid = confidence > 0
+    depth_mask = real_patch & geometry_valid & torch.isfinite(depth) & (depth > 0)
+    point_mask = real_patch & geometry_valid & torch.isfinite(point).all(dim=-1)
+    world_mask = (real_patch & geometry_valid).any(dim=1)
+    camera_mask = encoded["view_mask"] & torch.isfinite(
+        encoded["camera_pose"]
+    ).all(dim=-1)
+    frames = UnifiedFrameCache(
+        source_observation_rows=torch.from_numpy(
+            np.asarray(prepared.source_evidence["selected_source_rows"], dtype=np.int64)
+        ),
+        frame_times_s=prepared.robot_tensors["observation_times_s"][
+            torch.as_tensor(
+                prepared.source_evidence["selected_source_rows"], dtype=torch.long
+            )
+        ].to(torch.float64),
+        view_tokens=encoded["view_tokens"],
+        rgb=encoded["rgb"],
+        view_mask=encoded["view_mask"],
+        world_token_mask=world_mask,
+        depth=depth,
+        depth_mask=depth_mask,
+        point=point,
+        point_mask=point_mask,
+        camera_pose=encoded["camera_pose"],
+        camera_pose_mask=camera_mask,
+        geometry_confidence=encoded["geometry_confidence"],
+    )
+    encoded_prepared = PreparedTask(
+        task=prepared.task,
+        frames=frames,
+        robot_tensors=prepared.robot_tensors,
+        source_evidence=prepared.source_evidence,
+        images=torch.empty(0),
+        view_mask=torch.empty(0, dtype=torch.bool),
+        prepare_seconds=prepared.prepare_seconds,
+        encode_seconds=time.perf_counter() - started,
+    )
+    return encoded_prepared
+
+
+def _write_task(
+    prepared: PreparedTask, *, cache_root: Path
+) -> tuple[dict[str, Any], float]:
+    started = time.perf_counter()
+    if prepared.frames is None:
+        raise CacheWorkerError("prepared task has no encoded frames")
+    result = write_cache_task(
+        task=prepared.task,
+        cache_root=cache_root,
+        frames=prepared.frames,
+        robot_tensors=prepared.robot_tensors,
+        source_evidence=prepared.source_evidence,
+    )
+    return result, time.perf_counter() - started
+
+
+def _finish_write(
+    future: Future[tuple[dict[str, Any], float]], *,
+    prepared: PreparedTask,
+    worker_index: int,
+    ordinal: int,
+    assigned: int,
+    counters: dict[str, int],
+    worker_started: float,
+) -> None:
+    result, write_seconds = future.result()
+    counters["published"] += int(result["status"] == "published")
+    counters["already_complete"] += int(result["status"] == "already_complete")
+    counters["finished"] += 1
+    frames = int(result.get("frames", 0))
+    print(
+        json.dumps(
+            {
+                "worker": worker_index,
+                "ordinal": ordinal,
+                "assigned": assigned,
+                **counters,
+                "task_id": prepared.task.task_id,
+                "frames": frames,
+                "prepare_seconds": round(prepared.prepare_seconds, 3),
+                "encode_seconds": round(prepared.encode_seconds, 3),
+                "write_seconds": round(write_seconds, 3),
+                "elapsed_seconds": round(time.perf_counter() - worker_started, 3),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
     )
 
 
@@ -263,6 +360,18 @@ def main() -> None:
     parser.add_argument("--worker-count", type=int, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-frames", type=int, default=8)
+    parser.add_argument(
+        "--decode-workers",
+        type=int,
+        default=0,
+        help="每个 GPU worker 的视频解码线程数；0 表示读取 data profile。",
+    )
+    parser.add_argument(
+        "--writer-threads",
+        type=int,
+        default=0,
+        help="每个 GPU worker 的并行写盘线程数；0 表示读取 data profile。",
+    )
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
     if not 0 <= args.worker_index < args.worker_count or args.worker_count <= 0:
@@ -270,6 +379,14 @@ def main() -> None:
     if args.batch_frames <= 0:
         raise CacheWorkerError("batch-frames must be positive")
     profile = load_data_profile(args.data_profile, verify_source_manifests=True)
+    decode_workers = int(
+        args.decode_workers or profile.cache["decode_workers_per_gpu"]
+    )
+    writer_threads = int(
+        args.writer_threads or profile.cache["writer_threads_per_worker"]
+    )
+    if decode_workers <= 0 or writer_threads <= 0:
+        raise CacheWorkerError("decode/writer worker counts must be positive")
     sources = {item.name: item for item in profile.sources}
     adapters = {
         item.name: load_adapter_contract(
@@ -331,11 +448,49 @@ def main() -> None:
                 f"encoder/data representation {name} mismatch: "
                 f"{getattr(encoder_config, name)} != {expected}"
             )
-    device = torch.device(args.device)
-    encoder = NativeVGGTEncoder(encoder_config, device=str(device)).eval()
     task_encoder_digests = {task.task_encoder_contract_sha256 for task in tasks}
     if len(task_encoder_digests) != 1:
         raise CacheWorkerError("task plan mixes task encoder contracts")
+    worker_started = time.perf_counter()
+    pending: list[tuple[int, Any, Any]] = []
+    counters = {
+        "published": 0,
+        "already_complete": 0,
+        "failed": 0,
+        "finished": 0,
+    }
+    for ordinal, task in enumerate(selected, 1):
+        source = sources.get(task.source)
+        if source is None or source.embodiment != task.embodiment:
+            raise CacheWorkerError("task source/embodiment is absent from profile")
+        if AtomicTaskClaim(args.cache_root, task).completed():
+            counters["already_complete"] += 1
+            counters["finished"] += 1
+        else:
+            pending.append((ordinal, task, source))
+
+    if not pending:
+        elapsed = time.perf_counter() - worker_started
+        print(
+            json.dumps(
+                {
+                    "worker": args.worker_index,
+                    "assigned": len(selected),
+                    **counters,
+                    "decode_workers": decode_workers,
+                    "writer_threads": writer_threads,
+                    "batch_frames": args.batch_frames,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "tasks_per_second": 0.0,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return
+
+    device = torch.device(args.device)
+    encoder = NativeVGGTEncoder(encoder_config, device=str(device)).eval()
     task_store = TaskEmbeddingStore(
         root=args.task_bank_root,
         index_sha256=args.task_bank_index_sha256,
@@ -346,59 +501,135 @@ def main() -> None:
         expected_encoder_contract_sha256=next(iter(task_encoder_digests)),
     )
     asset_verifier = VerifiedAssetStore()
-    published = complete = failed = 0
-    for ordinal, task in enumerate(selected, 1):
-        try:
-            source = sources.get(task.source)
-            if source is None or source.embodiment != task.embodiment:
-                raise CacheWorkerError("task source/embodiment is absent from profile")
-            # Avoid decoding or loading raw robot arrays for receipts already
-            # proven complete.  write_cache_task repeats this check atomically.
-            if AtomicTaskClaim(args.cache_root, task).completed():
-                complete += 1
-                continue
-            result = _process_task(
-                task=task,
-                source=source,
-                adapter=adapters[task.source],
-                profile=profile,
-                encoder=encoder,
-                task_store=task_store,
-                device=device,
-                batch_frames=args.batch_frames,
-                cache_root=args.cache_root,
-                asset_verifier=asset_verifier,
-                encoder_input_size=encoder_config.input_rgb_size,
-                task_bank_index_sha256=args.task_bank_index_sha256,
-            )
-            published += int(result["status"] == "published")
-            complete += int(result["status"] == "already_complete")
-        except Exception as exc:
-            failed += 1
-            record = {
-                "worker": args.worker_index,
-                "task_id": task.task_id,
-                "type": type(exc).__name__,
-                "error": str(exc),
-            }
-            print(json.dumps(record, ensure_ascii=False, sort_keys=True), file=sys.stderr)
-            if args.fail_fast:
-                raise
-        print(
-            json.dumps(
-                {
-                    "worker": args.worker_index,
-                    "ordinal": ordinal,
-                    "assigned": len(selected),
-                    "published": published,
-                    "already_complete": complete,
-                    "failed": failed,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
+
+    def prepare(row: tuple[int, Any, Any]) -> tuple[int, PreparedTask]:
+        ordinal, task, source = row
+        return ordinal, _prepare_task(
+            task=task,
+            source=source,
+            adapter=adapters[task.source],
+            profile=profile,
+            task_store=task_store,
+            asset_verifier=asset_verifier,
+            encoder_input_size=encoder_config.input_rgb_size,
+            task_bank_index_sha256=args.task_bank_index_sha256,
+            decode_workers=decode_workers,
         )
-    if failed:
+
+    queued_writes: deque[
+        tuple[int, PreparedTask, Future[tuple[dict[str, Any], float]]]
+    ] = deque()
+    with (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="wm3d-prepare") as preparer,
+        ThreadPoolExecutor(
+            max_workers=writer_threads, thread_name_prefix="wm3d-writer"
+        ) as writer,
+    ):
+        next_prepared: Future[tuple[int, PreparedTask]] | None = (
+            preparer.submit(prepare, pending[0]) if pending else None
+        )
+        for position in range(len(pending)):
+            ordinal, task, _source = pending[position]
+            current_prepared = next_prepared
+            next_prepared = (
+                preparer.submit(prepare, pending[position + 1])
+                if position + 1 < len(pending)
+                else None
+            )
+            try:
+                if current_prepared is None:
+                    raise AssertionError("cache prepare pipeline lost its future")
+                prepared_ordinal, prepared = current_prepared.result()
+                if prepared_ordinal != ordinal or prepared.task.task_id != task.task_id:
+                    raise AssertionError("cache prepare pipeline changed task order")
+                encoded = _encode_task(
+                    prepared,
+                    encoder=encoder,
+                    device=device,
+                    batch_frames=args.batch_frames,
+                )
+                queued_writes.append(
+                    (
+                        ordinal,
+                        encoded,
+                        writer.submit(_write_task, encoded, cache_root=args.cache_root),
+                    )
+                )
+                if len(queued_writes) > writer_threads:
+                    done_ordinal, done_prepared, done_future = queued_writes.popleft()
+                    _finish_write(
+                        done_future,
+                        prepared=done_prepared,
+                        worker_index=args.worker_index,
+                        ordinal=done_ordinal,
+                        assigned=len(selected),
+                        counters=counters,
+                        worker_started=worker_started,
+                    )
+            except Exception as exc:
+                counters["failed"] += 1
+                print(
+                    json.dumps(
+                        {
+                            "worker": args.worker_index,
+                            "task_id": task.task_id,
+                            "type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                if args.fail_fast:
+                    raise
+        while queued_writes:
+            ordinal, prepared, future = queued_writes.popleft()
+            try:
+                _finish_write(
+                    future,
+                    prepared=prepared,
+                    worker_index=args.worker_index,
+                    ordinal=ordinal,
+                    assigned=len(selected),
+                    counters=counters,
+                    worker_started=worker_started,
+                )
+            except Exception as exc:
+                counters["failed"] += 1
+                print(
+                    json.dumps(
+                        {
+                            "worker": args.worker_index,
+                            "task_id": prepared.task.task_id,
+                            "type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
+                if args.fail_fast:
+                    raise
+    elapsed = time.perf_counter() - worker_started
+    print(
+        json.dumps(
+            {
+                "worker": args.worker_index,
+                "assigned": len(selected),
+                **counters,
+                "decode_workers": decode_workers,
+                "writer_threads": writer_threads,
+                "batch_frames": args.batch_frames,
+                "elapsed_seconds": round(elapsed, 3),
+                "tasks_per_second": round(len(pending) / elapsed, 4) if elapsed else 0.0,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if counters["failed"]:
         raise SystemExit(1)
 
 

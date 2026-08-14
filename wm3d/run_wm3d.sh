@@ -30,6 +30,7 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_wm3d.sh window <materialize_window_index.py 参数...>
   ./run_wm3d.sh normalization <build_grouped_normalization.py 参数...>
   ./run_wm3d.sh runtime <materialize_runtime.py 参数...>
+  ./run_wm3d.sh formal-runtime <materialize_formal_cache_runtime.py 参数...>
   ./run_wm3d.sh preflight <torchrun 参数...> -- --runtime <runtime.yaml>
   ./run_wm3d.sh train <torchrun 参数...> -- <训练参数...>
   ./run_wm3d.sh eval <torchrun 参数...> -- <评测参数...>
@@ -145,6 +146,7 @@ case "${command}" in
   window) exec "${PYTHON_BIN}" scripts/data/materialize_window_index.py "$@" ;;
   normalization) exec "${PYTHON_BIN}" scripts/data/build_grouped_normalization.py "$@" ;;
   runtime) exec "${PYTHON_BIN}" scripts/materialize_runtime.py "$@" ;;
+  formal-runtime) exec "${PYTHON_BIN}" scripts/materialize_formal_cache_runtime.py "$@" ;;
   preflight) torchrun_preflight_split "$@" ;;
   train) torchrun_split wm3d.training.pretrain "$@" ;;
   eval) torchrun_split wm3d.training.offline_eval "$@" ;;

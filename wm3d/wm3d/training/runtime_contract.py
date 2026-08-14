@@ -15,6 +15,11 @@ from wm3d.data.cache_tasks import (
     CACHE_WINDOW_SEAL_SCHEMA,
 )
 from wm3d.data.manifest_contract import SHA256_RE, load_data_profile, sha256_file
+from wm3d.data.formal_cache_adapter import (
+    FORMAL_CACHE_CLOSURE_SCHEMA,
+    FormalCacheError,
+    validate_formal_cache_closure,
+)
 from wm3d.models.model_factory import (
     validate_model_data_compatibility,
     validate_model_profile,
@@ -443,24 +448,45 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     )
     objective_config_from_mapping(objective["objective"])
     closure = value["data_closure"]
-    validate_data_closure(closure)
-    data_profile = load_data_profile(
-        Path(str(closure["data_profile_path"])), verify_source_manifests=False
-    )
-    validate_model_data_compatibility(model, data_profile)
-    window_seal = json.loads(
-        Path(str(closure["cache_seal_path"])).read_text(encoding="utf-8")
-    )
-    if window_seal["model_profile_sha256"] != canonical_sha256(model):
-        raise RuntimeContractError("window seal belongs to a different model profile")
-    sealed_model_path = Path(str(window_seal["model_profile_path"])).resolve(
-        strict=True
-    )
-    sealed_model = load_yaml(sealed_model_path)
-    if canonical_sha256(sealed_model) != window_seal["model_profile_sha256"]:
-        raise RuntimeContractError("window seal model profile file/content mismatch")
-    if sealed_model != model:
-        raise RuntimeContractError("materialized runtime model differs from window seal")
+    if closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
+        try:
+            receipt = validate_formal_cache_closure(closure)
+        except FormalCacheError as exc:
+            raise RuntimeContractError(str(exc)) from exc
+        representation = receipt["cache_representation"]
+        required = {
+            "T": 16,
+            "P": int(representation["spatial_tokens"]),
+            "K": 8,
+            "token_dim": int(representation["token_dim"]),
+            "task_dim": 2048,
+            "num_views": int(representation["num_views"]),
+            "rgb_size": int(representation["rgb_size"]),
+        }
+        for name, expected in required.items():
+            if int(model["model"][name]) != expected:
+                raise RuntimeContractError(
+                    f"formal cache/model {name} mismatch: {model['model'][name]} != {expected}"
+                )
+    else:
+        validate_data_closure(closure)
+        data_profile = load_data_profile(
+            Path(str(closure["data_profile_path"])), verify_source_manifests=False
+        )
+        validate_model_data_compatibility(model, data_profile)
+        window_seal = json.loads(
+            Path(str(closure["cache_seal_path"])).read_text(encoding="utf-8")
+        )
+        if window_seal["model_profile_sha256"] != canonical_sha256(model):
+            raise RuntimeContractError("window seal belongs to a different model profile")
+        sealed_model_path = Path(str(window_seal["model_profile_path"])).resolve(
+            strict=True
+        )
+        sealed_model = load_yaml(sealed_model_path)
+        if canonical_sha256(sealed_model) != window_seal["model_profile_sha256"]:
+            raise RuntimeContractError("window seal model profile file/content mismatch")
+        if sealed_model != model:
+            raise RuntimeContractError("materialized runtime model differs from window seal")
     bindings = value["bindings"]
     required_bindings = {
         "model_profile_sha256",

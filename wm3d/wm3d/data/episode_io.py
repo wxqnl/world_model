@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -297,6 +298,7 @@ def decode_episode_views(
     canonical_view_slots: Sequence[str],
     selected_observation_rows: Sequence[int],
     asset_verifier: VerifiedAssetStore | None = None,
+    decode_workers: int = 1,
 ) -> tuple[dict[str, DecodedEpisodeVideo], dict[str, Mapping[str, object]]]:
     """Decode each real view and bind it to observation rows by ordinal.
 
@@ -304,11 +306,17 @@ def decode_episode_views(
     nearest-neighbour alignment clock: several real LeRobot releases carry
     one video frame per episode row while their encoded PTS cadence differs
     from the Parquet observation timestamp cadence.
+
+    Asset verification remains serial and deterministic.  Only independent
+    codec work runs in parallel, so multi-camera episodes can use the CPU
+    while the preceding episode is encoded on the GPU.
     """
 
     slots = tuple(str(item) for item in canonical_view_slots)
     if not slots or len(set(slots)) != len(slots):
         raise EpisodeIOError("canonical view slots must be unique/non-empty")
+    if decode_workers <= 0:
+        raise EpisodeIOError("decode_workers must be positive")
     rows = np.asarray(selected_observation_rows, dtype=np.int64)
     if (
         rows.ndim != 1
@@ -321,10 +329,9 @@ def decode_episode_views(
     asset_by_role = {role: (path, digest) for role, path, digest in task.assets}
     if len(asset_by_role) != len(task.assets):
         raise EpisodeIOError("cache task contains duplicate asset roles")
-    output: dict[str, DecodedEpisodeVideo] = {}
-    evidence: dict[str, Mapping[str, object]] = {}
+    jobs: list[tuple[str, str, str, float | None, float | None, Path, str]] = []
     for name, role, segment_kind, start_s, stop_s in task.views:
-        if name not in slots or name in output:
+        if name not in slots or any(item[0] == name for item in jobs):
             raise EpisodeIOError(f"view {name!r} is unknown or duplicated")
         if role not in asset_by_role:
             raise EpisodeIOError(f"view {name!r} references missing asset role {role!r}")
@@ -332,11 +339,14 @@ def decode_episode_views(
         path = _safe_asset(
             source_root, relative, digest, verifier=asset_verifier
         )
+        jobs.append((name, role, segment_kind, start_s, stop_s, path, digest))
+
+    def decode_one(
+        job: tuple[str, str, str, float | None, float | None, Path, str]
+    ) -> tuple[str, DecodedEpisodeVideo, Mapping[str, object]]:
+        name, role, segment_kind, start_s, stop_s, path, digest = job
         frames, pts = _decode_segment(
-            path,
-            segment_kind=segment_kind,
-            start_s=start_s,
-            stop_s=stop_s,
+            path, segment_kind=segment_kind, start_s=start_s, stop_s=stop_s
         )
         if len(frames) != task.observation_samples:
             raise EpisodeIOError(
@@ -344,13 +354,13 @@ def decode_episode_views(
                 f"{task.observation_samples} observation rows; ordinal binding failed"
             )
         digest_pts = canonical_timestamp_sha256(pts)
-        output[name] = DecodedEpisodeVideo(
+        decoded = DecodedEpisodeVideo(
             frames=frames[rows].copy(),
             recorded_pts_s=pts,
             pts_sha256=digest_pts,
             segment_kind=segment_kind,
         )
-        evidence[name] = {
+        view_evidence = {
             "asset_role": role,
             "asset_sha256": digest,
             "segment_kind": segment_kind,
@@ -361,6 +371,20 @@ def decode_episode_views(
             "recorded_pts_sha256": digest_pts,
             "binding": "episode_row_ordinal",
         }
+        return name, decoded, view_evidence
+
+    if not jobs:
+        raise EpisodeIOError("episode contains no decodable real view")
+    workers = min(int(decode_workers), len(jobs))
+    if workers == 1:
+        decoded_jobs = [decode_one(job) for job in jobs]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="wm3d-video"
+        ) as executor:
+            decoded_jobs = list(executor.map(decode_one, jobs))
+    output = {name: decoded for name, decoded, _evidence in decoded_jobs}
+    evidence = {name: row for name, _decoded, row in decoded_jobs}
     if not output:
         raise EpisodeIOError("episode contains no decodable real view")
     return output, evidence

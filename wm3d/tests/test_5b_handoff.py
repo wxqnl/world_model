@@ -8,6 +8,7 @@ import sys
 import yaml
 import pytest
 
+from scripts.data.materialize_oxe_replacement import build_templates
 from wm3d.models.model_factory import validate_model_profile
 from wm3d.training.runtime_contract import validate_runtime_profile
 
@@ -18,13 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize(
     "profile,total_steps,checkpoint_steps,checkpoint_interval",
     [
-        ("h200_128_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000),
-        ("h200_128_fsdp2_validation10k.yaml", 10_000, [100, 500], 1_000),
-        ("h200_128_fsdp2_validation100k.yaml", 100_000, [], 1_000),
-        ("h200_128_fsdp2.yaml", 600_000, [1_000, 5_000, 20_000], 20_000),
+        ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000),
+        ("h200_64_fsdp2_validation10k.yaml", 10_000, [100, 500], 1_000),
+        ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000),
+        ("h200_64_fsdp2.yaml", 600_000, [1_000, 5_000, 20_000], 20_000),
     ],
 )
-def test_5b_presets_match_native_5b_and_128_h200(
+def test_5b_presets_match_native_5b_and_64_h200(
     profile: str,
     total_steps: int,
     checkpoint_steps: list[int],
@@ -35,10 +36,12 @@ def test_5b_presets_match_native_5b_and_128_h200(
     validate_model_profile(model)
     validate_runtime_profile(runtime)
     assert model["expected_parameter_count"] == 5_108_342_963
-    assert runtime["expected_world_size"] == 128
+    assert runtime["expected_world_size"] == 64
     assert runtime["distributed"]["shard_degree"] == 8
     assert runtime["resources"]["gpu_name_substring"] == "H200"
     assert runtime["resources"]["minimum_ib_rate_gbps"] == 400.0
+    assert runtime["train"]["gradient_accumulation"] == 2
+    assert runtime["train"]["global_batch_size"] == 128
     assert runtime["train"]["total_steps"] == total_steps
     assert runtime["train"]["checkpoint_steps"] == checkpoint_steps
     assert runtime["train"]["checkpoint_interval"] == checkpoint_interval
@@ -67,10 +70,10 @@ def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "preset,runtime,steps",
     [
-        ("canary1k", "h200_128_fsdp2_canary1k.yaml", "1000"),
-        ("validation10k", "h200_128_fsdp2_validation10k.yaml", "10000"),
-        ("validation100k", "h200_128_fsdp2_validation100k.yaml", "100000"),
-        ("formal600k", "h200_128_fsdp2.yaml", "600000"),
+        ("canary1k", "h200_64_fsdp2_canary1k.yaml", "1000"),
+        ("validation10k", "h200_64_fsdp2_validation10k.yaml", "10000"),
+        ("validation100k", "h200_64_fsdp2_validation100k.yaml", "100000"),
+        ("formal600k", "h200_64_fsdp2.yaml", "600000"),
     ],
 )
 def test_5b_init_selects_a_complete_preset(
@@ -135,6 +138,109 @@ def test_5b_lock_passes_exact_license_confirmation() -> None:
     wrapper = (ROOT / "scripts/cluster/wm3d_5b.sh").read_text()
     assert "ACCEPT_DATA_LICENSES=YES" in wrapper
     assert "--confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES" in wrapper
+
+
+def test_5b_site_defaults_to_full_data_and_64_gpu_saturated_cache() -> None:
+    site = (ROOT / "configs/cluster/h200_5b.env.example").read_text()
+    assert "NNODES=8" in site
+    assert "GPUS_PER_NODE=8" in site
+    assert "CACHE_WORKER_COUNT=64" in site
+    assert "CACHE_BATCH_FRAMES=16" in site
+    assert "CACHE_DECODE_WORKERS=4" in site
+    assert "CACHE_WRITER_THREADS=2" in site
+    assert "DATA_FAMILY=public_robot_6106h" in site
+    assert "SOURCE_TEMPLATE=configs/sources/public_sources.template.yaml" in site
+    assert "DATA_TEMPLATE=configs/data/public_robot_6106h.template.yaml" in site
+
+
+def _oxe_info(action_dim: int, state_dim: int, views: int = 1) -> dict:
+    features = {
+        "action": {"dtype": "float32", "shape": [action_dim]},
+        "observation.state": {"dtype": "float32", "shape": [state_dim]},
+    }
+    for index in range(views):
+        features[f"observation.images.camera_{index}"] = {
+            "dtype": "video",
+            "shape": [128, 128, 3],
+        }
+    return {"features": features}
+
+
+def test_5b_oxe_generator_only_replaces_agibot_beta_weight() -> None:
+    default = yaml.safe_load(
+        (ROOT / "configs/data/public_robot_6106h.template.yaml").read_text()
+    )
+    source = yaml.safe_load(
+        (ROOT / "configs/sources/public_sources.template.yaml").read_text()
+    )
+    repos = ("lerobot/droid_1.0.1",) + tuple(
+        f"lerobot/fixture_{index:02d}" for index in range(55)
+    )
+    generated_sources, replacement, adapters = build_templates(
+        base_source=source,
+        base_data=default,
+        repo_ids=repos,
+        metadata_by_repo={repo: _oxe_info(7, 7, 2) for repo in repos[1:]},
+    )
+    default_weights = {row["name"]: row["weight"] for row in default["sources"]}
+    replacement_weights = {
+        row["name"]: row["weight"] for row in replacement["sources"]
+    }
+
+    assert default_weights["agibot_beta"] == 30
+    assert "agibot_beta" not in replacement_weights
+    main = {
+        name: value
+        for name, value in replacement_weights.items()
+        if not name.startswith("oxe_")
+    }
+    assert main == {
+        name: value * 55
+        for name, value in default_weights.items()
+        if name != "agibot_beta"
+    }
+    oxe = {
+        name: value
+        for name, value in replacement_weights.items()
+        if name.startswith("oxe_")
+    }
+    assert len(oxe) == 55
+    assert set(oxe.values()) == {30}
+    assert sum(default_weights.values()) == 100
+    assert sum(main.values()) / sum(replacement_weights.values()) == pytest.approx(0.70)
+    assert len(generated_sources["sources"]) == 61
+    assert len(replacement["sources"]) == 63
+    assert replacement["notes"]["oxe_dataset_count_including_droid"] == 56
+    assert replacement["notes"]["oxe_new_source_count"] == 55
+    assert len(adapters) == 55
+    assert all(
+        adapter["groups"][0]["action"][0]["columns"] == list(range(7))
+        for adapter in adapters.values()
+    )
+
+
+def test_5b_oxe_generator_rejects_capacity_overflow() -> None:
+    default = yaml.safe_load(
+        (ROOT / "configs/data/public_robot_6106h.template.yaml").read_text()
+    )
+    source = yaml.safe_load(
+        (ROOT / "configs/sources/public_sources.template.yaml").read_text()
+    )
+    with pytest.raises(ValueError, match="outside WM3D capacity"):
+        build_templates(
+            base_source=source,
+            base_data=default,
+            repo_ids=("lerobot/droid_1.0.1", "lerobot/too_wide"),
+            metadata_by_repo={"lerobot/too_wide": _oxe_info(17, 7)},
+        )
+
+
+def test_5b_cache_wrapper_wires_decode_encode_write_parallelism() -> None:
+    wrapper = (ROOT / "scripts/cluster/wm3d_5b.sh").read_text()
+    assert '--decode-workers "${CACHE_DECODE_WORKERS:-4}"' in wrapper
+    assert '--writer-threads "${CACHE_WRITER_THREADS:-2}"' in wrapper
+    assert '--batch-frames "${CACHE_BATCH_FRAMES:-16}"' in wrapper
+    assert "--fail-fast" in wrapper
 
 
 def test_5b_report_accepts_complete_synthetic_run(tmp_path: Path) -> None:

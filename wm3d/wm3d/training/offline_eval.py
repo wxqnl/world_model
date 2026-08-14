@@ -80,6 +80,18 @@ def declared_eval_coverage_lanes(
 ) -> frozenset[str]:
     """Intersect objective lanes with supervision declared by the sealed profile."""
 
+    formal_lanes = getattr(profile, "declared_eval_coverage_lanes", None)
+    if formal_lanes is not None:
+        declared_sources = {source.name for source in profile.sources}
+        if not active_source_names or not active_source_names <= declared_sources:
+            raise OfflineEvalError(
+                "eval active-source closure is empty or differs from sealed profile"
+            )
+        lanes = frozenset(str(value) for value in formal_lanes)
+        if not lanes or not lanes <= _KNOWN_COVERAGE_LANES:
+            raise OfflineEvalError("formal cache declared unknown coverage lanes")
+        return lanes
+
     declared_sources = {source.name for source in profile.sources}
     if not active_source_names or not active_source_names <= declared_sources:
         raise OfflineEvalError(

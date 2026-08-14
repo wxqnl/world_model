@@ -1,0 +1,17 @@
+schema: wm3d_v8_source_adapter_v3
+name: oxe_taco_play_native_control
+raw_format: lerobot_parquet_video
+observation_time_key: timestamp
+views:
+  - {name: head, key: observation.images.rgb_static}
+  - {name: left_wrist, key: observation.images.rgb_gripper}
+groups:
+  - group: controller
+    supervision: fine_command
+    action:
+      - {key: action, columns: [0, 1, 2, 3, 4, 5, 6], scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    state:
+      - {key: observation.state, columns: [0, 1, 2, 3, 4, 5, 6], scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    action_time_key: timestamp
+    state_time_key: timestamp
+    world_interval_index_key: null
