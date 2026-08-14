@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -42,6 +43,7 @@ class VerifiedAssetStore:
 
     def __init__(self) -> None:
         self._verified: dict[Path, _VerifiedAsset] = {}
+        self._lock = threading.RLock()
 
     @staticmethod
     def _fingerprint(path: Path, expected_sha256: str) -> _VerifiedAsset:
@@ -56,6 +58,10 @@ class VerifiedAssetStore:
         )
 
     def verify(self, root: Path, relative: str, expected_sha256: str) -> Path:
+        with self._lock:
+            return self._verify_locked(root, relative, expected_sha256)
+
+    def _verify_locked(self, root: Path, relative: str, expected_sha256: str) -> Path:
         root = Path(root).resolve(strict=True)
         candidate = root / relative
         if candidate.is_symlink() or not candidate.is_file():

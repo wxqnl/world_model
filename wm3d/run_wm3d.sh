@@ -29,6 +29,7 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_wm3d.sh cache-seal <seal_episode_cache.py 参数...>
   ./run_wm3d.sh window <materialize_window_index.py 参数...>
   ./run_wm3d.sh normalization <build_grouped_normalization.py 参数...>
+  ./run_wm3d.sh streaming-prepare <materialize_streaming_metadata.py 参数...>
   ./run_wm3d.sh runtime <materialize_runtime.py 参数...>
   ./run_wm3d.sh formal-runtime <materialize_formal_cache_runtime.py 参数...>
   ./run_wm3d.sh preflight <torchrun 参数...> -- --runtime <runtime.yaml>
@@ -145,6 +146,7 @@ case "${command}" in
   cache-seal) exec "${PYTHON_BIN}" scripts/data/seal_episode_cache.py "$@" ;;
   window) exec "${PYTHON_BIN}" scripts/data/materialize_window_index.py "$@" ;;
   normalization) exec "${PYTHON_BIN}" scripts/data/build_grouped_normalization.py "$@" ;;
+  streaming-prepare) exec "${PYTHON_BIN}" scripts/data/materialize_streaming_metadata.py "$@" ;;
   runtime) exec "${PYTHON_BIN}" scripts/materialize_runtime.py "$@" ;;
   formal-runtime) exec "${PYTHON_BIN}" scripts/materialize_formal_cache_runtime.py "$@" ;;
   preflight) torchrun_preflight_split "$@" ;;

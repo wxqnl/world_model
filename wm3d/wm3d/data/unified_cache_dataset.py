@@ -76,6 +76,16 @@ class _ShardStore:
         self._resolved: dict[str, Path] = {}
         self._verified: set[str] = set()
 
+    def register(self, relative: str, expected_sha256: str) -> None:
+        """Register a lazily materialized shard without weakening SHA checks."""
+
+        previous = self.expected_sha.get(relative)
+        if previous is not None and previous != expected_sha256:
+            raise CacheDataError(
+                f"cache shard {relative} changed digest within one dataset process"
+            )
+        self.expected_sha[relative] = expected_sha256
+
     def path(self, relative: str) -> Path:
         path = self._resolved.get(relative)
         if path is None:
@@ -455,8 +465,9 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         if not bool(result["current_state_mask"].any()):
             raise CacheDataError(f"sample {entry.sample_id} has no measured current state")
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        entry = self.entries[index]
+    def _sample_from_entry(
+        self, entry: CacheIndexEntry, *, sample_index: int
+    ) -> dict[str, torch.Tensor]:
         context_rows = entry.context_feature_rows
         future_rows = entry.future_feature_rows
         all_rows = context_rows + future_rows
@@ -683,7 +694,10 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             "target_rgb": target_rgb,
             "target_rgb_mask": rgb_view_mask[..., None, None, None],
             "source_id": torch.tensor(self.source_to_id[entry.source], dtype=torch.long),
-            "sample_index": torch.tensor(index, dtype=torch.long),
+            "sample_index": torch.tensor(sample_index, dtype=torch.long),
         }
         self._validate_sample(result, entry)
         return result
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        return self._sample_from_entry(self.entries[index], sample_index=index)

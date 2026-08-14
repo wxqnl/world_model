@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from bisect import bisect_right
 import hashlib
 from math import gcd
 
@@ -125,6 +126,84 @@ class AffinePermutation:
         return (multiplier * position + offset) % self.length
 
 
+class EpisodeLocalPermutation:
+    """A deterministic no-replacement permutation that keeps episodes contiguous.
+
+    The episode order and each episode's starting window change every epoch,
+    while adjacent global positions stay in the same episode whenever possible.
+    This is critical for amortizing raw decode/encoding over all of an
+    episode's windows without changing exact-resume addressing.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_start: int,
+        source_stop: int,
+        episode_spans: Sequence[tuple[int, int]],
+        seed: int,
+        source_name: str,
+    ) -> None:
+        self.source_start = int(source_start)
+        self.length = int(source_stop) - self.source_start
+        self.seed = int(seed)
+        self.source_name = str(source_name)
+        self.spans = tuple((int(start), int(stop)) for start, stop in episode_spans)
+        cursor = self.source_start
+        for start, stop in self.spans:
+            if start != cursor or stop <= start:
+                raise SamplingContractError(
+                    f"episode spans for {source_name} are not contiguous"
+                )
+            cursor = stop
+        if cursor != int(source_stop) or not self.spans:
+            raise SamplingContractError(
+                f"episode spans for {source_name} do not cover its source span"
+            )
+        self._cached_epoch: int | None = None
+        self._ordered_spans: tuple[tuple[int, int, int], ...] = ()
+        self._cumulative: tuple[int, ...] = ()
+
+    def _epoch_layout(self, epoch: int) -> None:
+        if self._cached_epoch == epoch:
+            return
+        count = len(self.spans)
+        permutation = AffinePermutation(
+            count,
+            seed=_seed64(self.seed, self.source_name, "episode-order"),
+            source_name=f"{self.source_name}:episode:{epoch}",
+        )
+        ordered: list[tuple[int, int, int]] = []
+        cumulative: list[int] = []
+        total = 0
+        for position in range(count):
+            span_index = permutation.at(epoch * count + position)
+            start, stop = self.spans[span_index]
+            span_length = stop - start
+            rotation = _splitmix64(
+                _seed64(self.seed, self.source_name, "window", epoch, span_index)
+            ) % span_length
+            ordered.append((start, stop, int(rotation)))
+            total += span_length
+            cumulative.append(total)
+        if total != self.length:
+            raise AssertionError("episode-local permutation lost source windows")
+        self._cached_epoch = epoch
+        self._ordered_spans = tuple(ordered)
+        self._cumulative = tuple(cumulative)
+
+    def at(self, absolute_position: int) -> int:
+        if absolute_position < 0:
+            raise SamplingContractError("permutation position must be non-negative")
+        epoch, position = divmod(int(absolute_position), self.length)
+        self._epoch_layout(epoch)
+        episode_index = bisect_right(self._cumulative, position)
+        previous = 0 if episode_index == 0 else self._cumulative[episode_index - 1]
+        start, stop, rotation = self._ordered_spans[episode_index]
+        within = position - previous
+        return start - self.source_start + ((within + rotation) % (stop - start))
+
+
 class StepAddressedBatchSampler(Sampler[list[int]]):
     """Reconstruct local batches from the optimizer step without cursor state."""
 
@@ -141,6 +220,9 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
         start_optimizer_step: int,
         num_optimizer_steps: int,
         seed: int,
+        source_episode_spans: Mapping[
+            str, Sequence[tuple[int, int]]
+        ] | None = None,
     ) -> None:
         self.source_spans = {
             str(name): (int(span[0]), int(span[1])) for name, span in source_spans.items()
@@ -163,7 +245,7 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
             raise SamplingContractError("invalid optimizer-step interval")
         self.global_micro_batch = self.world_size * self.micro_batch_size
         self.global_batch = self.global_micro_batch * self.gradient_accumulation
-        self._permutations: dict[str, AffinePermutation] = {}
+        self._permutations: dict[str, AffinePermutation | EpisodeLocalPermutation] = {}
         for source_name, (start, stop) in self.source_spans.items():
             length = stop - start
             if start < 0 or stop <= start:
@@ -173,9 +255,22 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
                     f"source {source_name} has {length} windows, below global batch "
                     f"{self.global_batch}; a no-replacement optimizer step cannot be formed"
                 )
-            self._permutations[source_name] = AffinePermutation(
-                length, seed=self.seed, source_name=source_name
-            )
+            if source_episode_spans is None:
+                self._permutations[source_name] = AffinePermutation(
+                    length, seed=self.seed, source_name=source_name
+                )
+            else:
+                if set(source_episode_spans) != set(self.source_spans):
+                    raise SamplingContractError(
+                        "episode-local spans must exactly match scheduled sources"
+                    )
+                self._permutations[source_name] = EpisodeLocalPermutation(
+                    source_start=start,
+                    source_stop=stop,
+                    episode_spans=source_episode_spans[source_name],
+                    seed=self.seed,
+                    source_name=source_name,
+                )
 
     def __len__(self) -> int:
         return self.num_optimizer_steps * self.gradient_accumulation

@@ -15,6 +15,10 @@ from wm3d.data.cache_tasks import (
     CACHE_WINDOW_SEAL_SCHEMA,
 )
 from wm3d.data.manifest_contract import SHA256_RE, load_data_profile, sha256_file
+from wm3d.data.streaming_raw import (
+    STREAMING_DATA_CLOSURE_SCHEMA,
+    load_streaming_metadata_seal,
+)
 from wm3d.data.formal_cache_adapter import (
     FORMAL_CACHE_CLOSURE_SCHEMA,
     FormalCacheError,
@@ -371,7 +375,7 @@ def validate_data_closure(value: Mapping[str, Any]) -> None:
     if (
         not isinstance(receipts, dict)
         or len(receipts) != int(episode_seal["task_count"])
-        or any(SHA256_RE.fullmatch(str(value)) is None for value in receipts.values())
+        or any(SHA256_RE.fullmatch(str(item)) is None for item in receipts.values())
     ):
         raise RuntimeContractError("episode seal receipt digest set is invalid")
     if episode_seal["episode_index_sha256"] != value["episode_cache_index_sha256"]:
@@ -395,6 +399,125 @@ def validate_data_closure(value: Mapping[str, Any]) -> None:
         expected_window_index_sha256=value["cache_index_sha256"],
         data_profile=profile,
     )
+
+
+def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
+    required = {
+        "schema",
+        "name",
+        "data_profile_path",
+        "data_profile_sha256",
+        "metadata_seal_path",
+        "metadata_seal_sha256",
+        "metadata_root",
+        "episode_index_path",
+        "episode_index_sha256",
+        "cache_index_path",
+        "cache_index_sha256",
+        "grouped_normalization_path",
+        "grouped_normalization_sha256",
+        "task_manifest_path",
+        "task_manifest_sha256",
+        "encoder_contract_path",
+        "encoder_contract_sha256",
+        "task_bank_root",
+        "task_bank_index_sha256",
+        "source_manifest_sha256_by_name",
+        "adapter_contract_sha256_by_name",
+        "lru_root",
+        "lru_max_bytes_per_rank",
+        "encode_batch_frames",
+        "decode_workers",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise RuntimeContractError("streaming_raw closure fields mismatch")
+    if value.get("schema") != STREAMING_DATA_CLOSURE_SCHEMA:
+        raise RuntimeContractError("streaming_raw closure schema mismatch")
+    for field in (
+        "data_profile_sha256",
+        "metadata_seal_sha256",
+        "episode_index_sha256",
+        "cache_index_sha256",
+        "grouped_normalization_sha256",
+        "task_manifest_sha256",
+        "encoder_contract_sha256",
+        "task_bank_index_sha256",
+    ):
+        _require_sha(value[field], field)
+    for field in (
+        "lru_max_bytes_per_rank",
+        "encode_batch_frames",
+        "decode_workers",
+    ):
+        if isinstance(value[field], bool) or int(value[field]) <= 0:
+            raise RuntimeContractError(f"streaming_raw {field} must be positive")
+    for field in ("metadata_root", "task_bank_root"):
+        root = Path(str(value[field]))
+        if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+            raise RuntimeContractError(f"streaming_raw {field} is invalid")
+    lru_root = Path(str(value["lru_root"]))
+    if not lru_root.is_absolute() or lru_root.is_symlink():
+        raise RuntimeContractError("streaming_raw lru_root must be absolute/non-symlink")
+    path_fields = {
+        "data_profile_path": "data_profile_sha256",
+        "metadata_seal_path": "metadata_seal_sha256",
+        "episode_index_path": "episode_index_sha256",
+        "cache_index_path": "cache_index_sha256",
+        "grouped_normalization_path": "grouped_normalization_sha256",
+        "task_manifest_path": "task_manifest_sha256",
+        "encoder_contract_path": "encoder_contract_sha256",
+    }
+    for path_name, sha_name in path_fields.items():
+        path = Path(str(value[path_name]))
+        if (
+            not path.is_absolute()
+            or path.is_symlink()
+            or not path.is_file()
+            or sha256_file(path) != value[sha_name]
+        ):
+            raise RuntimeContractError(f"streaming_raw {path_name} is invalid")
+    try:
+        seal = load_streaming_metadata_seal(
+            Path(str(value["metadata_seal_path"])),
+            expected_sha256=str(value["metadata_seal_sha256"]),
+        )
+    except Exception as exc:
+        raise RuntimeContractError("streaming_raw metadata seal is invalid") from exc
+    closure_to_seal = {
+        "data_profile_path": "data_profile_path",
+        "data_profile_sha256": "data_profile_sha256",
+        "metadata_root": "metadata_root",
+        "episode_index_path": "episode_index_path",
+        "episode_index_sha256": "episode_index_sha256",
+        "cache_index_path": "window_index_path",
+        "cache_index_sha256": "window_index_sha256",
+        "grouped_normalization_path": "grouped_normalization_path",
+        "grouped_normalization_sha256": "grouped_normalization_sha256",
+        "task_manifest_path": "task_manifest_path",
+        "task_manifest_sha256": "task_manifest_sha256",
+        "encoder_contract_path": "encoder_contract_path",
+        "encoder_contract_sha256": "encoder_contract_sha256",
+        "task_bank_root": "task_bank_root",
+        "task_bank_index_sha256": "task_bank_index_sha256",
+        "source_manifest_sha256_by_name": "source_manifest_sha256_by_name",
+        "adapter_contract_sha256_by_name": "adapter_contract_sha256_by_name",
+    }
+    for closure_name, seal_name in closure_to_seal.items():
+        if value[closure_name] != seal[seal_name]:
+            raise RuntimeContractError(
+                f"streaming_raw closure differs from metadata seal: {closure_name}"
+            )
+    profile = load_data_profile(
+        Path(str(value["data_profile_path"])), verify_source_manifests=False
+    )
+    if value["source_manifest_sha256_by_name"] != {
+        source.name: source.manifest_sha256 for source in profile.sources
+    }:
+        raise RuntimeContractError("streaming_raw source manifest closure mismatch")
+    if value["adapter_contract_sha256_by_name"] != {
+        source.name: source.adapter_contract_sha256 for source in profile.sources
+    }:
+        raise RuntimeContractError("streaming_raw adapter closure mismatch")
 
 
 def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
@@ -468,6 +591,24 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
                 raise RuntimeContractError(
                     f"formal cache/model {name} mismatch: {model['model'][name]} != {expected}"
                 )
+    elif closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
+        validate_streaming_data_closure(closure)
+        data_profile = load_data_profile(
+            Path(str(closure["data_profile_path"])), verify_source_manifests=False
+        )
+        validate_model_data_compatibility(model, data_profile)
+        metadata_seal = load_streaming_metadata_seal(
+            Path(str(closure["metadata_seal_path"])),
+            expected_sha256=str(closure["metadata_seal_sha256"]),
+        )
+        if metadata_seal["model_profile_sha256"] != canonical_sha256(model):
+            raise RuntimeContractError(
+                "streaming metadata belongs to a different model profile"
+            )
+        if load_yaml(Path(str(metadata_seal["model_profile_path"]))) != model:
+            raise RuntimeContractError(
+                "streaming metadata model profile differs from runtime"
+            )
     else:
         validate_data_closure(closure)
         data_profile = load_data_profile(

@@ -251,7 +251,11 @@ def _launch_config(
             "resources": stage0["runtime_profile"].get("resources"),
         },
         "data_closure": {
-            "cache_root": str(stage0["data_closure"]["cache_root"]),
+            "cache_root": str(
+                stage0["data_closure"].get(
+                    "cache_root", stage0["data_closure"].get("lru_root", "")
+                )
+            ),
         },
     }
 

@@ -165,6 +165,7 @@ def _prepare_task(
     encoder_input_size: int,
     task_bank_index_sha256: str,
     decode_workers: int,
+    decode_visuals: bool = True,
 ) -> PreparedTask:
     started = time.perf_counter()
     accessor = open_episode_accessor(
@@ -187,18 +188,23 @@ def _prepare_task(
         observation_clock,
         minimum_separation_s=float(selection["minimum_separation_seconds"]),
     )
-    slots = tuple(str(item) for item in profile.cache_representation["view_slots"])
-    decoded, video_evidence = decode_episode_views(
-        task=task,
-        source_root=source.raw_root,
-        canonical_view_slots=slots,
-        selected_observation_rows=selected_rows,
-        asset_verifier=asset_verifier,
-        decode_workers=decode_workers,
-    )
-    images, view_mask = _view_batch(
-        decoded=decoded, slots=slots, input_size=encoder_input_size
-    )
+    if decode_visuals:
+        slots = tuple(str(item) for item in profile.cache_representation["view_slots"])
+        decoded, video_evidence = decode_episode_views(
+            task=task,
+            source_root=source.raw_root,
+            canonical_view_slots=slots,
+            selected_observation_rows=selected_rows,
+            asset_verifier=asset_verifier,
+            decode_workers=decode_workers,
+        )
+        images, view_mask = _view_batch(
+            decoded=decoded, slots=slots, input_size=encoder_input_size
+        )
+    else:
+        video_evidence = {}
+        images = torch.empty(0, dtype=torch.float32)
+        view_mask = torch.empty(0, dtype=torch.bool)
     embodiment = profile.embodiments[task.embodiment]
     robot = build_episode_robot_cache(
         embodiment=embodiment,

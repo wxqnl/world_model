@@ -303,7 +303,9 @@ def main() -> None:
             model=model,
             expected=expectations,
         )
-        dataset, profile = _build_mixed_dataset(config, split="val")
+        dataset, profile = _build_mixed_dataset(
+            config, split="val", device=context.device, rank=context.rank
+        )
         loader = _make_loader(
             dataset,
             profile,

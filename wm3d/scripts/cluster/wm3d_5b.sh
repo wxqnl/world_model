@@ -20,6 +20,7 @@ WM3D 5B 集群操作入口：
   ./run_wm3d.sh 5b cache-plan <site.env>
   ./run_wm3d.sh 5b cache-worker <site.env> <global-worker-index> <worker-count> <local-gpu|inherited>
   ./run_wm3d.sh 5b cache-seal <site.env>
+  ./run_wm3d.sh 5b streaming-prepare <site.env>
   ./run_wm3d.sh 5b window <site.env>
   ./run_wm3d.sh 5b normalization <site.env>
   ./run_wm3d.sh 5b runtime <site.env>
@@ -113,6 +114,18 @@ load_site() {
   # shellcheck disable=SC1090
   source "${site}"
   set +a
+  WM3D_DATA_MODE=${WM3D_DATA_MODE:-episode_cache}
+  STREAMING_METADATA_ROOT=${STREAMING_METADATA_ROOT:-${CONTROL_ROOT}/streaming_metadata}
+  STREAMING_METADATA_SEAL=${STREAMING_METADATA_SEAL:-${STREAMING_METADATA_ROOT}/metadata_seal_5b.json}
+  STREAMING_LRU_ROOT=${STREAMING_LRU_ROOT:-${WORK_ROOT}/streaming_lru}
+  STREAMING_LRU_GIB_PER_RANK=${STREAMING_LRU_GIB_PER_RANK:-64}
+  STREAMING_METADATA_WORKERS=${STREAMING_METADATA_WORKERS:-32}
+  STREAMING_ENCODE_BATCH_FRAMES=${STREAMING_ENCODE_BATCH_FRAMES:-16}
+  STREAMING_DECODE_WORKERS=${STREAMING_DECODE_WORKERS:-4}
+  case "${WM3D_DATA_MODE}" in
+    episode_cache|streaming_raw) ;;
+    *) die "WM3D_DATA_MODE 必须是 episode_cache 或 streaming_raw" ;;
+  esac
   for name in WM3D_5B_PRESET WM3D_5B_RUN_ID DATA_FAMILY WORK_ROOT CONTROL_ROOT RAW_ROOT \
     CACHE_ROOT ENV_DIR PYTHON_BIN \
     HF_TOKEN_FILE ACCEPT_DATA_LICENSES SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
@@ -276,6 +289,8 @@ WM3D 5B site plan
   raw:        ${RAW_ROOT}
   data:       ${DATA_PROFILE}
   cache:      ${CACHE_ROOT}
+  data mode:  ${WM3D_DATA_MODE}
+  stream LRU: ${STREAMING_LRU_ROOT} (${STREAMING_LRU_GIB_PER_RANK} GiB/rank)
   runtime:    ${RUNTIME_YAML}
   run:        ${RUN_ROOT}
   topology:   ${NNODES} nodes x ${GPUS_PER_NODE} GPUs
@@ -374,6 +389,25 @@ EOF
       --episode-index-fragment-root "${CACHE_ROOT}/episode_index_fragments" \
       --output-index "${EPISODE_INDEX}" --output-seal "${EPISODE_SEAL}"
     ;;
+  streaming-prepare)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ "${WM3D_DATA_MODE}" == streaming_raw ]] || \
+      die "streaming-prepare 只用于 WM3D_DATA_MODE=streaming_raw"
+    require_file "cache task manifest" "${TASK_MANIFEST}"
+    require_file "task bank index" "${TASK_BANK_INDEX}"
+    task_bank_sha=$(sha256 "${TASK_BANK_INDEX}")
+    mkdir -p "${STREAMING_METADATA_ROOT}"
+    "${ENTRY}" streaming-prepare \
+      --task-manifest "${TASK_MANIFEST}" --data-profile "${DATA_PROFILE}" \
+      --model-profile "${MODEL_PROFILE}" --encoder-contract "${ENCODER_CONTRACT}" \
+      --task-bank-root "${TASK_BANK_ROOT}" \
+      --task-bank-index-sha256 "${task_bank_sha}" \
+      --output-root "${STREAMING_METADATA_ROOT}/payload" \
+      --episode-index "${EPISODE_INDEX}" --window-index "${WINDOW_INDEX}" \
+      --grouped-normalization "${GROUPED_NORMALIZATION}" \
+      --output-seal "${STREAMING_METADATA_SEAL}" \
+      --workers "${STREAMING_METADATA_WORKERS}"
+    ;;
   window)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     "${ENTRY}" window --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
@@ -393,13 +427,25 @@ EOF
     [[ $# -eq 0 ]] || { usage; exit 2; }
     require_file "environment receipt" "${ENV_DIR}/environment_receipt.json"
     mkdir -p "${CONTROL_ROOT}" "${RUN_ROOT}"
-    "${ENTRY}" runtime --model "${MODEL_PROFILE}" --data "${DATA_PROFILE}" \
+    common=(runtime --model "${MODEL_PROFILE}" --data "${DATA_PROFILE}" \
       --runtime "${RUNTIME_PROFILE}" --objective "${OBJECTIVE_PROFILE}" \
-      --cache-root "${CACHE_ROOT}" --episode-cache-index "${EPISODE_INDEX}" \
-      --episode-cache-seal "${EPISODE_SEAL}" --cache-index "${WINDOW_INDEX}" \
-      --cache-seal "${WINDOW_SEAL}" --grouped-normalization "${GROUPED_NORMALIZATION}" \
       --environment-lock "${ENV_DIR}/environment_receipt.json" --run-name "${RUN_NAME}" \
-      --run-lineage "${RUN_LINEAGE}" --output-root "${RUN_ROOT}" --output "${RUNTIME_YAML}"
+      --run-lineage "${RUN_LINEAGE}" --output-root "${RUN_ROOT}" --output "${RUNTIME_YAML}")
+    if [[ "${WM3D_DATA_MODE}" == streaming_raw ]]; then
+      require_file "streaming metadata seal" "${STREAMING_METADATA_SEAL}"
+      "${ENTRY}" "${common[@]}" --data-mode streaming_raw \
+        --streaming-metadata-seal "${STREAMING_METADATA_SEAL}" \
+        --streaming-lru-root "${STREAMING_LRU_ROOT}" \
+        --streaming-lru-gib-per-rank "${STREAMING_LRU_GIB_PER_RANK}" \
+        --streaming-encode-batch-frames "${STREAMING_ENCODE_BATCH_FRAMES}" \
+        --streaming-decode-workers "${STREAMING_DECODE_WORKERS}"
+    else
+      "${ENTRY}" "${common[@]}" --data-mode episode_cache \
+        --cache-root "${CACHE_ROOT}" --episode-cache-index "${EPISODE_INDEX}" \
+        --episode-cache-seal "${EPISODE_SEAL}" --cache-index "${WINDOW_INDEX}" \
+        --cache-seal "${WINDOW_SEAL}" \
+        --grouped-normalization "${GROUPED_NORMALIZATION}"
+    fi
     ;;
   preflight)
     [[ $# -eq 0 ]] || { usage; exit 2; }

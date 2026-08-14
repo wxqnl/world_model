@@ -22,6 +22,10 @@ from torch.utils.data import DataLoader, default_collate
 from wm3d.data.manifest_contract import load_data_profile
 from wm3d.data.step_sampler import StepAddressedBatchSampler
 from wm3d.data.unified_cache_dataset import UnifiedCacheDataset
+from wm3d.data.streaming_raw import (
+    STREAMING_DATA_CLOSURE_SCHEMA,
+    StreamingRawDataset,
+)
 from wm3d.data.grouped_normalization import GroupedRobotNormalizer
 from wm3d.data.formal_cache_adapter import (
     FORMAL_CACHE_CLOSURE_SCHEMA,
@@ -205,13 +209,21 @@ def _resource_preflight(
     if resources is None:
         return None
     output_root = Path(config["run"]["output_root"])
+    closure = config["data_closure"]
+    cache_root = Path(
+        closure.get("cache_root", closure.get("lru_root", ""))
+    )
+    if not cache_root.is_absolute():
+        raise PretrainError("resource preflight data root is not absolute")
+    if closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
+        cache_root.mkdir(parents=True, exist_ok=True)
     status: list[Any] = [None]
     try:
         receipt = run_resource_preflight(
             resources=resources,
             context=context,
             runtime_config_sha256=config_sha,
-            cache_root=Path(config["data_closure"]["cache_root"]),
+            cache_root=cache_root,
             output_root=output_root,
         )
         if context.is_rank0:
@@ -413,7 +425,12 @@ def _forward(model: torch.nn.Module, batch: Mapping[str, torch.Tensor]) -> Mappi
 
 
 def _build_mixed_dataset(
-    runtime: Mapping[str, Any], *, split: str, profile: Any | None = None
+    runtime: Mapping[str, Any],
+    *,
+    split: str,
+    profile: Any | None = None,
+    device: torch.device | None = None,
+    rank: int = 0,
 ) -> tuple[Any, Any]:
     closure = runtime["data_closure"]
     if closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
@@ -430,6 +447,19 @@ def _build_mixed_dataset(
         expected_window_index_sha256=closure["cache_index_sha256"],
         data_profile=profile,
     )
+    if closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
+        if device is None:
+            raise PretrainError("streaming_raw dataset requires the current rank device")
+        dataset = StreamingRawDataset(
+            closure=closure,
+            data_profile=profile,
+            model_profile=runtime["model_profile"],
+            split=split,
+            grouped_normalizer=normalizer,
+            device=device,
+            rank=rank,
+        )
+        return dataset, profile
     dataset = UnifiedCacheDataset(
         cache_root=Path(closure["cache_root"]),
         index_path=Path(closure["cache_index_path"]),
@@ -518,8 +548,13 @@ def _make_loader(
         start_optimizer_step=start_step,
         num_optimizer_steps=num_steps,
         seed=seed,
+        source_episode_spans=getattr(dataset, "source_episode_spans", None),
     )
-    workers = int(train["num_workers"])
+    workers = (
+        0
+        if bool(getattr(dataset, "requires_main_process", False))
+        else int(train["num_workers"])
+    )
     kwargs: dict[str, Any] = {
         "batch_sampler": sampler,
         "num_workers": workers,
@@ -782,7 +817,9 @@ def main() -> None:
             )
         except LaunchQualificationError as exc:
             raise PretrainError("runtime code provenance failed") from exc
-        train_dataset, profile = _build_mixed_dataset(config, split="train")
+        train_dataset, profile = _build_mixed_dataset(
+            config, split="train", device=context.device, rank=context.rank
+        )
         model_cfg = config["model_profile"]["model"]
         cache_representation = profile.cache_representation
         if int(cache_representation["spatial_tokens"]) < int(model_cfg["P"]):
@@ -962,7 +999,11 @@ def main() -> None:
         validation_dataset: UnifiedCacheDataset | None = None
         if int(runtime["train"]["validate_every"]) > 0:
             validation_dataset, _ = _build_mixed_dataset(
-                config, split="val", profile=profile
+                config,
+                split="val",
+                profile=profile,
+                device=context.device,
+                rank=context.rank,
             )
         checkpoint_steps = _checkpoint_steps(runtime["train"])
         if stop_after_step not in checkpoint_steps:
@@ -1046,6 +1087,11 @@ def main() -> None:
                         "seconds_per_log_interval": time.monotonic() - last_log,
                         **metrics,
                     }
+                    streaming_metrics = getattr(
+                        train_dataset, "streaming_metrics", None
+                    )
+                    if streaming_metrics is not None:
+                        record["streaming_raw"] = dict(streaming_metrics)
                     if completed == 1:
                         record["gradient_ownership"] = gradient_ownership
                     last_log = time.monotonic()
