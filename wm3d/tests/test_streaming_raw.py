@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from wm3d.data.step_sampler import EpisodeLocalPermutation, StepAddressedBatchSampler
+from wm3d.data.streaming_raw import StreamingRawError, _StreamingEpisodeCache
 from wm3d.data.unified_cache_dataset import CacheDataError, _ShardStore
 
 
@@ -70,3 +73,31 @@ def test_dynamic_shard_registration_rejects_digest_drift(tmp_path: Path) -> None
     with pytest.raises(CacheDataError, match="changed digest"):
         store.register("episode/features.safetensors", "b" * 64)
 
+
+def test_streaming_hot_hit_uses_verified_file_identity(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    payloads = ("feature.bin", "robot.bin", "rgb.bin")
+    for name in payloads:
+        (root / name).write_bytes(name.encode("utf-8"))
+    entry = SimpleNamespace(
+        feature_shard=payloads[0],
+        robot_shard=payloads[1],
+        rgb_pack=payloads[2],
+    )
+    task = SimpleNamespace(task_id="episode")
+    cache = object.__new__(_StreamingEpisodeCache)
+    cache.root = root
+    cache._entries = OrderedDict(
+        {task.task_id: (entry, sum((root / name).stat().st_size for name in payloads))}
+    )
+    cache._verified_payload_identity = {
+        task.task_id: cache._payload_identity(entry)
+    }
+    cache.cache_hits = 0
+
+    assert cache.ensure(task) is entry
+    assert cache.cache_hits == 1
+
+    (root / payloads[0]).write_bytes(b"different")
+    with pytest.raises(StreamingRawError, match="changed after"):
+        cache.ensure(task)

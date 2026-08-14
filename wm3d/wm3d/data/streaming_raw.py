@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import shutil
 import socket
+import stat
 import time
 from typing import Any, Mapping
 
@@ -201,6 +202,9 @@ class _StreamingEpisodeCache:
         self._encoder: Any | None = None
         self._encoder_config: Any | None = None
         self._entries: OrderedDict[str, tuple[CacheEpisodeEntry, int]] = OrderedDict()
+        self._verified_payload_identity: dict[
+            str, tuple[tuple[str, int, int, int, int], ...]
+        ] = {}
         self.generated_episodes = 0
         self.cache_hits = 0
         self.evicted_episodes = 0
@@ -225,6 +229,36 @@ class _StreamingEpisodeCache:
                 raise StreamingRawError(f"streaming LRU payload is missing: {path}")
             total += int(path.stat().st_size)
         return total
+
+    def _payload_identity(
+        self, entry: CacheEpisodeEntry
+    ) -> tuple[tuple[str, int, int, int, int], ...]:
+        """Return a cheap identity for payloads already verified by SHA.
+
+        JIT cache files are immutable and rank-local.  Hashing an 80+ MB
+        feature shard for every window defeats episode-local sampling, so a
+        full SHA is paid once per process and hot hits use stable file
+        identity instead.
+        """
+
+        result: list[tuple[str, int, int, int, int]] = []
+        for relative in (entry.feature_shard, entry.robot_shard, entry.rgb_pack):
+            path = self.root / relative
+            if path.is_symlink():
+                raise StreamingRawError("streaming LRU payload became a symlink")
+            metadata = path.stat(follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StreamingRawError("streaming LRU payload is not a regular file")
+            result.append(
+                (
+                    relative,
+                    int(metadata.st_dev),
+                    int(metadata.st_ino),
+                    int(metadata.st_size),
+                    int(metadata.st_mtime_ns),
+                )
+            )
+        return tuple(result)
 
     def _bootstrap_existing(self) -> None:
         fragments = self.root / "episode_index_fragments"
@@ -268,6 +302,7 @@ class _StreamingEpisodeCache:
             path = self.root / relative
             if path.is_symlink() or not path.is_file() or sha256_file(path) != digest:
                 raise StreamingRawError("streaming LRU episode payload SHA mismatch")
+        self._verified_payload_identity[task.task_id] = self._payload_identity(entry)
         return entry
 
     def _load_encoder(self) -> tuple[Any, Any]:
@@ -346,6 +381,7 @@ class _StreamingEpisodeCache:
         ):
             if path.exists() or path.is_symlink():
                 path.unlink()
+        self._verified_payload_identity.pop(task_id, None)
         self.evicted_episodes += 1
 
     def _trim(self, *, protected: str) -> None:
@@ -365,11 +401,18 @@ class _StreamingEpisodeCache:
     def ensure(self, task: CacheTask) -> CacheEpisodeEntry:
         cached = self._entries.pop(task.task_id, None)
         if cached is not None:
-            entry = self._load_existing(task)
-            if entry is None:
-                raise StreamingRawError("streaming LRU entry disappeared")
+            entry, size = cached
+            verified_identity = self._verified_payload_identity.get(task.task_id)
+            if verified_identity is None:
+                entry = self._load_existing(task)
+                if entry is None:
+                    raise StreamingRawError("streaming LRU entry disappeared")
+            elif self._payload_identity(entry) != verified_identity:
+                raise StreamingRawError(
+                    "streaming LRU payload changed after its full SHA verification"
+                )
             self.cache_hits += 1
-            self._entries[task.task_id] = (entry, cached[1])
+            self._entries[task.task_id] = (entry, size)
             return entry
         started = time.perf_counter()
         entry = self._load_existing(task)
