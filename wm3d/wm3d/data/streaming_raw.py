@@ -17,6 +17,7 @@ import time
 from typing import Any, Mapping
 
 import torch
+import yaml
 
 from .cache_tasks import CacheTask, cache_task_from_mapping
 from .episode_io import VerifiedAssetStore
@@ -24,6 +25,7 @@ from .manifest_contract import (
     CacheEpisodeEntry,
     CacheIndexEntry,
     DataProfile,
+    canonical_sha256,
     iter_jsonl,
     load_cache_episode_index,
     sha256_file,
@@ -103,7 +105,6 @@ def load_streaming_metadata_seal(
         raise StreamingRawError("streaming metadata requires one episode per task")
     path_fields = {
         "data_profile_path": "data_profile_sha256",
-        "model_profile_path": "model_profile_sha256",
         "task_manifest_path": "task_manifest_sha256",
         "episode_index_path": "episode_index_sha256",
         "window_index_path": "window_index_sha256",
@@ -119,6 +120,12 @@ def load_streaming_metadata_seal(
             or sha256_file(candidate) != value[sha_name]
         ):
             raise StreamingRawError(f"streaming metadata {path_name} is invalid")
+    model_path = Path(str(value["model_profile_path"]))
+    if not model_path.is_absolute() or model_path.is_symlink() or not model_path.is_file():
+        raise StreamingRawError("streaming metadata model_profile_path is invalid")
+    model = yaml.safe_load(model_path.read_text(encoding="utf-8"))
+    if not isinstance(model, dict) or canonical_sha256(model) != value["model_profile_sha256"]:
+        raise StreamingRawError("streaming metadata model profile content mismatch")
     for root_name in ("metadata_root", "task_bank_root"):
         root = Path(str(value[root_name]))
         if not root.is_absolute() or root.is_symlink() or not root.is_dir():
