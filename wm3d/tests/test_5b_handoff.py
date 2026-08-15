@@ -8,7 +8,7 @@ import sys
 import yaml
 import pytest
 
-from scripts.data.materialize_oxe_replacement import build_templates
+from scripts.data.materialize_oxe_default import build_templates
 from wm3d.models.model_factory import validate_model_profile
 from wm3d.training.runtime_contract import validate_runtime_profile
 
@@ -98,7 +98,7 @@ def test_5b_init_selects_a_complete_preset(
     payload = site.read_text()
     payload = payload.replace("PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}")
     payload = payload.replace(
-        "HF_TOKEN_FILE=/shared/secrets/huggingface_token",
+        "HF_TOKEN_FILE=/data/secrets/huggingface_token",
         f"HF_TOKEN_FILE={tmp_path / 'token'}",
     )
     site.write_text(payload)
@@ -141,7 +141,7 @@ def test_5b_lock_passes_exact_license_confirmation() -> None:
     assert "--confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES" in wrapper
 
 
-def test_5b_site_defaults_to_full_data_and_64_gpu_saturated_cache() -> None:
+def test_5b_site_defaults_to_oxe_without_beta_and_64_gpu_saturated_cache() -> None:
     site = (ROOT / "configs/cluster/h200_5b.env.example").read_text()
     assert "NNODES=8" in site
     assert "GPUS_PER_NODE=8" in site
@@ -149,9 +149,10 @@ def test_5b_site_defaults_to_full_data_and_64_gpu_saturated_cache() -> None:
     assert "CACHE_BATCH_FRAMES=16" in site
     assert "CACHE_DECODE_WORKERS=4" in site
     assert "CACHE_WRITER_THREADS=2" in site
-    assert "DATA_FAMILY=public_robot_6106h" in site
-    assert "SOURCE_TEMPLATE=configs/sources/public_sources.template.yaml" in site
-    assert "DATA_TEMPLATE=configs/data/public_robot_6106h.template.yaml" in site
+    assert "DATA_FAMILY=public_robot_oxe" in site
+    assert "INCLUDE_AGIBOT_BETA=NO" in site
+    assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
+    assert "DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe.template.yaml" in site
 
 
 def _oxe_info(action_dim: int, state_dim: int, views: int = 1) -> dict:
@@ -167,7 +168,7 @@ def _oxe_info(action_dim: int, state_dim: int, views: int = 1) -> dict:
     return {"features": features}
 
 
-def test_5b_oxe_generator_only_replaces_agibot_beta_weight() -> None:
+def test_5b_oxe_generator_adds_sources_without_a_fixed_pool_share() -> None:
     default = yaml.safe_load(
         (ROOT / "configs/data/public_robot_6106h.template.yaml").read_text()
     )
@@ -177,47 +178,77 @@ def test_5b_oxe_generator_only_replaces_agibot_beta_weight() -> None:
     repos = ("lerobot/droid_1.0.1",) + tuple(
         f"lerobot/fixture_{index:02d}" for index in range(55)
     )
-    generated_sources, replacement, adapters = build_templates(
+    generated_sources, generated_data, adapters = build_templates(
         base_source=source,
         base_data=default,
         repo_ids=repos,
         metadata_by_repo={repo: _oxe_info(7, 7, 2) for repo in repos[1:]},
     )
     default_weights = {row["name"]: row["weight"] for row in default["sources"]}
-    replacement_weights = {
-        row["name"]: row["weight"] for row in replacement["sources"]
+    generated_weights = {
+        row["name"]: row["weight"] for row in generated_data["sources"]
     }
 
     assert default_weights["agibot_beta"] == 30
-    assert "agibot_beta" not in replacement_weights
+    assert "agibot_beta" not in generated_weights
     main = {
         name: value
-        for name, value in replacement_weights.items()
+        for name, value in generated_weights.items()
         if not name.startswith("oxe_")
     }
     assert main == {
-        name: value * 55
+        name: value
         for name, value in default_weights.items()
         if name != "agibot_beta"
     }
     oxe = {
         name: value
-        for name, value in replacement_weights.items()
+        for name, value in generated_weights.items()
         if name.startswith("oxe_")
     }
     assert len(oxe) == 55
-    assert set(oxe.values()) == {30}
+    assert set(oxe.values()) == {1}
     assert sum(default_weights.values()) == 100
-    assert sum(main.values()) / sum(replacement_weights.values()) == pytest.approx(0.70)
+    assert sum(main.values()) == 70
+    assert sum(generated_weights.values()) == 125
     assert len(generated_sources["sources"]) == 61
-    assert len(replacement["sources"]) == 63
-    assert replacement["notes"]["oxe_dataset_count_including_droid"] == 56
-    assert replacement["notes"]["oxe_new_source_count"] == 55
+    assert len(generated_data["sources"]) == 63
+    assert generated_data["name"] == "public_robot_oxe"
+    assert generated_data["notes"]["agibot_beta_enabled"] is False
+    assert generated_data["notes"]["oxe_dataset_count_including_droid"] == 56
+    assert generated_data["notes"]["oxe_new_source_count"] == 55
+    assert generated_data["notes"]["oxe_added_source_weight"] == 1
     assert len(adapters) == 55
     assert all(
         adapter["groups"][0]["action"][0]["columns"] == list(range(7))
         for adapter in adapters.values()
     )
+
+
+def test_5b_oxe_generator_keeps_beta_only_when_explicitly_enabled() -> None:
+    default = yaml.safe_load(
+        (ROOT / "configs/data/public_robot_6106h.template.yaml").read_text()
+    )
+    source = yaml.safe_load(
+        (ROOT / "configs/sources/public_sources.template.yaml").read_text()
+    )
+    repos = ("lerobot/droid_1.0.1", "lerobot/fixture")
+    generated_sources, generated_data, _ = build_templates(
+        base_source=source,
+        base_data=default,
+        repo_ids=repos,
+        metadata_by_repo={"lerobot/fixture": _oxe_info(7, 7, 2)},
+        include_agibot_beta=True,
+    )
+    source_names = {row["name"] for row in generated_sources["sources"]}
+    weights = {row["name"]: row["weight"] for row in generated_data["sources"]}
+
+    assert {"agibot_beta", "agibot_alpha_converter"} <= source_names
+    assert weights["agibot_beta"] == 30
+    assert weights["oxe_fixture"] == 1
+    assert sum(weights.values()) == 101
+    assert generated_data["name"] == "public_robot_oxe_with_agibot_beta"
+    assert generated_data["notes"]["agibot_beta_enabled"] is True
 
 
 def test_5b_oxe_generator_rejects_capacity_overflow() -> None:

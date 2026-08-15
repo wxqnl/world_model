@@ -11,10 +11,10 @@ WM3D 5B 集群操作入口：
 
   ./run_wm3d.sh 5b init <canary1k|validation10k|validation100k|formal600k> <site.env>
   ./run_wm3d.sh 5b env <site.env>
+  ./run_wm3d.sh 5b data-template <site.env>
   ./run_wm3d.sh 5b doctor <site.env>
   ./run_wm3d.sh 5b plan <site.env>
   ./run_wm3d.sh 5b lock <site.env>
-  ./run_wm3d.sh 5b oxe-replacement <site.env>
   ./run_wm3d.sh 5b download <site.env>
   ./run_wm3d.sh 5b task-bank <site.env>
   ./run_wm3d.sh 5b cache-plan <site.env>
@@ -122,9 +122,14 @@ load_site() {
   STREAMING_METADATA_WORKERS=${STREAMING_METADATA_WORKERS:-32}
   STREAMING_ENCODE_BATCH_FRAMES=${STREAMING_ENCODE_BATCH_FRAMES:-16}
   STREAMING_DECODE_WORKERS=${STREAMING_DECODE_WORKERS:-4}
+  INCLUDE_AGIBOT_BETA=${INCLUDE_AGIBOT_BETA:-NO}
   case "${WM3D_DATA_MODE}" in
     episode_cache|streaming_raw) ;;
     *) die "WM3D_DATA_MODE 必须是 episode_cache 或 streaming_raw" ;;
+  esac
+  case "${INCLUDE_AGIBOT_BETA}" in
+    YES|NO) ;;
+    *) die "INCLUDE_AGIBOT_BETA 必须是 YES 或 NO" ;;
   esac
   for name in WM3D_5B_PRESET WM3D_5B_RUN_ID DATA_FAMILY WORK_ROOT CONTROL_ROOT RAW_ROOT \
     CACHE_ROOT ENV_DIR PYTHON_BIN \
@@ -304,7 +309,7 @@ WM3D 5B site plan
   final step: ${TOTAL_STEPS}
 
 Order:
-  env -> doctor -> lock -> download -> adapter/inventory approval
+  env -> data-template -> doctor -> lock -> download -> adapter/inventory approval
   -> ${data_steps} -> runtime -> preflight
   -> train/resume milestones: ${MILESTONES}
   -> eval -> verify
@@ -324,18 +329,23 @@ EOF
       --token-file "${HF_TOKEN_FILE}" \
       --confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES
     ;;
-  oxe-replacement)
+  data-template|oxe-replacement)
     [[ $# -eq 0 ]] || { usage; exit 2; }
-    [[ "${DATA_FAMILY}" == public_robot_oxe_no_beta ]] || \
-      die "oxe-replacement 只用于 DATA_FAMILY=public_robot_oxe_no_beta"
+    [[ "${DATA_FAMILY}" == public_robot_oxe ]] || \
+      die "data-template 只用于 DATA_FAMILY=public_robot_oxe"
     mkdir -p "${CONTROL_ROOT}/adapters"
-    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${PYTHON_BIN}" \
-      "${ROOT}/scripts/data/materialize_oxe_replacement.py" \
-      --base-source-template "${ROOT}/configs/sources/public_sources.template.yaml" \
-      --base-data-template "${ROOT}/configs/data/public_robot_6106h.template.yaml" \
-      --output-source-template "${SOURCE_TEMPLATE}" \
-      --output-data-template "${DATA_TEMPLATE}" \
+    template_args=(
+      "${ROOT}/scripts/data/materialize_oxe_default.py"
+      --base-source-template "${ROOT}/configs/sources/public_sources.template.yaml"
+      --base-data-template "${ROOT}/configs/data/public_robot_6106h.template.yaml"
+      --output-source-template "${SOURCE_TEMPLATE}"
+      --output-data-template "${DATA_TEMPLATE}"
       --output-adapter-root "${CONTROL_ROOT}/adapters"
+    )
+    if [[ "${INCLUDE_AGIBOT_BETA}" == YES ]]; then
+      template_args+=(--include-agibot-beta)
+    fi
+    HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${PYTHON_BIN}" "${template_args[@]}"
     ;;
   download)
     [[ $# -eq 0 ]] || { usage; exit 2; }

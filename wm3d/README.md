@@ -52,8 +52,8 @@ Python 包、脚本和文档统一使用 `WM3D` / `wm3d`。
 
 ## 环境
 
-推荐 Linux x86_64、Python 3.10、PyTorch 2.7.1 和 CUDA 12.8。正式多机运行要求共享
-存储、节点内 NVLink、节点间 InfiniBand，以及足够的 cache/checkpoint 空间。
+推荐 Linux x86_64、Python 3.10、PyTorch 2.7.1 和 CUDA 12.8。正式多机运行要求各节点能够
+访问配置的数据和输出路径，并具备节点内 NVLink、节点间 InfiniBand 和足够的磁盘空间。
 
 ```bash
 git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
@@ -88,6 +88,10 @@ gripper 极性、group 边界和 fine/coarse supervision 必须人工确认；�
 `configs/data/public_robot_5649h_legacy_compatible.template.yaml`。它保留已交付数据家庭、
 小时预算和采样权重，但所有样本都重新进入当前 grouped action/current-state/native-time
 ABI。旧 residual 只能由 `legacy-residual-import` 审计并转换，不能直接读取旧 cache。
+
+5B 集群流程默认使用完整 OXE collection，并保留 DROID、Bridge、RoboCasa365 和
+AgiBotWorld2026。AgiBotWorld Beta 默认关闭，可在生成 5B 数据模板前显式启用。具体命令见
+[WM3D 5B 训练流程](docs/WM3D_5B_SCALING.md)。
 
 ## 真实小样本验收
 

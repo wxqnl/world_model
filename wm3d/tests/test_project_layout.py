@@ -50,4 +50,5 @@ def test_5b_operator_handoff_is_discoverable() -> None:
     assert '5b) exec bash scripts/cluster/wm3d_5b.sh' in entry
     assert (ROOT / "configs/cluster/h200_5b.env.example").is_file()
     assert (ROOT / "configs/runtime/h200_64_fsdp2_validation10k.yaml").is_file()
+    assert (ROOT / "scripts/data/materialize_oxe_default.py").is_file()
     assert (ROOT / "scripts/tools/report_5b_run.py").is_file()

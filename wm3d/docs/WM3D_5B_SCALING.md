@@ -50,6 +50,7 @@ SITE=/data/wm3d/control/5b_validation10k.env
 ./run_wm3d.sh 5b init validation10k "$SITE"
 vim "$SITE"
 ./run_wm3d.sh 5b env "$SITE"
+./run_wm3d.sh 5b data-template "$SITE"
 ./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b plan "$SITE"
 ```
@@ -60,6 +61,7 @@ vim "$SITE"
 WORK_ROOT=/data/wm3d
 HF_TOKEN_FILE=/data/secrets/huggingface_token
 ACCEPT_DATA_LICENSES=YES
+INCLUDE_AGIBOT_BETA=NO
 MASTER_ADDR=TRAIN_NODE_0
 WM3D_VGGT_SOURCE_ROOT=/data/models/vggt
 WM3D_VGGT_MODEL_SNAPSHOT=/data/models/facebook-VGGT-1B
@@ -72,68 +74,76 @@ QWEN3_VL_EMBEDDING_PATH=/data/models/Qwen3-VL-Embedding-2B
 
 ### 3.1 默认数据组合
 
-默认数据模板为 `configs/data/public_robot_6106h.template.yaml`。数据整理完成后，实际训练
-使用 site 文件中 `DATA_PROFILE` 指向的物化配置。公开仓库和默认下载目录如下：
+默认 `DATA_FAMILY=public_robot_oxe`。项目保留 DROID、Bridge、RoboCasa365 和
+AgiBotWorld2026，并加入完整的
+[LeRobot Open X-Embodiment collection](https://huggingface.co/collections/lerobot/open-x-embodiment-68de658d8b544a43be4c6687)。
+AgiBotWorld Beta 默认关闭。
 
-| 数据源 | 公开仓库 | 规划时长 | `$RAW_ROOT/` 下的目录 |
-|---|---|---:|---|
-| DROID | [`lerobot/droid_1.0.1`](https://huggingface.co/datasets/lerobot/droid_1.0.1) | 约 350 h | `droid` |
-| Bridge V2 | [`ember-lab-berkeley/bridge_v2`](https://huggingface.co/datasets/ember-lab-berkeley/bridge_v2) | 约 100 h | `bridge` |
-| RoboCasa365 Atomic | [`ember-lab-berkeley/robocasa365-pretrain-atomic`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-atomic) | 约 21 h | `atomic` |
-| RoboCasa365 Composite | [`ember-lab-berkeley/robocasa365-pretrain-composite`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-composite) | 约 383 h | `composite` |
-| RoboCasa365 MG | [`ember-lab-berkeley/robocasa365-pretrain-mg`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-mg) | 约 1,615 h | `mg` |
-| AgiBotWorld2026 真机数据 | [`agibot-world/AgiBotWorld2026`](https://huggingface.co/datasets/agibot-world/AgiBotWorld2026) | 约 661 h | `agibot_world_2026` |
-| AgiBotWorld Beta | [`agibot-world/AgiBotWorld-Beta`](https://huggingface.co/datasets/agibot-world/AgiBotWorld-Beta) | 约 2,976.4 h | `agibot_beta` |
+| 数据源 | 公开仓库 | 默认状态 | 规划时长 | `$RAW_ROOT/` 下的目录 |
+|---|---|---|---:|---|
+| DROID | [`lerobot/droid_1.0.1`](https://huggingface.co/datasets/lerobot/droid_1.0.1) | 使用 | 约 350 h | `droid` |
+| Bridge V2 | [`ember-lab-berkeley/bridge_v2`](https://huggingface.co/datasets/ember-lab-berkeley/bridge_v2) | 使用 | 约 100 h | `bridge` |
+| RoboCasa365 Atomic | [`ember-lab-berkeley/robocasa365-pretrain-atomic`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-atomic) | 使用 | 约 21 h | `atomic` |
+| RoboCasa365 Composite | [`ember-lab-berkeley/robocasa365-pretrain-composite`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-composite) | 使用 | 约 383 h | `composite` |
+| RoboCasa365 MG | [`ember-lab-berkeley/robocasa365-pretrain-mg`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-mg) | 使用 | 约 1,615 h | `mg` |
+| AgiBotWorld2026 真机数据 | [`agibot-world/AgiBotWorld2026`](https://huggingface.co/datasets/agibot-world/AgiBotWorld2026) | 使用 | 约 661 h | `agibot_world_2026` |
+| OXE | [LeRobot OXE collection](https://huggingface.co/collections/lerobot/open-x-embodiment-68de658d8b544a43be4c6687) | 使用，DROID 去重 | 当前约 97.3 h | `oxe/<dataset>` |
+| AgiBotWorld Beta | [`agibot-world/AgiBotWorld-Beta`](https://huggingface.co/datasets/agibot-world/AgiBotWorld-Beta) | 可选，默认关闭 | 约 2,976.4 h | `agibot_beta` |
 
-默认组合的规划总量约为 6,106.4 小时。AgiBotWorld2026 只使用 Imitation Learning、
-Rich Interaction 和 Reinforcement Learning 三类真机数据，不使用其 Simulation 部分。
-AgiBotWorld Alpha 只提供 Beta 的官方格式转换器，不进入训练统计。表中的时长用于容量规划；
-最终训练量以整理后的 episode、frame 和 window 数量为准。
+当前官方清单包含 56 套 OXE 数据，其中 DROID 已作为主数据使用，因此默认新增 55 个 OXE
+source。默认组合共 63 个训练 source，规划时长约 3,227 小时。官方 collection 发生变化时，
+source 数量以 `data-template` 生成结果为准。
 
-### 3.2 用 OXE 替换 AgiBotWorld Beta
+AgiBotWorld2026 只使用 Imitation Learning、Rich Interaction 和 Reinforcement Learning
+三类真机数据，不使用其 Simulation 部分。表中的时长用于容量规划；最终训练量以整理后的
+episode、frame 和 window 数量为准。
 
-如果磁盘或预处理算力不足，可以暂时去掉 AgiBotWorld Beta，改用
-完整的 [LeRobot Open X-Embodiment collection](https://huggingface.co/collections/lerobot/open-x-embodiment-68de658d8b544a43be4c6687)。
-它不是 OXE-only 训练：DROID、Bridge、RoboCasa 和 AgiBotWorld 2026 仍然保留，只移除
-AgiBotWorld Beta。DROID 本身已在主数据中，因此不会重复下载或重复计权；collection 中其余
-全部数据集组成一个等权 OXE 池，整体接替 Beta 原来的 30% 采样份额，其它主数据的相对权重
-保持不变。撰写本文时官方 collection 含 56 套数据，其中 DROID 已存在，因此会新增 55 个
-source；实际数量以运行生成命令时的官方清单为准。
+### 3.2 生成默认数据模板
 
-当前官方清单下，替代组合的规模和 cache 预算如下：
+site 文件默认配置为：
+
+```bash
+DATA_FAMILY=public_robot_oxe
+INCLUDE_AGIBOT_BETA=NO
+```
+
+运行：
+
+```bash
+./run_wm3d.sh 5b data-template "$SITE"
+```
+
+该命令读取官方 OXE collection 和每个数据集的 `meta/info.json`，生成 source template、data
+template 和 adapter 候选。DROID 自动去重。现有主数据权重保持不变；每个新增 OXE 数据集
+作为普通 source 加入，权重为 1。OXE 不再拥有固定的整体采样比例。
+
+如需加入 AgiBotWorld Beta，在第一次生成模板前设置：
+
+```bash
+INCLUDE_AGIBOT_BETA=YES
+```
+
+启用后，生成器同时加入 Beta 和官方 Alpha converter。已经生成的模板不会被不同配置覆盖；
+更改该选项时应使用新的 site 和 `CONTROL_ROOT`。
+
+当前默认组合的规模和 cache 预算如下：
 
 | 组成 | 数据变化 | 数据规模 | 预计 episode cache |
 |---|---|---:|---:|
-| 保留的主数据 | DROID、Bridge、RoboCasa、AgiBotWorld2026，均保持不变 | 约 3,130 h | 约 105.5 TB |
-| OXE 池 | 新增除 DROID 外的 55 个 OXE source | 约 97.3 h 原始记录；约 264.6 万个 cache 帧 | 约 2.5 TB |
-| **替代组合合计** | **63 个训练 source，不含 AgiBotWorld Beta** | **约 3,227 h 原始记录** | **约 108 TB（约 98 TiB）** |
+| 保留的主数据 | DROID、Bridge、RoboCasa、AgiBotWorld2026 | 约 3,130 h | 约 105.5 TB |
+| OXE | 新增除 DROID 外的 55 个 source | 约 97.3 h 原始记录；约 264.6 万个 cache 帧 | 约 2.5 TB |
+| **默认组合合计** | **63 个训练 source，不含 AgiBotWorld Beta** | **约 3,227 h 原始记录** | **约 108 TB（约 98 TiB）** |
 
 cache 估算按正式的三视角 `native_p144` 表征、每个视角 144 个 token、最高约 10 Hz
 保留观测计算，平均每个被保留的观测约占 0.936 MB。OXE 中许多数据是 20 Hz 或 50 Hz，
 因此会按真实时间戳降到最高约 10 Hz；动作和状态仍保留原始时间戳，不做固定频率插值。
 
 `108 TB` 是最终 episode cache 本身。把原始下载、下载缓存、临时文件、日志和 checkpoint
-一并计算后，OXE 替代组合的完整 cache 方案建议准备 **130–150 TB 总磁盘**。作为对比，保留
-AgiBotWorld Beta 的 6,106.4 小时默认组合仅 episode cache 就约为 206 TB，总磁盘需求还会更高。
+一并计算后，默认组合的完整 cache 方案建议准备 **130–150 TB 总磁盘**。启用 AgiBotWorld
+Beta 后，episode cache 预计增加到约 209 TB，总磁盘也需要相应增加。
 
-选择替代方案时，在 site 文件中改这五行，然后生成替代模板：
-
-```bash
-DATA_FAMILY=public_robot_oxe_no_beta
-SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe_no_beta.template.yaml
-SOURCE_LOCK=${CONTROL_ROOT}/public_sources_oxe_no_beta.lock.yaml
-DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe_no_beta.template.yaml
-DATA_PROFILE=${CONTROL_ROOT}/public_robot_oxe_no_beta.yaml
-```
-
-```bash
-./run_wm3d.sh 5b oxe-replacement "$SITE"
-```
-
-该命令读取官方 collection 当前清单和每个数据集的 `meta/info.json`，生成下载模板、data
-template 和独立 adapter 候选。随后照常执行 `lock`、`download`、schema audit、adapter audit
-和 inventory。这样上游 collection 新增或删除数据集时不会靠手工列表悄悄遗漏；如果某个数据
-的动作或状态维度超过 WM3D 容量，生成步骤会直接停止并报告数据集名称。
+生成模板后照常执行 `lock`、`download`、schema audit、adapter audit 和 inventory。某个数据集
+的动作或状态维度超过 WM3D 容量时，生成步骤会停止并报告数据集名称。
 
 ### 3.3 下载
 
@@ -170,8 +180,8 @@ RoboCasa 和 AgiBotWorld 2026 先按 [WM3D 从零数据流程](WM3D_FROM_ZERO.md
 archive、schema、adapter、inventory 命令整理。OXE 数据已经是 LeRobot 格式；生成命令会为
 每套数据保留其官方相机键、action/state 维度和原始时间戳，并生成 opaque controller adapter
 候选。负责人仍需按同一数据流程完成 schema、adapter audit、inventory 和 data-profile，不能
-把候选文件直接当成已审计 adapter。默认完整配置应包含 9 个训练 source；替代配置的 source
-数量由官方 OXE collection 当前清单决定。每个 source 都必须有非空 episode 数量。
+把候选文件直接当成已审计 adapter。当前默认配置应包含 63 个训练 source；启用 Beta 后为
+64 个。source 数量随官方 OXE collection 调整，每个 source 都必须有非空 episode 数量。
 
 完成后运行：
 
@@ -253,12 +263,11 @@ worker 可重入。任务中断后用完全相同的 worker count 重跑，已�
 视频并运行冻结的 VGGT，然后把生成的标准 episode cache 放进有容量上限的 LRU。后续窗口直接读取
 这份缓存；达到容量上限后，LRU 只淘汰最久未使用的 episode。
 
-只有几十 TB 磁盘时，建议同时采用第 3.2 节的 OXE 替代组合和本节的
-`streaming_raw`：前者用 OXE 替换 AgiBotWorld Beta，后者取消全量视觉 cache。DROID、
-Bridge、RoboCasa、AgiBotWorld 2026 和 OXE 池仍全部参与训练。
+只有几十 TB 磁盘时，使用默认数据组合并启用 `streaming_raw`。DROID、Bridge、RoboCasa、
+AgiBotWorld 2026 和 OXE 都参与训练，按需缓存只改变数据访问方式。
 
 两种数据访问方式使用相同的 data profile、采样权重、模型输入和训练目标。下表是 64×H200、
-OXE 替代组合和 600K 正式训练的容量与时间预算：
+默认 OXE 组合和 600K 正式训练的容量与时间预算：
 
 | 数据访问方式 | 建议总磁盘 | 相对训练吞吐 | 600K 预计用时 | 选择条件 |
 |---|---:|---:|---:|---|
@@ -286,7 +295,7 @@ batch 256；64 卡实际跑完前 100–500 steps 后，用日志中的单步中
 | 600K 正式训练 | 40–55 天，通常按约 45 天安排，资源窗口预留 55 天 |
 
 `streaming_raw` 去掉的是约 108 TB 的完整视觉 cache，原始数据仍需保留。当前上游规模下，
-OXE 替代组合的原始数据预计约 15–20 TB。总磁盘按下面的项目规划：
+默认 OXE 组合的原始数据预计约 15–20 TB。总磁盘按下面的项目规划：
 
 | 项目 | 预计空间 | 使用阶段 |
 |---|---:|---|
