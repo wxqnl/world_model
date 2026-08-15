@@ -75,8 +75,9 @@ def test_h200_64_formal_profile_preserves_scaling_budget() -> None:
     schedule = value["schedule"]
     assert value["name"] == "h200_64_fsdp2_formal600k"
     assert train["total_steps"] == 600000
-    assert train["global_batch_size"] == 128
-    assert train["gradient_accumulation"] == 2
+    assert train["micro_batch_size"] == 4
+    assert train["global_batch_size"] == 256
+    assert train["gradient_accumulation"] == 1
     assert train["seed"] == 271828
     assert train["validation_seed"] == 314159
     assert train["validate_every"] == 5000
@@ -103,7 +104,9 @@ def test_h200_64_canary1k_uses_the_same_cluster_gate() -> None:
     train = value["train"]
     assert value["name"] == "h200_64_fsdp2_canary1k"
     assert train["total_steps"] == 1000
-    assert train["global_batch_size"] == 128
+    assert train["micro_batch_size"] == 4
+    assert train["gradient_accumulation"] == 1
+    assert train["global_batch_size"] == 256
     assert train["seed"] == 271828
     assert train["validation_seed"] == 314159
     assert train["validate_every"] == 250

@@ -2,8 +2,8 @@
 
 WM3D 5B 使用 `configs/model/native_5b.yaml`，参数量约 51 亿。默认训练规模为
 8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做 8-way FSDP2
-分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 1，梯度累积
-2 次，global batch 为 128。
+分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，不做梯度累积，
+global batch 为 256。
 
 整个流程按数据下载、数据整理、数据访问准备、1K 集群验证、10K 验证性训练和正式训练
 依次进行。数据访问可以使用完整 episode cache，也可以使用有容量上限的按需缓存。命令会
@@ -20,6 +20,9 @@ WM3D 5B 使用 `configs/model/native_5b.yaml`，参数量约 51 亿。默认训�
 
 四套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
 和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
+
+默认 global batch 为 256，因此 1K、10K、100K 和 600K 分别对应约 25.6 万、256 万、
+2,560 万和 1.536 亿个全局采样位置。
 
 ## 2. 服务器与存储
 
@@ -266,9 +269,8 @@ OXE 替代组合和 600K 正式训练的容量与时间预算：
 计入 episode 第一次解码和 VGGT 编码，因此约为 `0.75–0.9`。换算成训练耗时，按需缓存通常是
 完整 cache 的 `1.1–1.35` 倍。短 episode 较多、原始视频盘较慢或 LRU 频繁淘汰时，差距会扩大。
 
-这些时间是排期估算，不代替 64 卡 canary。当前配置下，完整 cache 按每 step 约 4–6 秒、
-按需缓存按每 step 约 5–7 秒估算，并为验证、checkpoint 和短暂停顿保留余量。64 卡实际跑完
-前 100–500 steps 后，用日志中的单步中位时间更新正式排期：
+这些时间是排期估算，不代替 64 卡 canary。默认配置使用 H200、micro batch 4 和 global
+batch 256；64 卡实际跑完前 100–500 steps 后，用日志中的单步中位时间更新正式排期：
 
 ```text
 预计天数 = 剩余 steps × 单步中位秒数 ÷ 86400 × 1.08
@@ -417,7 +419,7 @@ optimizer、sampler 或分布式状态问题。
 
 ## 6. 10K 验证性训练
 
-10K 使用约 128 万个全局采样位置，主要验证数据分布、吞吐、loss、梯度和长期资源稳定性。
+10K 使用约 256 万个全局采样位置，主要验证数据分布、吞吐、loss、梯度和长期资源稳定性。
 
 ```bash
 SITE=/data/wm3d/control/5b_validation10k.env
@@ -509,7 +511,7 @@ run_5b eval 600000
 | cache OOM | 先将 `CACHE_BATCH_FRAMES` 从 16 降到 12 或 8 |
 | streaming 冷缓存反复生成 | 提高 LRU 容量；恢复时尽量复用原缓存路径和 rank 布局 |
 | streaming 中 GPU 长时间空闲 | 检查原始视频盘、CPU 绑定和 `STREAMING_DECODE_WORKERS`；再观察 `prepare_seconds` |
-| 训练 OOM | 检查 8-way FSDP2、BF16、activation checkpoint 和 64 卡 topology |
+| 训练 OOM | 先检查 8-way FSDP2、BF16、activation checkpoint 和 64 卡 topology；确认无误后将 micro batch 从 4 降为 2，并同步把 global batch 改为 128 |
 | GPU busy、ECC、NVLink、IB 失败 | 更换节点或修复资源后重新运行 preflight |
 | 恢复失败 | 只从完整编号 checkpoint 恢复，并重新运行 preflight |
 | eval coverage 为 0 | 检查验证集和对应 action/视觉 supervision 是否真实存在 |

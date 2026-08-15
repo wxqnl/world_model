@@ -40,8 +40,9 @@ def test_5b_presets_match_native_5b_and_64_h200(
     assert runtime["distributed"]["shard_degree"] == 8
     assert runtime["resources"]["gpu_name_substring"] == "H200"
     assert runtime["resources"]["minimum_ib_rate_gbps"] == 400.0
-    assert runtime["train"]["gradient_accumulation"] == 2
-    assert runtime["train"]["global_batch_size"] == 128
+    assert runtime["train"]["micro_batch_size"] == 4
+    assert runtime["train"]["gradient_accumulation"] == 1
+    assert runtime["train"]["global_batch_size"] == 256
     assert runtime["train"]["total_steps"] == total_steps
     assert runtime["train"]["checkpoint_steps"] == checkpoint_steps
     assert runtime["train"]["checkpoint_interval"] == checkpoint_interval
