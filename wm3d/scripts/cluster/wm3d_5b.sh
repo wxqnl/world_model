@@ -9,7 +9,7 @@ usage() {
   cat <<'EOF'
 WM3D 5B 集群操作入口：
 
-  ./run_wm3d.sh 5b init <canary1k|validation10k|validation100k|formal600k> <site.env>
+  ./run_wm3d.sh 5b init <canary1k|validation100k|formal600k> <site.env>
   ./run_wm3d.sh 5b env <site.env>
   ./run_wm3d.sh 5b data-template <site.env>
   ./run_wm3d.sh 5b doctor <site.env>
@@ -68,8 +68,8 @@ require_file() {
 
 validate_preset() {
   case "$1" in
-    canary1k|validation10k|validation100k|formal600k) ;;
-    *) die "未知 5B preset：$1（可选 canary1k、validation10k、validation100k、formal600k）" ;;
+    canary1k|validation100k|formal600k) ;;
+    *) die "未知 5B preset：$1（可选 canary1k、validation100k、formal600k）" ;;
   esac
 }
 
@@ -80,11 +80,6 @@ apply_preset() {
       RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_canary1k.yaml
       TOTAL_STEPS=1000
       MILESTONES="100 -> 500 -> 1000"
-      ;;
-    validation10k)
-      RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_validation10k.yaml
-      TOTAL_STEPS=10000
-      MILESTONES="100 -> 500 -> 10000"
       ;;
     validation100k)
       RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_validation100k.yaml

@@ -1,15 +1,16 @@
 # 5B site configuration
 
-Create a site file for one of the four schedules, then edit the storage, token, model snapshot,
+Create a site file for one of the three schedules, then edit the storage, token, model snapshot,
 and rendezvous paths:
 
 ```bash
-./run_wm3d.sh 5b init validation10k /data/wm3d/control/h200_5b.env
+./run_wm3d.sh 5b init canary1k /data/wm3d/control/h200_5b.env
 ./run_wm3d.sh 5b data-template /data/wm3d/control/h200_5b.env
 ./run_wm3d.sh 5b doctor /data/wm3d/control/h200_5b.env
 ```
 
-Available presets are `canary1k`, `validation10k`, `validation100k`, and `formal600k`.
+Available presets are `canary1k`, `validation100k`, and `formal600k`. The required validation run
+is `canary1k`; `validation100k` is an optional intermediate run.
 The wrapper derives the runtime profile, run identity, final checkpoint, and eval path from the
 selected preset.
 

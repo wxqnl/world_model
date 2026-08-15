@@ -5,7 +5,7 @@ WM3D 5B 使用 `configs/model/native_5b.yaml`，参数量约 51 亿。默认训�
 分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，不做梯度累积，
 global batch 为 256。
 
-整个流程按数据下载、数据整理、数据访问准备、1K 集群验证、10K 验证性训练和正式训练
+整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练
 依次进行。数据访问可以使用完整 episode cache，也可以使用有容量上限的按需缓存。命令会
 自动记录和校验中间产物，使用者只需要指定数据目录、数据许可、模型目录和集群地址。
 
@@ -14,15 +14,14 @@ global batch 为 256。
 | preset | optimizer steps | 用途 |
 |---|---:|---|
 | `canary1k` | 1,000 | 验证 64 卡通信、训练、保存、恢复和评测 |
-| `validation10k` | 10,000 | 验证数据质量、吞吐和训练稳定性 |
-| `validation100k` | 100,000 | 中程训练 |
+| `validation100k` | 100,000 | 可选的中程训练，不是正式训练前置条件 |
 | `formal600k` | 600,000 | 正式训练 |
 
-四套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
+三套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
 和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
 
-默认 global batch 为 256，因此 1K、10K、100K 和 600K 分别对应约 25.6 万、256 万、
-2,560 万和 1.536 亿个全局采样位置。
+默认 global batch 为 256，因此 1K、100K 和 600K 分别对应约 25.6 万、2,560 万和
+1.536 亿个全局采样位置。
 
 ## 2. 服务器与存储
 
@@ -43,11 +42,11 @@ git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
 cd world_model/wm3d
 ```
 
-创建 10K 站点配置和 Python 环境：
+创建 1K 验证站点配置和 Python 环境：
 
 ```bash
-SITE=/data/wm3d/control/5b_validation10k.env
-./run_wm3d.sh 5b init validation10k "$SITE"
+SITE=/data/wm3d/control/5b_canary1k.env
+./run_wm3d.sh 5b init canary1k "$SITE"
 vim "$SITE"
 ./run_wm3d.sh 5b env "$SITE"
 ./run_wm3d.sh 5b data-template "$SITE"
@@ -210,7 +209,7 @@ worker 会流水执行“准备下一个 episode、GPU 编码当前 episode、�
 用 Slurm 在 64 张卡上启动 cache：
 
 ```bash
-export SITE=/data/wm3d/control/5b_validation10k.env
+export SITE=/data/wm3d/control/5b_canary1k.env
 srun --nodes=8 --ntasks=64 --ntasks-per-node=8 --gpus-per-task=1 \
   --cpus-per-task=8 --cpu-bind=cores \
   --export=ALL,SITE bash -lc '
@@ -267,19 +266,25 @@ worker 可重入。任务中断后用完全相同的 worker count 重跑，已�
 AgiBotWorld 2026 和 OXE 都参与训练，按需缓存只改变数据访问方式。
 
 两种数据访问方式使用相同的 data profile、采样权重、模型输入和训练目标。下表是 64×H200、
-默认 OXE 组合和 600K 正式训练的容量与时间预算：
+默认 OXE 组合的容量与排期预算。`300K 等样本预算`与旧 global batch 128 下的 600K
+拥有相同的 7,680 万个全局采样位置；当前正式预设仍训练 600K steps，共 1.536 亿个采样位置。
 
-| 数据访问方式 | 建议总磁盘 | 相对训练吞吐 | 600K 预计用时 | 选择条件 |
-|---|---:|---:|---:|---|
-| `episode_cache` | 约 130–150 TB | 1.0 | 约 30–45 天 | 磁盘充足，优先训练吞吐 |
-| `streaming_raw` | 约 35–45 TB | 约 0.75–0.9 | 约 40–55 天 | 只有几十 TB，接受一定速度损失 |
+| 数据访问方式 | 建议总磁盘 | 相对训练吞吐 | 300K 等样本预算 | 600K 正式训练 | 选择条件 |
+|---|---:|---:|---:|---:|---|
+| `episode_cache` | 约 130–150 TB | 1.0 | 约 15–23 天 | 约 30–45 天 | 磁盘充足，优先训练吞吐 |
+| `streaming_raw` | 约 35–45 TB | 约 0.75–0.9 | 约 20–28 天 | 约 40–55 天 | 只有几十 TB，接受一定速度损失 |
 
 吞吐按完整 cache 为 `1.0`。LRU 命中后的读取速度约为完整 cache 的 `0.95–1.0`；长期平均还要
 计入 episode 第一次解码和 VGGT 编码，因此约为 `0.75–0.9`。换算成训练耗时，按需缓存通常是
 完整 cache 的 `1.1–1.35` 倍。短 episode 较多、原始视频盘较慢或 LRU 频繁淘汰时，差距会扩大。
 
-这些时间是排期估算，不代替 64 卡 canary。默认配置使用 H200、micro batch 4 和 global
-batch 256；64 卡实际跑完前 100–500 steps 后，用日志中的单步中位时间更新正式排期：
+micro batch 从 1 调到 4、梯度累积从 2 调到 1 后，每个 rank 每个 optimizer step 的有效
+样本数从 2 增加到 4，global batch 从 128 增加到 256。这使固定样本预算所需的 optimizer
+steps 减半，但不是 8 倍墙钟加速。当前 `formal600k` 没有减少 steps，而是把训练样本预算
+翻倍，因此 600K 排期不能直接除以 2 或 8。
+
+这些时间是排期估算，不代替 64 卡 canary。64 卡实际跑完前 100–500 steps 后，用日志中的
+单步中位时间更新正式排期：
 
 ```text
 预计天数 = 剩余 steps × 单步中位秒数 ÷ 86400 × 1.08
@@ -290,7 +295,6 @@ batch 256；64 卡实际跑完前 100–500 steps 后，用日志中的单步中
 | 训练预设 | 预计用时 |
 |---|---:|
 | 1K canary | 2–3 小时 |
-| 10K 验证训练 | 18–24 小时 |
 | 100K | 6–9 天 |
 | 600K 正式训练 | 40–55 天，通常按约 45 天安排，资源窗口预留 55 天 |
 
@@ -423,52 +427,13 @@ run_5b eval 1000
 ./run_wm3d.sh 5b verify "$SITE" 1000
 ```
 
-`verify` 通过后再开始 10K。不要跳过独立进程 resume，因为它能发现只在恢复时出现的模型、
-optimizer、sampler 或分布式状态问题。
+`verify` 通过后可以开始 600K 正式训练。不要跳过独立进程 resume，因为它能发现只在恢复时
+出现的模型、optimizer、sampler 或分布式状态问题。
 
-## 6. 10K 验证性训练
+## 6. 正式训练
 
-10K 使用约 256 万个全局采样位置，主要验证数据分布、吞吐、loss、梯度和长期资源稳定性。
-
-```bash
-SITE=/data/wm3d/control/5b_validation10k.env
-./run_wm3d.sh 5b runtime "$SITE"
-
-run_5b preflight
-run_5b train 100
-
-run_5b preflight
-run_5b resume 100 500
-
-run_5b preflight
-run_5b resume 500 10000
-
-run_5b preflight
-run_5b eval 10000
-./run_wm3d.sh 5b verify "$SITE" 10000
-```
-
-训练期间查看：
-
-```bash
-tail -f /data/wm3d/runs/5b_validation10k/train_metrics.jsonl
-watch -n 2 nvidia-smi
-./run_wm3d.sh 5b status "$SITE"
-```
-
-需要重点确认：
-
-- 64 个 rank 全部在线，8 张 GPU/节点都参与计算；
-- step 连续增加，`total`、`token_mse`、`rgb`、`depth`、`point`、`pose` 均为有限数；
-- `action_fine` 或数据声明的 action lane 有有效监督；
-- required gradient owners 非零，nonfinite 数量为 0；
-- 吞吐稳定，没有周期性长时间 GPU 空闲；
-- step 100、500 和 10,000 的 checkpoint 都完整；
-- offline eval 的 supervision coverage 非零。
-
-## 7. 正式训练
-
-10K 通过后再创建 100K 或 600K site。它们复用 data profile 和已选择的数据访问方式；
+1K 通过后创建 600K site。需要观察中程曲线时可以另建 100K site，但它不是正式训练的
+前置条件。两者复用 data profile 和已选择的数据访问方式；
 `episode_cache` 复用完整 cache，`streaming_raw` 复用 metadata 和有容量上限的 LRU。每个 preset
 仍从自己的 step 0 开始训练。
 
@@ -509,7 +474,7 @@ run_5b eval 600000
 ./run_wm3d.sh 5b verify "$SITE" 600000
 ```
 
-## 8. 常见问题
+## 7. 常见问题
 
 | 现象 | 处理 |
 |---|---|

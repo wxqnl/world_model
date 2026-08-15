@@ -20,7 +20,6 @@ ROOT = Path(__file__).resolve().parents[1]
     "profile,total_steps,checkpoint_steps,checkpoint_interval",
     [
         ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000),
-        ("h200_64_fsdp2_validation10k.yaml", 10_000, [100, 500], 1_000),
         ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000),
         ("h200_64_fsdp2.yaml", 600_000, [1_000, 5_000, 20_000], 20_000),
     ],
@@ -54,14 +53,14 @@ def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
         "bash",
         str(ROOT / "scripts/cluster/wm3d_5b.sh"),
         "init",
-        "validation10k",
+        "canary1k",
         str(destination),
     ]
     first = subprocess.run(command, cwd=ROOT, check=False, text=True, capture_output=True)
     assert first.returncode == 0, first.stderr
     assert destination.is_file()
     assert destination.stat().st_mode & 0o777 == 0o600
-    assert "WM3D_5B_PRESET=validation10k" in destination.read_text()
+    assert "WM3D_5B_PRESET=canary1k" in destination.read_text()
     payload = destination.read_bytes()
     second = subprocess.run(command, cwd=ROOT, check=False, text=True, capture_output=True)
     assert second.returncode == 2
@@ -72,7 +71,6 @@ def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
     "preset,runtime,steps",
     [
         ("canary1k", "h200_64_fsdp2_canary1k.yaml", "1000"),
-        ("validation10k", "h200_64_fsdp2_validation10k.yaml", "10000"),
         ("validation100k", "h200_64_fsdp2_validation100k.yaml", "100000"),
         ("formal600k", "h200_64_fsdp2.yaml", "600000"),
     ],
@@ -124,6 +122,24 @@ def test_5b_init_rejects_unknown_preset(tmp_path: Path) -> None:
             str(ROOT / "scripts/cluster/wm3d_5b.sh"),
             "init",
             "not-a-preset",
+            str(tmp_path / "site.env"),
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "未知 5B preset" in result.stderr
+
+
+def test_5b_init_rejects_retired_validation10k_preset(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/cluster/wm3d_5b.sh"),
+            "init",
+            "validation10k",
             str(tmp_path / "site.env"),
         ],
         cwd=ROOT,
