@@ -7,7 +7,7 @@ WM3D 5B 使用 `configs/model/native_5b.yaml`，参数量约 51 亿。默认训�
 
 整个流程按数据下载、数据整理、数据访问准备、1K 集群验证、10K 验证性训练和正式训练
 依次进行。数据访问可以使用完整 episode cache，也可以使用有容量上限的按需缓存。命令会
-自动记录和校验中间产物，使用者只需要指定共享存储、数据许可、模型目录和集群地址。
+自动记录和校验中间产物，使用者只需要指定数据目录、数据许可、模型目录和集群地址。
 
 ## 1. 训练预设
 
@@ -21,16 +21,17 @@ WM3D 5B 使用 `configs/model/native_5b.yaml`，参数量约 51 亿。默认训�
 四套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
 和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
 
-## 2. 服务器与共享存储
+## 2. 服务器与存储
 
 默认集群配置：
 
 - 8 个 8×H200 SXM 节点，节点内 NVLink；
 - 400 Gb/s InfiniBand；
 - Linux x86_64、Python 3.10、CUDA 12.8；
-- 代码、原始数据、cache 和训练输出在所有节点上使用相同绝对路径；
-- cache 放在并行文件系统或本地 NVMe 汇聚存储，不要放在低吞吐 NAS；
-- 原始数据和 cache 分开计量磁盘空间，下载前先用 `df -h` 确认容量。
+- 所有节点都能访问代码、原始数据、cache 和训练输出；底层可以是共享存储，也可以是各节点
+  独立存储并由站点配置映射；
+- 数据盘应能持续供给训练和 cache 构建所需的读写吞吐；
+- 按第 4.1 节的总量规划磁盘，下载前用 `df -h` 确认剩余容量。
 
 克隆项目：
 
@@ -42,7 +43,7 @@ cd world_model/wm3d
 创建 10K 站点配置和 Python 环境：
 
 ```bash
-SITE=/shared/wm3d/control/5b_validation10k.env
+SITE=/data/wm3d/control/5b_validation10k.env
 ./run_wm3d.sh 5b init validation10k "$SITE"
 vim "$SITE"
 ./run_wm3d.sh 5b env "$SITE"
@@ -53,13 +54,13 @@ vim "$SITE"
 站点文件至少需要修改：
 
 ```bash
-WORK_ROOT=/shared/wm3d
-HF_TOKEN_FILE=/shared/secrets/huggingface_token
+WORK_ROOT=/data/wm3d
+HF_TOKEN_FILE=/data/secrets/huggingface_token
 ACCEPT_DATA_LICENSES=YES
 MASTER_ADDR=TRAIN_NODE_0
-WM3D_VGGT_SOURCE_ROOT=/shared/models/vggt
-WM3D_VGGT_MODEL_SNAPSHOT=/shared/models/facebook-VGGT-1B
-QWEN3_VL_EMBEDDING_PATH=/shared/models/Qwen3-VL-Embedding-2B
+WM3D_VGGT_SOURCE_ROOT=/data/models/vggt
+WM3D_VGGT_MODEL_SNAPSHOT=/data/models/facebook-VGGT-1B
+QWEN3_VL_EMBEDDING_PATH=/data/models/Qwen3-VL-Embedding-2B
 ```
 
 默认值已经设置为 `NNODES=8`、`GPUS_PER_NODE=8`，不需要再改 world size。
@@ -108,11 +109,9 @@ cache 估算按正式的三视角 `native_p144` 表征、每个视角 144 个 to
 保留观测计算，平均每个被保留的观测约占 0.936 MB。OXE 中许多数据是 20 Hz 或 50 Hz，
 因此会按真实时间戳降到最高约 10 Hz；动作和状态仍保留原始时间戳，不做固定频率插值。
 
-`108 TB` 只表示最终 episode cache，不包含原始下载、Hugging Face 下载缓存、临时文件和
-训练 checkpoint。实际部署建议为替代组合单独准备 **130–150 TB** 的 cache 空间。若只有
-200 TB 可用空间，单独存放 cache 足够；如果原始数据和训练输出也在同一文件系统，应分别
-统计并预留空间。作为对比，保留 AgiBotWorld Beta 的 6,106.4 小时默认组合，按相同格式估算
-约需 206 TB cache。
+`108 TB` 是最终 episode cache 本身。把原始下载、下载缓存、临时文件、日志和 checkpoint
+一并计算后，OXE 替代组合的完整 cache 方案建议准备 **130–150 TB 总磁盘**。作为对比，保留
+AgiBotWorld Beta 的 6,106.4 小时默认组合仅 episode cache 就约为 206 TB，总磁盘需求还会更高。
 
 选择替代方案时，在 site 文件中改这五行，然后生成替代模板：
 
@@ -138,12 +137,12 @@ template 和独立 adapter 候选。随后照常执行 `lock`、`download`、sch
 先准备 Hugging Face token：
 
 ```bash
-install -d -m 700 /shared/secrets
+install -d -m 700 /data/secrets
 umask 077
 read -rsp "Hugging Face token: " HF_TOKEN
-printf '%s\n' "$HF_TOKEN" > /shared/secrets/huggingface_token
+printf '%s\n' "$HF_TOKEN" > /data/secrets/huggingface_token
 unset HF_TOKEN
-chmod 600 /shared/secrets/huggingface_token
+chmod 600 /data/secrets/huggingface_token
 ```
 
 下载命令：
@@ -198,7 +197,7 @@ worker 会流水执行“准备下一个 episode、GPU 编码当前 episode、�
 用 Slurm 在 64 张卡上启动 cache：
 
 ```bash
-export SITE=/shared/wm3d/control/5b_validation10k.env
+export SITE=/data/wm3d/control/5b_validation10k.env
 srun --nodes=8 --ntasks=64 --ntasks-per-node=8 --gpus-per-task=1 \
   --cpus-per-task=8 --cpu-bind=cores \
   --export=ALL,SITE bash -lc '
@@ -217,8 +216,8 @@ CACHE_WRITER_THREADS=2
 ```
 
 H200 显存足够时保持这组默认值。只有出现单卡 OOM 时，才把 `CACHE_BATCH_FRAMES` 降为 12
-或 8；不要先减少 worker 数量。共享存储写入吃不满时，先检查挂载和 striping，再考虑增加
-写线程，避免在慢盘上盲目堆线程。
+或 8；不要先减少 worker 数量。写入吃不满时，先检查存储带宽、挂载方式和小文件性能，再
+考虑增加写线程，避免在慢盘上盲目堆线程。
 
 运行期间查看：
 
@@ -246,22 +245,22 @@ worker 可重入。任务中断后用完全相同的 worker count 重跑，已�
 
 ### 4.1 几十 TB 磁盘：按需缓存训练
 
-共享存储无法容纳完整视觉 cache 时，使用 `streaming_raw`。这个模式不会在每一步重复处理
+磁盘无法容纳完整视觉 cache 时，使用 `streaming_raw`。这个模式不会在每一步重复处理
 原始视频。它先生成全量的轻量 metadata 和窗口索引，训练第一次访问某个 episode 时才解码
-视频并运行冻结的 VGGT，然后把生成的标准 episode cache 放进本机 NVMe。后续窗口直接读取
+视频并运行冻结的 VGGT，然后把生成的标准 episode cache 放进有容量上限的 LRU。后续窗口直接读取
 这份缓存；达到容量上限后，LRU 只淘汰最久未使用的 episode。
 
-只有几十 TB 共享存储时，建议同时采用第 3.2 节的 OXE 替代组合和本节的
+只有几十 TB 磁盘时，建议同时采用第 3.2 节的 OXE 替代组合和本节的
 `streaming_raw`：前者用 OXE 替换 AgiBotWorld Beta，后者取消全量视觉 cache。DROID、
 Bridge、RoboCasa、AgiBotWorld 2026 和 OXE 池仍全部参与训练。
 
 两种数据访问方式使用相同的 data profile、采样权重、模型输入和训练目标。下表是 64×H200、
 OXE 替代组合和 600K 正式训练的容量与时间预算：
 
-| 数据访问方式 | 共享存储预算 | 每节点本地 NVMe | 相对训练吞吐 | 600K 预计用时 | 选择条件 |
-|---|---:|---:|---:|---:|---|
-| `episode_cache` | 约 150–170 TB | 无硬性要求 | 1.0 | 约 30–45 天 | 共享存储至少 160 TB，优先训练吞吐 |
-| `streaming_raw` | 建议 40 TB | 默认 512 GiB | 约 0.75–0.9 | 约 40–55 天 | 共享存储只有几十 TB |
+| 数据访问方式 | 建议总磁盘 | 相对训练吞吐 | 600K 预计用时 | 选择条件 |
+|---|---:|---:|---:|---|
+| `episode_cache` | 约 130–150 TB | 1.0 | 约 30–45 天 | 磁盘充足，优先训练吞吐 |
+| `streaming_raw` | 约 35–45 TB | 约 0.75–0.9 | 约 40–55 天 | 只有几十 TB，接受一定速度损失 |
 
 吞吐按完整 cache 为 `1.0`。LRU 命中后的读取速度约为完整 cache 的 `0.95–1.0`；长期平均还要
 计入 episode 第一次解码和 VGGT 编码，因此约为 `0.75–0.9`。换算成训练耗时，按需缓存通常是
@@ -285,7 +284,7 @@ OXE 替代组合和 600K 正式训练的容量与时间预算：
 | 600K 正式训练 | 40–55 天，通常按约 45 天安排，资源窗口预留 55 天 |
 
 `streaming_raw` 去掉的是约 108 TB 的完整视觉 cache，原始数据仍需保留。当前上游规模下，
-OXE 替代组合的原始数据预计约 15–20 TB。共享存储按下面的项目规划：
+OXE 替代组合的原始数据预计约 15–20 TB。总磁盘按下面的项目规划：
 
 | 项目 | 预计空间 | 使用阶段 |
 |---|---:|---|
@@ -293,37 +292,30 @@ OXE 替代组合的原始数据预计约 15–20 TB。共享存储按下面的�
 | 下载、转换临时文件 | 峰值额外 5–10 TB | 数据确认后清理 |
 | metadata、task bank、日志和临时输出 | 预留 1–2 TB | 全程 |
 | 10 个完整 5B checkpoint | 约 1 TB | 训练期间 |
-| **长期稳定占用** | **约 20–25 TB** | 清理下载和转换临时文件后 |
-| **准备阶段峰值** | **约 30–35 TB** | 下载和转换期间 |
+| 有容量上限的 episode LRU | 建议预留 2–4 TB | 训练期间，可按可用空间调整 |
+| **建议总磁盘** | **约 35–45 TB** | 覆盖准备阶段峰值并保留运行余量 |
 
-因此建议提供 40 TB 共享存储，不要按 25 TB 的理论稳定值采购。LRU 放在各节点的本地 NVMe，
-不占共享存储额度。
-
-默认 LRU 容量如下：
-
-| `STREAMING_LRU_GIB_PER_RANK` | 每个 8 卡节点 | 8 节点合计 | 建议 |
-|---:|---:|---:|---|
-| 64 GiB | 512 GiB | 4 TiB | 默认，优先使用 |
-| 32 GiB | 256 GiB | 2 TiB | 本地 NVMe 较小时使用 |
-
-LRU 路径会自动按主机名和 global rank 隔离。所有节点可以填写相同的绝对路径，但该路径必须
-指向各自的本地 NVMe，不能指向共享 NAS。
+因此实际规划按 **40 TB 左右** 准备最稳妥，不要按清理临时文件后的理论最低值采购。LRU
+建议从总量 2–4 TB 起步；磁盘更紧时可以缩小，代价是 episode 淘汰增加、吞吐下降。LRU
+可以放在共享存储或节点本地存储，优先选择现场速度最快且容量稳定的路径。程序会按主机名和
+global rank 自动隔离缓存目录。
 
 在 site 文件中设置：
 
 ```bash
 WM3D_DATA_MODE=streaming_raw
-STREAMING_METADATA_ROOT=/shared/wm3d/streaming_metadata/native_p144
-STREAMING_LRU_ROOT=/local_nvme/wm3d_streaming_lru
+STREAMING_METADATA_ROOT=/data/wm3d/streaming_metadata/native_p144
+STREAMING_LRU_ROOT=/data/wm3d/streaming_lru
 STREAMING_LRU_GIB_PER_RANK=64
 STREAMING_METADATA_WORKERS=32
 STREAMING_ENCODE_BATCH_FRAMES=16
 STREAMING_DECODE_WORKERS=4
 ```
 
-`STREAMING_METADATA_ROOT` 放共享存储，保存时间戳、动作、状态、任务向量和窗口索引；它不保存
-VGGT 视觉 token、depth、point 或 RGB pack。`STREAMING_METADATA_WORKERS=32` 用于并行扫描
-episode；如果共享存储的 metadata IOPS 足够，可以提高到 64。
+以上路径和容量是起始建议，不是存储架构要求。`STREAMING_METADATA_ROOT` 保存时间戳、动作、
+状态、任务向量和窗口索引，不保存 VGGT 视觉 token、depth、point 或 RGB pack。
+`STREAMING_LRU_GIB_PER_RANK` 可按总磁盘空间调整；`STREAMING_METADATA_WORKERS=32` 用于并行
+扫描 episode，存储和 CPU 还有余量时可以提高到 64。
 
 下载、adapter audit、inventory 和 data profile 与完整 cache 模式相同。完成这些步骤后执行：
 
@@ -354,13 +346,13 @@ run_5b eval 500
 ./run_wm3d.sh 5b verify "$SITE" 500
 ```
 
-第一次训练进程会产生冷缓存。恢复进程继续使用相同节点和 rank 对应的本地 LRU，因此应当
-看到缓存命中。更换节点不会影响 checkpoint 正确性，但新节点需要重新生成自己的 LRU。
+第一次训练进程会产生冷缓存。恢复进程继续使用已有 LRU 时应当看到缓存命中。更换节点或
+缓存路径不会影响 checkpoint 正确性，但未命中的 episode 需要重新生成。
 
 训练日志中会增加 `streaming_raw` 字段：
 
 - `generated_episodes`：本进程从原始数据生成的 episode 数；
-- `cache_hits`：命中本地 LRU 的次数；
+- `cache_hits`：命中 LRU 的次数；
 - `evicted_episodes`：因容量上限被删除的 episode 数；
 - `prepare_seconds`、`encode_seconds`：累计解码准备和 VGGT 编码时间；
 - `resident_bytes`、`resident_episodes`：当前 LRU 占用。
@@ -373,7 +365,7 @@ run_5b eval 500
 - `evicted_episodes` 不应每个 step 都快速增加，否则应扩大 LRU 或检查采样是否保持 episode 连续；
 - checkpoint、独立进程恢复和离线评测与完整 cache 模式使用相同的通过标准。
 
-性能调优顺序是本地 NVMe、LRU 容量、CPU/视频读取带宽、解码线程和 VGGT batch。默认每 GPU
+性能调优顺序是缓存盘吞吐、LRU 容量、CPU/视频读取带宽、解码线程和 VGGT batch。默认每 GPU
 使用 4 个解码线程、`batch_frames=16`。`prepare_seconds` 长期高于 `encode_seconds` 时，先增加
 CPU 和原始视频盘带宽；VGGT OOM 时把 `STREAMING_ENCODE_BATCH_FRAMES` 调到 12 或 8。
 冷缓存阶段 GPU 利用率会随视频准备产生波动，LRU 命中后的训练阶段应恢复稳定。
@@ -384,7 +376,7 @@ CPU 和原始视频盘带宽；VGGT OOM 时把 `STREAMING_ENCODE_BATCH_FRAMES` �
 checkpoint、独立进程恢复和离线评测。
 
 ```bash
-SITE=/shared/wm3d/control/5b_canary1k.env
+SITE=/data/wm3d/control/5b_canary1k.env
 ./run_wm3d.sh 5b init canary1k "$SITE"
 vim "$SITE"
 ./run_wm3d.sh 5b doctor "$SITE"
@@ -428,7 +420,7 @@ optimizer、sampler 或分布式状态问题。
 10K 使用约 128 万个全局采样位置，主要验证数据分布、吞吐、loss、梯度和长期资源稳定性。
 
 ```bash
-SITE=/shared/wm3d/control/5b_validation10k.env
+SITE=/data/wm3d/control/5b_validation10k.env
 ./run_wm3d.sh 5b runtime "$SITE"
 
 run_5b preflight
@@ -448,7 +440,7 @@ run_5b eval 10000
 训练期间查看：
 
 ```bash
-tail -f /shared/wm3d/runs/5b_validation10k/train_metrics.jsonl
+tail -f /data/wm3d/runs/5b_validation10k/train_metrics.jsonl
 watch -n 2 nvidia-smi
 ./run_wm3d.sh 5b status "$SITE"
 ```
@@ -466,18 +458,18 @@ watch -n 2 nvidia-smi
 ## 7. 正式训练
 
 10K 通过后再创建 100K 或 600K site。它们复用 data profile 和已选择的数据访问方式；
-`episode_cache` 复用完整 cache，`streaming_raw` 复用 metadata 和节点本地 LRU。每个 preset
+`episode_cache` 复用完整 cache，`streaming_raw` 复用 metadata 和有容量上限的 LRU。每个 preset
 仍从自己的 step 0 开始训练。
 
 ```bash
-./run_wm3d.sh 5b init validation100k /shared/wm3d/control/5b_validation100k.env
-./run_wm3d.sh 5b init formal600k /shared/wm3d/control/5b_formal600k.env
+./run_wm3d.sh 5b init validation100k /data/wm3d/control/5b_validation100k.env
+./run_wm3d.sh 5b init formal600k /data/wm3d/control/5b_formal600k.env
 ```
 
 100K：
 
 ```bash
-SITE=/shared/wm3d/control/5b_validation100k.env
+SITE=/data/wm3d/control/5b_validation100k.env
 ./run_wm3d.sh 5b runtime "$SITE"
 run_5b preflight
 run_5b train 1000
@@ -491,7 +483,7 @@ run_5b eval 100000
 600K：
 
 ```bash
-SITE=/shared/wm3d/control/5b_formal600k.env
+SITE=/data/wm3d/control/5b_formal600k.env
 ./run_wm3d.sh 5b runtime "$SITE"
 run_5b preflight
 run_5b train 1000
@@ -513,9 +505,9 @@ run_5b eval 600000
 | `data_profile=WAITING` | 数据尚未完成 schema、inventory 和 profile 物化 |
 | 下载 401/403 | 先在上游页面接受许可，再检查 token 文件 |
 | cache 中 GPU 经常为 0% | 检查是否启动了 64 个 worker、CPU 绑定、原始视频盘吞吐和 batch size |
-| cache 写盘积压 | 检查并行文件系统带宽、striping 和小文件性能 |
+| cache 写盘积压 | 检查存储带宽、挂载方式和小文件性能 |
 | cache OOM | 先将 `CACHE_BATCH_FRAMES` 从 16 降到 12 或 8 |
-| streaming 冷缓存反复生成 | 确认 LRU 位于本地 NVMe；提高每 rank 容量，并保持相同节点与 rank 恢复 |
+| streaming 冷缓存反复生成 | 提高 LRU 容量；恢复时尽量复用原缓存路径和 rank 布局 |
 | streaming 中 GPU 长时间空闲 | 检查原始视频盘、CPU 绑定和 `STREAMING_DECODE_WORKERS`；再观察 `prepare_seconds` |
 | 训练 OOM | 检查 8-way FSDP2、BF16、activation checkpoint 和 64 卡 topology |
 | GPU busy、ECC、NVLink、IB 失败 | 更换节点或修复资源后重新运行 preflight |
