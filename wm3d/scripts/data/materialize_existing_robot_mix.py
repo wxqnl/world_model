@@ -4,8 +4,9 @@
 This is deliberately a local-reuse materializer: it does not download data,
 does not apply the legacy GAM canonical action transforms, and does not build a
 full visual cache.  It emits strict source-native adapters, a WM3D data-profile
-template, one train/val/test episode per source, and a receipt binding the
-existing raw roots.
+template, enough real train episodes per source to form an optimizer batch,
+one validation/test episode per source, and a receipt binding the existing raw
+roots.
 """
 
 from __future__ import annotations
@@ -282,6 +283,8 @@ def _window_evidence(clock: np.ndarray, model_profile: dict) -> dict | None:
     except EpisodeIOError:
         return None
     cached_clock = np.asarray(clock, dtype=np.float64)[selected_rows]
+    first: dict | None = None
+    valid_window_count = 0
     for anchor in range(len(cached_clock)):
         try:
             window = select_observed_world_window(
@@ -298,24 +301,32 @@ def _window_evidence(clock: np.ndarray, model_profile: dict) -> dict | None:
             )
         except WindowSelectionError:
             continue
-        return {
-            "raw_frame_count": int(len(clock)),
-            "cache_frame_count": int(len(cached_clock)),
-            "duration_s": float(cached_clock[-1] - cached_clock[0]),
-            "first_valid_anchor_index": int(anchor),
-            "context_coverage_s": float(
-                cached_clock[anchor] - cached_clock[window.context_indices[0]]
-            ),
-            "future_coverage_s": float(
-                cached_clock[window.future_indices[-1]] - cached_clock[anchor]
-            ),
-        }
-    return None
+        valid_window_count += 1
+        if first is None:
+            first = {
+                "raw_frame_count": int(len(clock)),
+                "cache_frame_count": int(len(cached_clock)),
+                "duration_s": float(cached_clock[-1] - cached_clock[0]),
+                "first_valid_anchor_index": int(anchor),
+                "context_coverage_s": float(
+                    cached_clock[anchor] - cached_clock[window.context_indices[0]]
+                ),
+                "future_coverage_s": float(
+                    cached_clock[window.future_indices[-1]] - cached_clock[anchor]
+                ),
+            }
+    if first is None:
+        return None
+    return {**first, "valid_window_count": valid_window_count}
 
 
 def _selected_indices(
-    source: str, root: Path, model_profile: dict
-) -> tuple[tuple[int, int, int], dict[str, dict]]:
+    source: str,
+    root: Path,
+    model_profile: dict,
+    *,
+    minimum_train_windows: int,
+) -> tuple[tuple[int, ...], dict[str, dict]]:
     info = json.loads(_regular(root / "meta/info.json", f"{source} info").read_text())
     data_template = str(
         info.get(
@@ -353,11 +364,17 @@ def _selected_indices(
         )
         candidates[split].append((length, index, row))
 
-    selected: dict[str, int] = {}
+    selected: dict[str, list[int]] = {}
     evidence: dict[str, dict] = {}
     parquet_cache: dict[Path, pq.ParquetFile] = {}
     for split in ("train", "val", "test"):
-        for length, index, row in sorted(candidates[split], reverse=True):
+        target = minimum_train_windows if split == "train" else 1
+        selected[split] = []
+        selected_evidence = []
+        valid_window_count = 0
+        for length, index, row in sorted(
+            candidates[split], key=lambda item: (item[0], item[1]), reverse=True
+        ):
             values = _path_values(row, index)
             payload_candidates = []
             if row.get("data_path"):
@@ -408,18 +425,27 @@ def _selected_indices(
             observed = _window_evidence(clock, model_profile)
             if observed is None:
                 continue
-            selected[split] = index
-            evidence[split] = {"episode_index": index, **observed}
-            break
-        if split not in selected:
+            selected[split].append(index)
+            selected_evidence.append({"episode_index": index, **observed})
+            valid_window_count += int(observed["valid_window_count"])
+            if valid_window_count >= target:
+                break
+        if valid_window_count < target:
             raise RuntimeError(
-                f"{source}: no {split} episode satisfies the sealed model sampling "
-                "contract; exclude it explicitly or use a compatible model profile"
+                f"{source}: {split} provides only {valid_window_count} valid windows "
+                f"but {target} are required by the sealed sampling contract; exclude "
+                "it explicitly or use a compatible model profile"
             )
-    return (
-        tuple(selected[split] for split in ("train", "val", "test")),
-        evidence,
-    )
+        evidence[split] = {
+            "required_valid_window_count": target,
+            "selected_valid_window_count": valid_window_count,
+            "selected_episodes": selected_evidence,
+        }
+    return tuple(
+        index
+        for split in ("train", "val", "test")
+        for index in selected[split]
+    ), evidence
 
 
 def _profiles(model_path: Path, encoder_path: Path) -> tuple[dict, dict, dict]:
@@ -484,7 +510,10 @@ def main() -> None:
     parser.add_argument("--code-commit", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--exclude-source", action="append", default=[])
+    parser.add_argument("--minimum-train-windows", type=int, default=1)
     args = parser.parse_args()
+    if args.minimum_train_windows < 1:
+        raise RuntimeError("--minimum-train-windows must be positive")
     roots = {
         "oxe": _real_dir(args.oxe_root, "OXE root"),
         "droid": _real_dir(args.droid_root, "DROID root"),
@@ -519,7 +548,10 @@ def main() -> None:
             yaml.safe_dump(adapter, sort_keys=False, allow_unicode=True).encode("utf-8"),
         )
         selected, selection_evidence = _selected_indices(
-            plan.name, root, model_profile
+            plan.name,
+            root,
+            model_profile,
+            minimum_train_windows=args.minimum_train_windows,
         )
         episode_path = episode_root / f"{plan.name}.txt"
         _publish(episode_path, ("\n".join(str(item) for item in selected) + "\n").encode())
@@ -563,7 +595,11 @@ def main() -> None:
             "source_count": len(plans),
             "requested_source_count": len(PLANS),
             "excluded_sources": sorted(excluded),
-            "split_policy": "one deterministic train/val/test episode per source for canary",
+            "split_policy": (
+                "longest deterministic train episodes until the minimum train-window "
+                "budget is met, plus one validation/test episode per source"
+            ),
+            "minimum_train_windows_per_source": args.minimum_train_windows,
             "action_state_policy": "source-native opaque controller vectors with recorded timestamps",
             "color_policy": "legacy GAM BGR declarations are explicitly restored before RGB supervision",
         },
@@ -590,6 +626,7 @@ def main() -> None:
         "requested_source_count": len(PLANS),
         "source_count": len(receipt_rows),
         "excluded_sources": sorted(excluded),
+        "minimum_train_windows_per_source": args.minimum_train_windows,
         "sources": receipt_rows,
     }
     receipt_path = output / "local_reuse_receipt.json"

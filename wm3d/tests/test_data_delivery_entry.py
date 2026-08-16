@@ -14,10 +14,30 @@ import pyarrow.parquet as pq
 import torch
 import yaml
 
+from scripts.data.materialize_existing_robot_mix import _window_evidence
 from scripts.data.run_cache_worker import _view_batch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_existing_robot_mix_counts_every_physically_valid_window() -> None:
+    evidence = _window_evidence(
+        np.arange(20, dtype=np.float64) * 0.25,
+        {
+            "model": {"T": 4, "K": 2},
+            "sampling": {
+                "minimum_anchor_separation_seconds": 0.25,
+                "context_horizon_seconds": 0.75,
+                "future_horizon_seconds": 0.5,
+                "minimum_horizon_coverage": 1.0,
+                "future_offsets_seconds": [0.25, 0.5],
+            },
+        },
+    )
+    assert evidence is not None
+    assert evidence["first_valid_anchor_index"] == 4
+    assert evidence["valid_window_count"] == 14
 
 
 def _sha(path: Path) -> str:
