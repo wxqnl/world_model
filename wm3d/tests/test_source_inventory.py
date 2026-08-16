@@ -12,7 +12,11 @@ import yaml
 
 from wm3d.data.grouped_robot import bimanual_arm_spec
 from wm3d.data.source_adapters import load_adapter_contract
-from wm3d.data.source_inventory import SourceInventoryError, scan_lerobot_source
+from wm3d.data.source_inventory import (
+    SourceInventoryError,
+    _task_text,
+    scan_lerobot_source,
+)
 
 
 def _sha(path: Path) -> str:
@@ -120,6 +124,10 @@ def test_inventory_preserves_both_arms_and_recorded_irregular_clock(tmp_path: Pa
     assert rows[0]["task_text"] == "insert with both arms"
     assert rows[0]["views"][0]["segment_kind"] == "entire_file"
     assert receipt["episode_count"] == 1
+
+
+def test_blank_inline_task_falls_back_to_explicit_default() -> None:
+    assert _task_text({"tasks": [""]}, {}, "fallback") == "fallback"
 
 
 def test_inventory_rejects_non_monotonic_recorded_clock(tmp_path: Path) -> None:

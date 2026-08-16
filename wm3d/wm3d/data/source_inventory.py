@@ -153,8 +153,9 @@ def _task_text(
     if isinstance(values, Sequence) and not isinstance(values, str) and values:
         first = values[0]
         if isinstance(first, str):
-            return first
-        if int(first) in tasks:
+            if first.strip():
+                return first
+        elif int(first) in tasks:
             return tasks[int(first)]
     task_index = row.get("task_index")
     if task_index is not None and int(task_index) in tasks:
