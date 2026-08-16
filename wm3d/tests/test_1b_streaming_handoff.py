@@ -47,8 +47,9 @@ def test_1b_streaming_presets_use_native_1b_and_saturating_batch() -> None:
         validate_runtime_profile(runtime)
         assert runtime["expected_world_size"] == 8
         assert runtime["resources"]["gpu_name_substring"] == "H100"
-        assert runtime["train"]["micro_batch_size"] == 4
-        assert runtime["train"]["gradient_accumulation"] == 2
+        assert runtime["train"]["micro_batch_size"] == 8
+        assert runtime["train"]["validation_micro_batch_size"] == 2
+        assert runtime["train"]["gradient_accumulation"] == 1
         assert runtime["train"]["global_batch_size"] == 64
         assert runtime["train"]["total_steps"] == steps
 

@@ -181,10 +181,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 - step 100/500/1000 都有完整 DCP，独立恢复的 sampler step 连续；
 - eval receipt 中所有 required coverage 大于 0，`all_metrics_finite=true`。
 
-默认 runtime 使用 `micro_batch_size=4`、`gradient_accumulation=2`、global batch 64。这是
-H100 80GB 的起始配置，不是假定最终最优值。canary 前 100 steps 应记录峰值显存和
-seconds/step；若峰值显存低于约 65GB 且数据供给稳定，可以在新 runtime profile 中实测更大
-micro batch，不能在已封存 runtime 上原地改值。
+默认 runtime 使用训练 `micro_batch_size=8`、验证 `validation_micro_batch_size=2`、
+`gradient_accumulation=1`、global batch 64。该配置已经在 8 张 H100 80GB 上完成从零训练、
+step 20 独立恢复至 step 100、完整验证和 DCP 提交；训练计算阶段 GPU 接近满载，峰值显存约
+55GB/卡。验证单独使用较小 micro batch，避免小型 canary 的单 source validation split 容量
+不足；不得在已封存 runtime 上原地改值。
 
 ### RGB、depth 直观检查
 

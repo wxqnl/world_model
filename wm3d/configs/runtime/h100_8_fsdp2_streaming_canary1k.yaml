@@ -28,8 +28,9 @@ resources:
   minimum_allreduce_gbps: 100
   maximum_preflight_age_seconds: 1800
 train:
-  micro_batch_size: 4
-  gradient_accumulation: 2
+  micro_batch_size: 8
+  validation_micro_batch_size: 2
+  gradient_accumulation: 1
   global_batch_size: 64
   total_steps: 1000
   seed: 3407
