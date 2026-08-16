@@ -17,11 +17,23 @@ import os
 from pathlib import Path
 import uuid
 
+import numpy as np
 import pyarrow.parquet as pq
 import yaml
 
+from wm3d.data.episode_io import EpisodeIOError, select_episode_cache_rows
 from wm3d.data.manifest_contract import sha256_file
-from wm3d.data.source_inventory import deterministic_split
+from wm3d.data.source_inventory import (
+    _existing_relative,
+    _format,
+    _path_values,
+    _slice_column,
+    deterministic_split,
+)
+from wm3d.data.window_selection import (
+    WindowSelectionError,
+    select_observed_world_window,
+)
 
 
 @dataclass(frozen=True)
@@ -213,15 +225,29 @@ def _adapter(plan: SourcePlan, info: dict) -> tuple[dict, dict]:
     return adapter, embodiment
 
 
+_EPISODE_METADATA_COLUMNS = (
+    "episode_index",
+    "length",
+    "episode_length",
+    "data/chunk_index",
+    "data/file_index",
+    "dataset_from_index",
+    "dataset_to_index",
+    "data/from_index",
+    "data/to_index",
+    "data_path",
+)
+
+
 def _episode_candidates(root: Path):
     jsonl = root / "meta/episodes.jsonl"
     if jsonl.is_file() and not jsonl.is_symlink():
         with jsonl.open("r", encoding="utf-8") as handle:
             for line in handle:
                 row = json.loads(line)
-                yield int(row["episode_index"]), int(
-                    row.get("length", row.get("episode_length", 0))
-                )
+                if not isinstance(row, dict):
+                    raise RuntimeError(f"episode metadata row is not an object: {jsonl}")
+                yield row
         return
     paths = sorted((root / "meta/episodes").glob("chunk-*/file-*.parquet"))
     if not paths:
@@ -229,21 +255,94 @@ def _episode_candidates(root: Path):
     for path in paths:
         safe = _regular(path, "episode metadata")
         parquet = pq.ParquetFile(safe)
-        length_key = (
-            "length" if "length" in parquet.schema_arrow.names else "episode_length"
+        columns = [
+            name
+            for name in _EPISODE_METADATA_COLUMNS
+            if name in parquet.schema_arrow.names
+        ]
+        if "episode_index" not in columns or not {
+            "length",
+            "episode_length",
+        }.intersection(columns):
+            raise RuntimeError(f"episode metadata misses index/length: {safe}")
+        for batch in parquet.iter_batches(columns=columns, batch_size=4096):
+            yield from batch.to_pylist()
+
+
+def _window_evidence(clock: np.ndarray, model_profile: dict) -> dict | None:
+    sampling = model_profile["sampling"]
+    model = model_profile["model"]
+    try:
+        selected_rows = select_episode_cache_rows(
+            clock,
+            minimum_separation_s=float(
+                sampling["minimum_anchor_separation_seconds"]
+            ),
         )
-        for batch in parquet.iter_batches(
-            columns=["episode_index", length_key], batch_size=4096
-        ):
-            for index, length in zip(
-                batch.column(0).to_pylist(), batch.column(1).to_pylist(), strict=True
-            ):
-                yield int(index), int(length)
+    except EpisodeIOError:
+        return None
+    cached_clock = np.asarray(clock, dtype=np.float64)[selected_rows]
+    for anchor in range(len(cached_clock)):
+        try:
+            window = select_observed_world_window(
+                cached_clock,
+                anchor_index=anchor,
+                context_samples=int(model["T"]),
+                future_samples=int(model["K"]),
+                context_horizon_s=float(sampling["context_horizon_seconds"]),
+                future_horizon_s=float(sampling["future_horizon_seconds"]),
+                minimum_horizon_coverage=float(
+                    sampling["minimum_horizon_coverage"]
+                ),
+                future_offsets_s=sampling.get("future_offsets_seconds"),
+            )
+        except WindowSelectionError:
+            continue
+        return {
+            "raw_frame_count": int(len(clock)),
+            "cache_frame_count": int(len(cached_clock)),
+            "duration_s": float(cached_clock[-1] - cached_clock[0]),
+            "first_valid_anchor_index": int(anchor),
+            "context_coverage_s": float(
+                cached_clock[anchor] - cached_clock[window.context_indices[0]]
+            ),
+            "future_coverage_s": float(
+                cached_clock[window.future_indices[-1]] - cached_clock[anchor]
+            ),
+        }
+    return None
 
 
-def _selected_indices(source: str, root: Path) -> tuple[int, int, int]:
-    selected: dict[str, tuple[int, int]] = {}
-    for index, length in _episode_candidates(root):
+def _selected_indices(
+    source: str, root: Path, model_profile: dict
+) -> tuple[tuple[int, int, int], dict[str, dict]]:
+    info = json.loads(_regular(root / "meta/info.json", f"{source} info").read_text())
+    data_template = str(
+        info.get(
+            "data_path",
+            "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        )
+    )
+    candidates: dict[str, list[tuple[int, int, dict]]] = {
+        split: [] for split in ("train", "val", "test")
+    }
+    file_origins: dict[tuple[int, int, str], int] = {}
+    for row in _episode_candidates(root):
+        index = int(row["episode_index"])
+        length = int(row.get("length", row.get("episode_length", 0)))
+        if length < 2:
+            continue
+        values = _path_values(row, index)
+        key = (
+            values["chunk_index"],
+            values["file_index"],
+            str(row.get("data_path", "")),
+        )
+        if row.get("data/from_index") is None:
+            dataset_start = int(row.get("dataset_from_index", 0))
+            file_origins[key] = min(
+                file_origins.get(key, dataset_start), dataset_start
+            )
         episode_id = f"{source}:{index:09d}"
         split = deterministic_split(
             source,
@@ -252,14 +351,78 @@ def _selected_indices(source: str, root: Path) -> tuple[int, int, int]:
             train_fraction=0.8,
             validation_fraction=0.1,
         )
-        if split not in selected or length > selected[split][1]:
-            selected[split] = (index, length)
-    if set(selected) != {"train", "val", "test"}:
-        raise RuntimeError(f"{source}: could not select train/val/test canary episodes")
-    return tuple(selected[split][0] for split in ("train", "val", "test"))
+        candidates[split].append((length, index, row))
+
+    selected: dict[str, int] = {}
+    evidence: dict[str, dict] = {}
+    parquet_cache: dict[Path, pq.ParquetFile] = {}
+    for split in ("train", "val", "test"):
+        for length, index, row in sorted(candidates[split], reverse=True):
+            values = _path_values(row, index)
+            payload_candidates = []
+            if row.get("data_path"):
+                payload_candidates.append(str(row["data_path"]))
+            payload_candidates.extend(
+                [
+                    _format(data_template, values),
+                    (
+                        "data/chunk-{chunk_index:03d}/"
+                        "episode_{episode_index:06d}.parquet"
+                    ).format(**values),
+                    (
+                        "data/chunk-{chunk_index:03d}/"
+                        "file-{file_index:03d}.parquet"
+                    ).format(**values),
+                ]
+            )
+            try:
+                relative = _existing_relative(root, payload_candidates)
+            except RuntimeError:
+                continue
+            explicit_start = row.get("data/from_index")
+            explicit_stop = row.get("data/to_index")
+            if (explicit_start is None) != (explicit_stop is None):
+                continue
+            if explicit_start is not None:
+                row_start, row_stop = int(explicit_start), int(explicit_stop)
+            else:
+                dataset_start = int(row.get("dataset_from_index", 0))
+                dataset_stop = int(
+                    row.get("dataset_to_index", dataset_start + length)
+                )
+                key = (
+                    values["chunk_index"],
+                    values["file_index"],
+                    str(row.get("data_path", "")),
+                )
+                row_start = dataset_start - file_origins[key]
+                row_stop = dataset_stop - file_origins[key]
+            if row_start < 0 or row_stop - row_start != length:
+                continue
+            payload = root / relative
+            parquet = parquet_cache.setdefault(payload, pq.ParquetFile(payload))
+            try:
+                clock = _slice_column(parquet, "timestamp", row_start, row_stop)
+            except RuntimeError:
+                continue
+            observed = _window_evidence(clock, model_profile)
+            if observed is None:
+                continue
+            selected[split] = index
+            evidence[split] = {"episode_index": index, **observed}
+            break
+        if split not in selected:
+            raise RuntimeError(
+                f"{source}: no {split} episode satisfies the sealed model sampling "
+                "contract; exclude it explicitly or use a compatible model profile"
+            )
+    return (
+        tuple(selected[split] for split in ("train", "val", "test")),
+        evidence,
+    )
 
 
-def _profiles(model_path: Path, encoder_path: Path) -> tuple[dict, dict]:
+def _profiles(model_path: Path, encoder_path: Path) -> tuple[dict, dict, dict]:
     model = yaml.safe_load(_regular(model_path, "model profile").read_text())
     encoder = yaml.safe_load(_regular(encoder_path, "encoder contract").read_text())
     model_body = model["model"]
@@ -305,7 +468,7 @@ def _profiles(model_path: Path, encoder_path: Path) -> tuple[dict, dict]:
         "rgb_codec": "jpeg_pack",
         "action_proprio_storage": "same_episode_artifact",
     }
-    return representation, cache
+    return representation, cache, model
 
 
 def main() -> None:
@@ -320,6 +483,7 @@ def main() -> None:
     parser.add_argument("--old-log", type=Path, required=True)
     parser.add_argument("--code-commit", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--exclude-source", action="append", default=[])
     args = parser.parse_args()
     roots = {
         "oxe": _real_dir(args.oxe_root, "OXE root"),
@@ -328,13 +492,23 @@ def main() -> None:
     }
     output = args.output_root.absolute()
     output.mkdir(parents=True, exist_ok=True)
-    representation, cache = _profiles(args.model_profile, args.encoder_contract)
+    representation, cache, model_profile = _profiles(
+        args.model_profile, args.encoder_contract
+    )
+    excluded = frozenset(str(name) for name in args.exclude_source)
+    known = {plan.name for plan in PLANS}
+    unknown = sorted(excluded - known)
+    if unknown:
+        raise RuntimeError(f"unknown excluded sources: {unknown}")
+    plans = tuple(plan for plan in PLANS if plan.name not in excluded)
+    if not plans:
+        raise RuntimeError("all existing robot sources were excluded")
     sources = []
     embodiments = []
     receipt_rows = []
     adapter_root = output / "adapters"
     episode_root = output / "episode_indices"
-    for plan in PLANS:
+    for plan in plans:
         root = _root(plan, **roots)
         info_path = _regular(root / "meta/info.json", f"{plan.name} info")
         info = json.loads(info_path.read_text(encoding="utf-8"))
@@ -344,7 +518,9 @@ def main() -> None:
             adapter_path,
             yaml.safe_dump(adapter, sort_keys=False, allow_unicode=True).encode("utf-8"),
         )
-        selected = _selected_indices(plan.name, root)
+        selected, selection_evidence = _selected_indices(
+            plan.name, root, model_profile
+        )
         episode_path = episode_root / f"{plan.name}.txt"
         _publish(episode_path, ("\n".join(str(item) for item in selected) + "\n").encode())
         sources.append({
@@ -373,6 +549,7 @@ def main() -> None:
             "adapter_sha256": sha256_file(adapter_path.absolute()),
             "episode_index_sha256": sha256_file(episode_path.absolute()),
             "selected_episode_indices": list(selected),
+            "selection_window_evidence": selection_evidence,
         })
     template = {
         "schema": "wm3d_v8_data_profile_v4",
@@ -383,7 +560,9 @@ def main() -> None:
         "embodiments": embodiments,
         "notes": {
             "purpose": "no-PCA raw streaming canary over the existing GAM/OXE and RoboCasa data",
-            "source_count": len(PLANS),
+            "source_count": len(plans),
+            "requested_source_count": len(PLANS),
+            "excluded_sources": sorted(excluded),
             "split_policy": "one deterministic train/val/test episode per source for canary",
             "action_state_policy": "source-native opaque controller vectors with recorded timestamps",
             "color_policy": "legacy GAM BGR declarations are explicitly restored before RGB supervision",
@@ -408,7 +587,9 @@ def main() -> None:
         },
         "data_template_path": str(template_path.absolute()),
         "data_template_sha256": sha256_file(template_path.absolute()),
+        "requested_source_count": len(PLANS),
         "source_count": len(receipt_rows),
+        "excluded_sources": sorted(excluded),
         "sources": receipt_rows,
     }
     receipt_path = output / "local_reuse_receipt.json"
@@ -417,7 +598,8 @@ def main() -> None:
         (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode("utf-8"),
     )
     print(json.dumps({
-        "source_count": len(PLANS),
+        "source_count": len(plans),
+        "excluded_sources": sorted(excluded),
         "data_template": str(template_path.absolute()),
         "data_template_sha256": sha256_file(template_path.absolute()),
         "local_reuse_receipt": str(receipt_path.absolute()),

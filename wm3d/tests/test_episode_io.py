@@ -8,7 +8,11 @@ import numpy as np
 import pytest
 
 import wm3d.data.episode_io as episode_io
-from wm3d.data.episode_io import EpisodeIOError, VerifiedAssetStore
+from wm3d.data.episode_io import (
+    EpisodeIOError,
+    VerifiedAssetStore,
+    select_episode_cache_rows,
+)
 
 
 def _sha(path: Path) -> str:
@@ -58,6 +62,18 @@ def test_verified_asset_store_rejects_escape(tmp_path: Path) -> None:
     outside.write_bytes(b"outside")
     with pytest.raises(EpisodeIOError, match="escapes source root"):
         VerifiedAssetStore().verify(root, "../outside.bin", _sha(outside))
+
+
+def test_cache_row_selection_preserves_float32_five_hz_clock() -> None:
+    clock = np.arange(117, dtype=np.float32) / np.float32(5.0)
+    rows = select_episode_cache_rows(clock, minimum_separation_s=0.2)
+    np.testing.assert_array_equal(rows, np.arange(clock.size, dtype=np.int64))
+
+
+def test_cache_row_selection_still_rejects_materially_short_spacing() -> None:
+    clock = np.arange(20, dtype=np.float64) * 0.199
+    rows = select_episode_cache_rows(clock, minimum_separation_s=0.2)
+    assert len(rows) < len(clock)
 
 
 def test_decode_episode_views_parallelizes_real_cameras_without_reordering(

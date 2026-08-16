@@ -177,3 +177,77 @@ def test_inventory_explicit_episode_selection_is_bound_and_fail_closed(
             default_task="fallback",
             episode_indices=[99],
         )
+
+
+def test_explicit_shared_file_selection_uses_global_file_origin(
+    tmp_path: Path,
+) -> None:
+    adapter_path = _raw_fixture(tmp_path)
+    (tmp_path / "meta/episodes.jsonl").unlink()
+    (tmp_path / "data/chunk-000/episode_000000.parquet").unlink()
+    (tmp_path / "meta/episodes/chunk-000").mkdir(parents=True)
+    (tmp_path / "videos/observation.images.top/chunk-000").mkdir(parents=True)
+    (tmp_path / "videos/observation.images.top/chunk-000/file-000.mp4").write_bytes(
+        b"shared-video-container"
+    )
+    (tmp_path / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+                "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            }
+        )
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0, 1],
+                "length": [4, 4],
+                "data/chunk_index": [0, 0],
+                "data/file_index": [0, 0],
+                "dataset_from_index": [100, 104],
+                "dataset_to_index": [104, 108],
+                "tasks": pa.array(
+                    [["first shared episode"], ["second shared episode"]],
+                    type=pa.list_(pa.string()),
+                ),
+                "videos/observation.images.top/chunk_index": [0, 0],
+                "videos/observation.images.top/file_index": [0, 0],
+                "videos/observation.images.top/from_timestamp": [0.0, 10.0],
+                "videos/observation.images.top/to_timestamp": [0.4, 10.4],
+            }
+        ),
+        tmp_path / "meta/episodes/chunk-000/file-000.parquet",
+    )
+    time = np.asarray([0.0, 0.1, 0.2, 0.3, 10.0, 10.1, 10.2, 10.3])
+    pq.write_table(
+        pa.table(
+            {
+                "timestamp": time,
+                "action": pa.array(
+                    np.arange(112, dtype=np.float32).reshape(8, 14).tolist(),
+                    type=pa.list_(pa.float32(), 14),
+                ),
+                "observation.state": pa.array(
+                    np.arange(112, dtype=np.float32).reshape(8, 14).tolist(),
+                    type=pa.list_(pa.float32(), 14),
+                ),
+            }
+        ),
+        tmp_path / "data/chunk-000/file-000.parquet",
+    )
+    adapter = load_adapter_contract(adapter_path, expected_sha256=_sha(adapter_path))
+    rows, _receipt = scan_lerobot_source(
+        root=tmp_path,
+        source="aloha",
+        embodiment=bimanual_arm_spec(),
+        adapter=adapter,
+        split_seed=7,
+        train_fraction=0.8,
+        validation_fraction=0.1,
+        default_task="fallback",
+        episode_indices=[1],
+    )
+    assert rows[0]["payload_row_start"] == 4
+    assert rows[0]["payload_row_stop"] == 8
+    assert rows[0]["observation_clock"]["start_s"] == pytest.approx(10.0)

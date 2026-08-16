@@ -109,9 +109,26 @@ def select_episode_cache_rows(
         raise EpisodeIOError("minimum cache-state separation must be non-negative")
     if minimum_separation_s == 0:
         return np.arange(clock.size, dtype=np.int64)
+    # Many LeRobot sources store an exact 5 Hz clock in float32.  When those
+    # values are promoted to float64, adjacent 0.2 s samples can differ by
+    # 0.1999998... s.  A 1e-12 comparison then incorrectly drops every other
+    # recorded frame and makes otherwise valid T=16 windows impossible.  The
+    # bounded tolerance below covers timestamp quantization only; it never
+    # fabricates or interpolates a sample.
+    clock_magnitude_s = max(1.0, float(np.max(np.abs(clock))))
+    separation_tolerance_s = max(
+        1.0e-12,
+        min(
+            minimum_separation_s * 1.0e-3,
+            2.0 * float(np.finfo(np.float32).eps) * clock_magnitude_s,
+        ),
+    )
     rows = [0]
     for row in range(1, len(clock) - 1):
-        if clock[row] - clock[rows[-1]] + 1.0e-12 >= minimum_separation_s:
+        if (
+            clock[row] - clock[rows[-1]] + separation_tolerance_s
+            >= minimum_separation_s
+        ):
             rows.append(row)
     if rows[-1] != len(clock) - 1:
         rows.append(len(clock) - 1)

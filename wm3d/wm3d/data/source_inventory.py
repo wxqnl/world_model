@@ -254,7 +254,28 @@ def _episode_rows(
     )
     tasks = _task_lookup(root)
     rows: list[dict[str, Any]] = []
-    file_origin: dict[str, int] = {}
+    metadata_rows = sorted(
+        _episode_metadata(root), key=lambda value: int(value["episode_index"])
+    )
+    file_origin: dict[tuple[int, int, str], int] = {}
+    for metadata in metadata_rows:
+        episode_index = int(metadata["episode_index"])
+        explicit_start = metadata.get("data/from_index")
+        explicit_stop = metadata.get("data/to_index")
+        if (explicit_start is None) != (explicit_stop is None):
+            raise SourceInventoryError(f"episode {episode_index} has partial row bounds")
+        if explicit_start is None:
+            values = _path_values(metadata, episode_index)
+            key = (
+                values["chunk_index"],
+                values["file_index"],
+                str(metadata.get("data_path", "")),
+            )
+            dataset_start = int(metadata.get("dataset_from_index", 0))
+            previous = file_origin.get(key)
+            file_origin[key] = (
+                dataset_start if previous is None else min(previous, dataset_start)
+            )
     digest_cache: dict[str, str] = {}
 
     def digest(relative: str) -> str:
@@ -266,7 +287,7 @@ def _episode_rows(
 
     seen_episode_indices: set[int] = set()
     available_episode_indices: set[int] = set()
-    for metadata in sorted(_episode_metadata(root), key=lambda value: int(value["episode_index"])):
+    for metadata in metadata_rows:
         episode_index = int(metadata["episode_index"])
         available_episode_indices.add(episode_index)
         if episode_index in seen_episode_indices:
@@ -298,7 +319,12 @@ def _episode_rows(
         else:
             dataset_start = int(metadata.get("dataset_from_index", 0))
             dataset_stop = int(metadata.get("dataset_to_index", dataset_start + length))
-            origin = file_origin.setdefault(payload, dataset_start)
+            key = (
+                values["chunk_index"],
+                values["file_index"],
+                str(metadata.get("data_path", "")),
+            )
+            origin = file_origin[key]
             row_start, row_stop = dataset_start - origin, dataset_stop - origin
         if row_start < 0 or row_stop - row_start != length:
             raise SourceInventoryError(f"episode {episode_index} has invalid row slice")
