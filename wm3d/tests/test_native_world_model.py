@@ -60,6 +60,8 @@ def _tiny_config() -> NativeWorldModelConfig:
         aux_dim=8,
         max_aux_type_id=8,
         rgb_hidden=16,
+        rgb_res_blocks=1,
+        rgb_decode_chunk_size=1,
         rgb_size=16,
         rgb_decode_indices=(0, 1),
         geom_hidden=16,
@@ -168,6 +170,9 @@ def test_one_core_handles_bimanual_nonuniform_state_and_action_times() -> None:
     assert output["pred_tokens"].shape == (2, cfg.K, cfg.P, cfg.token_dim)
     assert output["depth"].shape == (2, cfg.K, cfg.num_views, cfg.P)
     assert output["point"].shape == (2, cfg.K, cfg.num_views, cfg.P, 3)
+    assert output["rgb"].shape == (
+        2, cfg.K, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
     assert output["policy_action"].shape == (
         2,
         cfg.max_action_groups,
@@ -178,6 +183,22 @@ def test_one_core_handles_bimanual_nonuniform_state_and_action_times() -> None:
     assert not output["policy_action_mask"][1, 1].any()
     assert torch.all((output["policy_action"][output["policy_gripper_mask"]] >= 0))
     assert torch.all((output["policy_action"][output["policy_gripper_mask"]] <= 1))
+
+
+def test_rgb_decoder_uses_native_tokens_and_skips_unsupervised_views() -> None:
+    cfg = _tiny_config()
+    model = NativeWorldModel(cfg).train()
+    batch = _batch(cfg)
+    view_mask = torch.zeros(2, cfg.K, cfg.num_views, dtype=torch.bool)
+    view_mask[:, :, 0] = True
+    output = model(**batch, rgb_view_mask=view_mask)
+
+    assert output["rgb"][:, :, 0].abs().sum() > 0
+    assert output["rgb"][:, :, 1].count_nonzero() == 0
+    output["rgb"][:, :, 0].square().mean().backward()
+    assert model.token_output.weight.grad is not None
+    assert torch.isfinite(model.token_output.weight.grad).all()
+    assert model.token_output.weight.grad.abs().sum() > 0
 
 
 def test_future_factual_action_changes_world_but_cannot_change_policy() -> None:

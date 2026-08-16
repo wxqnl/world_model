@@ -1,14 +1,43 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from wm3d.data.grouped_robot import COMPOSITION_OPERATOR_IDS
 from wm3d.training.native_objective import (
     NativeObjectiveConfig,
+    NativeObjectiveError,
+    _masked_rgb_perceptual,
     compose_axis_angle_sequence,
     compose_policy_to_world_intervals,
     compute_native_objective,
 )
+
+
+class _MeanFeatureDistance(torch.nn.Module):
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (prediction - target).abs().mean(dim=(1, 2, 3), keepdim=True)
+
+
+def test_perceptual_rgb_loss_masks_whole_views_and_backpropagates() -> None:
+    prediction = torch.full((1, 2, 2, 3, 8, 8), 0.75, requires_grad=True)
+    target = torch.full_like(prediction, 0.25)
+    mask = torch.zeros(1, 2, 2, 1, 1, 1, dtype=torch.bool)
+    mask[:, :, 0] = True
+
+    loss = _masked_rgb_perceptual(
+        prediction, target, mask, _MeanFeatureDistance()
+    )
+    loss.backward()
+    assert loss.item() > 0
+    assert prediction.grad is not None
+    assert prediction.grad[:, :, 0].abs().sum() > 0
+    assert prediction.grad[:, :, 1].count_nonzero() == 0
+
+    partial = torch.zeros_like(prediction, dtype=torch.bool)
+    partial[..., :4, :] = True
+    with pytest.raises(NativeObjectiveError, match="whole-image"):
+        _masked_rgb_perceptual(prediction, target, partial, _MeanFeatureDistance())
 
 
 def test_composition_uses_real_query_times_and_physical_operators() -> None:

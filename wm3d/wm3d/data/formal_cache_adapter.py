@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any, Mapping
@@ -52,6 +53,7 @@ _EMBODIMENT_IDS = {
     "robocasa_composite": 3,
     "robocasa_mg": 3,
 }
+_GIT_OBJECT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 class FormalCacheError(RuntimeError):
@@ -75,6 +77,13 @@ def _sha(value: object, *, field: str) -> str:
     text = str(value)
     if SHA256_RE.fullmatch(text) is None:
         raise FormalCacheError(f"{field} must be a lowercase SHA256")
+    return text
+
+
+def _git_object_id(value: object, *, field: str) -> str:
+    text = str(value)
+    if _GIT_OBJECT_RE.fullmatch(text) is None:
+        raise FormalCacheError(f"{field} must be a lowercase Git object ID")
     return text
 
 
@@ -122,8 +131,10 @@ def validate_formal_cache_closure(
     reader = Path(str(receipt["legacy_reader_root"]))
     if not reader.is_absolute() or reader.is_symlink() or not reader.is_dir():
         raise FormalCacheError("legacy reader root must be an absolute clean checkout")
-    commit = _sha(receipt["legacy_reader_commit"], field="legacy_reader_commit")
-    tree = _sha(receipt["legacy_reader_tree"], field="legacy_reader_tree")
+    commit = _git_object_id(
+        receipt["legacy_reader_commit"], field="legacy_reader_commit"
+    )
+    tree = _git_object_id(receipt["legacy_reader_tree"], field="legacy_reader_tree")
     if _git(reader, "status", "--porcelain"):
         raise FormalCacheError("legacy cache reader checkout is dirty")
     if _git(reader, "rev-parse", "HEAD") != commit or _git(reader, "rev-parse", "HEAD^{tree}") != tree:
@@ -230,8 +241,17 @@ class FormalCacheDataset(Dataset[dict[str, torch.Tensor]]):
                 raise FormalCacheError(
                     f"formal cache requires model.{field}={expected}, got {self.model[field]}"
                 )
-        if tuple(int(v) for v in self.model["rgb_decode_indices"]) != (1, 3, 5, 7):
-            raise FormalCacheError("formal cache requires RGB indices [1,3,5,7]")
+        self.rgb_indices = tuple(
+            int(value) for value in self.model["rgb_decode_indices"]
+        )
+        if (
+            not self.rgb_indices
+            or tuple(sorted(set(self.rgb_indices))) != self.rgb_indices
+            or any(index < 0 or index >= required_model["K"] for index in self.rgb_indices)
+        ):
+            raise FormalCacheError(
+                "formal cache RGB indices must be unique increasing K-frame indices"
+            )
 
     def __len__(self) -> int:
         return int(len(self.legacy))
@@ -394,13 +414,15 @@ class FormalCacheDataset(Dataset[dict[str, torch.Tensor]]):
         target_tokens = self._decode(old["s_tgt_codec"])
         target_token_mask = torch.isfinite(target_tokens.float()).all(dim=-1)
 
-        rgb_indices = torch.tensor((1, 3, 5, 7), dtype=torch.long)
+        rgb_indices = torch.tensor(self.rgb_indices, dtype=torch.long)
         selected_rgb = old["rgb_tgt"].index_select(0, rgb_indices).float().permute(0, 3, 1, 2)
         if selected_rgb.max() > 1.5:
             selected_rgb = selected_rgb / 255.0
-        target_rgb = torch.zeros(4, V, 3, 256, 256)
+        target_rgb = torch.zeros(len(self.rgb_indices), V, 3, 256, 256)
         target_rgb[:, 0] = selected_rgb
-        target_rgb_mask = torch.zeros(4, V, 1, 1, 1, dtype=torch.bool)
+        target_rgb_mask = torch.zeros(
+            len(self.rgb_indices), V, 1, 1, 1, dtype=torch.bool
+        )
         target_rgb_mask[:, 0] = True
         depth = old["depth_tgt"].float().reshape(K, P)
         depth_conf = old["depth_conf_tgt"].float().reshape(K, P)

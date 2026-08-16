@@ -3,6 +3,7 @@
 - `README.md` is the short operational overview.
 - `WM3D_FROM_ZERO.md` is the authoritative data-to-checkpoint procedure.
 - `WM3D_SCALING.md` owns model sizing and distributed topology.
+- `WM3D_NATIVE_RGB.md` owns the native token-to-RGB architecture, objective and quality gates.
 - `WM3D_5B_SCALING.md` is the complete data, cache, 1K/100K/600K training, and evaluation procedure.
 - `WM3D_STAGE1_UNIFIED.md` owns the Stage0-to-Stage1 workflow.
 - `WM3D_RELEASE_VALIDATION.md` records evidence and the boundary between pipeline correctness

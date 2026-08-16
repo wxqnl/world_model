@@ -49,6 +49,7 @@ from wm3d.training.distributed_runtime import (
     wrap_model,
 )
 from wm3d.training.native_objective import (
+    build_rgb_perceptual_model,
     compute_native_objective,
     objective_config_from_mapping,
 )
@@ -421,6 +422,11 @@ def _forward(model: torch.nn.Module, batch: Mapping[str, torch.Tensor]) -> Mappi
         raise PretrainError("RGB supervision indices drifted within a batch")
     kwargs = {name: batch[name] for name in _MODEL_INPUTS}
     kwargs["rgb_frame_indices"] = indices[0].tolist()
+    if "target_rgb_mask" in batch:
+        rgb_mask = batch["target_rgb_mask"]
+        if rgb_mask.ndim != 6 or tuple(rgb_mask.shape[-3:]) != (1, 1, 1):
+            raise PretrainError("target_rgb_mask must be [B,F,V,1,1,1]")
+        kwargs["rgb_view_mask"] = rgb_mask[..., 0, 0, 0]
     return model(**kwargs)
 
 
@@ -574,6 +580,7 @@ def _validate(
     profile: Any,
     runtime_profile: Mapping[str, Any],
     objective: Any,
+    perceptual_model: torch.nn.Module | None,
     context: Any,
 ) -> dict[str, float]:
     count = int(runtime_profile["train"]["validation_steps"])
@@ -594,7 +601,10 @@ def _validate(
         batch = _batch_to_device(cpu_batch, context.device)
         with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
             losses = compute_native_objective(
-                output=_forward(model, batch), batch=batch, config=objective
+                output=_forward(model, batch),
+                batch=batch,
+                config=objective,
+                perceptual_model=perceptual_model,
             )
         for name, value in losses.items():
             totals[name] = totals.get(name, torch.zeros_like(value)) + value
@@ -887,6 +897,9 @@ def main() -> None:
         )
         initialize_adamw_state(optimizer)
         objective = objective_config_from_mapping(config["objective_profile"]["objective"])
+        perceptual_model = build_rgb_perceptual_model(
+            objective, device=context.device
+        )
 
         output_root = Path(config["run"]["output_root"])
         status: list[Any] = [None]
@@ -1037,7 +1050,10 @@ def main() -> None:
                 with no_sync_context(model, enabled=not final_micro):
                     with autocast_context(strategy):
                         losses = compute_native_objective(
-                            output=_forward(model, batch), batch=batch, config=objective
+                            output=_forward(model, batch),
+                            batch=batch,
+                            config=objective,
+                            perceptual_model=perceptual_model,
                         )
                     (losses["total"] / accumulation).backward()
                 for name, value in losses.items():
@@ -1101,7 +1117,13 @@ def main() -> None:
             if validate_every > 0 and completed % validate_every == 0:
                 assert validation_dataset is not None
                 validation = _validate(
-                    model, validation_dataset, profile, runtime, objective, context
+                    model,
+                    validation_dataset,
+                    profile,
+                    runtime,
+                    objective,
+                    perceptual_model,
+                    context,
                 )
                 if context.is_rank0:
                     record = {"step": completed, "validation": validation}

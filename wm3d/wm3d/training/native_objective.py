@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from wm3d.data.grouped_robot import COMPOSITION_OPERATOR_IDS
@@ -19,8 +20,10 @@ class NativeObjectiveError(ValueError):
 class NativeObjectiveConfig:
     token_mse: float = 1.0
     token_cosine: float = 0.1
+    rgb_l1: float = 0.0
     rgb_charbonnier: float = 2.0
     rgb_gradient: float = 0.5
+    rgb_perceptual: float = 0.0
     depth_log: float = 1.5
     point: float = 0.5
     camera_pose: float = 0.1
@@ -50,6 +53,26 @@ def objective_config_from_mapping(mapping: Mapping[str, object]) -> NativeObject
     return config
 
 
+def build_rgb_perceptual_model(
+    config: NativeObjectiveConfig,
+    *,
+    device: torch.device,
+) -> nn.Module | None:
+    """Build one frozen VGG LPIPS network per training rank."""
+
+    if config.rgb_perceptual <= 0:
+        return None
+    try:
+        import lpips
+    except ImportError as exc:  # pragma: no cover - release environment gate
+        raise NativeObjectiveError(
+            "rgb_perceptual requires the sealed lpips dependency"
+        ) from exc
+    model = lpips.LPIPS(net="vgg", verbose=False).to(device=device).eval()
+    model.requires_grad_(False)
+    return model
+
+
 def _masked_mean(
     value: torch.Tensor,
     mask: torch.Tensor,
@@ -68,6 +91,39 @@ def _charbonnier(value: torch.Tensor, epsilon: float) -> torch.Tensor:
 
 def _image_gradient(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return value[..., 1:, :] - value[..., :-1, :], value[..., :, 1:] - value[..., :, :-1]
+
+
+def _masked_rgb_perceptual(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    model: nn.Module,
+) -> torch.Tensor:
+    if prediction.ndim != 6 or prediction.shape[-3] != 3:
+        raise NativeObjectiveError("RGB perceptual tensors must be [B,F,V,3,H,W]")
+    if prediction.shape != target.shape:
+        raise NativeObjectiveError("RGB prediction/target shapes differ")
+    expanded_mask = torch.broadcast_to(mask, prediction.shape)
+    flat_mask = expanded_mask.reshape(-1, *prediction.shape[-3:])
+    image_all = flat_mask.all(dim=(1, 2, 3))
+    image_any = flat_mask.any(dim=(1, 2, 3))
+    if not bool((image_all == image_any).all()):
+        raise NativeObjectiveError(
+            "RGB perceptual supervision requires whole-image masks"
+        )
+    valid = torch.nonzero(image_all, as_tuple=False).flatten()
+    if valid.numel() == 0:
+        return prediction.new_zeros(())
+    pred_images = prediction.reshape(-1, *prediction.shape[-3:]).index_select(0, valid)
+    target_images = target.reshape(-1, *target.shape[-3:]).index_select(0, valid)
+    total = prediction.new_zeros((), dtype=torch.float32)
+    for start in range(0, int(valid.numel()), 4):
+        pred_chunk = pred_images[start : start + 4].float().mul(2.0).sub(1.0)
+        target_chunk = target_images[start : start + 4].float().mul(2.0).sub(1.0)
+        with torch.autocast(device_type=prediction.device.type, enabled=False):
+            distance = model(pred_chunk, target_chunk)
+        total = total + distance.float().sum()
+    return total / valid.numel()
 
 
 def _rotvec_to_quaternion(rotvec: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -299,6 +355,7 @@ def compute_native_objective(
     output: Mapping[str, torch.Tensor],
     batch: Mapping[str, torch.Tensor],
     config: NativeObjectiveConfig,
+    perceptual_model: nn.Module | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute finite, mask-aware Stage0 world and policy losses."""
 
@@ -316,13 +373,20 @@ def compute_native_objective(
     token_cosine = _masked_mean(cosine, token_mask, epsilon=epsilon)
 
     zero = token_mse.new_zeros(())
+    rgb_l1 = zero
     rgb_charbonnier = zero
     rgb_gradient = zero
+    rgb_perceptual = zero
     if "target_rgb" in batch and output["rgb"].numel():
         target_rgb = batch["target_rgb"]
         rgb_mask = batch.get(
             "target_rgb_mask",
             torch.ones_like(target_rgb[:, :, :, :1, :1, :1], dtype=torch.bool),
+        )
+        rgb_l1 = _masked_mean(
+            (output["rgb"] - target_rgb).abs(),
+            rgb_mask,
+            epsilon=epsilon,
         )
         rgb_charbonnier = _masked_mean(
             _charbonnier(output["rgb"] - target_rgb, epsilon),
@@ -343,6 +407,14 @@ def compute_native_objective(
                 epsilon=epsilon,
             )
         )
+        if config.rgb_perceptual > 0:
+            if perceptual_model is None:
+                raise NativeObjectiveError(
+                    "rgb_perceptual is enabled but no perceptual model was provided"
+                )
+            rgb_perceptual = _masked_rgb_perceptual(
+                output["rgb"], target_rgb, rgb_mask, perceptual_model
+            )
 
     depth_log = zero
     if "target_depth" in batch:
@@ -451,8 +523,10 @@ def compute_native_objective(
     losses = {
         "token_mse": token_mse,
         "token_cosine": token_cosine,
+        "rgb_l1": rgb_l1,
         "rgb_charbonnier": rgb_charbonnier,
         "rgb_gradient": rgb_gradient,
+        "rgb_perceptual": rgb_perceptual,
         "depth_log": depth_log,
         "point": point,
         "camera_pose": camera_pose,
@@ -507,8 +581,10 @@ def compute_native_objective(
     total = (
         config.token_mse * token_mse
         + config.token_cosine * token_cosine
+        + config.rgb_l1 * rgb_l1
         + config.rgb_charbonnier * rgb_charbonnier
         + config.rgb_gradient * rgb_gradient
+        + config.rgb_perceptual * rgb_perceptual
         + config.depth_log * depth_log
         + config.point * point
         + config.camera_pose * camera_pose

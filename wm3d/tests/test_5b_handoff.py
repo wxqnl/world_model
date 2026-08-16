@@ -34,7 +34,7 @@ def test_5b_presets_match_native_5b_and_64_h200(
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_108_342_963
+    assert model["expected_parameter_count"] == 5_285_182_899
     assert runtime["expected_world_size"] == 64
     assert runtime["distributed"]["shard_degree"] == 8
     assert runtime["resources"]["gpu_name_substring"] == "H200"

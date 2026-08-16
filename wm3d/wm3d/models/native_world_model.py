@@ -27,7 +27,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS
 
 
-NATIVE_WORLD_MODEL_SCHEMA = "wm3d_native_world_model_v1"
+NATIVE_WORLD_MODEL_SCHEMA = "wm3d_native_world_model_v2"
 
 
 def _round_multiple(value: float, multiple: int = 256) -> int:
@@ -92,7 +92,9 @@ class NativeWorldModelConfig:
     max_aux_type_id: int = 128
 
     # Explicit native prediction heads.
-    rgb_hidden: int = 512
+    rgb_hidden: int = 1280
+    rgb_res_blocks: int = 2
+    rgb_decode_chunk_size: int = 4
     rgb_size: int = 384
     rgb_decode_indices: tuple[int, ...] = (3, 7, 11, 15)
     geom_hidden: int = 768
@@ -128,6 +130,18 @@ class NativeWorldModelConfig:
             raise ValueError("bridge layer index is outside state trunk")
         if self.dynamics_layers <= 0:
             raise ValueError("dynamics_layers must be positive")
+        if (
+            self.rgb_hidden <= 0
+            or self.rgb_res_blocks <= 0
+            or self.rgb_decode_chunk_size <= 0
+        ):
+            raise ValueError(
+                "rgb_hidden, rgb_res_blocks and rgb_decode_chunk_size must be positive"
+            )
+        if not self.rgb_decode_indices:
+            raise ValueError("rgb_decode_indices cannot be empty")
+        if tuple(sorted(set(self.rgb_decode_indices))) != self.rgb_decode_indices:
+            raise ValueError("rgb_decode_indices must be unique and increasing")
         if any(index < 0 or index >= self.K for index in self.rgb_decode_indices):
             raise ValueError("rgb_decode_indices must refer to future world-state steps")
         for name in (
@@ -794,65 +808,122 @@ class NativeGeometryHead(nn.Module):
 class ResidualConvBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
-        groups = min(32, channels)
+        groups = min(8, channels)
         while channels % groups:
             groups -= 1
-        self.block = nn.Sequential(
-            nn.GroupNorm(groups, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(groups, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-        )
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        return value + self.block(value)
+        residual = self.conv1(F.gelu(self.norm1(value)))
+        residual = self.conv2(F.gelu(self.norm2(residual)))
+        return value + residual
 
 
-class NativeRGBDecoder(nn.Module):
+class NativeRGBImageDecoder(nn.Module):
+    """Decode one bounded image chunk from native tokens."""
+
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.cfg = cfg
         self.grid = isqrt(cfg.P)
-        self.input = nn.Linear(cfg.state_hidden, cfg.rgb_hidden, bias=False)
+        self.stem = nn.Sequential(
+            nn.Conv2d(cfg.token_dim, cfg.rgb_hidden, 1),
+            nn.GroupNorm(min(8, cfg.rgb_hidden), cfg.rgb_hidden),
+            nn.GELU(),
+        )
+        stages = (cfg.rgb_size // self.grid).bit_length() - 1
+        if stages == 5:
+            channels = (
+                cfg.rgb_hidden,
+                cfg.rgb_hidden,
+                cfg.rgb_hidden // 2,
+                cfg.rgb_hidden // 4,
+                cfg.rgb_hidden // 4,
+                cfg.rgb_hidden // 8,
+            )
+        elif stages == 4:
+            channels = (
+                cfg.rgb_hidden,
+                cfg.rgb_hidden,
+                cfg.rgb_hidden // 2,
+                cfg.rgb_hidden // 4,
+                cfg.rgb_hidden // 8,
+            )
+        else:
+            channels = tuple(
+                [cfg.rgb_hidden]
+                + [
+                    max(cfg.rgb_hidden >> index, cfg.rgb_hidden // 8)
+                    for index in range(stages)
+                ]
+            )
+        ups: list[nn.Module] = []
+        for input_channels, output_channels in zip(channels, channels[1:]):
+            stage: list[nn.Module] = [
+                nn.ConvTranspose2d(
+                    input_channels, output_channels, kernel_size=4, stride=2, padding=1
+                ),
+                nn.GroupNorm(min(8, output_channels), output_channels),
+                nn.GELU(),
+            ]
+            stage.extend(
+                ResidualConvBlock(output_channels)
+                for _ in range(cfg.rgb_res_blocks)
+            )
+            ups.append(nn.Sequential(*stage))
+        self.ups = nn.ModuleList(ups)
+        self.output = nn.Conv2d(channels[-1], 3, 1)
+
+    def forward(
+        self, tokens: torch.Tensor, view_embedding: torch.Tensor
+    ) -> torch.Tensor:
+        value = tokens.transpose(1, 2).reshape(
+            tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
+        )
+        value = self.stem(value) + view_embedding
+        for upsample in self.ups:
+            value = upsample(value)
+        return torch.sigmoid(self.output(value))
+
+
+class NativeRGBDecoder(nn.Module):
+    """Restore the V7 native token-to-pixel path with bounded image chunks."""
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
         self.view_embed = nn.Parameter(
-            torch.empty(1, 1, cfg.num_views, 1, cfg.rgb_hidden)
+            torch.empty(cfg.num_views, cfg.rgb_hidden, 1, 1)
         )
         nn.init.normal_(self.view_embed, std=0.02)
-        stages = (cfg.rgb_size // self.grid).bit_length() - 1
-        modules: list[nn.Module] = [ResidualConvBlock(cfg.rgb_hidden)]
-        channels = cfg.rgb_hidden
-        for _ in range(stages):
-            next_channels = max(64, channels // 2)
-            modules.extend(
-                (
-                    nn.Upsample(scale_factor=2, mode="nearest"),
-                    nn.Conv2d(channels, next_channels, 3, padding=1),
-                    ResidualConvBlock(next_channels),
-                )
-            )
-            channels = next_channels
-        self.decoder = nn.Sequential(*modules)
-        self.output = nn.Conv2d(channels, 3, 3, padding=1)
+        image_decoder: nn.Module = NativeRGBImageDecoder(cfg)
+        if cfg.activation_checkpointing:
+            image_decoder = checkpoint_wrapper(image_decoder)
+        self.image_decoder = image_decoder
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.view_embed, std=0.02)
 
     def forward(
         self,
-        future_state: torch.Tensor,
+        future_tokens: torch.Tensor,
         frame_indices: Optional[Sequence[int]],
+        target_view_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         indices = tuple(
             self.cfg.rgb_decode_indices if frame_indices is None else frame_indices
         )
-        if any(index < 0 or index >= future_state.shape[1] for index in indices):
+        if any(index < 0 or index >= future_tokens.shape[1] for index in indices):
             raise ValueError("RGB decode index is outside the future horizon")
-        index_tensor = torch.tensor(indices, dtype=torch.long, device=future_state.device)
+        if tuple(future_tokens.shape[2:]) != (self.cfg.P, self.cfg.token_dim):
+            raise ValueError("future RGB tokens must end in [P,token_dim]")
+        index_tensor = torch.tensor(indices, dtype=torch.long, device=future_tokens.device)
         if not indices:
-            empty = future_state.new_empty(
-                future_state.shape[0],
+            empty = future_tokens.new_empty(
+                future_tokens.shape[0],
                 0,
                 self.cfg.num_views,
                 3,
@@ -860,16 +931,53 @@ class NativeRGBDecoder(nn.Module):
                 self.cfg.rgb_size,
             )
             return empty, index_tensor
-        selected = future_state.index_select(1, index_tensor)
-        value = self.input(selected)[:, :, None] + self.view_embed
-        batch, frames, views, patches, channels = value.shape
-        value = value.permute(0, 1, 2, 4, 3).reshape(
-            batch * frames * views, channels, self.grid, self.grid
+        selected = future_tokens.index_select(1, index_tensor)
+        batch, frames, patches, token_dim = selected.shape
+        views = self.cfg.num_views
+        expanded = selected[:, :, None].expand(-1, -1, views, -1, -1)
+        expanded = expanded.reshape(batch * frames * views, patches, token_dim)
+        view_ids = torch.arange(views, device=future_tokens.device)
+        view_ids = view_ids.view(1, 1, views).expand(batch, frames, -1).reshape(-1)
+        if target_view_mask is None:
+            valid = torch.ones(
+                batch * frames * views, dtype=torch.bool, device=future_tokens.device
+            )
+        else:
+            if tuple(target_view_mask.shape) != (batch, frames, views):
+                raise ValueError("target_view_mask must be [B,F,V]")
+            valid = target_view_mask.reshape(-1).bool()
+        valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
+        if valid_indices.numel() == 0:
+            empty = future_tokens.new_zeros(
+                batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
+            )
+            return empty, index_tensor
+        decoded_chunks: list[torch.Tensor] = []
+        for start in range(
+            0, int(valid_indices.numel()), self.cfg.rgb_decode_chunk_size
+        ):
+            chunk_indices = valid_indices[
+                start : start + self.cfg.rgb_decode_chunk_size
+            ]
+            decoded_chunks.append(
+                self.image_decoder(
+                    expanded.index_select(0, chunk_indices),
+                    self.view_embed.index_select(
+                        0, view_ids.index_select(0, chunk_indices)
+                    ),
+                )
+            )
+        decoded = torch.cat(decoded_chunks, dim=0)
+        dense = decoded.new_zeros(
+            batch * frames * views, 3, self.cfg.rgb_size, self.cfg.rgb_size
         )
-        rgb = torch.sigmoid(self.output(self.decoder(value)))
-        return rgb.view(
-            batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
-        ), index_tensor
+        dense = dense.index_copy(0, valid_indices, decoded)
+        return (
+            dense.view(
+                batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
+            ),
+            index_tensor,
+        )
 
 
 class NativeWorldModel(nn.Module):
@@ -1057,6 +1165,7 @@ class NativeWorldModel(nn.Module):
         aux_mask: Optional[torch.Tensor] = None,
         aux_type_ids: Optional[torch.Tensor] = None,
         rgb_frame_indices: Optional[Sequence[int]] = None,
+        rgb_view_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         expected_world = (cfg.T, cfg.num_views, cfg.P, cfg.token_dim)
@@ -1213,11 +1322,13 @@ class NativeWorldModel(nn.Module):
             )
         factual_future = self.state_norm(factual_future)
 
+        action_free_pred_tokens = self.token_output(action_free_future)
+        pred_tokens = self.token_output(factual_future)
         output: dict[str, torch.Tensor] = {
             "action_free_native_state": action_free_future,
-            "action_free_pred_tokens": self.token_output(action_free_future),
+            "action_free_pred_tokens": action_free_pred_tokens,
             "native_state": factual_future,
-            "pred_tokens": self.token_output(factual_future),
+            "pred_tokens": pred_tokens,
             "policy_latent": policy_query.transpose(1, 2),
             "world_times_s": world_times_s,
             "policy_query_dt": policy_query_dt,
@@ -1232,7 +1343,13 @@ class NativeWorldModel(nn.Module):
             )
         )
         output.update(self.geometry_head(factual_future))
-        rgb, rgb_indices = self.rgb_head(factual_future, rgb_frame_indices)
+        rgb, rgb_indices = self._run(
+            self.rgb_head,
+            pred_tokens,
+            rgb_frame_indices,
+            rgb_view_mask,
+            enabled=cfg.activation_checkpointing,
+        )
         output["rgb"] = rgb
         output["rgb_frame_indices"] = rgb_indices
         return output
@@ -1245,7 +1362,7 @@ class NativeWorldModel(nn.Module):
         yield from self.action_blocks
         yield from self.bridges
         yield from self.dynamics_blocks
-        yield self.rgb_head
+        yield self.rgb_head.image_decoder
         yield self.geometry_head
 
     def iter_activation_checkpoint_units(self) -> Iterable[nn.Module]:
@@ -1257,6 +1374,7 @@ class NativeWorldModel(nn.Module):
         yield from self.action_blocks
         yield from self.bridges
         yield from self.dynamics_blocks
+        yield self.rgb_head.image_decoder
 
     def parameter_counts(self) -> dict[str, int]:
         groups: Mapping[str, nn.Module] = {

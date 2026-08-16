@@ -18,8 +18,10 @@ def _objective() -> SimpleNamespace:
     return SimpleNamespace(
         token_mse=1.0,
         token_cosine=0.1,
+        rgb_l1=0.5,
         rgb_charbonnier=2.0,
         rgb_gradient=0.5,
+        rgb_perceptual=0.1,
         depth_log=1.5,
         point=0.5,
         camera_pose=0.1,

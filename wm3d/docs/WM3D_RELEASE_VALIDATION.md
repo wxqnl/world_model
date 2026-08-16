@@ -4,6 +4,11 @@
 commit 上生成的 `smoke-real` 总 receipt 为准；开发 worktree 的结果只用于定位问题，
 不能替代发布验收。
 
+> RGB decoder 已升级为 `wm3d_native_world_model_v2`。本文第 3–4 节现有数值来自旧的
+> lightweight RGB v1 验收，只能证明历史 pipeline，不是 v2 图像质量证据。v2 必须在
+> 新 clean commit 上重新跑 canary、exact resume、offline eval 和固定样本视觉门禁后，
+> 才能补写新的发布 receipt。
+
 ## 1. V7 问题与 WM3D 修正
 
 | V7 问题 | WM3D 实现 | 验收方式 |
@@ -59,7 +64,7 @@ normalization 是独立的小型派生 artifact。
 
 ### 3.2 FSDP2 与 activation checkpoint
 
-`native_1b` 的精确参数量为 `1,194,740,883`。node43 的 GPU 0–1 完成：
+历史 RGB v1 `native_1b` 的精确参数量为 `1,194,740,883`。node43 的 GPU 0–1 完成：
 
 ```text
 BF16 mixed precision
@@ -126,7 +131,7 @@ DCP 独立回归还逐 rank 比较了保存前的下一步与换新进程恢复�
 
 ## 4. 5B 承载证据
 
-`native_5b` 的精确参数量为 `5,108,342,963`。node43 双卡 FSDP2
+历史 RGB v1 `native_5b` 的精确参数量为 `5,108,342,963`。node43 双卡 FSDP2
 meta-sharded 物化结果：
 
 | rank | 本地参数存储 | 全局占比 | 峰值显存 |

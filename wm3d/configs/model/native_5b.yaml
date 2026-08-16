@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_5b
 architecture: native_world_model
-expected_parameter_count: 5108342963
+expected_parameter_count: 5285182899
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -13,7 +13,7 @@ sampling:
   policy_training_times: observed_action_timestamps
   interpolation: forbidden
 model:
-  schema: wm3d_native_world_model_v1
+  schema: wm3d_native_world_model_v2
   T: 24
   P: 144
   K: 16
@@ -49,9 +49,11 @@ model:
   max_aux_tokens: 16
   aux_dim: 256
   max_aux_type_id: 128
-  rgb_hidden: 512
+  rgb_hidden: 1536
+  rgb_res_blocks: 2
+  rgb_decode_chunk_size: 2
   rgb_size: 384
-  rgb_decode_indices: [3, 7, 11, 15]
+  rgb_decode_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
   geom_hidden: 768
   dropout: 0.0
   activation_checkpointing: true

@@ -1,10 +1,14 @@
 schema: wm3d_v8_objective_profile_v1
 name: stage0_native
 objective:
+  rgb_l1: 0.5
+  # LPIPS restores perceptual supervision; pixel and gradient terms remain
+  # explicit anchors instead of being silently replaced.
+  rgb_perceptual: 0.1
   token_mse: 1.0
   token_cosine: 0.1
-  rgb_charbonnier: 2.0
-  rgb_gradient: 0.5
+  rgb_charbonnier: 1.0
+  rgb_gradient: 0.25
   depth_log: 1.5
   point: 0.5
   camera_pose: 0.1

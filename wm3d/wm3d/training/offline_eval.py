@@ -29,6 +29,7 @@ from wm3d.training.distributed_runtime import (
     wrap_model,
 )
 from wm3d.training.native_objective import (
+    build_rgb_perceptual_model,
     compute_native_objective,
     objective_config_from_mapping,
 )
@@ -54,7 +55,12 @@ from wm3d.training.runtime_contract import load_materialized_runtime
 EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_offline_eval_v2"
 _COVERAGE_WEIGHTS = {
     "native_token_supervised_elements": ("token_mse", "token_cosine"),
-    "rgb_supervised_elements": ("rgb_charbonnier", "rgb_gradient"),
+    "rgb_supervised_elements": (
+        "rgb_l1",
+        "rgb_charbonnier",
+        "rgb_gradient",
+        "rgb_perceptual",
+    ),
     "depth_supervised_elements": ("depth_log",),
     "point_supervised_elements": ("point",),
     "camera_pose_supervised_elements": ("camera_pose",),
@@ -320,6 +326,9 @@ def main() -> None:
         objective = objective_config_from_mapping(
             config["objective_profile"]["objective"]
         )
+        perceptual_model = build_rgb_perceptual_model(
+            objective, device=context.device
+        )
         totals: dict[str, torch.Tensor] = {}
         model.eval()
         with torch.no_grad():
@@ -327,7 +336,10 @@ def main() -> None:
                 batch = _batch_to_device(cpu_batch, context.device)
                 with autocast_context(strategy):
                     losses = compute_native_objective(
-                        output=_forward(model, batch), batch=batch, config=objective
+                        output=_forward(model, batch),
+                        batch=batch,
+                        config=objective,
+                        perceptual_model=perceptual_model,
                     )
                 for name, value in losses.items():
                     if not bool(torch.isfinite(value).all()):

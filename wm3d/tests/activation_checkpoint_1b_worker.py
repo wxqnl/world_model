@@ -1,6 +1,6 @@
 """Real 2-GPU FSDP2 BF16 activation-checkpoint proof for native_1b.
 
-This worker constructs the sealed 1.194B profile on meta, materializes only
+This worker constructs the sealed 1.319B profile on meta, materializes only
 FSDP2 shards, and executes one complete forward/backward/AdamW step.  It is an
 explicit integration worker, not part of the CPU pytest suite.
 """

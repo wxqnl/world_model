@@ -67,7 +67,7 @@ objective profile   决定 Stage0/Stage1 loss 及其权重
 | max action substeps/interval | 容量上限 128 | 容量上限 128；batch 使用真实较短 S |
 | max policy queries | 容量上限 256 | 容量上限 256；batch 使用真实较短 C |
 
-这里的 `token D=2048` 是 VGGT/codec 外部接口，`hidden` 才是主干容量。5B profile 保留已经规划的 T24、P144、K16 和 2560/2048 双主干，不通过缩短序列、减少 decoder 或冻结大块参数伪造 5B 训练。WM3D 为隔离 action-free policy state 与 factual-action world state新增 dynamics refinement；高频动作则在汇聚前对每个 `(真实时间戳, 动作值)` 做联合非线性编码，避免交换两个子步后表示不变。当前统一 5B profile 的精确参数量为 `5,108,342,963`，统一 1B profile 为 `1,194,740,883`。两者都必须在参数报告中精确封印，不能把新增模块藏进“约 5B”的口径。
+这里的 `token D=2048` 是 VGGT/codec 外部接口，`hidden` 才是主干容量。5B profile 保留已经规划的 T24、P144、K16 和 2560/2048 双主干，不通过缩短序列、减少 decoder 或冻结大块参数伪造 5B 训练。WM3D 为隔离 action-free policy state 与 factual-action world state新增 dynamics refinement；高频动作则在汇聚前对每个 `(真实时间戳, 动作值)` 做联合非线性编码，避免交换两个子步后表示不变。当前原生 RGB v2 profile 的精确参数量为：5B `5,285,182,899`，1B `1,319,203,443`。两者都必须在参数报告中精确封印，不能为了保留旧的整数标签而削弱 RGB 输出。
 
 实测参数组成如下；数字由 `NativeWorldModel.parameter_counts()` 从正式 profile
 实例化后计算，不是按层数手工估算：
@@ -79,11 +79,11 @@ objective profile   决定 Stage0/Stage1 loss 及其权重
 | state/action bridges | 99,550,080 | 424,719,360 | 10 个深层交互点让 policy 读取预测的原生 3D 状态 |
 | factual dynamics refinement | 50,390,400 | 127,810,560 | 只让已执行 action 修正 future world，不把未来真值 action 泄漏给 policy |
 | multi-view fuser | 9,884,160 | 16,783,360 | 同时间戳多相机融合；缺失视角只用 mask |
-| RGB head | 5,286,243 | 9,357,443 | 始终保留显式 RGB 输出；清晰度还由 token/gradient/RGB 监督共同约束 |
+| RGB head | 129,748,803 | 186,197,379 | 从完整 2048D native tokens 解码；1B/5B 分别为 1280/1536 hidden、每层级 2 个 residual block，并监督全部 K 帧 |
 | geometry head | 1,656,864 | 3,959,840 | depth、point、camera/pose 的显式几何输出 |
 | grouped action head | 21,776 | 34,832 | 轻量共享 head；能力来自 3D/action trunk，而不是另建大型 VLA decoder |
 | 其余 embedding/norm/projection | 34,631,040 | 79,371,264 | task、连续时间、group、semantic、embodiment、current-state 等合同参数 |
-| **总计** | **1,194,740,883** | **5,108,342,963** | 与两份 profile 的 `expected_parameter_count` 精确一致 |
+| **总计** | **1,319,203,443** | **5,285,182,899** | 与两份 profile 的 `expected_parameter_count` 精确一致 |
 
 `dynamics_layers=1` 是显式的架构取舍，不是为了凑参数：32 层 action-free state
 trunk 负责主要未来建模，一层 factual refinement 只注入真实已执行动作的物理影响。
