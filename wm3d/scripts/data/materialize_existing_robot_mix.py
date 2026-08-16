@@ -436,6 +436,7 @@ def _selected_indices(
     view_keys: tuple[str, ...],
     minimum_train_windows: int,
     minimum_eval_windows: int,
+    select_all_usable: bool,
 ) -> tuple[tuple[int, ...], dict[str, dict]]:
     info = json.loads(_regular(root / "meta/info.json", f"{source} info").read_text())
     data_template = str(
@@ -546,8 +547,12 @@ def _selected_indices(
                         zero_copy_only=False
                     )
                     timestamp_cache[payload] = all_timestamps
+                if row_stop > len(all_timestamps):
+                    continue
                 clock = all_timestamps[row_start:row_stop]
             except (KeyError, ValueError):
+                continue
+            if len(clock) != length:
                 continue
             observed = _window_evidence(clock, model_profile)
             if observed is None:
@@ -562,15 +567,16 @@ def _selected_indices(
             ):
                 continue
             selected[split].append(index)
-            selected_evidence.append(
-                {
-                    "episode_index": index,
-                    "video_coverage": "container_bounds_verified",
-                    **observed,
-                }
-            )
+            if not select_all_usable:
+                selected_evidence.append(
+                    {
+                        "episode_index": index,
+                        "video_coverage": "container_bounds_verified",
+                        **observed,
+                    }
+                )
             valid_window_count += int(observed["valid_window_count"])
-            if valid_window_count >= target:
+            if not select_all_usable and valid_window_count >= target:
                 break
         if valid_window_count < target:
             raise RuntimeError(
@@ -579,10 +585,17 @@ def _selected_indices(
                 "it explicitly or use a compatible model profile"
             )
         evidence[split] = {
+            "selection_mode": (
+                "all_usable_episodes"
+                if select_all_usable
+                else "minimum_window_budget"
+            ),
             "required_valid_window_count": target,
             "selected_valid_window_count": valid_window_count,
-            "selected_episodes": selected_evidence,
+            "selected_episode_count": len(selected[split]),
         }
+        if not select_all_usable:
+            evidence[split]["selected_episodes"] = selected_evidence
     return tuple(
         index
         for split in ("train", "val", "test")
@@ -654,6 +667,7 @@ def main() -> None:
     parser.add_argument("--exclude-source", action="append", default=[])
     parser.add_argument("--minimum-train-windows", type=int, default=1)
     parser.add_argument("--minimum-eval-windows", type=int, default=1)
+    parser.add_argument("--select-all-usable-episodes", action="store_true")
     args = parser.parse_args()
     if args.minimum_train_windows < 1:
         raise RuntimeError("--minimum-train-windows must be positive")
@@ -699,6 +713,7 @@ def main() -> None:
             view_keys=plan.views,
             minimum_train_windows=args.minimum_train_windows,
             minimum_eval_windows=args.minimum_eval_windows,
+            select_all_usable=args.select_all_usable_episodes,
         )
         episode_path = episode_root / f"{plan.name}.txt"
         _publish(episode_path, ("\n".join(str(item) for item in selected) + "\n").encode())
@@ -732,20 +747,38 @@ def main() -> None:
         })
     template = {
         "schema": "wm3d_v8_data_profile_v4",
-        "name": "wm3d_1b_existing_robot_raw_canary",
+        "name": (
+            "wm3d_1b_existing_robot_raw_formal"
+            if args.select_all_usable_episodes
+            else "wm3d_1b_existing_robot_raw_canary"
+        ),
         "cache_representation": representation,
         "cache": cache,
         "sources": sources,
         "embodiments": embodiments,
         "notes": {
-            "purpose": "no-PCA raw streaming canary over the existing GAM/OXE and RoboCasa data",
+            "purpose": (
+                "no-PCA raw streaming formal training over all usable existing "
+                "GAM/OXE and RoboCasa episodes"
+                if args.select_all_usable_episodes
+                else "no-PCA raw streaming canary over the existing GAM/OXE and RoboCasa data"
+            ),
             "source_count": len(plans),
             "requested_source_count": len(PLANS),
             "excluded_sources": sorted(excluded),
             "split_policy": (
-                "longest deterministic train episodes until the minimum train-window "
-                "budget is met, with validation/test episodes selected until their "
-                "minimum eval-window budgets are met"
+                "all physically usable episodes in each deterministic split"
+                if args.select_all_usable_episodes
+                else (
+                    "longest deterministic train episodes until the minimum train-window "
+                    "budget is met, with validation/test episodes selected until their "
+                    "minimum eval-window budgets are met"
+                )
+            ),
+            "selection_mode": (
+                "all_usable_episodes"
+                if args.select_all_usable_episodes
+                else "minimum_window_budget"
             ),
             "minimum_train_windows_per_source": args.minimum_train_windows,
             "minimum_eval_windows_per_source": args.minimum_eval_windows,
@@ -777,6 +810,11 @@ def main() -> None:
         "excluded_sources": sorted(excluded),
         "minimum_train_windows_per_source": args.minimum_train_windows,
         "minimum_eval_windows_per_source": args.minimum_eval_windows,
+        "selection_mode": (
+            "all_usable_episodes"
+            if args.select_all_usable_episodes
+            else "minimum_window_budget"
+        ),
         "sources": receipt_rows,
     }
     receipt_path = output / "local_reuse_receipt.json"

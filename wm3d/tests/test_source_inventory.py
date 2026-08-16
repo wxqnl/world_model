@@ -180,7 +180,7 @@ def test_inventory_explicit_episode_selection_is_bound_and_fail_closed(
 
 
 def test_explicit_shared_file_selection_uses_global_file_origin(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     adapter_path = _raw_fixture(tmp_path)
     (tmp_path / "meta/episodes.jsonl").unlink()
@@ -236,6 +236,16 @@ def test_explicit_shared_file_selection_uses_global_file_origin(
         ),
         tmp_path / "data/chunk-000/file-000.parquet",
     )
+    original_read_table = pq.read_table
+    payload_reads = 0
+
+    def counting_read_table(path: Path, *args: object, **kwargs: object) -> pa.Table:
+        nonlocal payload_reads
+        if Path(path) == tmp_path / "data/chunk-000/file-000.parquet":
+            payload_reads += 1
+        return original_read_table(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_table", counting_read_table)
     adapter = load_adapter_contract(adapter_path, expected_sha256=_sha(adapter_path))
     rows, _receipt = scan_lerobot_source(
         root=tmp_path,
@@ -251,3 +261,4 @@ def test_explicit_shared_file_selection_uses_global_file_origin(
     assert rows[0]["payload_row_start"] == 4
     assert rows[0]["payload_row_stop"] == 8
     assert rows[0]["observation_clock"]["start_s"] == pytest.approx(10.0)
+    assert payload_reads == 1

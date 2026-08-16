@@ -284,6 +284,9 @@ def _episode_rows(
             observed = sha256_file(root / relative)
             digest_cache[relative] = observed
         return observed
+    payload_cache_path: str | None = None
+    payload_cache_rows = 0
+    payload_cache: dict[str, np.ndarray] = {}
 
     seen_episode_indices: set[int] = set()
     available_episode_indices: set[int] = set()
@@ -329,12 +332,24 @@ def _episode_rows(
         if row_start < 0 or row_stop - row_start != length:
             raise SourceInventoryError(f"episode {episode_index} has invalid row slice")
         payload_path = root / payload
-        parquet = pq.ParquetFile(payload_path)
-        if row_stop > parquet.metadata.num_rows:
+        if payload != payload_cache_path:
+            required_keys = tuple(dict.fromkeys(adapter.required_array_keys))
+            try:
+                table = pq.read_table(payload_path, columns=list(required_keys))
+            except (KeyError, OSError) as exc:
+                raise SourceInventoryError(
+                    f"payload misses an adapter field or cannot be read: {payload}"
+                ) from exc
+            payload_cache = {
+                key: np.asarray(table[key].to_pylist()) for key in required_keys
+            }
+            payload_cache_rows = table.num_rows
+            payload_cache_path = payload
+        if row_stop > payload_cache_rows:
             raise SourceInventoryError(f"episode {episode_index} row slice exceeds payload")
         arrays = {
-            key: _slice_column(parquet, key, row_start, row_stop)
-            for key in adapter.required_array_keys
+            key: payload_cache[key][row_start:row_stop]
+            for key in payload_cache
         }
         observation_clock = _clock(
             arrays,
