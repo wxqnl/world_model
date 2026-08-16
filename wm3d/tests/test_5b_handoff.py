@@ -31,10 +31,20 @@ def test_5b_presets_match_native_5b_and_64_h200(
     checkpoint_interval: int,
 ) -> None:
     model = yaml.safe_load((ROOT / "configs/model/native_5b.yaml").read_text())
+    objective = yaml.safe_load(
+        (ROOT / "configs/objective/stage0_native.yaml").read_text()
+    )
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
     assert model["expected_parameter_count"] == 5_285_182_899
+    assert model["model"]["schema"] == "wm3d_native_world_model_v2"
+    assert model["model"]["rgb_hidden"] == 1536
+    assert model["model"]["rgb_res_blocks"] == 2
+    assert model["model"]["rgb_decode_chunk_size"] == 2
+    assert model["model"]["rgb_decode_indices"] == list(range(16))
+    assert objective["objective"]["rgb_l1"] == 0.5
+    assert objective["objective"]["rgb_perceptual"] == 0.1
     assert runtime["expected_world_size"] == 64
     assert runtime["distributed"]["shard_degree"] == 8
     assert runtime["resources"]["gpu_name_substring"] == "H200"

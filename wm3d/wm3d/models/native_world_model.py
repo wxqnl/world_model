@@ -96,7 +96,7 @@ class NativeWorldModelConfig:
     rgb_res_blocks: int = 2
     rgb_decode_chunk_size: int = 4
     rgb_size: int = 384
-    rgb_decode_indices: tuple[int, ...] = (3, 7, 11, 15)
+    rgb_decode_indices: tuple[int, ...] = tuple(range(16))
     geom_hidden: int = 768
 
     dropout: float = 0.0

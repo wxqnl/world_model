@@ -8,6 +8,7 @@ from typing import Mapping
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from wm3d.data.grouped_robot import COMPOSITION_OPERATOR_IDS
 
@@ -121,7 +122,15 @@ def _masked_rgb_perceptual(
         pred_chunk = pred_images[start : start + 4].float().mul(2.0).sub(1.0)
         target_chunk = target_images[start : start + 4].float().mul(2.0).sub(1.0)
         with torch.autocast(device_type=prediction.device.type, enabled=False):
-            distance = model(pred_chunk, target_chunk)
+            if torch.is_grad_enabled() and pred_chunk.requires_grad:
+                distance = checkpoint(
+                    model,
+                    pred_chunk,
+                    target_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                distance = model(pred_chunk, target_chunk)
         total = total + distance.float().sum()
     return total / valid.numel()
 

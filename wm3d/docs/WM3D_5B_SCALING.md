@@ -1,9 +1,16 @@
 # WM3D 5B 训练流程
 
-WM3D 5B 使用 `configs/model/native_5b.yaml`，参数量约 51 亿。默认训练规模为
+WM3D 5B 使用 `configs/model/native_5b.yaml`，精确参数量为 `5,285,182,899`。默认训练规模为
 8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做 8-way FSDP2
 分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，不做梯度累积，
 global batch 为 256。
+
+该 profile 已包含正式 native RGB v2 decoder，不需要同事额外修改配置：decoder hidden 为
+1536，每个上采样层含 2 个 residual blocks，并监督未来全部 16 帧。RGB 目标同时启用 L1、
+Charbonnier、spatial gradient 和冻结的 VGG LPIPS；不依赖 Wan。训练只解码数据中实际有
+RGB 监督的相机，decoder 与 LPIPS 都按小块执行 activation checkpoint，因此不能为了省显存
+把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
+[原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
 
 整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练
 依次进行。数据访问可以使用完整 episode cache，也可以使用有容量上限的按需缓存。命令会
@@ -190,7 +197,9 @@ archive、schema、adapter、inventory 命令整理。OXE 数据已经是 LeRobo
 ```
 
 输出应显示 `native_5b`、64 个 rank，以及与所选配置一致的数据 source 数量，并且不再
-出现 `data_profile=WAITING`。
+出现 `data_profile=WAITING`。同时确认 runtime 封存的模型参数量是 `5,285,182,899`、
+模型 schema 是 `wm3d_native_world_model_v2`，RGB future indices 为 `0..15`；任一项不同都
+不要启动 64 卡训练。
 
 ## 4. 高吞吐 episode cache
 
