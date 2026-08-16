@@ -5,10 +5,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from wm3d.data.step_sampler import EpisodeLocalPermutation, StepAddressedBatchSampler
 from wm3d.data.streaming_raw import StreamingRawError, _StreamingEpisodeCache
 from wm3d.data.unified_cache_dataset import CacheDataError, _ShardStore
+from wm3d.training.pretrain import PretrainError, _relative_world_times_for_model
 
 
 def test_episode_local_permutation_is_bijective_and_local() -> None:
@@ -101,3 +103,24 @@ def test_streaming_hot_hit_uses_verified_file_identity(tmp_path: Path) -> None:
     (root / payloads[0]).write_bytes(b"different")
     with pytest.raises(StreamingRawError, match="changed after"):
         cache.ensure(task)
+
+
+def test_world_times_are_recentered_before_bf16_model_input_cast() -> None:
+    original = 252.0 + torch.arange(24, dtype=torch.float64) * 0.2
+    world_times = original.unsqueeze(0)
+
+    # At this episode offset, the root FSDP BF16 cast merges adjacent frames.
+    assert not bool(torch.diff(world_times.to(torch.bfloat16), dim=1).gt(0).all())
+
+    relative = _relative_world_times_for_model(world_times, context_length=16)
+
+    assert relative.dtype == torch.float64
+    assert relative[0, 15].item() == 0.0
+    assert bool(torch.diff(relative.to(torch.bfloat16), dim=1).gt(0).all())
+    torch.testing.assert_close(world_times, original.unsqueeze(0), rtol=0, atol=0)
+
+
+def test_world_time_recentering_rejects_nonmonotonic_input() -> None:
+    world_times = torch.tensor([[0.0, 0.2, 0.2, 0.4]], dtype=torch.float64)
+    with pytest.raises(PretrainError, match="strictly increasing"):
+        _relative_world_times_for_model(world_times, context_length=2)

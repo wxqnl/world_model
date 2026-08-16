@@ -416,12 +416,39 @@ _MODEL_INPUTS = {
 }
 
 
+def _relative_world_times_for_model(
+    world_times_s: torch.Tensor, *, context_length: int
+) -> torch.Tensor:
+    """Recenter timestamps before FSDP mixed precision casts model inputs.
+
+    Absolute episode times can be hundreds of seconds. Casting those values to
+    BF16 at the root FSDP boundary can collapse distinct observed timestamps.
+    The model consumes time relative to the last context frame, so performing
+    that invariant transformation in the source dtype preserves the real
+    intervals without changing model semantics.
+    """
+
+    if world_times_s.ndim != 2:
+        raise PretrainError("world_times_s must be a batched matrix")
+    if context_length <= 0 or context_length > int(world_times_s.shape[1]):
+        raise PretrainError("world context length is incompatible with timestamps")
+    if not bool(torch.isfinite(world_times_s).all()):
+        raise PretrainError("world_times_s contains non-finite values")
+    if not bool(torch.diff(world_times_s, dim=1).gt(0).all()):
+        raise PretrainError("world_times_s must be strictly increasing per sample")
+    return world_times_s - world_times_s[:, context_length - 1 : context_length]
+
+
 def _forward(model: torch.nn.Module, batch: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
     indices = batch["rgb_frame_indices"]
     if indices.ndim != 2 or not bool((indices == indices[:1]).all()):
         raise PretrainError("RGB supervision indices drifted within a batch")
     kwargs = {name: batch[name] for name in _MODEL_INPUTS}
     kwargs["rgb_frame_indices"] = indices[0].tolist()
+    kwargs["world_times_s"] = _relative_world_times_for_model(
+        kwargs["world_times_s"],
+        context_length=int(kwargs["world_tokens"].shape[1]),
+    )
     if "target_rgb_mask" in batch:
         rgb_mask = batch["target_rgb_mask"]
         if rgb_mask.ndim != 6 or tuple(rgb_mask.shape[-3:]) != (1, 1, 1):
