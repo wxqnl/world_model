@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from wm3d.data.grouped_robot import bimanual_arm_spec
 from wm3d.data.source_adapters import (
@@ -144,3 +145,25 @@ def test_complete_action_decode_is_independent_of_policy_anchor(tmp_path: Path) 
         policy_chunk_start_s=0.04,
     )
     assert [item.timestamp_s for item in states] == [0.04, 0.04]
+
+
+def test_color_order_v4_accepts_bgr_and_rejects_unknown_order(tmp_path: Path) -> None:
+    path = tmp_path / "adapter.yaml"
+    _write_contract(path)
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value["schema"] = "wm3d_source_adapter_v4"
+    value["views"][0]["color_order"] = "bgr"
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    contract = load_adapter_contract(
+        path,
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+    assert contract.views[0].color_order == "bgr"
+
+    value["views"][0]["color_order"] = "yuv"
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    with pytest.raises(AdapterContractError, match="color_order must be rgb/bgr"):
+        load_adapter_contract(
+            path,
+            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )

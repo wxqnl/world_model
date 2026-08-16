@@ -77,7 +77,14 @@ def _view_batch(
     decoded: Mapping[str, Any],
     slots: tuple[str, ...],
     input_size: int,
+    color_order_by_view: Mapping[str, str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    color_order_by_view = dict(color_order_by_view or {})
+    unknown = sorted(set(color_order_by_view) - set(slots))
+    if unknown:
+        raise CacheWorkerError(
+            f"adapter color_order names are absent from canonical slots: {unknown}"
+        )
     first = next(iter(decoded.values())).frames
     count, _height, _width, channels = first.shape
     if channels != 3:
@@ -95,6 +102,13 @@ def _view_batch(
         frames = item.frames
         if frames.shape[0] != count or frames.ndim != 4 or frames.shape[-1] != 3:
             raise CacheWorkerError("real view frame count/RGB layout differs")
+        color_order = color_order_by_view.get(name, "rgb")
+        if color_order == "bgr":
+            frames = frames[..., ::-1].copy()
+        elif color_order != "rgb":
+            raise CacheWorkerError(
+                f"unsupported decoded color_order {color_order!r} for view {name!r}"
+            )
         tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).float().div_(255)
         height, width = tensor.shape[-2:]
         scale = float(input_size) / float(max(height, width))
@@ -199,7 +213,12 @@ def _prepare_task(
             decode_workers=decode_workers,
         )
         images, view_mask = _view_batch(
-            decoded=decoded, slots=slots, input_size=encoder_input_size
+            decoded=decoded,
+            slots=slots,
+            input_size=encoder_input_size,
+            color_order_by_view={
+                view.name: view.color_order for view in adapter.views
+            },
         )
     else:
         video_evidence = {}

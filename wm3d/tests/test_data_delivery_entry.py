@@ -311,6 +311,26 @@ def test_cache_rgb_bicubic_resize_preserves_normalized_input_range() -> None:
     assert mask.tolist() == [[True, False, False], [True, False, False]]
 
 
+def test_cache_rgb_restores_declared_bgr_source_order() -> None:
+    class Decoded:
+        pass
+
+    decoded = Decoded()
+    decoded.frames = np.zeros((1, 14, 14, 3), dtype=np.uint8)
+    decoded.frames[..., 0] = 10
+    decoded.frames[..., 1] = 20
+    decoded.frames[..., 2] = 30
+    images, mask = _view_batch(
+        decoded={"head": decoded},
+        slots=("head",),
+        input_size=14,
+        color_order_by_view={"head": "bgr"},
+    )
+    assert mask.tolist() == [[True]]
+    expected = torch.tensor([30.0, 20.0, 10.0]) / 255.0
+    torch.testing.assert_close(images[0, 0, :, 0, 0], expected)
+
+
 def test_external_converter_is_receipt_bound_and_closes_all_jobs(tmp_path: Path) -> None:
     import sys
 

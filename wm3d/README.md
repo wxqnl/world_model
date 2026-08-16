@@ -93,6 +93,11 @@ ABI。旧 residual 只能由 `legacy-residual-import` 审计并转换，不能�
 AgiBotWorld2026。AgiBotWorld Beta 默认关闭，可在生成 5B 数据模板前显式启用。具体命令见
 [WM3D 5B 训练流程](docs/WM3D_5B_SCALING.md)。
 
+单机 8×H100 的 1B 新训练可使用全 OXE 按需缓存路径：保留 DROID、Bridge 和三类
+RoboCasa，加入去重后的 55 个 OXE source，不使用旧 PCA token cache。数据容量、1K canary、
+100K 正式训练与结果检查见
+[WM3D 1B 全 OXE 按需缓存训练](docs/WM3D_1B_STREAMING.md)。
+
 ## 真实小样本验收
 
 在正式训练前，用两张空闲 GPU 从冻结的公开 ALOHA 小样本真实跑通环境、下载、adapter、

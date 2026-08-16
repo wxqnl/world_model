@@ -1,4 +1,18 @@
-# 5B site configuration
+# Cluster site configuration
+
+For single-node 1B streaming training on 8×H100:
+
+```bash
+./run_wm3d.sh 1b init canary1k /data/wm3d_1b_oxe/control/1b_canary.env
+./run_wm3d.sh 1b data-template /data/wm3d_1b_oxe/control/1b_canary.env
+./run_wm3d.sh 1b doctor /data/wm3d_1b_oxe/control/1b_canary.env
+```
+
+The 1B presets are `canary1k` and `formal100k`. The default uses P64/256px
+`streaming_raw`, all official OXE sources after DROID de-duplication, and excludes both
+AgiBot options. See `docs/WM3D_1B_STREAMING.md`.
+
+For multi-node 5B:
 
 Create a site file for one of the three schedules, then edit the storage, token, model snapshot,
 and rendezvous paths:

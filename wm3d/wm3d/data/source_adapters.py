@@ -24,6 +24,7 @@ from .manifest_contract import sha256_file
 
 
 ADAPTER_SCHEMA = "wm3d_v8_source_adapter_v3"
+ADAPTER_COLOR_SCHEMA = "wm3d_source_adapter_v4"
 
 
 class AdapterContractError(ValueError):
@@ -54,6 +55,7 @@ class ViewMapping:
 
     name: str
     key: str
+    color_order: str = "rgb"
 
 
 @dataclass(frozen=True)
@@ -132,8 +134,9 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
     }
     if not isinstance(value, dict) or set(value) != required:
         raise AdapterContractError("adapter contract root fields mismatch")
-    if value["schema"] != ADAPTER_SCHEMA:
-        raise AdapterContractError(f"adapter schema must be {ADAPTER_SCHEMA}")
+    schema = str(value["schema"])
+    if schema not in {ADAPTER_SCHEMA, ADAPTER_COLOR_SCHEMA}:
+        raise AdapterContractError(f"unsupported adapter schema {schema!r}")
     raw_format = str(value["raw_format"])
     if raw_format not in {"lerobot_parquet_video", "agibot_parquet_video", "npz"}:
         raise AdapterContractError(f"unsupported raw_format {raw_format!r}")
@@ -147,9 +150,14 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
     view_names: set[str] = set()
     view_keys: set[str] = set()
     for raw_view in raw_views:
-        if not isinstance(raw_view, dict) or set(raw_view) != {"name", "key"}:
+        view_fields = (
+            {"name", "key"}
+            if schema == ADAPTER_SCHEMA
+            else {"name", "key", "color_order"}
+        )
+        if not isinstance(raw_view, dict) or set(raw_view) != view_fields:
             raise AdapterContractError(
-                "adapter view fields must be exactly ['key', 'name']"
+                f"adapter view fields must be exactly {sorted(view_fields)}"
             )
         name = str(raw_view["name"])
         key = str(raw_view["key"])
@@ -159,7 +167,12 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
             raise AdapterContractError("adapter view names/keys must be unique")
         view_names.add(name)
         view_keys.add(key)
-        views.append(ViewMapping(name=name, key=key))
+        color_order = str(raw_view.get("color_order", "rgb"))
+        if color_order not in {"rgb", "bgr"}:
+            raise AdapterContractError(
+                f"adapter view color_order must be rgb/bgr, got {color_order!r}"
+            )
+        views.append(ViewMapping(name=name, key=key, color_order=color_order))
     groups: list[GroupMapping] = []
     seen: set[str] = set()
     for raw in value["groups"]:

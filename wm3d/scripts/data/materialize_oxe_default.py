@@ -22,6 +22,8 @@ COLLECTION_API = (
 )
 SOURCE_SCHEMA = "wm3d_v8_raw_source_lock_v1"
 DATA_SCHEMA = "wm3d_v8_data_profile_v4"
+MODEL_SCHEMA = "wm3d_v8_model_profile_v1"
+ENCODER_SCHEMA = "wm3d_native_vggt_encoder_v1"
 MAX_ACTION_DIM = 16
 MAX_STATE_DIM = 32
 VIEW_SLOTS = ("head", "left_wrist", "right_wrist")
@@ -221,6 +223,55 @@ def _adapter_and_embodiment(
     return adapter, embodiment
 
 
+def _representation_from_profiles(
+    *,
+    base: dict,
+    model_path: Path,
+    encoder_path: Path,
+) -> dict:
+    model_profile = _load_yaml(model_path, schema=MODEL_SCHEMA)
+    encoder = _load_yaml(encoder_path, schema=ENCODER_SCHEMA)
+    model = model_profile.get("model")
+    sampling = model_profile.get("sampling")
+    if not isinstance(model, dict) or not isinstance(sampling, dict):
+        raise ValueError("model profile is missing model/sampling mappings")
+    grid = int(encoder["token_grid"])
+    spatial_tokens = grid * grid
+    expected = {
+        "spatial_tokens": int(model["P"]),
+        "token_dim": int(model["token_dim"]),
+        "num_views": int(model["num_views"]),
+        "rgb_size": int(model["rgb_size"]),
+    }
+    actual = {
+        "spatial_tokens": spatial_tokens,
+        "token_dim": int(encoder["token_dim"]),
+        "num_views": int(encoder["max_views"]),
+        "rgb_size": int(encoder["target_rgb_size"]),
+    }
+    if actual != expected:
+        raise ValueError(
+            f"model/encoder representation mismatch: expected={expected} actual={actual}"
+        )
+    result = copy.deepcopy(base)
+    result.update(
+        {
+            "token_grid": grid,
+            "spatial_tokens": spatial_tokens,
+            "token_dim": actual["token_dim"],
+            "num_views": actual["num_views"],
+            "rgb_size": actual["rgb_size"],
+        }
+    )
+    selection = result.get("state_frame_selection")
+    if not isinstance(selection, dict):
+        raise ValueError("base data template is missing state_frame_selection")
+    selection["minimum_separation_seconds"] = float(
+        sampling["minimum_anchor_separation_seconds"]
+    )
+    return result
+
+
 def build_templates(
     *,
     base_source: dict,
@@ -228,6 +279,10 @@ def build_templates(
     repo_ids: tuple[str, ...],
     metadata_by_repo: dict[str, dict],
     include_agibot_beta: bool = False,
+    include_agibot_2026: bool = True,
+    representation_override: dict | None = None,
+    profile_name: str | None = None,
+    profile_role: str = "default_5b_public_profile",
 ) -> tuple[dict, dict, dict[str, dict]]:
     source_rows = base_source.get("sources")
     data_rows = base_data.get("sources")
@@ -237,9 +292,11 @@ def build_templates(
     if not isinstance(embodiments, list):
         raise ValueError("base data template must contain embodiments")
 
-    excluded_source_names = (
-        set() if include_agibot_beta else {"agibot_beta", "agibot_alpha_converter"}
-    )
+    excluded_source_names = set()
+    if not include_agibot_beta:
+        excluded_source_names.update({"agibot_beta", "agibot_alpha_converter"})
+    if not include_agibot_2026:
+        excluded_source_names.add("agibot_world_2026")
     source_output = copy.deepcopy(base_source)
     source_output["sources"] = [
         copy.deepcopy(row)
@@ -247,7 +304,7 @@ def build_templates(
         if row.get("name") not in excluded_source_names
     ]
     data_output = copy.deepcopy(base_data)
-    data_output["name"] = (
+    data_output["name"] = profile_name or (
         "public_robot_oxe_with_agibot_beta"
         if include_agibot_beta
         else "public_robot_oxe"
@@ -255,9 +312,12 @@ def build_templates(
     data_output["sources"] = [
         copy.deepcopy(row)
         for row in data_rows
-        if include_agibot_beta or row.get("name") != "agibot_beta"
+        if (include_agibot_beta or row.get("name") != "agibot_beta")
+        and (include_agibot_2026 or not str(row.get("name", "")).startswith("agibot_2026"))
     ]
     data_output["embodiments"] = copy.deepcopy(embodiments)
+    if representation_override is not None:
+        data_output["cache_representation"] = copy.deepcopy(representation_override)
 
     oxe = [repo for repo in repo_ids if repo != "lerobot/droid_1.0.1"]
     if not oxe:
@@ -303,6 +363,15 @@ def build_templates(
         )
         data_output["embodiments"].append(embodiment)
 
+    referenced_embodiments = {
+        str(row["embodiment"]) for row in data_output["sources"]
+    }
+    data_output["embodiments"] = [
+        row
+        for row in data_output["embodiments"]
+        if str(row.get("name", "")) in referenced_embodiments
+    ]
+
     notes = dict(data_output.get("notes") or {})
     notes.pop("nominal_total_hours", None)
     notes.pop("formal_target_unique_hours", None)
@@ -316,11 +385,12 @@ def build_templates(
     )
     data_output["notes"] = {
         **notes,
-        "profile_role": "default_5b_public_profile",
+        "profile_role": profile_role,
         "default_data_policy": (
             "all official LeRobot OXE datasets are included; the already-present "
-            "DROID source is de-duplicated; AgiBotWorld Beta is opt-in"
+            "DROID source is de-duplicated; optional AgiBot sources follow explicit flags"
         ),
+        "agibot_world_2026_enabled": include_agibot_2026,
         "agibot_beta_enabled": include_agibot_beta,
         "nominal_main_hours_excluding_oxe": nominal_main_hours,
         "oxe_collection_url": COLLECTION_API,
@@ -346,6 +416,11 @@ def main() -> None:
     parser.add_argument("--output-data-template", type=Path, required=True)
     parser.add_argument("--output-adapter-root", type=Path, required=True)
     parser.add_argument("--include-agibot-beta", action="store_true")
+    parser.add_argument("--exclude-agibot-2026", action="store_true")
+    parser.add_argument("--model-profile", type=Path)
+    parser.add_argument("--encoder-contract", type=Path)
+    parser.add_argument("--profile-name")
+    parser.add_argument("--profile-role", default="default_5b_public_profile")
     args = parser.parse_args()
     source = _load_yaml(args.base_source_template, schema=SOURCE_SCHEMA)
     data = _load_yaml(args.base_data_template, schema=DATA_SCHEMA)
@@ -379,12 +454,25 @@ def main() -> None:
         for repo in repos
         if repo != "lerobot/droid_1.0.1"
     }
+    if (args.model_profile is None) != (args.encoder_contract is None):
+        raise ValueError("--model-profile and --encoder-contract must be supplied together")
+    representation = None
+    if args.model_profile is not None and args.encoder_contract is not None:
+        representation = _representation_from_profiles(
+            base=data["cache_representation"],
+            model_path=args.model_profile,
+            encoder_path=args.encoder_contract,
+        )
     source_output, data_output, adapters = build_templates(
         base_source=source,
         base_data=data,
         repo_ids=repos,
         metadata_by_repo=metadata,
         include_agibot_beta=args.include_agibot_beta,
+        include_agibot_2026=not args.exclude_agibot_2026,
+        representation_override=representation,
+        profile_name=args.profile_name,
+        profile_role=args.profile_role,
     )
     _publish(
         args.output_source_template,
@@ -404,6 +492,7 @@ def main() -> None:
             {
                 "official_oxe_dataset_count": len(repos),
                 "new_oxe_source_count": len(repos) - 1,
+                "agibot_world_2026_enabled": not args.exclude_agibot_2026,
                 "agibot_beta_enabled": args.include_agibot_beta,
                 "source_template": str(args.output_source_template.absolute()),
                 "data_template": str(args.output_data_template.absolute()),

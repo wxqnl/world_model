@@ -3,40 +3,60 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 ENTRY="${ROOT}/run_wm3d.sh"
-TEMPLATE="${ROOT}/configs/cluster/h200_5b.env.example"
+SCALE=${WM3D_CLUSTER_SCALE:-5b}
+case "${SCALE}" in
+  1b)
+    SCALE_LABEL=1B
+    PRESET_VAR=WM3D_1B_PRESET
+    RUN_ID_VAR=WM3D_1B_RUN_ID
+    TEMPLATE="${ROOT}/configs/cluster/h100_1b_streaming.env.example"
+    GUIDE=docs/WM3D_1B_STREAMING.md
+    ;;
+  5b)
+    SCALE_LABEL=5B
+    PRESET_VAR=WM3D_5B_PRESET
+    RUN_ID_VAR=WM3D_5B_RUN_ID
+    TEMPLATE="${ROOT}/configs/cluster/h200_5b.env.example"
+    GUIDE=docs/WM3D_5B_SCALING.md
+    ;;
+  *)
+    echo "WM3D_CLUSTER_SCALE 必须是 1b 或 5b" >&2
+    exit 2
+    ;;
+esac
 
 usage() {
-  cat <<'EOF'
-WM3D 5B 集群操作入口：
+  cat <<EOF
+WM3D ${SCALE_LABEL} 集群操作入口：
 
-  ./run_wm3d.sh 5b init <canary1k|validation100k|formal600k> <site.env>
-  ./run_wm3d.sh 5b env <site.env>
-  ./run_wm3d.sh 5b data-template <site.env>
-  ./run_wm3d.sh 5b doctor <site.env>
-  ./run_wm3d.sh 5b plan <site.env>
-  ./run_wm3d.sh 5b lock <site.env>
-  ./run_wm3d.sh 5b download <site.env>
-  ./run_wm3d.sh 5b task-bank <site.env>
-  ./run_wm3d.sh 5b cache-plan <site.env>
-  ./run_wm3d.sh 5b cache-worker <site.env> <global-worker-index> <worker-count> <local-gpu|inherited>
-  ./run_wm3d.sh 5b cache-seal <site.env>
-  ./run_wm3d.sh 5b streaming-prepare <site.env>
-  ./run_wm3d.sh 5b window <site.env>
-  ./run_wm3d.sh 5b normalization <site.env>
-  ./run_wm3d.sh 5b runtime <site.env>
-  ./run_wm3d.sh 5b preflight <site.env>
-  ./run_wm3d.sh 5b train <site.env> [sealed-stop-step]
-  ./run_wm3d.sh 5b resume <site.env> <step|checkpoint> [sealed-stop-step]
-  ./run_wm3d.sh 5b eval <site.env> [step|checkpoint] [output.json]
-  ./run_wm3d.sh 5b status <site.env>
-  ./run_wm3d.sh 5b verify <site.env> [step|checkpoint] [eval.json]
+  ./run_wm3d.sh ${SCALE} init <preset> <site.env>
+  ./run_wm3d.sh ${SCALE} env <site.env>
+  ./run_wm3d.sh ${SCALE} data-template <site.env>
+  ./run_wm3d.sh ${SCALE} doctor <site.env>
+  ./run_wm3d.sh ${SCALE} plan <site.env>
+  ./run_wm3d.sh ${SCALE} lock <site.env>
+  ./run_wm3d.sh ${SCALE} download <site.env>
+  ./run_wm3d.sh ${SCALE} task-bank <site.env>
+  ./run_wm3d.sh ${SCALE} cache-plan <site.env>
+  ./run_wm3d.sh ${SCALE} cache-worker <site.env> <global-worker-index> <worker-count> <local-gpu|inherited>
+  ./run_wm3d.sh ${SCALE} cache-seal <site.env>
+  ./run_wm3d.sh ${SCALE} streaming-prepare <site.env>
+  ./run_wm3d.sh ${SCALE} window <site.env>
+  ./run_wm3d.sh ${SCALE} normalization <site.env>
+  ./run_wm3d.sh ${SCALE} runtime <site.env>
+  ./run_wm3d.sh ${SCALE} preflight <site.env>
+  ./run_wm3d.sh ${SCALE} train <site.env> [sealed-stop-step]
+  ./run_wm3d.sh ${SCALE} resume <site.env> <step|checkpoint> [sealed-stop-step]
+  ./run_wm3d.sh ${SCALE} eval <site.env> [step|checkpoint] [output.json]
+  ./run_wm3d.sh ${SCALE} status <site.env>
+  ./run_wm3d.sh ${SCALE} verify <site.env> [step|checkpoint] [eval.json]
 
-完整顺序和多机启动示例见 docs/WM3D_5B_SCALING.md。
+完整顺序见 ${GUIDE}。
 EOF
 }
 
 die() {
-  echo "5b: $*" >&2
+  echo "${SCALE}: $*" >&2
   exit 2
 }
 
@@ -67,35 +87,52 @@ require_file() {
 }
 
 validate_preset() {
-  case "$1" in
-    canary1k|validation100k|formal600k) ;;
-    *) die "未知 5B preset：$1（可选 canary1k、validation100k、formal600k）" ;;
-  esac
+  if [[ "${SCALE}" == 1b ]]; then
+    case "$1" in
+      canary1k|formal100k) ;;
+      *) die "未知 1B preset：$1（可选 canary1k、formal100k）" ;;
+    esac
+  else
+    case "$1" in
+      canary1k|validation100k|formal600k) ;;
+      *) die "未知 5B preset：$1（可选 canary1k、validation100k、formal600k）" ;;
+    esac
+  fi
 }
 
 apply_preset() {
-  validate_preset "${WM3D_5B_PRESET}"
-  case "${WM3D_5B_PRESET}" in
-    canary1k)
+  validate_preset "${WM3D_PRESET}"
+  case "${SCALE}:${WM3D_PRESET}" in
+    1b:canary1k)
+      RUNTIME_PROFILE=configs/runtime/h100_8_fsdp2_streaming_canary1k.yaml
+      TOTAL_STEPS=1000
+      MILESTONES="100 -> 500 -> 1000"
+      ;;
+    1b:formal100k)
+      RUNTIME_PROFILE=configs/runtime/h100_8_fsdp2_streaming_formal100k.yaml
+      TOTAL_STEPS=100000
+      MILESTONES="1000 -> 5000 -> 10000 -> 100000"
+      ;;
+    5b:canary1k)
       RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_canary1k.yaml
       TOTAL_STEPS=1000
       MILESTONES="100 -> 500 -> 1000"
       ;;
-    validation100k)
+    5b:validation100k)
       RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_validation100k.yaml
       TOTAL_STEPS=100000
       MILESTONES="1000 -> 100000"
       ;;
-    formal600k)
+    5b:formal600k)
       RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2.yaml
       TOTAL_STEPS=600000
       MILESTONES="1000 -> 5000 -> 20000 -> 600000"
       ;;
   esac
-  RUN_ROOT="${WORK_ROOT}/runs/5b_${WM3D_5B_RUN_ID}"
-  RUNTIME_YAML="${CONTROL_ROOT}/runtime_5b_${WM3D_5B_RUN_ID}.yaml"
-  RUN_NAME="wm3d_5b_${WM3D_5B_RUN_ID}"
-  RUN_LINEAGE="wm3d_5b_${DATA_FAMILY}_${WM3D_5B_RUN_ID}_v1"
+  RUN_ROOT="${WORK_ROOT}/runs/${SCALE}_${WM3D_RUN_ID}"
+  RUNTIME_YAML="${CONTROL_ROOT}/runtime_${SCALE}_${WM3D_RUN_ID}.yaml"
+  RUN_NAME="wm3d_${SCALE}_${WM3D_RUN_ID}"
+  RUN_LINEAGE="wm3d_${SCALE}_${DATA_FAMILY}_${WM3D_RUN_ID}_v1"
   printf -v FINAL_STEP_PADDED '%08d' "${TOTAL_STEPS}"
   EVAL_OUTPUT="${RUN_ROOT}/eval_step_${FINAL_STEP_PADDED}.json"
 }
@@ -109,14 +146,20 @@ load_site() {
   # shellcheck disable=SC1090
   source "${site}"
   set +a
+  require_var "${PRESET_VAR}"
+  require_var "${RUN_ID_VAR}"
+  WM3D_PRESET=${!PRESET_VAR}
+  WM3D_RUN_ID=${!RUN_ID_VAR}
   WM3D_DATA_MODE=${WM3D_DATA_MODE:-episode_cache}
   STREAMING_METADATA_ROOT=${STREAMING_METADATA_ROOT:-${CONTROL_ROOT}/streaming_metadata}
-  STREAMING_METADATA_SEAL=${STREAMING_METADATA_SEAL:-${STREAMING_METADATA_ROOT}/metadata_seal_5b.json}
+  STREAMING_METADATA_SEAL=${STREAMING_METADATA_SEAL:-${STREAMING_METADATA_ROOT}/metadata_seal_${SCALE}.json}
   STREAMING_LRU_ROOT=${STREAMING_LRU_ROOT:-${WORK_ROOT}/streaming_lru}
   STREAMING_LRU_GIB_PER_RANK=${STREAMING_LRU_GIB_PER_RANK:-64}
   STREAMING_METADATA_WORKERS=${STREAMING_METADATA_WORKERS:-32}
   STREAMING_ENCODE_BATCH_FRAMES=${STREAMING_ENCODE_BATCH_FRAMES:-16}
   STREAMING_DECODE_WORKERS=${STREAMING_DECODE_WORKERS:-4}
+  MINIMUM_RAW_FILESYSTEM_BYTES=${MINIMUM_RAW_FILESYSTEM_BYTES:-0}
+  INCLUDE_AGIBOT_2026=${INCLUDE_AGIBOT_2026:-YES}
   INCLUDE_AGIBOT_BETA=${INCLUDE_AGIBOT_BETA:-NO}
   case "${WM3D_DATA_MODE}" in
     episode_cache|streaming_raw) ;;
@@ -126,7 +169,11 @@ load_site() {
     YES|NO) ;;
     *) die "INCLUDE_AGIBOT_BETA 必须是 YES 或 NO" ;;
   esac
-  for name in WM3D_5B_PRESET WM3D_5B_RUN_ID DATA_FAMILY WORK_ROOT CONTROL_ROOT RAW_ROOT \
+  case "${INCLUDE_AGIBOT_2026}" in
+    YES|NO) ;;
+    *) die "INCLUDE_AGIBOT_2026 必须是 YES 或 NO" ;;
+  esac
+  for name in DATA_FAMILY WORK_ROOT CONTROL_ROOT RAW_ROOT \
     CACHE_ROOT ENV_DIR PYTHON_BIN \
     HF_TOKEN_FILE ACCEPT_DATA_LICENSES SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
     TASK_BANK_INDEX TASK_MANIFEST EPISODE_INDEX EPISODE_SEAL WINDOW_INDEX WINDOW_SEAL \
@@ -215,7 +262,7 @@ case "${action}" in
     [[ ! -e "${target}" && ! -L "${target}" ]] || die "拒绝覆盖已有 site 文件：${target}"
     mkdir -p "$(dirname "${target}")"
     install -m 600 "${TEMPLATE}" "${target}"
-    sed -i "s/^WM3D_5B_PRESET=.*/WM3D_5B_PRESET=${preset}/" "${target}"
+    sed -i "s/^${PRESET_VAR}=.*/${PRESET_VAR}=${preset}/" "${target}"
     echo "已创建 ${target}（preset=${preset}）；编辑站点路径后运行 doctor。"
     exit 0
     ;;
@@ -259,6 +306,17 @@ print(f"model={model['name']} expected_parameters={int(model['expected_parameter
 print(f"world_size={runtime['expected_world_size']} total_steps={runtime['train']['total_steps']}")
 PY
     [[ "${MASTER_ADDR}" != REQUIRED_MASTER_ADDR ]] || die "MASTER_ADDR 仍是 REQUIRED_MASTER_ADDR"
+    if (( MINIMUM_RAW_FILESYSTEM_BYTES > 0 )); then
+      raw_probe=${RAW_ROOT}
+      while [[ ! -e "${raw_probe}" && "${raw_probe}" != / ]]; do
+        raw_probe=$(dirname "${raw_probe}")
+      done
+      [[ -d "${raw_probe}" && ! -L "${raw_probe}" ]] || \
+        die "RAW_ROOT 的已有父目录无效或是符号链接：${raw_probe}"
+      raw_filesystem_bytes=$(df -B1 --output=size "${raw_probe}" | tail -n 1 | tr -d ' ')
+      (( raw_filesystem_bytes >= MINIMUM_RAW_FILESYSTEM_BYTES )) || \
+        die "RAW_ROOT 文件系统容量不足：${raw_filesystem_bytes} < ${MINIMUM_RAW_FILESYSTEM_BYTES} bytes"
+    fi
     [[ -d "${WM3D_VGGT_SOURCE_ROOT}" && ! -L "${WM3D_VGGT_SOURCE_ROOT}" ]] || \
       die "VGGT source root 缺失或是符号链接：${WM3D_VGGT_SOURCE_ROOT}"
     [[ -d "${WM3D_VGGT_MODEL_SNAPSHOT}" && ! -L "${WM3D_VGGT_MODEL_SNAPSHOT}" ]] || \
@@ -288,8 +346,8 @@ PY
       data_steps="task-bank -> cache-plan -> cache-worker[*] -> cache-seal -> window -> normalization"
     fi
     cat <<EOF
-WM3D 5B site plan
-  preset:     ${WM3D_5B_PRESET}
+WM3D ${SCALE_LABEL} site plan
+  preset:     ${WM3D_PRESET}
   work:       ${WORK_ROOT}
   raw:        ${RAW_ROOT}
   data:       ${DATA_PROFILE}
@@ -337,8 +395,19 @@ EOF
       --output-data-template "${DATA_TEMPLATE}"
       --output-adapter-root "${CONTROL_ROOT}/adapters"
     )
+    if [[ "${SCALE}" == 1b ]]; then
+      template_args+=(
+        --model-profile "${MODEL_PROFILE}"
+        --encoder-contract "${ENCODER_CONTRACT}"
+        --profile-name public_robot_1b_oxe
+        --profile-role default_1b_public_profile
+      )
+    fi
     if [[ "${INCLUDE_AGIBOT_BETA}" == YES ]]; then
       template_args+=(--include-agibot-beta)
+    fi
+    if [[ "${INCLUDE_AGIBOT_2026}" == NO ]]; then
+      template_args+=(--exclude-agibot-2026)
     fi
     HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${PYTHON_BIN}" "${template_args[@]}"
     ;;
