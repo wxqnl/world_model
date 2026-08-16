@@ -435,6 +435,7 @@ def _selected_indices(
     *,
     view_keys: tuple[str, ...],
     minimum_train_windows: int,
+    minimum_eval_windows: int,
 ) -> tuple[tuple[int, ...], dict[str, dict]]:
     info = json.loads(_regular(root / "meta/info.json", f"{source} info").read_text())
     data_template = str(
@@ -485,7 +486,7 @@ def _selected_indices(
     timestamp_cache: dict[Path, np.ndarray] = {}
     video_bounds_cache: dict[Path, tuple[float, float, int | None] | None] = {}
     for split in ("train", "val", "test"):
-        target = minimum_train_windows if split == "train" else 1
+        target = minimum_train_windows if split == "train" else minimum_eval_windows
         selected[split] = []
         selected_evidence = []
         valid_window_count = 0
@@ -652,9 +653,12 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--exclude-source", action="append", default=[])
     parser.add_argument("--minimum-train-windows", type=int, default=1)
+    parser.add_argument("--minimum-eval-windows", type=int, default=1)
     args = parser.parse_args()
     if args.minimum_train_windows < 1:
         raise RuntimeError("--minimum-train-windows must be positive")
+    if args.minimum_eval_windows < 1:
+        raise RuntimeError("--minimum-eval-windows must be positive")
     roots = {
         "oxe": _real_dir(args.oxe_root, "OXE root"),
         "droid": _real_dir(args.droid_root, "DROID root"),
@@ -694,6 +698,7 @@ def main() -> None:
             model_profile,
             view_keys=plan.views,
             minimum_train_windows=args.minimum_train_windows,
+            minimum_eval_windows=args.minimum_eval_windows,
         )
         episode_path = episode_root / f"{plan.name}.txt"
         _publish(episode_path, ("\n".join(str(item) for item in selected) + "\n").encode())
@@ -739,9 +744,11 @@ def main() -> None:
             "excluded_sources": sorted(excluded),
             "split_policy": (
                 "longest deterministic train episodes until the minimum train-window "
-                "budget is met, plus one validation/test episode per source"
+                "budget is met, with validation/test episodes selected until their "
+                "minimum eval-window budgets are met"
             ),
             "minimum_train_windows_per_source": args.minimum_train_windows,
+            "minimum_eval_windows_per_source": args.minimum_eval_windows,
             "action_state_policy": "source-native opaque controller vectors with recorded timestamps",
             "color_policy": "legacy GAM BGR declarations are explicitly restored before RGB supervision",
         },
@@ -769,6 +776,7 @@ def main() -> None:
         "source_count": len(receipt_rows),
         "excluded_sources": sorted(excluded),
         "minimum_train_windows_per_source": args.minimum_train_windows,
+        "minimum_eval_windows_per_source": args.minimum_eval_windows,
         "sources": receipt_rows,
     }
     receipt_path = output / "local_reuse_receipt.json"

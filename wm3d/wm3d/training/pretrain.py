@@ -600,6 +600,31 @@ def _make_loader(
     return DataLoader(dataset, **kwargs)
 
 
+def _require_sampling_capacity(
+    dataset: Any,
+    profile: Any,
+    runtime_profile: Mapping[str, Any],
+    *,
+    rank: int,
+    world_size: int,
+    gradient_accumulation: int,
+    seed: int,
+) -> None:
+    """Reject undersized source splits before model construction or training."""
+
+    _make_loader(
+        dataset,
+        profile,
+        runtime_profile,
+        rank=rank,
+        world_size=world_size,
+        start_step=0,
+        num_steps=1,
+        seed=seed,
+        gradient_accumulation=gradient_accumulation,
+    )
+
+
 @torch.no_grad()
 def _validate(
     model: torch.nn.Module,
@@ -857,6 +882,33 @@ def main() -> None:
         train_dataset, profile = _build_mixed_dataset(
             config, split="train", device=context.device, rank=context.rank
         )
+        _require_sampling_capacity(
+            train_dataset,
+            profile,
+            runtime,
+            rank=context.rank,
+            world_size=context.world_size,
+            gradient_accumulation=int(runtime["train"]["gradient_accumulation"]),
+            seed=int(runtime["train"]["seed"]),
+        )
+        validation_dataset: UnifiedCacheDataset | None = None
+        if int(runtime["train"]["validate_every"]) > 0:
+            validation_dataset, _ = _build_mixed_dataset(
+                config,
+                split="val",
+                profile=profile,
+                device=context.device,
+                rank=context.rank,
+            )
+            _require_sampling_capacity(
+                validation_dataset,
+                profile,
+                runtime,
+                rank=context.rank,
+                world_size=context.world_size,
+                gradient_accumulation=1,
+                seed=int(runtime["train"]["validation_seed"]),
+            )
         model_cfg = config["model_profile"]["model"]
         cache_representation = profile.cache_representation
         if int(cache_representation["spatial_tokens"]) < int(model_cfg["P"]):
@@ -880,6 +932,11 @@ def main() -> None:
                             "runtime_sha256": config_sha,
                             "world_size": context.world_size,
                             "train_windows": len(train_dataset),
+                            "validation_windows": (
+                                None
+                                if validation_dataset is None
+                                else len(validation_dataset)
+                            ),
                             "sources": profile.source_order,
                             "resource_preflight_sha256": preflight_result_sha256,
                         },
@@ -1036,15 +1093,6 @@ def main() -> None:
             gradient_accumulation=int(runtime["train"]["gradient_accumulation"]),
         )
         iterator = iter(loader)
-        validation_dataset: UnifiedCacheDataset | None = None
-        if int(runtime["train"]["validate_every"]) > 0:
-            validation_dataset, _ = _build_mixed_dataset(
-                config,
-                split="val",
-                profile=profile,
-                device=context.device,
-                rank=context.rank,
-            )
         checkpoint_steps = _checkpoint_steps(runtime["train"])
         if stop_after_step not in checkpoint_steps:
             raise PretrainError(

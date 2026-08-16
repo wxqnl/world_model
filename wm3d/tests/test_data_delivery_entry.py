@@ -11,6 +11,7 @@ import tarfile
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import torch
 import yaml
 
@@ -20,9 +21,60 @@ from scripts.data.materialize_existing_robot_mix import (
     _window_evidence,
 )
 from scripts.data.run_cache_worker import _view_batch
+from wm3d.data.step_sampler import SamplingContractError
+from wm3d.training.pretrain import _require_sampling_capacity
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _CapacityDataset:
+    requires_main_process = True
+    source_names = ("fixture",)
+    source_episode_spans = None
+
+    def __init__(self, windows: int) -> None:
+        self.source_spans = {"fixture": (0, windows)}
+
+    def __len__(self) -> int:
+        return self.source_spans["fixture"][1]
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        raise AssertionError(f"capacity preflight must not read sample {index}")
+
+
+class _CapacityProfile:
+    source_weights = {"fixture": 1}
+
+
+def test_preflight_checks_validation_global_micro_batch_capacity() -> None:
+    runtime = {
+        "train": {
+            "micro_batch_size": 4,
+            "num_workers": 0,
+            "persistent_workers": False,
+            "prefetch_factor": 2,
+        }
+    }
+    with pytest.raises(SamplingContractError, match="below global batch 32"):
+        _require_sampling_capacity(
+            _CapacityDataset(31),
+            _CapacityProfile(),
+            runtime,
+            rank=0,
+            world_size=8,
+            gradient_accumulation=1,
+            seed=7340,
+        )
+    _require_sampling_capacity(
+        _CapacityDataset(32),
+        _CapacityProfile(),
+        runtime,
+        rank=0,
+        world_size=8,
+        gradient_accumulation=1,
+        seed=7340,
+    )
 
 
 def test_existing_robot_mix_counts_every_physically_valid_window() -> None:
