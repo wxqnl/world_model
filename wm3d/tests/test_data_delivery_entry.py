@@ -81,22 +81,25 @@ def test_preflight_checks_validation_global_micro_batch_capacity() -> None:
 
 
 def test_existing_robot_mix_counts_every_physically_valid_window() -> None:
-    evidence = _window_evidence(
-        np.arange(20, dtype=np.float64) * 0.25,
-        {
-            "model": {"T": 4, "K": 2},
-            "sampling": {
-                "minimum_anchor_separation_seconds": 0.25,
-                "context_horizon_seconds": 0.75,
-                "future_horizon_seconds": 0.5,
-                "minimum_horizon_coverage": 1.0,
-                "future_offsets_seconds": [0.25, 0.5],
-            },
+    clock = np.arange(20, dtype=np.float64) * 0.25
+    model_profile = {
+        "model": {"T": 4, "K": 2},
+        "sampling": {
+            "minimum_anchor_separation_seconds": 0.25,
+            "context_horizon_seconds": 0.75,
+            "future_horizon_seconds": 0.5,
+            "minimum_horizon_coverage": 1.0,
+            "future_offsets_seconds": [0.25, 0.5],
         },
-    )
+    }
+    evidence = _window_evidence(clock, model_profile)
     assert evidence is not None
     assert evidence["first_valid_anchor_index"] == 4
     assert evidence["valid_window_count"] == 14
+    fast_evidence = _window_evidence(clock, model_profile, count_all=False)
+    assert fast_evidence is not None
+    assert fast_evidence["first_valid_anchor_index"] == 4
+    assert fast_evidence["valid_window_count"] == 1
 
 
 def test_existing_robot_mix_rejects_episode_segment_beyond_video() -> None:

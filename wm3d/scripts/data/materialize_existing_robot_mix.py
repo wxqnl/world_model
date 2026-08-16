@@ -276,7 +276,9 @@ def _episode_candidates(root: Path):
             yield from batch.to_pylist()
 
 
-def _window_evidence(clock: np.ndarray, model_profile: dict) -> dict | None:
+def _window_evidence(
+    clock: np.ndarray, model_profile: dict, *, count_all: bool = True
+) -> dict | None:
     sampling = model_profile["sampling"]
     model = model_profile["model"]
     try:
@@ -321,6 +323,8 @@ def _window_evidence(clock: np.ndarray, model_profile: dict) -> dict | None:
                     cached_clock[window.future_indices[-1]] - cached_clock[anchor]
                 ),
             }
+            if not count_all:
+                break
     if first is None:
         return None
     return {**first, "valid_window_count": valid_window_count}
@@ -554,7 +558,11 @@ def _selected_indices(
                 continue
             if len(clock) != length:
                 continue
-            observed = _window_evidence(clock, model_profile)
+            observed = _window_evidence(
+                clock,
+                model_profile,
+                count_all=(not select_all_usable or valid_window_count < target),
+            )
             if observed is None:
                 continue
             if not _episode_video_coverage(
@@ -591,9 +599,15 @@ def _selected_indices(
                 else "minimum_window_budget"
             ),
             "required_valid_window_count": target,
-            "selected_valid_window_count": valid_window_count,
             "selected_episode_count": len(selected[split]),
         }
+        evidence[split][
+            (
+                "selected_valid_window_count_lower_bound"
+                if select_all_usable
+                else "selected_valid_window_count"
+            )
+        ] = valid_window_count
         if not select_all_usable:
             evidence[split]["selected_episodes"] = selected_evidence
     return tuple(
