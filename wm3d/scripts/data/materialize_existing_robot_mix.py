@@ -28,7 +28,6 @@ from wm3d.data.source_inventory import (
     _existing_relative,
     _format,
     _path_values,
-    _slice_column,
     deterministic_split,
 )
 from wm3d.data.window_selection import (
@@ -367,6 +366,7 @@ def _selected_indices(
     selected: dict[str, list[int]] = {}
     evidence: dict[str, dict] = {}
     parquet_cache: dict[Path, pq.ParquetFile] = {}
+    timestamp_cache: dict[Path, np.ndarray] = {}
     for split in ("train", "val", "test"):
         target = minimum_train_windows if split == "train" else 1
         selected[split] = []
@@ -419,8 +419,17 @@ def _selected_indices(
             payload = root / relative
             parquet = parquet_cache.setdefault(payload, pq.ParquetFile(payload))
             try:
-                clock = _slice_column(parquet, "timestamp", row_start, row_stop)
-            except RuntimeError:
+                all_timestamps = timestamp_cache.get(payload)
+                if all_timestamps is None:
+                    timestamp_column = parquet.read(columns=["timestamp"])[
+                        "timestamp"
+                    ].combine_chunks()
+                    all_timestamps = timestamp_column.to_numpy(
+                        zero_copy_only=False
+                    )
+                    timestamp_cache[payload] = all_timestamps
+                clock = all_timestamps[row_start:row_stop]
+            except (KeyError, ValueError):
                 continue
             observed = _window_evidence(clock, model_profile)
             if observed is None:
