@@ -18,6 +18,8 @@ import os
 from pathlib import Path
 import uuid
 
+import av
+from av.error import FFmpegError
 import numpy as np
 import pyarrow.parquet as pq
 import yaml
@@ -319,11 +321,114 @@ def _window_evidence(clock: np.ndarray, model_profile: dict) -> dict | None:
     return {**first, "valid_window_count": valid_window_count}
 
 
+def _segment_has_video_coverage(
+    *,
+    requested_start_s: float | None,
+    requested_stop_s: float | None,
+    available_start_s: float,
+    available_stop_s: float,
+    frame_count: int | None,
+) -> bool:
+    if frame_count is not None and frame_count < 2:
+        return False
+    available = np.asarray([available_start_s, available_stop_s], dtype=np.float64)
+    if not bool(np.isfinite(available).all()) or available_stop_s <= available_start_s:
+        return False
+    if requested_start_s is None and requested_stop_s is None:
+        return True
+    if requested_start_s is None or requested_stop_s is None:
+        return False
+    requested = np.asarray([requested_start_s, requested_stop_s], dtype=np.float64)
+    if not bool(np.isfinite(requested).all()) or requested_stop_s <= requested_start_s:
+        return False
+    tolerance_s = 1e-3
+    return (
+        requested_start_s >= available_start_s - tolerance_s
+        and requested_stop_s <= available_stop_s + tolerance_s
+    )
+
+
+def _video_bounds(
+    path: Path,
+    cache: dict[Path, tuple[float, float, int | None] | None],
+) -> tuple[float, float, int | None] | None:
+    if path in cache:
+        return cache[path]
+    try:
+        safe = _regular(path, "selected episode video")
+        with av.open(str(safe), mode="r") as container:
+            stream = container.streams.video[0]
+            time_base = float(stream.time_base)
+            start_s = float((stream.start_time or 0) * time_base)
+            if stream.duration is not None:
+                duration_s = float(stream.duration * time_base)
+            elif container.duration is not None:
+                duration_s = float(container.duration) / float(av.time_base)
+            else:
+                cache[path] = None
+                return None
+            frames = int(stream.frames) if int(stream.frames or 0) > 0 else None
+            result = (start_s, start_s + duration_s, frames)
+    except (FFmpegError, OSError, ValueError, RuntimeError, IndexError):
+        result = None
+    cache[path] = result
+    return result
+
+
+def _episode_video_coverage(
+    *,
+    root: Path,
+    row: dict,
+    episode_index: int,
+    view_keys: tuple[str, ...],
+    video_template: str,
+    cache: dict[Path, tuple[float, float, int | None] | None],
+) -> bool:
+    values = _path_values(row, episode_index)
+    for view_key in view_keys:
+        direct = row.get(f"videos/{view_key}/path")
+        video_values = {**values, "video_key": view_key}
+        candidates = [str(direct)] if direct else []
+        candidates.extend(
+            [
+                _format(video_template, video_values),
+                (
+                    "videos/chunk-"
+                    f"{int(row.get(f'videos/{view_key}/chunk_index', values['chunk_index'])):03d}/"
+                    f"{view_key}/episode_{episode_index:06d}.mp4"
+                ),
+                (
+                    f"videos/{view_key}/chunk-"
+                    f"{int(row.get(f'videos/{view_key}/chunk_index', values['chunk_index'])):03d}/"
+                    "file-"
+                    f"{int(row.get(f'videos/{view_key}/file_index', values['file_index'])):03d}.mp4"
+                ),
+            ]
+        )
+        try:
+            relative = _existing_relative(root, candidates)
+        except RuntimeError:
+            return False
+        bounds = _video_bounds(root / relative, cache)
+        if bounds is None:
+            return False
+        if not _segment_has_video_coverage(
+            requested_start_s=row.get(f"videos/{view_key}/from_timestamp"),
+            requested_stop_s=row.get(f"videos/{view_key}/to_timestamp"),
+            available_start_s=bounds[0],
+            available_stop_s=bounds[1],
+            frame_count=bounds[2],
+        ):
+            return False
+    return True
+
+
 def _selected_indices(
     source: str,
     root: Path,
     model_profile: dict,
     *,
+    view_keys: tuple[str, ...],
     minimum_train_windows: int,
 ) -> tuple[tuple[int, ...], dict[str, dict]]:
     info = json.loads(_regular(root / "meta/info.json", f"{source} info").read_text())
@@ -331,6 +436,12 @@ def _selected_indices(
         info.get(
             "data_path",
             "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        )
+    )
+    video_template = str(
+        info.get(
+            "video_path",
+            "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         )
     )
     candidates: dict[str, list[tuple[int, int, dict]]] = {
@@ -367,6 +478,7 @@ def _selected_indices(
     evidence: dict[str, dict] = {}
     parquet_cache: dict[Path, pq.ParquetFile] = {}
     timestamp_cache: dict[Path, np.ndarray] = {}
+    video_bounds_cache: dict[Path, tuple[float, float, int | None] | None] = {}
     for split in ("train", "val", "test"):
         target = minimum_train_windows if split == "train" else 1
         selected[split] = []
@@ -434,8 +546,23 @@ def _selected_indices(
             observed = _window_evidence(clock, model_profile)
             if observed is None:
                 continue
+            if not _episode_video_coverage(
+                root=root,
+                row=row,
+                episode_index=index,
+                view_keys=view_keys,
+                video_template=video_template,
+                cache=video_bounds_cache,
+            ):
+                continue
             selected[split].append(index)
-            selected_evidence.append({"episode_index": index, **observed})
+            selected_evidence.append(
+                {
+                    "episode_index": index,
+                    "video_coverage": "container_bounds_verified",
+                    **observed,
+                }
+            )
             valid_window_count += int(observed["valid_window_count"])
             if valid_window_count >= target:
                 break
@@ -560,6 +687,7 @@ def main() -> None:
             plan.name,
             root,
             model_profile,
+            view_keys=plan.views,
             minimum_train_windows=args.minimum_train_windows,
         )
         episode_path = episode_root / f"{plan.name}.txt"

@@ -14,7 +14,10 @@ import pyarrow.parquet as pq
 import torch
 import yaml
 
-from scripts.data.materialize_existing_robot_mix import _window_evidence
+from scripts.data.materialize_existing_robot_mix import (
+    _segment_has_video_coverage,
+    _window_evidence,
+)
 from scripts.data.run_cache_worker import _view_batch
 
 
@@ -38,6 +41,30 @@ def test_existing_robot_mix_counts_every_physically_valid_window() -> None:
     assert evidence is not None
     assert evidence["first_valid_anchor_index"] == 4
     assert evidence["valid_window_count"] == 14
+
+
+def test_existing_robot_mix_rejects_episode_segment_beyond_video() -> None:
+    assert _segment_has_video_coverage(
+        requested_start_s=10.0,
+        requested_stop_s=20.0,
+        available_start_s=0.0,
+        available_stop_s=20.0,
+        frame_count=400,
+    )
+    assert not _segment_has_video_coverage(
+        requested_start_s=10.0,
+        requested_stop_s=20.1,
+        available_start_s=0.0,
+        available_stop_s=20.0,
+        frame_count=400,
+    )
+    assert not _segment_has_video_coverage(
+        requested_start_s=None,
+        requested_stop_s=None,
+        available_start_s=0.0,
+        available_stop_s=20.0,
+        frame_count=1,
+    )
 
 
 def _sha(path: Path) -> str:
