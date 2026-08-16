@@ -177,10 +177,11 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "checkpoint_interval",
         "checkpoint_steps",
     }
-    if set(train) != required_train:
+    optional_train = {"validation_micro_batch_size"}
+    if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
             f"train fields mismatch: missing={sorted(required_train-set(train))} "
-            f"unknown={sorted(set(train)-required_train)}"
+            f"unknown={sorted(set(train)-required_train-optional_train)}"
         )
     derived_global = (
         expected_world_size
@@ -202,6 +203,13 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
     ):
         if int(train[field]) <= 0:
             raise RuntimeContractError(f"train.{field} must be positive")
+    if (
+        "validation_micro_batch_size" in train
+        and int(train["validation_micro_batch_size"]) <= 0
+    ):
+        raise RuntimeContractError(
+            "train.validation_micro_batch_size must be positive"
+        )
     if int(train["num_workers"]) < 0 or int(train["prefetch_factor"]) <= 0:
         raise RuntimeContractError("dataloader worker/prefetch values are invalid")
     if float(train["gradient_clip"]) <= 0:

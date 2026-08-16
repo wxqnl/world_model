@@ -565,6 +565,7 @@ def _make_loader(
     num_steps: int,
     seed: int,
     gradient_accumulation: int,
+    micro_batch_size: int | None = None,
 ) -> DataLoader:
     train = runtime_profile["train"]
     sampler = StepAddressedBatchSampler(
@@ -576,7 +577,11 @@ def _make_loader(
         },
         world_size=world_size,
         rank=rank,
-        micro_batch_size=int(train["micro_batch_size"]),
+        micro_batch_size=(
+            int(train["micro_batch_size"])
+            if micro_batch_size is None
+            else int(micro_batch_size)
+        ),
         gradient_accumulation=gradient_accumulation,
         start_optimizer_step=start_step,
         num_optimizer_steps=num_steps,
@@ -609,6 +614,7 @@ def _require_sampling_capacity(
     world_size: int,
     gradient_accumulation: int,
     seed: int,
+    micro_batch_size: int | None = None,
 ) -> None:
     """Reject undersized source splits before model construction or training."""
 
@@ -622,7 +628,13 @@ def _require_sampling_capacity(
         num_steps=1,
         seed=seed,
         gradient_accumulation=gradient_accumulation,
+        micro_batch_size=micro_batch_size,
     )
+
+
+def _validation_micro_batch_size(runtime_profile: Mapping[str, Any]) -> int:
+    train = runtime_profile["train"]
+    return int(train.get("validation_micro_batch_size", train["micro_batch_size"]))
 
 
 @torch.no_grad()
@@ -646,6 +658,7 @@ def _validate(
         num_steps=count,
         seed=int(runtime_profile["train"]["validation_seed"]),
         gradient_accumulation=1,
+        micro_batch_size=_validation_micro_batch_size(runtime_profile),
     )
     totals: dict[str, torch.Tensor] = {}
     model.eval()
@@ -908,6 +921,7 @@ def main() -> None:
                 world_size=context.world_size,
                 gradient_accumulation=1,
                 seed=int(runtime["train"]["validation_seed"]),
+                micro_batch_size=_validation_micro_batch_size(runtime),
             )
         model_cfg = config["model_profile"]["model"]
         cache_representation = profile.cache_representation

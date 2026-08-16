@@ -40,6 +40,7 @@ from wm3d.training.pretrain import (
     _configure_reproducibility,
     _forward,
     _make_loader,
+    _validation_micro_batch_size,
     _require_recent_resource_preflight,
     _publish_and_validate_launch,
     _run_contract,
@@ -320,9 +321,10 @@ def main() -> None:
             world_size=context.world_size,
             start_step=0,
             num_steps=validation_steps,
-            seed=seed,
-            gradient_accumulation=1,
-        )
+        seed=seed,
+        gradient_accumulation=1,
+        micro_batch_size=_validation_micro_batch_size(runtime),
+    )
         objective = objective_config_from_mapping(
             config["objective_profile"]["objective"]
         )

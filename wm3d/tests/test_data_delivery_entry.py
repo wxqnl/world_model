@@ -50,7 +50,8 @@ class _CapacityProfile:
 def test_preflight_checks_validation_global_micro_batch_capacity() -> None:
     runtime = {
         "train": {
-            "micro_batch_size": 4,
+            "micro_batch_size": 8,
+            "validation_micro_batch_size": 4,
             "num_workers": 0,
             "persistent_workers": False,
             "prefetch_factor": 2,
@@ -65,6 +66,7 @@ def test_preflight_checks_validation_global_micro_batch_capacity() -> None:
             world_size=8,
             gradient_accumulation=1,
             seed=7340,
+            micro_batch_size=runtime["train"]["validation_micro_batch_size"],
         )
     _require_sampling_capacity(
         _CapacityDataset(32),
@@ -74,6 +76,7 @@ def test_preflight_checks_validation_global_micro_batch_capacity() -> None:
         world_size=8,
         gradient_accumulation=1,
         seed=7340,
+        micro_batch_size=runtime["train"]["validation_micro_batch_size"],
     )
 
 
