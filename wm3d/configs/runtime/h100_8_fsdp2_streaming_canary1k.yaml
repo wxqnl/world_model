@@ -42,7 +42,7 @@ train:
   validate_every: 100
   validation_steps: 10
   checkpoint_interval: 1000
-  checkpoint_steps: [100, 500]
+  checkpoint_steps: [20, 100, 500]
 optimizer:
   name: adamw
   peak_lr: 0.00012
