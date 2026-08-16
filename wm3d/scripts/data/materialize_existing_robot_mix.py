@@ -213,12 +213,15 @@ def _adapter(plan: SourcePlan, info: dict) -> tuple[dict, dict]:
     return adapter, embodiment
 
 
-def _episode_indices(root: Path):
+def _episode_candidates(root: Path):
     jsonl = root / "meta/episodes.jsonl"
     if jsonl.is_file() and not jsonl.is_symlink():
         with jsonl.open("r", encoding="utf-8") as handle:
             for line in handle:
-                yield int(json.loads(line)["episode_index"])
+                row = json.loads(line)
+                yield int(row["episode_index"]), int(
+                    row.get("length", row.get("episode_length", 0))
+                )
         return
     paths = sorted((root / "meta/episodes").glob("chunk-*/file-*.parquet"))
     if not paths:
@@ -226,14 +229,21 @@ def _episode_indices(root: Path):
     for path in paths:
         safe = _regular(path, "episode metadata")
         parquet = pq.ParquetFile(safe)
-        for batch in parquet.iter_batches(columns=["episode_index"], batch_size=4096):
-            for index in batch.column(0).to_pylist():
-                yield int(index)
+        length_key = (
+            "length" if "length" in parquet.schema_arrow.names else "episode_length"
+        )
+        for batch in parquet.iter_batches(
+            columns=["episode_index", length_key], batch_size=4096
+        ):
+            for index, length in zip(
+                batch.column(0).to_pylist(), batch.column(1).to_pylist(), strict=True
+            ):
+                yield int(index), int(length)
 
 
 def _selected_indices(source: str, root: Path) -> tuple[int, int, int]:
-    selected: dict[str, int] = {}
-    for index in _episode_indices(root):
+    selected: dict[str, tuple[int, int]] = {}
+    for index, length in _episode_candidates(root):
         episode_id = f"{source}:{index:09d}"
         split = deterministic_split(
             source,
@@ -242,10 +252,11 @@ def _selected_indices(source: str, root: Path) -> tuple[int, int, int]:
             train_fraction=0.8,
             validation_fraction=0.1,
         )
-        selected.setdefault(split, index)
-        if set(selected) == {"train", "val", "test"}:
-            return selected["train"], selected["val"], selected["test"]
-    raise RuntimeError(f"{source}: could not select train/val/test canary episodes")
+        if split not in selected or length > selected[split][1]:
+            selected[split] = (index, length)
+    if set(selected) != {"train", "val", "test"}:
+        raise RuntimeError(f"{source}: could not select train/val/test canary episodes")
+    return tuple(selected[split][0] for split in ("train", "val", "test"))
 
 
 def _profiles(model_path: Path, encoder_path: Path) -> tuple[dict, dict]:
