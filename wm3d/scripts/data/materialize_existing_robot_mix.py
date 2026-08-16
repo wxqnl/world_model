@@ -17,10 +17,11 @@ import os
 from pathlib import Path
 import uuid
 
+import pyarrow.parquet as pq
 import yaml
 
 from wm3d.data.manifest_contract import sha256_file
-from wm3d.data.source_inventory import _episode_metadata, deterministic_split
+from wm3d.data.source_inventory import deterministic_split
 
 
 @dataclass(frozen=True)
@@ -212,10 +213,27 @@ def _adapter(plan: SourcePlan, info: dict) -> tuple[dict, dict]:
     return adapter, embodiment
 
 
+def _episode_indices(root: Path):
+    jsonl = root / "meta/episodes.jsonl"
+    if jsonl.is_file() and not jsonl.is_symlink():
+        with jsonl.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                yield int(json.loads(line)["episode_index"])
+        return
+    paths = sorted((root / "meta/episodes").glob("chunk-*/file-*.parquet"))
+    if not paths:
+        raise RuntimeError(f"no episode metadata under {root}")
+    for path in paths:
+        safe = _regular(path, "episode metadata")
+        parquet = pq.ParquetFile(safe)
+        for batch in parquet.iter_batches(columns=["episode_index"], batch_size=4096):
+            for index in batch.column(0).to_pylist():
+                yield int(index)
+
+
 def _selected_indices(source: str, root: Path) -> tuple[int, int, int]:
     selected: dict[str, int] = {}
-    for row in sorted(_episode_metadata(root), key=lambda value: int(value["episode_index"])):
-        index = int(row["episode_index"])
+    for index in _episode_indices(root):
         episode_id = f"{source}:{index:09d}"
         split = deterministic_split(
             source,
