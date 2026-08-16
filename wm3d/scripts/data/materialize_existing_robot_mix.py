@@ -262,6 +262,11 @@ def _episode_candidates(root: Path):
             for name in _EPISODE_METADATA_COLUMNS
             if name in parquet.schema_arrow.names
         ]
+        columns.extend(
+            name
+            for name in parquet.schema_arrow.names
+            if name.startswith("videos/") and name not in columns
+        )
         if "episode_index" not in columns or not {
             "length",
             "episode_length",

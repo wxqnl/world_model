@@ -15,6 +15,7 @@ import torch
 import yaml
 
 from scripts.data.materialize_existing_robot_mix import (
+    _episode_candidates,
     _segment_has_video_coverage,
     _window_evidence,
 )
@@ -65,6 +66,32 @@ def test_existing_robot_mix_rejects_episode_segment_beyond_video() -> None:
         available_stop_s=20.0,
         frame_count=1,
     )
+
+
+def test_existing_robot_mix_reads_episode_video_segments(tmp_path: Path) -> None:
+    episodes = tmp_path / "meta" / "episodes" / "chunk-000"
+    episodes.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [7],
+                "length": [32],
+                "videos/observation.images.head/from_timestamp": [10443.1],
+                "videos/observation.images.head/to_timestamp": [10484.6],
+            }
+        ),
+        episodes / "file-000.parquet",
+    )
+
+    rows = list(_episode_candidates(tmp_path))
+    assert rows == [
+        {
+            "episode_index": 7,
+            "length": 32,
+            "videos/observation.images.head/from_timestamp": 10443.1,
+            "videos/observation.images.head/to_timestamp": 10484.6,
+        }
+    ]
 
 
 def _sha(path: Path) -> str:
