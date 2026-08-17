@@ -249,31 +249,58 @@ class RankEpisodeLocalPermutation:
                 f"{self.world_size} ranks"
             )
 
-        # One deterministic affine permutation assigns similarly sized episode
-        # counts without materializing a second full list.  The assignment is
-        # fixed across epochs, so two ranks can never materialize the same raw
-        # episode.
-        assignment_seed = _seed64(
-            self.seed, self.source_name, "rank-episode-assignment"
-        )
-        multiplier = _coprime_multiplier(len(spans), assignment_seed)
-        offset = _splitmix64(assignment_seed) % len(spans)
-        selected: list[tuple[int, int]] = []
+        # Group similarly sized episodes before assigning one member of each
+        # group to every rank.  All ranks then enter/leave raw episodes at
+        # approximately the same time instead of waiting for a random long
+        # encoder job on one straggling rank.
+        indices_by_length: dict[int, list[int]] = {}
+        for span_index, (start, stop) in enumerate(spans):
+            indices_by_length.setdefault(stop - start, []).append(span_index)
+        ordered_indices: list[int] = []
+        for span_length in sorted(indices_by_length):
+            indices = indices_by_length[span_length]
+            count = len(indices)
+            order_seed = _seed64(
+                self.seed, self.source_name, "episode-length", span_length
+            )
+            multiplier = _coprime_multiplier(count, order_seed)
+            offset = _splitmix64(order_seed) % count if count > 1 else 0
+            ordered_indices.extend(
+                indices[(multiplier * position + offset) % count]
+                if count > 1
+                else indices[0]
+                for position in range(count)
+            )
+
+        groups: list[tuple[tuple[int, int] | None, ...]] = []
         windows_by_rank = [0] * self.world_size
-        for position in range(len(spans)):
-            span_index = (multiplier * position + offset) % len(spans)
-            owner = position % self.world_size
-            start, stop = spans[span_index]
-            windows_by_rank[owner] += stop - start
-            if owner == self.rank:
-                selected.append((start, stop))
+        for group_index, group_start in enumerate(
+            range(0, len(ordered_indices), self.world_size)
+        ):
+            members: list[tuple[int, int] | None] = [None] * self.world_size
+            rank_shift = _splitmix64(
+                _seed64(self.seed, self.source_name, "episode-rank", group_index)
+            ) % self.world_size
+            for position, span_index in enumerate(
+                ordered_indices[group_start : group_start + self.world_size]
+            ):
+                owner = (position + rank_shift) % self.world_size
+                start, stop = spans[span_index]
+                members[owner] = (start, stop)
+                windows_by_rank[owner] += stop - start
+            groups.append(tuple(members))
         if min(windows_by_rank) < int(minimum_windows_per_rank):
             raise SamplingContractError(
                 f"source {source_name} cannot provide {minimum_windows_per_rank} "
                 "disjoint local windows to every rank"
             )
 
-        self.spans = tuple(selected)
+        self.groups = tuple(groups)
+        self.spans = tuple(
+            group[self.rank]
+            for group in self.groups
+            if group[self.rank] is not None
+        )
         self.length = windows_by_rank[self.rank]
         self._cached_epoch: int | None = None
         self._ordered_spans: tuple[tuple[int, int, int], ...] = ()
@@ -282,9 +309,9 @@ class RankEpisodeLocalPermutation:
     def _epoch_layout(self, epoch: int) -> None:
         if self._cached_epoch == epoch:
             return
-        count = len(self.spans)
+        count = len(self.groups)
         epoch_seed = _seed64(
-            self.seed, self.source_name, "rank-episode-order", self.rank, epoch
+            self.seed, self.source_name, "rank-episode-group-order", epoch
         )
         multiplier = _coprime_multiplier(count, epoch_seed)
         offset = _splitmix64(epoch_seed) % count if count > 1 else 0
@@ -292,8 +319,11 @@ class RankEpisodeLocalPermutation:
         cumulative: list[int] = []
         total = 0
         for position in range(count):
-            span_index = (multiplier * position + offset) % count if count > 1 else 0
-            start, stop = self.spans[span_index]
+            group_index = (multiplier * position + offset) % count if count > 1 else 0
+            span = self.groups[group_index][self.rank]
+            if span is None:
+                continue
+            start, stop = span
             span_length = stop - start
             rotation = _splitmix64(
                 _seed64(
@@ -302,7 +332,8 @@ class RankEpisodeLocalPermutation:
                     "rank-window",
                     self.rank,
                     epoch,
-                    span_index,
+                    start,
+                    stop,
                 )
             ) % span_length
             ordered.append((start, stop, int(rotation)))

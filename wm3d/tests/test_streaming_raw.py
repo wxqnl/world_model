@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from wm3d.data.step_sampler import EpisodeLocalPermutation, StepAddressedBatchSampler
+from wm3d.data.step_sampler import (
+    EpisodeLocalPermutation,
+    RankEpisodeLocalPermutation,
+    StepAddressedBatchSampler,
+)
 from wm3d.data.streaming_raw import StreamingRawError, _StreamingEpisodeCache
 from wm3d.data.unified_cache_dataset import CacheDataError, _ShardStore
 from wm3d.training.pretrain import (
@@ -138,6 +142,49 @@ def test_episode_local_sampler_falls_back_for_tiny_sources() -> None:
     ]
     flattened = [item for samples in by_rank for item in samples]
     assert len(flattened) == len(set(flattened)) == 8
+
+
+def test_rank_episode_streams_align_similar_episode_lengths() -> None:
+    lengths = (4,) * 4 + (8,) * 4 + (12,) * 4 + (16,) * 4
+    spans = []
+    cursor = 0
+    for length in lengths:
+        spans.append((cursor, cursor + length))
+        cursor += length
+    episode_by_window = {
+        window: episode
+        for episode, (start, stop) in enumerate(spans)
+        for window in range(start, stop)
+    }
+
+    run_lengths_by_rank = []
+    for rank in range(4):
+        permutation = RankEpisodeLocalPermutation(
+            source_start=0,
+            source_stop=cursor,
+            episode_spans=spans,
+            world_size=4,
+            rank=rank,
+            minimum_windows_per_rank=2,
+            seed=93,
+            source_name="robot",
+        )
+        episodes = [
+            episode_by_window[permutation.at(position)]
+            for position in range(permutation.length)
+        ]
+        runs = []
+        for episode in episodes:
+            if not runs or runs[-1][0] != episode:
+                runs.append([episode, 1])
+            else:
+                runs[-1][1] += 1
+        run_lengths_by_rank.append([length for _episode, length in runs])
+
+    assert all(
+        run_lengths == run_lengths_by_rank[0]
+        for run_lengths in run_lengths_by_rank[1:]
+    )
 
 
 def test_dynamic_shard_registration_rejects_digest_drift(tmp_path: Path) -> None:
