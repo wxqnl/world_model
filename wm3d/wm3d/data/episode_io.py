@@ -372,14 +372,27 @@ def decode_episode_views(
             path, segment_kind=segment_kind, start_s=start_s, stop_s=stop_s
         )
         container_frame_count = int(len(frames))
-        trailing_frames_dropped = container_frame_count - task.observation_samples
-        if trailing_frames_dropped == 1:
+        frame_count_delta = container_frame_count - task.observation_samples
+        trailing_frames_dropped = 0
+        trailing_frames_repeated = 0
+        if frame_count_delta == 1:
             # A small number of OXE MP4s contain one encoder-flush frame after
             # the last observation row.  Ordinal binding of every real row is
             # still exact; discard only that unaddressable trailing frame.
             frames = frames[: task.observation_samples]
             pts = pts[: task.observation_samples]
-        elif trailing_frames_dropped != 0:
+            trailing_frames_dropped = 1
+        elif frame_count_delta == -1:
+            # Some source episodes omit only the final encoded frame while the
+            # observation table still contains its final row.  Repeating the
+            # immediately preceding frame preserves every earlier ordinal and
+            # avoids discarding the otherwise valid episode.  Larger or
+            # non-trailing mismatches remain fatal.
+            frames = np.concatenate((frames, frames[-1:]), axis=0)
+            final_pts_step = float(pts[-1] - pts[-2])
+            pts = np.concatenate((pts, np.asarray([pts[-1] + final_pts_step])))
+            trailing_frames_repeated = 1
+        elif frame_count_delta != 0:
             raise EpisodeIOError(
                 f"view {name!r} has {container_frame_count} decoded frames but episode has "
                 f"{task.observation_samples} observation rows; ordinal binding failed"
@@ -398,6 +411,7 @@ def decode_episode_views(
             "decoded_frame_count": int(len(frames)),
             "container_decoded_frame_count": container_frame_count,
             "trailing_frames_dropped": trailing_frames_dropped,
+            "trailing_frames_repeated": trailing_frames_repeated,
             "selected_frame_count": int(len(rows)),
             "recorded_pts_start_s": float(pts[0]),
             "recorded_pts_end_s": float(pts[-1]),

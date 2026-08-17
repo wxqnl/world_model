@@ -143,6 +143,41 @@ def test_decode_episode_views_drops_exactly_one_unaddressable_tail_frame(
     assert evidence["head"]["container_decoded_frame_count"] == 5
     assert evidence["head"]["decoded_frame_count"] == 4
     assert evidence["head"]["trailing_frames_dropped"] == 1
+    assert evidence["head"]["trailing_frames_repeated"] == 0
+
+
+def test_decode_episode_views_repeats_exactly_one_missing_tail_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "head.mp4"
+    path.write_bytes(b"head")
+    task = SimpleNamespace(
+        assets=(("rgb/head", path.name, _sha(path)),),
+        views=(("head", "rgb/head", "entire_file", None, None),),
+        observation_samples=4,
+    )
+
+    def fake_decode(_path: Path, **_kwargs):
+        frames = np.arange(3, dtype=np.uint8).reshape(3, 1, 1, 1)
+        frames = np.repeat(frames, 3, axis=3)
+        return frames, np.arange(3, dtype=np.float64)
+
+    monkeypatch.setattr(episode_io, "_decode_segment", fake_decode)
+    decoded, evidence = episode_io.decode_episode_views(
+        task=task,
+        source_root=tmp_path,
+        canonical_view_slots=("head",),
+        selected_observation_rows=[0, 3],
+        decode_workers=1,
+    )
+    np.testing.assert_array_equal(decoded["head"].frames[:, 0, 0, 0], [0, 2])
+    np.testing.assert_array_equal(
+        decoded["head"].recorded_pts_s, [0.0, 1.0, 2.0, 3.0]
+    )
+    assert evidence["head"]["container_decoded_frame_count"] == 3
+    assert evidence["head"]["decoded_frame_count"] == 4
+    assert evidence["head"]["trailing_frames_dropped"] == 0
+    assert evidence["head"]["trailing_frames_repeated"] == 1
 
 
 def test_decode_episode_views_still_rejects_larger_frame_count_mismatch(
