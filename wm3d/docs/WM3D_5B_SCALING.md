@@ -5,12 +5,6 @@ WM3D 5B 使用 `configs/model/native_5b.yaml`，精确参数量为 `5,285,182,89
 分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，不做梯度累积，
 global batch 为 256。
 
-该 profile 已包含正式 native RGB v2 decoder，不需要同事额外修改配置：decoder hidden 为
-1536，每个上采样层含 2 个 residual blocks，并监督未来全部 16 帧。RGB 目标同时启用 L1、
-Charbonnier、spatial gradient 和冻结的 VGG LPIPS；不依赖 Wan。训练只解码数据中实际有
-RGB 监督的相机，decoder 与 LPIPS 都按小块执行 activation checkpoint，因此不能为了省显存
-把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
-[原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
 
 整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练
 依次进行。数据访问可以使用完整 episode cache，也可以使用有容量上限的按需缓存。命令会
