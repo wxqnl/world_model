@@ -624,7 +624,12 @@ class StreamingRawDataset(UnifiedCacheDataset):
             (episode.robot_shard, episode.robot_sha256),
             (episode.rgb_pack, episode.rgb_pack_sha256),
         ):
-            self.shards.register(relative, digest, verified=True)
+            self.shards.register(
+                relative,
+                digest,
+                verified=True,
+                allow_verified_replacement=True,
+            )
         entry = CacheIndexEntry(
             sample_id=thin.sample_id,
             source=thin.source,

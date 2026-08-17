@@ -77,15 +77,27 @@ class _ShardStore:
         self._verified: set[str] = set()
 
     def register(
-        self, relative: str, expected_sha256: str, *, verified: bool = False
+        self,
+        relative: str,
+        expected_sha256: str,
+        *,
+        verified: bool = False,
+        allow_verified_replacement: bool = False,
     ) -> None:
         """Register a lazily materialized shard without weakening SHA checks."""
 
         previous = self.expected_sha.get(relative)
         if previous is not None and previous != expected_sha256:
-            raise CacheDataError(
-                f"cache shard {relative} changed digest within one dataset process"
-            )
+            if not (verified and allow_verified_replacement):
+                raise CacheDataError(
+                    f"cache shard {relative} changed digest within one dataset process"
+                )
+            # A bounded streaming LRU may delete an old episode and later
+            # recreate the same task path.  The streaming manager verifies the
+            # replacement before registration; discard all state tied to the
+            # old inode and digest before accepting that verified replacement.
+            self._resolved.pop(relative, None)
+            self._verified.discard(relative)
         self.expected_sha[relative] = expected_sha256
         if verified:
             self._verified.add(relative)

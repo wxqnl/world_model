@@ -80,6 +80,32 @@ def test_dynamic_shard_registration_rejects_digest_drift(tmp_path: Path) -> None
         store.register("episode/features.safetensors", "b" * 64)
 
 
+def test_dynamic_shard_registration_accepts_verified_lru_replacement(
+    tmp_path: Path,
+) -> None:
+    relative = "episode/features.safetensors"
+    path = tmp_path / relative
+    path.parent.mkdir()
+    path.write_bytes(b"first")
+    store = _ShardStore(tmp_path.resolve(), {}, verify_on_open=True)
+    store.register(relative, "a" * 64, verified=True)
+    assert store.path(relative) == path
+
+    path.unlink()
+    path.write_bytes(b"replacement")
+    store.register(
+        relative,
+        "b" * 64,
+        verified=True,
+        allow_verified_replacement=True,
+    )
+
+    assert store.expected_sha[relative] == "b" * 64
+    assert relative not in store._resolved
+    assert relative in store._verified
+    assert store.path(relative) == path
+
+
 def test_streaming_hot_hit_uses_verified_file_identity(tmp_path: Path) -> None:
     root = tmp_path.resolve()
     payloads = ("feature.bin", "robot.bin", "rgb.bin")
