@@ -115,6 +115,31 @@ def test_episode_local_sampler_partitions_whole_episodes_across_ranks() -> None:
     )
 
 
+def test_episode_local_sampler_falls_back_for_tiny_sources() -> None:
+    kwargs = {
+        "source_spans": {"tiny": (0, 40)},
+        "source_order": ("tiny",),
+        "source_weights": {"tiny": 1},
+        "world_size": 4,
+        "micro_batch_size": 2,
+        "gradient_accumulation": 1,
+        "start_optimizer_step": 0,
+        "num_optimizer_steps": 1,
+        "seed": 44,
+        "source_episode_spans": {"tiny": ((0, 20), (20, 40))},
+    }
+    by_rank = [
+        [
+            item
+            for batch in StepAddressedBatchSampler(rank=rank, **kwargs)
+            for item in batch
+        ]
+        for rank in range(4)
+    ]
+    flattened = [item for samples in by_rank for item in samples]
+    assert len(flattened) == len(set(flattened)) == 8
+
+
 def test_dynamic_shard_registration_rejects_digest_drift(tmp_path: Path) -> None:
     root = tmp_path.resolve()
     store = _ShardStore(root, {}, verify_on_open=True)

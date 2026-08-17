@@ -367,7 +367,7 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
             raise SamplingContractError("invalid optimizer-step interval")
         self.global_micro_batch = self.world_size * self.micro_batch_size
         self.global_batch = self.global_micro_batch * self.gradient_accumulation
-        self._rank_episode_partitioned = source_episode_spans is not None
+        self._rank_episode_partitioned_sources: set[str] = set()
         self._permutations: dict[
             str,
             AffinePermutation | EpisodeLocalPermutation | RankEpisodeLocalPermutation,
@@ -390,18 +390,42 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
                     raise SamplingContractError(
                         "episode-local spans must exactly match scheduled sources"
                     )
-                self._permutations[source_name] = RankEpisodeLocalPermutation(
-                    source_start=start,
-                    source_stop=stop,
-                    episode_spans=source_episode_spans[source_name],
-                    world_size=self.world_size,
-                    rank=self.rank,
-                    minimum_windows_per_rank=(
-                        self.micro_batch_size * self.gradient_accumulation
-                    ),
-                    seed=self.seed,
-                    source_name=source_name,
-                )
+                spans = source_episode_spans[source_name]
+                if len(spans) < self.world_size:
+                    self._permutations[source_name] = EpisodeLocalPermutation(
+                        source_start=start,
+                        source_stop=stop,
+                        episode_spans=spans,
+                        seed=self.seed,
+                        source_name=source_name,
+                    )
+                    continue
+                try:
+                    permutation = RankEpisodeLocalPermutation(
+                        source_start=start,
+                        source_stop=stop,
+                        episode_spans=spans,
+                        world_size=self.world_size,
+                        rank=self.rank,
+                        minimum_windows_per_rank=(
+                            self.micro_batch_size * self.gradient_accumulation
+                        ),
+                        seed=self.seed,
+                        source_name=source_name,
+                    )
+                except SamplingContractError as exc:
+                    if "disjoint local windows" not in str(exc):
+                        raise
+                    self._permutations[source_name] = EpisodeLocalPermutation(
+                        source_start=start,
+                        source_stop=stop,
+                        episode_spans=spans,
+                        seed=self.seed,
+                        source_name=source_name,
+                    )
+                else:
+                    self._permutations[source_name] = permutation
+                    self._rank_episode_partitioned_sources.add(source_name)
 
     def __len__(self) -> int:
         return self.num_optimizer_steps * self.gradient_accumulation
@@ -425,13 +449,16 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
             address = self.schedule.address(step)
             source_start, _ = self.source_spans[address.source_name]
             permutation = self._permutations[address.source_name]
-            if self._rank_episode_partitioned:
+            rank_episode_partitioned = (
+                address.source_name in self._rank_episode_partitioned_sources
+            )
+            if rank_episode_partitioned:
                 local_batch = self.micro_batch_size * self.gradient_accumulation
                 step_base = address.source_occurrence * local_batch
             else:
                 step_base = address.source_occurrence * self.global_batch
             for micro_step in range(self.gradient_accumulation):
-                if self._rank_episode_partitioned:
+                if rank_episode_partitioned:
                     rank_base = step_base + micro_step * self.micro_batch_size
                 else:
                     rank_base = (
