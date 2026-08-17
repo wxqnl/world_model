@@ -371,9 +371,17 @@ def decode_episode_views(
         frames, pts = _decode_segment(
             path, segment_kind=segment_kind, start_s=start_s, stop_s=stop_s
         )
-        if len(frames) != task.observation_samples:
+        container_frame_count = int(len(frames))
+        trailing_frames_dropped = container_frame_count - task.observation_samples
+        if trailing_frames_dropped == 1:
+            # A small number of OXE MP4s contain one encoder-flush frame after
+            # the last observation row.  Ordinal binding of every real row is
+            # still exact; discard only that unaddressable trailing frame.
+            frames = frames[: task.observation_samples]
+            pts = pts[: task.observation_samples]
+        elif trailing_frames_dropped != 0:
             raise EpisodeIOError(
-                f"view {name!r} has {len(frames)} decoded frames but episode has "
+                f"view {name!r} has {container_frame_count} decoded frames but episode has "
                 f"{task.observation_samples} observation rows; ordinal binding failed"
             )
         digest_pts = canonical_timestamp_sha256(pts)
@@ -388,6 +396,8 @@ def decode_episode_views(
             "asset_sha256": digest,
             "segment_kind": segment_kind,
             "decoded_frame_count": int(len(frames)),
+            "container_decoded_frame_count": container_frame_count,
+            "trailing_frames_dropped": trailing_frames_dropped,
             "selected_frame_count": int(len(rows)),
             "recorded_pts_start_s": float(pts[0]),
             "recorded_pts_end_s": float(pts[-1]),

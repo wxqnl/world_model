@@ -114,6 +114,62 @@ def test_decode_episode_views_parallelizes_real_cameras_without_reordering(
     assert decoded["right_wrist"].frames.shape == (3, 2, 2, 3)
 
 
+def test_decode_episode_views_drops_exactly_one_unaddressable_tail_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "head.mp4"
+    path.write_bytes(b"head")
+    task = SimpleNamespace(
+        assets=(("rgb/head", path.name, _sha(path)),),
+        views=(("head", "rgb/head", "entire_file", None, None),),
+        observation_samples=4,
+    )
+
+    def fake_decode(_path: Path, **_kwargs):
+        frames = np.arange(5, dtype=np.uint8).reshape(5, 1, 1, 1)
+        frames = np.repeat(frames, 3, axis=3)
+        return frames, np.arange(5, dtype=np.float64)
+
+    monkeypatch.setattr(episode_io, "_decode_segment", fake_decode)
+    decoded, evidence = episode_io.decode_episode_views(
+        task=task,
+        source_root=tmp_path,
+        canonical_view_slots=("head",),
+        selected_observation_rows=[0, 3],
+        decode_workers=1,
+    )
+    np.testing.assert_array_equal(decoded["head"].frames[:, 0, 0, 0], [0, 3])
+    np.testing.assert_array_equal(decoded["head"].recorded_pts_s, [0.0, 1.0, 2.0, 3.0])
+    assert evidence["head"]["container_decoded_frame_count"] == 5
+    assert evidence["head"]["decoded_frame_count"] == 4
+    assert evidence["head"]["trailing_frames_dropped"] == 1
+
+
+def test_decode_episode_views_still_rejects_larger_frame_count_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "head.mp4"
+    path.write_bytes(b"head")
+    task = SimpleNamespace(
+        assets=(("rgb/head", path.name, _sha(path)),),
+        views=(("head", "rgb/head", "entire_file", None, None),),
+        observation_samples=4,
+    )
+
+    def fake_decode(_path: Path, **_kwargs):
+        return np.zeros((6, 1, 1, 3), dtype=np.uint8), np.arange(6, dtype=np.float64)
+
+    monkeypatch.setattr(episode_io, "_decode_segment", fake_decode)
+    with pytest.raises(EpisodeIOError, match="ordinal binding failed"):
+        episode_io.decode_episode_views(
+            task=task,
+            source_root=tmp_path,
+            canonical_view_slots=("head",),
+            selected_observation_rows=[0, 3],
+            decode_workers=1,
+        )
+
+
 def test_decode_episode_views_rejects_nonpositive_worker_count(tmp_path: Path) -> None:
     task = SimpleNamespace(assets=(), views=(), observation_samples=2)
     with pytest.raises(EpisodeIOError, match="decode_workers"):
