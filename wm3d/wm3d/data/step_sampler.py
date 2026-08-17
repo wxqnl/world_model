@@ -204,6 +204,128 @@ class EpisodeLocalPermutation:
         return start - self.source_start + ((within + rotation) % (stop - start))
 
 
+class RankEpisodeLocalPermutation:
+    """Episode-local stream with a stable, disjoint episode set per rank.
+
+    A global contiguous episode stream makes every rank land in the same raw
+    episode.  Each rank then materializes the full episode but consumes only
+    its small slice of windows.  Assigning whole episodes to ranks keeps the
+    global sample set disjoint while allowing each materialization to be reused
+    for every window from that episode.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_start: int,
+        source_stop: int,
+        episode_spans: Sequence[tuple[int, int]],
+        world_size: int,
+        rank: int,
+        minimum_windows_per_rank: int,
+        seed: int,
+        source_name: str,
+    ) -> None:
+        self.source_start = int(source_start)
+        self.seed = int(seed)
+        self.source_name = str(source_name)
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        spans = tuple((int(start), int(stop)) for start, stop in episode_spans)
+        cursor = self.source_start
+        for start, stop in spans:
+            if start != cursor or stop <= start:
+                raise SamplingContractError(
+                    f"episode spans for {source_name} are not contiguous"
+                )
+            cursor = stop
+        if cursor != int(source_stop) or not spans:
+            raise SamplingContractError(
+                f"episode spans for {source_name} do not cover its source span"
+            )
+        if len(spans) < self.world_size:
+            raise SamplingContractError(
+                f"source {source_name} has {len(spans)} episodes for "
+                f"{self.world_size} ranks"
+            )
+
+        # One deterministic affine permutation assigns similarly sized episode
+        # counts without materializing a second full list.  The assignment is
+        # fixed across epochs, so two ranks can never materialize the same raw
+        # episode.
+        assignment_seed = _seed64(
+            self.seed, self.source_name, "rank-episode-assignment"
+        )
+        multiplier = _coprime_multiplier(len(spans), assignment_seed)
+        offset = _splitmix64(assignment_seed) % len(spans)
+        selected: list[tuple[int, int]] = []
+        windows_by_rank = [0] * self.world_size
+        for position in range(len(spans)):
+            span_index = (multiplier * position + offset) % len(spans)
+            owner = position % self.world_size
+            start, stop = spans[span_index]
+            windows_by_rank[owner] += stop - start
+            if owner == self.rank:
+                selected.append((start, stop))
+        if min(windows_by_rank) < int(minimum_windows_per_rank):
+            raise SamplingContractError(
+                f"source {source_name} cannot provide {minimum_windows_per_rank} "
+                "disjoint local windows to every rank"
+            )
+
+        self.spans = tuple(selected)
+        self.length = windows_by_rank[self.rank]
+        self._cached_epoch: int | None = None
+        self._ordered_spans: tuple[tuple[int, int, int], ...] = ()
+        self._cumulative: tuple[int, ...] = ()
+
+    def _epoch_layout(self, epoch: int) -> None:
+        if self._cached_epoch == epoch:
+            return
+        count = len(self.spans)
+        epoch_seed = _seed64(
+            self.seed, self.source_name, "rank-episode-order", self.rank, epoch
+        )
+        multiplier = _coprime_multiplier(count, epoch_seed)
+        offset = _splitmix64(epoch_seed) % count if count > 1 else 0
+        ordered: list[tuple[int, int, int]] = []
+        cumulative: list[int] = []
+        total = 0
+        for position in range(count):
+            span_index = (multiplier * position + offset) % count if count > 1 else 0
+            start, stop = self.spans[span_index]
+            span_length = stop - start
+            rotation = _splitmix64(
+                _seed64(
+                    self.seed,
+                    self.source_name,
+                    "rank-window",
+                    self.rank,
+                    epoch,
+                    span_index,
+                )
+            ) % span_length
+            ordered.append((start, stop, int(rotation)))
+            total += span_length
+            cumulative.append(total)
+        if total != self.length:
+            raise AssertionError("rank episode-local permutation lost source windows")
+        self._cached_epoch = epoch
+        self._ordered_spans = tuple(ordered)
+        self._cumulative = tuple(cumulative)
+
+    def at(self, absolute_position: int) -> int:
+        if absolute_position < 0:
+            raise SamplingContractError("permutation position must be non-negative")
+        epoch, position = divmod(int(absolute_position), self.length)
+        self._epoch_layout(epoch)
+        episode_index = bisect_right(self._cumulative, position)
+        previous = 0 if episode_index == 0 else self._cumulative[episode_index - 1]
+        start, stop, rotation = self._ordered_spans[episode_index]
+        within = position - previous
+        return start - self.source_start + ((within + rotation) % (stop - start))
+
+
 class StepAddressedBatchSampler(Sampler[list[int]]):
     """Reconstruct local batches from the optimizer step without cursor state."""
 
@@ -245,7 +367,11 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
             raise SamplingContractError("invalid optimizer-step interval")
         self.global_micro_batch = self.world_size * self.micro_batch_size
         self.global_batch = self.global_micro_batch * self.gradient_accumulation
-        self._permutations: dict[str, AffinePermutation | EpisodeLocalPermutation] = {}
+        self._rank_episode_partitioned = source_episode_spans is not None
+        self._permutations: dict[
+            str,
+            AffinePermutation | EpisodeLocalPermutation | RankEpisodeLocalPermutation,
+        ] = {}
         for source_name, (start, stop) in self.source_spans.items():
             length = stop - start
             if start < 0 or stop <= start:
@@ -264,10 +390,15 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
                     raise SamplingContractError(
                         "episode-local spans must exactly match scheduled sources"
                     )
-                self._permutations[source_name] = EpisodeLocalPermutation(
+                self._permutations[source_name] = RankEpisodeLocalPermutation(
                     source_start=start,
                     source_stop=stop,
                     episode_spans=source_episode_spans[source_name],
+                    world_size=self.world_size,
+                    rank=self.rank,
+                    minimum_windows_per_rank=(
+                        self.micro_batch_size * self.gradient_accumulation
+                    ),
                     seed=self.seed,
                     source_name=source_name,
                 )
@@ -294,13 +425,20 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
             address = self.schedule.address(step)
             source_start, _ = self.source_spans[address.source_name]
             permutation = self._permutations[address.source_name]
-            step_base = address.source_occurrence * self.global_batch
+            if self._rank_episode_partitioned:
+                local_batch = self.micro_batch_size * self.gradient_accumulation
+                step_base = address.source_occurrence * local_batch
+            else:
+                step_base = address.source_occurrence * self.global_batch
             for micro_step in range(self.gradient_accumulation):
-                rank_base = (
-                    step_base
-                    + micro_step * self.global_micro_batch
-                    + self.rank * self.micro_batch_size
-                )
+                if self._rank_episode_partitioned:
+                    rank_base = step_base + micro_step * self.micro_batch_size
+                else:
+                    rank_base = (
+                        step_base
+                        + micro_step * self.global_micro_batch
+                        + self.rank * self.micro_batch_size
+                    )
                 yield [
                     source_start + permutation.at(rank_base + local_index)
                     for local_index in range(self.micro_batch_size)

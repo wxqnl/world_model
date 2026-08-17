@@ -71,6 +71,50 @@ def test_episode_local_sampler_resume_is_exact() -> None:
         assert len(flattened) == len(set(flattened))
 
 
+def test_episode_local_sampler_partitions_whole_episodes_across_ranks() -> None:
+    spans = tuple((start, start + 6) for start in range(0, 96, 6))
+    kwargs = {
+        "source_spans": {"robot": (0, 96)},
+        "source_order": ("robot",),
+        "source_weights": {"robot": 1},
+        "world_size": 4,
+        "micro_batch_size": 2,
+        "gradient_accumulation": 1,
+        "start_optimizer_step": 0,
+        "num_optimizer_steps": 12,
+        "seed": 812,
+        "source_episode_spans": {"robot": spans},
+    }
+    episode_by_window = {
+        window: episode
+        for episode, (start, stop) in enumerate(spans)
+        for window in range(start, stop)
+    }
+    samples_by_rank = [
+        [
+            item
+            for batch in StepAddressedBatchSampler(rank=rank, **kwargs)
+            for item in batch
+        ]
+        for rank in range(4)
+    ]
+    episodes_by_rank = [
+        {episode_by_window[item] for item in samples}
+        for samples in samples_by_rank
+    ]
+
+    assert all(len(samples) == len(set(samples)) == 24 for samples in samples_by_rank)
+    assert len(set().union(*episodes_by_rank)) == 16
+    for left in range(4):
+        for right in range(left + 1, 4):
+            assert episodes_by_rank[left].isdisjoint(episodes_by_rank[right])
+    # Each rank consumes all six windows from its first episode before moving on.
+    assert all(
+        len({episode_by_window[item] for item in samples[:6]}) == 1
+        for samples in samples_by_rank
+    )
+
+
 def test_dynamic_shard_registration_rejects_digest_drift(tmp_path: Path) -> None:
     root = tmp_path.resolve()
     store = _ShardStore(root, {}, verify_on_open=True)
