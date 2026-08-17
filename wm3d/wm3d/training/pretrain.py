@@ -875,11 +875,7 @@ def main() -> None:
             raise PretrainError(
                 f"WORLD_SIZE={context.world_size} != {runtime['expected_world_size']}"
             )
-        preflight_result_sha256 = (
-            _resource_preflight(config, config_sha, context)
-            if args.preflight_only
-            else None
-        )
+        preflight_result_sha256 = None
         resource_preflight = None
         if not args.preflight_only:
             resource_preflight = _require_recent_resource_preflight(
@@ -938,6 +934,12 @@ def main() -> None:
         if int(cache_representation["rgb_size"]) < int(model_cfg["rgb_size"]):
             raise PretrainError("model RGB size exceeds cached RGB representation")
         if args.preflight_only:
+            # Qualify resources after the potentially long full-corpus data
+            # validation so the freshness window starts when preflight is
+            # actually ready to hand off to training.
+            preflight_result_sha256 = _resource_preflight(
+                config, config_sha, context
+            )
             if context.is_rank0:
                 print(
                     json.dumps(
