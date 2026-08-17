@@ -10,7 +10,11 @@ import torch
 from wm3d.data.step_sampler import EpisodeLocalPermutation, StepAddressedBatchSampler
 from wm3d.data.streaming_raw import StreamingRawError, _StreamingEpisodeCache
 from wm3d.data.unified_cache_dataset import CacheDataError, _ShardStore
-from wm3d.training.pretrain import PretrainError, _relative_world_times_for_model
+from wm3d.training.pretrain import (
+    PretrainError,
+    _StreamingLookaheadBatchSampler,
+    _relative_world_times_for_model,
+)
 
 
 def test_episode_local_permutation_is_bijective_and_local() -> None:
@@ -103,6 +107,26 @@ def test_streaming_hot_hit_uses_verified_file_identity(tmp_path: Path) -> None:
     (root / payloads[0]).write_bytes(b"different")
     with pytest.raises(StreamingRawError, match="changed after"):
         cache.ensure(task)
+
+
+def test_streaming_batch_sampler_primes_two_future_batches() -> None:
+    class Dataset:
+        def __init__(self) -> None:
+            self.prefetched: list[tuple[int, ...]] = []
+
+        def prefetch_indices(self, indices: list[int]) -> None:
+            self.prefetched.append(tuple(indices))
+
+    dataset = Dataset()
+    sampler = _StreamingLookaheadBatchSampler(
+        [[0, 1], [2, 3], [4, 5], [6, 7]], dataset, lookahead_batches=2
+    )
+    iterator = iter(sampler)
+
+    assert next(iterator) == [0, 1]
+    assert dataset.prefetched == [(0, 1), (2, 3), (4, 5)]
+    assert list(iterator) == [[2, 3], [4, 5], [6, 7]]
+    assert dataset.prefetched == [(0, 1), (2, 3), (4, 5), (6, 7)]
 
 
 def test_world_times_are_recentered_before_bf16_model_input_cast() -> None:

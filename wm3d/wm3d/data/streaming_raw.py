@@ -9,6 +9,7 @@ same quantized feature/RGB/robot ABI as the normal precomputed-cache path.
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from pathlib import Path
 import shutil
@@ -205,6 +206,15 @@ class _StreamingEpisodeCache:
         self._verified_payload_identity: dict[
             str, tuple[tuple[str, int, int, int, int], ...]
         ] = {}
+        # Decode and resize future raw episodes on CPU while the current batch
+        # is encoded and trained. CUDA work stays in the owning main process.
+        self._prepare_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"wm3d-raw-rank-{self.rank}"
+        )
+        self._prepare_futures: dict[str, Future[Any]] = {}
+        self.prefetch_submitted = 0
+        self.prefetch_consumed = 0
+        self.prefetch_wait_seconds = 0.0
         self.generated_episodes = 0
         self.cache_hits = 0
         self.evicted_episodes = 0
@@ -316,28 +326,55 @@ class _StreamingEpisodeCache:
             ).eval()
         return self._encoder, self._encoder_config
 
-    def _materialize(self, task: CacheTask) -> CacheEpisodeEntry:
-        from scripts.data.run_cache_worker import (
-            _encode_task,
-            _prepare_task,
-            _write_task,
-        )
+    def _prepare_task_data(self, task: CacheTask) -> Any:
+        from scripts.data.run_cache_worker import _prepare_task
 
         source = self.sources.get(task.source)
         if source is None or source.embodiment != task.embodiment:
             raise StreamingRawError("streaming task source/embodiment mismatch")
-        encoder, config = self._load_encoder()
-        prepared = _prepare_task(
+        # Reading the immutable config is CPU-only; the background worker must
+        # never instantiate or touch the rank-local CUDA encoder.
+        if self._encoder_config is None:
+            from scripts.data.run_cache_worker import _strict_encoder
+
+            self._encoder_config = _strict_encoder(self.encoder_contract)
+        return _prepare_task(
             task=task,
             source=source,
             adapter=self.adapters[task.source],
             profile=self.profile,
             task_store=self.task_store,
             asset_verifier=self.asset_verifier,
-            encoder_input_size=int(config.input_rgb_size),
+            encoder_input_size=int(self._encoder_config.input_rgb_size),
             task_bank_index_sha256=task.task_bank_index_sha256,
             decode_workers=self.decode_workers,
         )
+
+    def prefetch(self, task: CacheTask) -> None:
+        """Queue CPU-only preparation for one future immutable episode."""
+
+        if task.task_id in self._entries or task.task_id in self._prepare_futures:
+            return
+        self._prepare_futures[task.task_id] = self._prepare_executor.submit(
+            self._prepare_task_data, task
+        )
+        self.prefetch_submitted += 1
+
+    def _prepared(self, task: CacheTask) -> Any:
+        future = self._prepare_futures.pop(task.task_id, None)
+        if future is None:
+            return self._prepare_task_data(task)
+        started = time.perf_counter()
+        prepared = future.result()
+        self.prefetch_wait_seconds += time.perf_counter() - started
+        self.prefetch_consumed += 1
+        return prepared
+
+    def _materialize(self, task: CacheTask) -> CacheEpisodeEntry:
+        from scripts.data.run_cache_worker import _encode_task, _write_task
+
+        prepared = self._prepared(task)
+        encoder, _config = self._load_encoder()
         encoded = _encode_task(
             prepared,
             encoder=encoder,
@@ -433,6 +470,10 @@ class _StreamingEpisodeCache:
             "evicted_episodes": self.evicted_episodes,
             "prepare_seconds": self.prepare_seconds,
             "encode_seconds": self.encode_seconds,
+            "prefetch_submitted": self.prefetch_submitted,
+            "prefetch_consumed": self.prefetch_consumed,
+            "prefetch_pending": len(self._prepare_futures),
+            "prefetch_wait_seconds": self.prefetch_wait_seconds,
             "resident_bytes": sum(size for _entry, size in self._entries.values()),
             "resident_episodes": len(self._entries),
         }
@@ -562,6 +603,17 @@ class StreamingRawDataset(UnifiedCacheDataset):
     @property
     def streaming_metrics(self) -> Mapping[str, float | int]:
         return self._manager.metrics()
+
+    def prefetch_indices(self, indices: list[int]) -> None:
+        """Prepare unique episodes referenced by a future local batch."""
+
+        seen: set[str] = set()
+        for index in indices:
+            thin = self.entries[int(index)]
+            task_id = self._task_id_by_feature[thin.feature_shard]
+            if task_id not in seen:
+                seen.add(task_id)
+                self._manager.prefetch(self._manager.tasks[task_id])
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         thin = self.entries[index]

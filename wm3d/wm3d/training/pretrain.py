@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import math
@@ -554,6 +555,41 @@ def _collate_and_trim(samples: list[Mapping[str, Any]]) -> dict[str, Any]:
     return batch
 
 
+class _StreamingLookaheadBatchSampler:
+    """Prime bounded raw CPU preparation before DataLoader fetches a batch."""
+
+    def __init__(self, sampler: Any, dataset: Any, *, lookahead_batches: int = 2):
+        if lookahead_batches <= 0:
+            raise ValueError("lookahead_batches must be positive")
+        self.sampler = sampler
+        self.dataset = dataset
+        self.lookahead_batches = int(lookahead_batches)
+
+    def __len__(self) -> int:
+        return len(self.sampler)
+
+    def __iter__(self):
+        iterator = iter(self.sampler)
+        pending: deque[list[int]] = deque()
+        for _ in range(self.lookahead_batches):
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            pending.append(batch)
+            self.dataset.prefetch_indices(batch)
+        while pending:
+            current = pending.popleft()
+            try:
+                future = next(iterator)
+            except StopIteration:
+                future = None
+            if future is not None:
+                pending.append(future)
+                self.dataset.prefetch_indices(future)
+            yield current
+
+
 def _make_loader(
     dataset: Any,
     profile: Any,
@@ -588,6 +624,10 @@ def _make_loader(
         seed=seed,
         source_episode_spans=getattr(dataset, "source_episode_spans", None),
     )
+    if callable(getattr(dataset, "prefetch_indices", None)):
+        sampler = _StreamingLookaheadBatchSampler(
+            sampler, dataset, lookahead_batches=2
+        )
     workers = (
         0
         if bool(getattr(dataset, "requires_main_process", False))
