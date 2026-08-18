@@ -180,6 +180,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
     optional_train = {
         "validation_micro_batch_size",
         "activation_checkpointing",
+        "rgb_decode_chunk_size",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
@@ -218,6 +219,15 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         and not isinstance(train["activation_checkpointing"], bool)
     ):
         raise RuntimeContractError("train.activation_checkpointing must be boolean")
+    if (
+        "rgb_decode_chunk_size" in train
+        and (
+            not isinstance(train["rgb_decode_chunk_size"], int)
+            or isinstance(train["rgb_decode_chunk_size"], bool)
+            or train["rgb_decode_chunk_size"] <= 0
+        )
+    ):
+        raise RuntimeContractError("train.rgb_decode_chunk_size must be a positive integer")
     if int(train["num_workers"]) < 0 or int(train["prefetch_factor"]) <= 0:
         raise RuntimeContractError("dataloader worker/prefetch values are invalid")
     if float(train["gradient_clip"]) <= 0:

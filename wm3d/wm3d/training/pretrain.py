@@ -1024,6 +1024,12 @@ def main() -> None:
                     effective_model["activation_checkpointing"],
                 )
             )
+            effective_model["rgb_decode_chunk_size"] = int(
+                runtime["train"].get(
+                    "rgb_decode_chunk_size",
+                    effective_model["rgb_decode_chunk_size"],
+                )
+            )
             effective_model_profile["model"] = effective_model
             model = build_world_model(effective_model_profile)
         if not isinstance(model, NativeWorldModel):

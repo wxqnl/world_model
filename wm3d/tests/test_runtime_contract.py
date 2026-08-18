@@ -60,6 +60,18 @@ def test_global_batch_is_derived_not_trusted() -> None:
         validate_runtime_profile(value)
 
 
+def test_rgb_decode_chunk_size_is_an_optional_positive_execution_tuning() -> None:
+    value = copy.deepcopy(_load("h100_8_fsdp2.yaml"))
+    value["train"]["rgb_decode_chunk_size"] = 16
+    validate_runtime_profile(value)
+
+    for invalid in (0, -1, True, 1.5):
+        invalid_value = copy.deepcopy(value)
+        invalid_value["train"]["rgb_decode_chunk_size"] = invalid
+        with pytest.raises(RuntimeContractError, match="rgb_decode_chunk_size"):
+            validate_runtime_profile(invalid_value)
+
+
 def test_runtime_does_not_contain_model_or_dataset_branch() -> None:
     value = _load("h200_128_fsdp2.yaml")
     serialized = yaml.safe_dump(value)
