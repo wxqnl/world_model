@@ -437,7 +437,11 @@ def _relative_world_times_for_model(
         raise PretrainError("world_times_s contains non-finite values")
     if not bool(torch.diff(world_times_s, dim=1).gt(0).all()):
         raise PretrainError("world_times_s must be strictly increasing per sample")
-    return world_times_s - world_times_s[:, context_length - 1 : context_length]
+    relative = world_times_s - world_times_s[:, context_length - 1 : context_length]
+    # Recenter in the source precision first, then present FP32 to the model.
+    # FSDP casts root inputs itself, while DDP relies on autocast, which does
+    # not convert FP64 inputs for BF16 linear layers.
+    return relative.to(dtype=torch.float32)
 
 
 def _forward(model: torch.nn.Module, batch: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:

@@ -280,7 +280,7 @@ def test_world_times_are_recentered_before_bf16_model_input_cast() -> None:
 
     relative = _relative_world_times_for_model(world_times, context_length=16)
 
-    assert relative.dtype == torch.float64
+    assert relative.dtype == torch.float32
     assert relative[0, 15].item() == 0.0
     assert bool(torch.diff(relative.to(torch.bfloat16), dim=1).gt(0).all())
     torch.testing.assert_close(world_times, original.unsqueeze(0), rtol=0, atol=0)
