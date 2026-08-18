@@ -71,7 +71,6 @@ from wm3d.training.resource_preflight import (
 from wm3d.training.launch_qualification import (
     LaunchQualificationError,
     build_launch_qualification,
-    load_published_launch_qualification,
     publish_launch_qualification,
     resource_contract_sha256,
     validate_launch_qualification,
@@ -818,6 +817,7 @@ def _publish_and_validate_launch(
                 "ok": True,
                 "path": str(path.resolve(strict=True)),
                 "sha256": digest,
+                "qualification": value,
             }
         except Exception as exc:
             publication[0] = {
@@ -829,9 +829,11 @@ def _publish_and_validate_launch(
     if not publication[0]["ok"]:
         raise PretrainError(f"launch qualification publication failed: {publication[0]}")
     try:
-        value = load_published_launch_qualification(
-            Path(publication[0]["path"]), str(publication[0]["sha256"])
-        )
+        # Training nodes have independent local filesystems.  Rank 0 keeps the
+        # durable receipt, while every rank validates the exact value carried
+        # by the existing distributed broadcast instead of reopening rank 0's
+        # local pathname.
+        value = publication[0]["qualification"]
         validate_launch_qualification(
             value,
             launch_kind=launch_kind,
