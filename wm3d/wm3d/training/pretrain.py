@@ -1016,7 +1016,16 @@ def main() -> None:
             else context.device
         )
         with torch.device(construction_device):
-            model = build_world_model(config["model_profile"])
+            effective_model_profile = dict(config["model_profile"])
+            effective_model = dict(effective_model_profile["model"])
+            effective_model["activation_checkpointing"] = bool(
+                runtime["train"].get(
+                    "activation_checkpointing",
+                    effective_model["activation_checkpointing"],
+                )
+            )
+            effective_model_profile["model"] = effective_model
+            model = build_world_model(effective_model_profile)
         if not isinstance(model, NativeWorldModel):
             raise PretrainError("unified pretrain currently requires native_world_model")
         native_model = model
