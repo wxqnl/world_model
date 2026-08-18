@@ -151,13 +151,41 @@ def _encode(
     device: torch.device,
     batch_frames: int,
 ) -> dict[str, torch.Tensor]:
+    if batch_frames <= 0:
+        raise CacheWorkerError("encoder batch_frames must be positive")
     output: dict[str, list[torch.Tensor]] = {}
-    for start in range(0, len(images), batch_frames):
-        stop = min(len(images), start + batch_frames)
-        encoded = encoder(
-            images[start:stop].to(device, non_blocking=True).unsqueeze(0),
-            view_mask[start:stop].to(device, non_blocking=True).unsqueeze(0),
-        )
+    effective_batch_frames = batch_frames
+    start = 0
+    while start < len(images):
+        stop = min(len(images), start + effective_batch_frames)
+        chunk_images = images[start:stop].to(device, non_blocking=True).unsqueeze(0)
+        chunk_view_mask = view_mask[start:stop].to(
+            device, non_blocking=True
+        ).unsqueeze(0)
+        try:
+            encoded = encoder(chunk_images, chunk_view_mask)
+        except torch.OutOfMemoryError:
+            del chunk_images, chunk_view_mask
+            if effective_batch_frames <= 1:
+                raise
+            attempted_batch_frames = effective_batch_frames
+            effective_batch_frames = max(1, effective_batch_frames // 2)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(
+                json.dumps(
+                    {
+                        "attempted_batch_frames": attempted_batch_frames,
+                        "remaining_frames": len(images) - start,
+                        "retry_batch_frames": effective_batch_frames,
+                        "streaming_raw_encoder": "oom_backoff",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            continue
+        del chunk_images, chunk_view_mask
         for name, value in encoded.items():
             if name == "world_tokens":
                 # Fused targets are reconstructed from per-view tokens and
@@ -165,6 +193,8 @@ def _encode(
                 # deliberately not persisted.
                 continue
             output.setdefault(name, []).append(value[0].detach().cpu())
+        del encoded
+        start = stop
     return {name: torch.cat(parts, dim=0) for name, parts in output.items()}
 
 

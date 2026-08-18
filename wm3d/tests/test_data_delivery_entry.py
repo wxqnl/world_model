@@ -20,12 +20,47 @@ from scripts.data.materialize_existing_robot_mix import (
     _segment_has_video_coverage,
     _window_evidence,
 )
-from scripts.data.run_cache_worker import _view_batch
+from scripts.data.run_cache_worker import _encode, _view_batch
 from wm3d.data.step_sampler import SamplingContractError
 from wm3d.training.pretrain import _require_sampling_capacity
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _OOMBackoffEncoder:
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    def __call__(
+        self, images: torch.Tensor, view_mask: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        del view_mask
+        frames = int(images.shape[1])
+        self.batch_sizes.append(frames)
+        if frames > 2:
+            raise torch.OutOfMemoryError("fixture encoder peak")
+        return {"tokens": torch.arange(frames).reshape(1, frames, 1)}
+
+
+def test_cache_encoder_retries_a_smaller_chunk_after_oom(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    encoder = _OOMBackoffEncoder()
+    encoded = _encode(
+        encoder=encoder,
+        images=torch.zeros(5, 1, 3, 2, 2),
+        view_mask=torch.ones(5, 1, dtype=torch.bool),
+        device=torch.device("cpu"),
+        batch_frames=4,
+    )
+
+    assert encoder.batch_sizes == [4, 2, 2, 1]
+    assert encoded["tokens"].shape == (5, 1)
+    event = json.loads(capsys.readouterr().out)
+    assert event["streaming_raw_encoder"] == "oom_backoff"
+    assert event["attempted_batch_frames"] == 4
+    assert event["retry_batch_frames"] == 2
 
 
 class _CapacityDataset:
