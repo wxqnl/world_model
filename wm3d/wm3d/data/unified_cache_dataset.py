@@ -402,7 +402,9 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             int(model["appearance_P"]), label="appearance model"
         )
         self.appearance_cache_grid = (
-            self.cache_grid if appearance_cache_grid is None else int(appearance_cache_grid)
+            int(representation.get("appearance_token_grid", self.cache_grid))
+            if appearance_cache_grid is None
+            else int(appearance_cache_grid)
         )
         if self.appearance_enabled and self.appearance_grid > self.appearance_cache_grid:
             raise CacheDataError(

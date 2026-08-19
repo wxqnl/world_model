@@ -20,8 +20,11 @@ cache 或未审计的数据 profile 混入新 run。
 默认不加入 AgiBotWorld 2026 和 AgiBotWorld Beta。OXE 新 source 各自权重为 1；已有五个
 source 的权重保持 `14/6/4/8/8`，不会让某一个 OXE 数据集仅凭体量压倒其它来源。
 
-模型使用 `configs/model/native_1b.yaml`：P64 native 3D token、8 个 future RGB 帧、256×256
-输出和增强后的 native RGB v2 decoder。数据访问使用 `streaming_raw`。
+模型使用 `configs/model/native_1b_dual_path.yaml`：融合 P64 geometry 继续承担 3D、动作、
+状态和动力学；逐视角 P256 appearance latent 专门保留 RGB 高频信息。RGB decoder 同时读取
+预测 appearance 与 3D future state，输出 8 个 256×256 future RGB 帧。目标使用
+`configs/objective/stage0_native_dual_path.yaml`。默认 site 文件已填好这些配置，操作者不需要
+手动替换。数据访问使用 `streaming_raw`。
 
 ### PCA 与磁盘
 
@@ -29,6 +32,9 @@ source 的权重保持 `14/6/4/8/8`，不会让某一个 OXE 数据集仅凭体�
 2048D token，只做逐向量 int8 量化并放入有上限的 LRU；RGB 监督来自原始视频并保存为 JPEG
 pack。PCA 过去压缩的是视觉/几何表征，不是 RGB 图像本身。旧图像模糊还与 decoder 容量、
 预测帧数和损失有关，这些已在当前 1B profile 中修正。
+
+同一次 VGGT forward 会同时生成 P64 geometry 和 P256 appearance，不会把 encoder 计算做
+两遍。旧 LRU 只有 geometry token；启动 dual-path run 时必须使用新的独立 LRU 根目录。
 
 `streaming_raw` 省掉完整视觉 cache，但仍要求冻结 revision 的原始视频可从本地文件系统读取。
 默认 OXE 组合原始数据约 15–20TB；准备阶段还要给下载临时文件留空间。因此不要把 7TB 单盘

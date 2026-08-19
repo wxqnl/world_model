@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -237,6 +238,18 @@ def _representation_from_profiles(
         raise ValueError("model profile is missing model/sampling mappings")
     grid = int(encoder["token_grid"])
     spatial_tokens = grid * grid
+    appearance_grid = int(encoder.get("appearance_token_grid", 0))
+    expected_appearance_grid = 0
+    if bool(model.get("appearance_enabled", False)):
+        appearance_tokens = int(model["appearance_P"])
+        expected_appearance_grid = math.isqrt(appearance_tokens)
+        if expected_appearance_grid * expected_appearance_grid != appearance_tokens:
+            raise ValueError("model appearance_P must be a square token grid")
+    if appearance_grid != expected_appearance_grid:
+        raise ValueError(
+            "model/encoder appearance grid mismatch: "
+            f"expected={expected_appearance_grid} actual={appearance_grid}"
+        )
     expected = {
         "spatial_tokens": int(model["P"]),
         "token_dim": int(model["token_dim"]),
@@ -263,6 +276,10 @@ def _representation_from_profiles(
             "rgb_size": actual["rgb_size"],
         }
     )
+    if appearance_grid > 0:
+        result["appearance_token_grid"] = appearance_grid
+    else:
+        result.pop("appearance_token_grid", None)
     selection = result.get("state_frame_selection")
     if not isinstance(selection, dict):
         raise ValueError("base data template is missing state_frame_selection")

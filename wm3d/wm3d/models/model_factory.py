@@ -135,7 +135,9 @@ def validate_model_data_compatibility(
         raise ValueError("model spatial grid exceeds the shared episode cache")
     if cfg.appearance_enabled:
         available_appearance_grid = (
-            cache_grid
+            int(
+                representation.get("appearance_token_grid", cache_grid)
+            )
             if appearance_cache_grid is None
             else int(appearance_cache_grid)
         )

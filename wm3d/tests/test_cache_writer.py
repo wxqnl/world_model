@@ -189,6 +189,7 @@ def _profile(root: Path) -> DataProfile:
         cache_representation={
             "schema": "wm3d_v8_episode_representation_v1",
             "token_grid": 2,
+            "appearance_token_grid": 4,
             "spatial_tokens": 4,
             "token_dim": 16,
             "num_views": 2,
@@ -351,7 +352,6 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
         data_profile=profile,
         model_profile=dual_profile,
         split="train",
-        appearance_cache_grid=4,
         grouped_normalizer=normalizer,
     )
     dual_loaded = dual_dataset[0]

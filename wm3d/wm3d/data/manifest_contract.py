@@ -443,8 +443,9 @@ def load_data_profile(path: Path, *, verify_source_manifests: bool = True) -> Da
         "missing_view_policy",
         "state_frame_selection",
     }
+    optional_representation = {"appearance_token_grid"}
     missing_representation = sorted(required_representation - set(representation))
-    unknown_representation = sorted(set(representation) - required_representation)
+    unknown_representation = sorted(set(representation) - required_representation - optional_representation)
     if missing_representation or unknown_representation:
         raise ManifestContractError(
             "cache_representation fields invalid: "
@@ -464,6 +465,15 @@ def load_data_profile(path: Path, *, verify_source_manifests: bool = True) -> Da
         if int(representation[field]) <= 0:
             raise ManifestContractError(
                 f"cache_representation.{field} must be positive"
+            )
+    if "appearance_token_grid" in representation:
+        appearance_grid = representation["appearance_token_grid"]
+        if (
+            isinstance(appearance_grid, bool)
+            or int(appearance_grid) < int(representation["token_grid"])
+        ):
+            raise ManifestContractError(
+                "cache_representation.appearance_token_grid must be at least token_grid"
             )
     if int(representation["token_grid"]) ** 2 != int(
         representation["spatial_tokens"]

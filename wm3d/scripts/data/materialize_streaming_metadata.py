@@ -170,10 +170,30 @@ def main() -> None:
     model = yaml.safe_load(model_path.read_text(encoding="utf-8"))
     if not isinstance(model, dict):
         raise StreamingMetadataError("model profile must be a mapping")
-    validate_model_data_compatibility(model, profile)
-    model_sha = canonical_sha256(model)
     encoder_path = args.encoder_contract.resolve(strict=True)
     encoder_config = _strict_encoder(encoder_path)
+    representation = profile.cache_representation
+    expected_encoder = {
+        "token_grid": int(representation["token_grid"]),
+        "appearance_token_grid": int(
+            representation.get("appearance_token_grid", 0)
+        ),
+        "target_rgb_size": int(representation["rgb_size"]),
+        "token_dim": int(representation["token_dim"]),
+        "max_views": int(representation["num_views"]),
+    }
+    for name, expected in expected_encoder.items():
+        if int(getattr(encoder_config, name)) != expected:
+            raise StreamingMetadataError(
+                f"encoder/data representation {name} mismatch: "
+                f"{getattr(encoder_config, name)} != {expected}"
+            )
+    validate_model_data_compatibility(
+        model,
+        profile,
+        appearance_cache_grid=expected_encoder["appearance_token_grid"],
+    )
+    model_sha = canonical_sha256(model)
     tasks = tuple(
         cache_task_from_mapping(dict(row))
         for _line, row in iter_jsonl(args.task_manifest)

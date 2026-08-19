@@ -666,10 +666,10 @@ def _plan(args: argparse.Namespace, repo: Path, work: Path, code_commit: str) ->
         repo / "configs/data/smoke_aloha_bimanual.template.yaml",
         repo / "configs/data/smoke_aloha_episode_indices.txt",
         repo / "configs/adapters/aloha_sim_insertion_human.yaml",
-        repo / "configs/encoder/vggt_native_p144.yaml",
+        repo / "configs/encoder/vggt_native_p144_appearance_p256.yaml",
         repo / "configs/encoder/task_qwen3_vl_embedding_2b.yaml",
-        repo / "configs/model/native_1b.yaml",
-        repo / "configs/objective/stage0_native.yaml",
+        repo / "configs/model/native_1b_dual_path.yaml",
+        repo / "configs/objective/stage0_native_dual_path.yaml",
         repo / "configs/runtime/smoke_2gpu_fsdp2.yaml",
     ]
     value = {
@@ -856,9 +856,9 @@ def main(arguments: Sequence[str] | None = None) -> None:
     flow.step(
         9,
         "cache_plan",
-        ["cache-plan", "--data-profile", data_profile, "--encoder-contract", repo / "configs/encoder/vggt_native_p144.yaml", "--task-encoder-contract", repo / "configs/encoder/task_qwen3_vl_embedding_2b.yaml", "--task-bank-index", task_bank / "index.jsonl", "--output", task_manifest],
+        ["cache-plan", "--data-profile", data_profile, "--encoder-contract", repo / "configs/encoder/vggt_native_p144_appearance_p256.yaml", "--task-encoder-contract", repo / "configs/encoder/task_qwen3_vl_embedding_2b.yaml", "--task-bank-index", task_bank / "index.jsonl", "--output", task_manifest],
         [(task_manifest, "file")],
-        inputs=[data_profile, task_bank / "index.jsonl", repo / "configs/encoder/vggt_native_p144.yaml", repo / "configs/encoder/task_qwen3_vl_embedding_2b.yaml"],
+        inputs=[data_profile, task_bank / "index.jsonl", repo / "configs/encoder/vggt_native_p144_appearance_p256.yaml", repo / "configs/encoder/task_qwen3_vl_embedding_2b.yaml"],
     )
     worker_outputs = [(cache / "payload", "tree"), (cache / "receipts", "tree"), (cache / "episode_index_fragments", "tree")]
     worker_receipt = work / "receipts" / "10_cache_workers.json"
@@ -875,7 +875,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
         commands = []
         for worker in range(2):
             commands.append(
-                [flow.run_wm3d, "cache-worker", "--task-manifest", str(task_manifest), "--data-profile", str(data_profile), "--encoder-contract", str(repo / "configs/encoder/vggt_native_p144.yaml"), "--task-bank-root", str(task_bank), "--task-bank-index-sha256", task_bank_sha, "--cache-root", str(cache), "--worker-index", str(worker), "--worker-count", "2", "--device", f"cuda:{worker}", "--batch-frames", str(args.batch_frames), "--fail-fast"]
+                [flow.run_wm3d, "cache-worker", "--task-manifest", str(task_manifest), "--data-profile", str(data_profile), "--encoder-contract", str(repo / "configs/encoder/vggt_native_p144_appearance_p256.yaml"), "--task-bank-root", str(task_bank), "--task-bank-index-sha256", task_bank_sha, "--cache-root", str(cache), "--worker-index", str(worker), "--worker-count", "2", "--device", f"cuda:{worker}", "--batch-frames", str(args.batch_frames), "--fail-fast"]
             )
         processes = []
         logs = []
@@ -904,23 +904,23 @@ def main(arguments: Sequence[str] | None = None) -> None:
     flow.step(
         12,
         "window",
-        ["window", "--episode-index", episode_index, "--episode-seal", episode_seal, "--cache-root", cache, "--data-profile", data_profile, "--model-profile", repo / "configs/model/native_1b.yaml", "--output-index", window_index, "--output-seal", window_seal],
+        ["window", "--episode-index", episode_index, "--episode-seal", episode_seal, "--cache-root", cache, "--data-profile", data_profile, "--model-profile", repo / "configs/model/native_1b_dual_path.yaml", "--output-index", window_index, "--output-seal", window_seal],
         [(window_index, "file"), (window_seal, "file")],
-        inputs=[episode_index, episode_seal, data_profile, repo / "configs/model/native_1b.yaml"],
+        inputs=[episode_index, episode_seal, data_profile, repo / "configs/model/native_1b_dual_path.yaml"],
     )
     flow.step(
         13,
         "normalization",
-        ["normalization", "--data-profile", data_profile, "--model-profile", repo / "configs/model/native_1b.yaml", "--window-index", window_index, "--window-index-sha256", _sha256(window_index), "--cache-root", cache, "--output", normalization],
+        ["normalization", "--data-profile", data_profile, "--model-profile", repo / "configs/model/native_1b_dual_path.yaml", "--window-index", window_index, "--window-index-sha256", _sha256(window_index), "--cache-root", cache, "--output", normalization],
         [(normalization, "file")],
-        inputs=[data_profile, repo / "configs/model/native_1b.yaml", window_index, episode_seal],
+        inputs=[data_profile, repo / "configs/model/native_1b_dual_path.yaml", window_index, episode_seal],
     )
     flow.step(
         14,
         "runtime",
-        ["runtime", "--model", repo / "configs/model/native_1b.yaml", "--data", data_profile, "--runtime", repo / "configs/runtime/smoke_2gpu_fsdp2.yaml", "--objective", repo / "configs/objective/stage0_native.yaml", "--cache-root", cache, "--episode-cache-index", episode_index, "--episode-cache-seal", episode_seal, "--cache-index", window_index, "--cache-seal", window_seal, "--grouped-normalization", normalization, "--environment-lock", (args.environment_dir or work / "environment") / "environment_receipt.json", "--run-name", "wm3d_real_aloha_1b_smoke", "--run-lineage", lineage, "--output-root", training, "--output", runtime],
+        ["runtime", "--model", repo / "configs/model/native_1b_dual_path.yaml", "--data", data_profile, "--runtime", repo / "configs/runtime/smoke_2gpu_fsdp2.yaml", "--objective", repo / "configs/objective/stage0_native_dual_path.yaml", "--cache-root", cache, "--episode-cache-index", episode_index, "--episode-cache-seal", episode_seal, "--cache-index", window_index, "--cache-seal", window_seal, "--grouped-normalization", normalization, "--environment-lock", (args.environment_dir or work / "environment") / "environment_receipt.json", "--run-name", "wm3d_real_aloha_1b_smoke", "--run-lineage", lineage, "--output-root", training, "--output", runtime],
         [(runtime, "file")],
-        inputs=[data_profile, episode_index, episode_seal, window_index, window_seal, normalization, repo / "configs/model/native_1b.yaml", repo / "configs/runtime/smoke_2gpu_fsdp2.yaml", repo / "configs/objective/stage0_native.yaml"],
+        inputs=[data_profile, episode_index, episode_seal, window_index, window_seal, normalization, repo / "configs/model/native_1b_dual_path.yaml", repo / "configs/runtime/smoke_2gpu_fsdp2.yaml", repo / "configs/objective/stage0_native_dual_path.yaml"],
     )
     runtime_sha = _sha256(runtime)
     torch_args = ["--nnodes=1", "--nproc_per_node=2", "--node_rank=0", "--master_addr=127.0.0.1"]

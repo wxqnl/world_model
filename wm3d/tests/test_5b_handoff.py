@@ -24,27 +24,32 @@ ROOT = Path(__file__).resolve().parents[1]
         ("h200_64_fsdp2.yaml", 600_000, [1_000, 5_000, 20_000], 20_000),
     ],
 )
-def test_5b_presets_match_native_5b_and_64_h200(
+def test_5b_presets_match_dual_path_5b_and_64_h200(
     profile: str,
     total_steps: int,
     checkpoint_steps: list[int],
     checkpoint_interval: int,
 ) -> None:
-    model = yaml.safe_load((ROOT / "configs/model/native_5b.yaml").read_text())
+    model = yaml.safe_load(
+        (ROOT / "configs/model/native_5b_dual_path.yaml").read_text()
+    )
     objective = yaml.safe_load(
-        (ROOT / "configs/objective/stage0_native.yaml").read_text()
+        (ROOT / "configs/objective/stage0_native_dual_path.yaml").read_text()
     )
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_285_182_899
+    assert model["expected_parameter_count"] == 5_323_627_059
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
+    assert model["model"]["appearance_P"] == 256
     assert model["model"]["rgb_hidden"] == 1536
     assert model["model"]["rgb_res_blocks"] == 2
     assert model["model"]["rgb_decode_chunk_size"] == 2
     assert model["model"]["rgb_decode_indices"] == list(range(16))
     assert objective["objective"]["rgb_l1"] == 0.5
     assert objective["objective"]["rgb_perceptual"] == 0.1
+    assert objective["objective"]["appearance_mse"] == 1.0
+    assert objective["objective"]["appearance_cosine"] == 0.1
     assert runtime["expected_world_size"] == 64
     assert runtime["distributed"]["shard_degree"] == 8
     assert runtime["resources"]["gpu_name_substring"] == "H200"
@@ -177,6 +182,13 @@ def test_5b_site_defaults_to_oxe_without_beta_and_64_gpu_saturated_cache() -> No
     assert "CACHE_WRITER_THREADS=2" in site
     assert "DATA_FAMILY=public_robot_oxe" in site
     assert "INCLUDE_AGIBOT_BETA=NO" in site
+    assert "WM3D_DATA_MODE=streaming_raw" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
+    assert (
+        "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml"
+        in site
+    )
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in site
     assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
     assert "DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe.template.yaml" in site
 

@@ -111,3 +111,16 @@ def test_existing_encoder_contract_defaults_to_geometry_only() -> None:
         Path("configs/encoder/vggt_native_p64.yaml")
     )
     assert config.token_grid == 8
+    assert config.appearance_token_grid == 0
+
+
+def test_dual_path_encoder_contracts_keep_geometry_and_appearance_grids() -> None:
+    one_b = _strict_encoder(
+        Path("configs/encoder/vggt_native_p64_appearance_p256.yaml")
+    )
+    five_b = _strict_encoder(
+        Path("configs/encoder/vggt_native_p144_appearance_p256.yaml")
+    )
+
+    assert (one_b.token_grid, one_b.appearance_token_grid) == (8, 16)
+    assert (five_b.token_grid, five_b.appearance_token_grid) == (12, 16)

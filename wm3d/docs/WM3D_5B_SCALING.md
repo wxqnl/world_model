@@ -1,14 +1,17 @@
 # WM3D 5B 训练流程
 
-WM3D 5B 使用 `configs/model/native_5b.yaml`，精确参数量为 `5,285,182,899`。默认训练规模为
-8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做 8-way FSDP2
-分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，不做梯度累积，
-global batch 为 256。
+WM3D 5B 使用 `configs/model/native_5b_dual_path.yaml`，参数量为 `5,323,627,059`。
+默认训练规模为 8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做
+8-way FSDP2 分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，
+不做梯度累积，global batch 为 256。
 
-该 profile 已包含正式 native RGB v2 decoder，不需要同事额外修改配置：decoder hidden 为
-1536，每个上采样层含 2 个 residual blocks，并监督未来全部 16 帧。RGB 目标同时启用 L1、
-Charbonnier、spatial gradient 和冻结的 VGG LPIPS；不依赖 Wan。训练只解码数据中实际有
-RGB 监督的相机，decoder 与 LPIPS 都按小块执行 activation checkpoint，因此不能为了省显存
+该 profile 使用正式 dual-path RGB：P144 融合 geometry 主干继续负责 3D、动作和动力学，
+逐视角 P256 appearance latent 保留高频纹理，RGB decoder 同时接受两者。decoder hidden
+为 1536，每个上采样层含 2 个 residual blocks，并监督未来全部 16 帧。RGB 目标使用
+`configs/objective/stage0_native_dual_path.yaml`，同时启用 appearance MSE/cosine、L1、
+Charbonnier、spatial gradient 和冻结的 VGG LPIPS；不依赖 Wan。默认 site 文件已经填好
+model、encoder 和 objective，拉取代码后无需手工调整。训练只解码数据中实际有 RGB
+监督的相机，decoder 与 LPIPS 都按小块执行 activation checkpoint，因此不能为了省显存
 把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
 [原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
 
@@ -111,6 +114,7 @@ site 文件默认配置为：
 ```bash
 DATA_FAMILY=public_robot_oxe
 INCLUDE_AGIBOT_BETA=NO
+WM3D_DATA_MODE=streaming_raw
 ```
 
 运行：
@@ -136,17 +140,17 @@ INCLUDE_AGIBOT_BETA=YES
 
 | 组成 | 数据变化 | 数据规模 | 预计 episode cache |
 |---|---|---:|---:|
-| 保留的主数据 | DROID、Bridge、RoboCasa、AgiBotWorld2026 | 约 3,130 h | 约 105.5 TB |
-| OXE | 新增除 DROID 外的 55 个 source | 约 97.3 h 原始记录；约 264.6 万个 cache 帧 | 约 2.5 TB |
-| **默认组合合计** | **63 个训练 source，不含 AgiBotWorld Beta** | **约 3,227 h 原始记录** | **约 108 TB（约 98 TiB）** |
+| 保留的主数据 | DROID、Bridge、RoboCasa、AgiBotWorld2026 | 约 3,130 h | 约 280–290 TB |
+| OXE | 新增除 DROID 外的 55 个 source | 约 97.3 h 原始记录；约 264.6 万个 cache 帧 | 约 6–7 TB |
+| **默认组合合计** | **63 个训练 source，不含 AgiBotWorld Beta** | **约 3,227 h 原始记录** | **约 290 TB** |
 
-cache 估算按正式的三视角 `native_p144` 表征、每个视角 144 个 token、最高约 10 Hz
-保留观测计算，平均每个被保留的观测约占 0.936 MB。OXE 中许多数据是 20 Hz 或 50 Hz，
-因此会按真实时间戳降到最高约 10 Hz；动作和状态仍保留原始时间戳，不做固定频率插值。
+cache 估算按正式的三视角 P144 geometry + P256 appearance 表征、最高约 10 Hz 保留观测
+计算。OXE 中许多数据是 20 Hz 或 50 Hz，因此会按真实时间戳降到最高约 10 Hz；动作和
+状态仍保留原始时间戳，不做固定频率插值。实际大小以 `plan` 对现场数据的输出为准。
 
-`108 TB` 是最终 episode cache 本身。把原始下载、下载缓存、临时文件、日志和 checkpoint
-一并计算后，默认组合的完整 cache 方案建议准备 **130–150 TB 总磁盘**。启用 AgiBotWorld
-Beta 后，episode cache 预计增加到约 209 TB，总磁盘也需要相应增加。
+完整 dual-path cache 明显大于旧 geometry-only cache。把原始下载、临时文件、日志和
+checkpoint 一并计算后，完整 cache 方案建议准备约 **320–350 TB 总磁盘**。因此默认站点
+使用 `streaming_raw` 和有上限的 LRU；只有现场确认容量充足时才切到 `episode_cache`。
 
 生成模板后照常执行 `lock`、`download`、schema audit、adapter audit 和 inventory。某个数据集
 的动作或状态维度超过 WM3D 容量时，生成步骤会停止并报告数据集名称。
@@ -196,14 +200,15 @@ archive、schema、adapter、inventory 命令整理。OXE 数据已经是 LeRobo
 ./run_wm3d.sh 5b plan "$SITE"
 ```
 
-输出应显示 `native_5b`、64 个 rank，以及与所选配置一致的数据 source 数量，并且不再
-出现 `data_profile=WAITING`。同时确认 runtime 封存的模型参数量是 `5,285,182,899`、
+输出应显示 `native_5b_dual_path`、64 个 rank，以及与所选配置一致的数据 source 数量，并且不再
+出现 `data_profile=WAITING`。同时确认 runtime 封存的模型参数量是 `5,323,627,059`、
 模型 schema 是 `wm3d_native_world_model_v2`，RGB future indices 为 `0..15`；任一项不同都
 不要启动 64 卡训练。
 
 ## 4. 高吞吐 episode cache
 
-cache 是数据准备中最耗时的阶段。默认配置按 64 张 GPU 全量展开：每张 GPU 一个长驻 worker，
+cache 是数据准备中最耗时的阶段。以下完整 cache 流程只在显式选择 `episode_cache` 时运行；
+默认 `streaming_raw` 直接进入 4.1 节。完整 cache 按 64 张 GPU 展开：每张 GPU 一个长驻 worker，
 每个 worker 使用 4 个视频解码线程、`batch_frames=16` 的 VGGT 前向和 2 个写盘线程。
 worker 会流水执行“准备下一个 episode、GPU 编码当前 episode、写盘上一个 episode”，避免
 解码和落盘期间 GPU 空转。
@@ -280,7 +285,7 @@ AgiBotWorld 2026 和 OXE 都参与训练，按需缓存只改变数据访问方�
 
 | 数据访问方式 | 建议总磁盘 | 相对训练吞吐 | 300K 等样本预算 | 600K 正式训练 | 选择条件 |
 |---|---:|---:|---:|---:|---|
-| `episode_cache` | 约 130–150 TB | 1.0 | 约 15–23 天 | 约 30–45 天 | 磁盘充足，优先训练吞吐 |
+| `episode_cache` | 约 320–350 TB | 1.0 | 约 15–23 天 | 约 30–45 天 | 磁盘充足，优先训练吞吐 |
 | `streaming_raw` | 约 35–45 TB | 约 0.75–0.9 | 约 20–28 天 | 约 40–55 天 | 只有几十 TB，接受一定速度损失 |
 
 吞吐按完整 cache 为 `1.0`。LRU 命中后的读取速度约为完整 cache 的 `0.95–1.0`；长期平均还要
@@ -307,7 +312,7 @@ steps 减半，但不是 8 倍墙钟加速。当前 `formal600k` 没有减少 st
 | 100K | 6–9 天 |
 | 600K 正式训练 | 40–55 天，通常按约 45 天安排，资源窗口预留 55 天 |
 
-`streaming_raw` 去掉的是约 108 TB 的完整视觉 cache，原始数据仍需保留。当前上游规模下，
+`streaming_raw` 去掉的是约 290 TB 的完整 dual-path 视觉 cache，原始数据仍需保留。当前上游规模下，
 默认 OXE 组合的原始数据预计约 15–20 TB。总磁盘按下面的项目规划：
 
 | 项目 | 预计空间 | 使用阶段 |

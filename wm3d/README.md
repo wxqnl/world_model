@@ -7,10 +7,14 @@ profile。
 
 ```mermaid
 flowchart LR
-  O["多视角观测 + 真实时间戳"] --> C["Native 3D core"]
+  O["多视角观测 + 真实时间戳"] --> G["融合 geometry tokens"]
+  O --> V["逐视角 P256 appearance"]
+  G --> C["Native 3D core"]
   A["source-native 已执行动作"] --> C
   S["current state + embodiment"] --> H["统一 action policy"]
-  C --> W["未来 RGB / depth / point / pose"]
+  C --> W["未来 depth / point / pose"]
+  C --> R["原生 RGB decoder"]
+  V --> R
   C --> H
   W --> P["Stage1 action-blind planner"]
 ```
@@ -21,7 +25,9 @@ flowchart LR
 - dynamics 使用真实执行过的 source-native fine command；policy 与 factual dynamics
   state 分离，避免未来动作泄漏。
 - grouped action/current-state ABI 表达单臂、双臂、底盘、腰部、头部和可变维度。
-- RGB、depth、point、pose 是显式监督和显式输出，不存在 VLA/WAN action 旁路。
+- 3D 主干使用融合后的 geometry tokens；RGB 额外保留逐视角 P256 appearance latent，
+  并由 3D future state 约束。RGB、depth、point、pose 都是显式监督和显式输出，
+  不存在 VLA/Wan action 或视频生成旁路。
 - Stage0 是联合世界动力学与 action policy 预训练；Stage1 冻结 Stage0，用真实 simulator
   candidates 和 native 3D future evidence 学习候选排序。
 - DDP/FSDP2 共用训练入口；DCP 支持完整编号 checkpoint、独立进程 exact resume 和受控
@@ -97,6 +103,8 @@ AgiBotWorld2026。AgiBotWorld Beta 默认关闭，可在生成 5B 数据模板�
 RoboCasa，加入去重后的 55 个 OXE source，不使用旧 PCA token cache。数据容量、1K canary、
 100K 正式训练与结果检查见
 [WM3D 1B 全 OXE 按需缓存训练](docs/WM3D_1B_STREAMING.md)。
+默认站点配置已经选择 P64 geometry + 逐视角 P256 appearance 的 dual-path 模型；
+无需操作者再手工替换 RGB 配置。
 
 ## 真实小样本验收
 

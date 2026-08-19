@@ -164,15 +164,20 @@ def main() -> None:
         if metadata_seal["data_profile_sha256"] != data_profile.profile_sha256:
             raise RuntimeError("streaming metadata belongs to another data profile")
         geometry_grid = int(data_profile.cache_representation["token_grid"])
-        appearance_grid = geometry_grid
-        model_config = model["model"]
-        if bool(model_config.get("appearance_enabled", False)):
-            appearance_tokens = int(model_config["appearance_P"])
-            appearance_grid = int(math.isqrt(appearance_tokens))
+        configured_appearance_grid = data_profile.cache_representation.get(
+            "appearance_token_grid"
+        )
+        if configured_appearance_grid is not None:
+            appearance_grid = int(configured_appearance_grid)
+        elif bool(model["model"].get("appearance_enabled", False)):
+            appearance_tokens = int(model["model"]["appearance_P"])
+            appearance_grid = math.isqrt(appearance_tokens)
             if appearance_grid * appearance_grid != appearance_tokens:
                 raise RuntimeError("appearance_P must be a square token grid")
-            if appearance_grid < geometry_grid:
-                raise RuntimeError("appearance grid cannot be below the geometry grid")
+        else:
+            appearance_grid = geometry_grid
+        if appearance_grid < geometry_grid:
+            raise RuntimeError("appearance grid cannot be below the geometry grid")
         lru_root = args.streaming_lru_root.absolute()
         if lru_root.is_symlink():
             raise RuntimeError("streaming LRU root cannot be a symlink")

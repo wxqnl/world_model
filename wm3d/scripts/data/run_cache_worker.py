@@ -506,6 +506,12 @@ def main() -> None:
                 f"encoder/data representation {name} mismatch: "
                 f"{getattr(encoder_config, name)} != {expected}"
             )
+    expected_appearance_grid = int(representation.get("appearance_token_grid", 0))
+    if int(encoder_config.appearance_token_grid) != expected_appearance_grid:
+        raise CacheWorkerError(
+            "encoder/data representation appearance_token_grid mismatch: "
+            f"{encoder_config.appearance_token_grid} != {expected_appearance_grid}"
+        )
     task_encoder_digests = {task.task_encoder_contract_sha256 for task in tasks}
     if len(task_encoder_digests) != 1:
         raise CacheWorkerError("task plan mixes task encoder contracts")
