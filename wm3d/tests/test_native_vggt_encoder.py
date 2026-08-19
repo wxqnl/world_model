@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from pathlib import Path
 import torch
+from scripts.data.run_cache_worker import _strict_encoder
+
 
 from wm3d.encoders.native_vggt import NativeVGGTConfig, NativeVGGTEncoder
 
@@ -101,3 +104,10 @@ def test_dual_grid_preserves_per_view_appearance_tokens() -> None:
     assert output["appearance_tokens"].shape == (1, 2, 3, 16, 2048)
     assert output["appearance_tokens"][:, 0, 2].eq(0).all()
     assert output["appearance_tokens"][:, 1, 1].eq(0).all()
+
+
+def test_existing_encoder_contract_defaults_to_geometry_only() -> None:
+    config = _strict_encoder(
+        Path("configs/encoder/vggt_native_p64.yaml")
+    )
+    assert config.token_grid == 8

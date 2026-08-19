@@ -61,11 +61,13 @@ class PreparedTask:
 
 def _strict_encoder(path: Path) -> NativeVGGTConfig:
     value = yaml.safe_load(path.resolve(strict=True).read_text(encoding="utf-8"))
-    required = set(NativeVGGTConfig.__dataclass_fields__)
-    if not isinstance(value, dict) or set(value) != required:
+    fields = set(NativeVGGTConfig.__dataclass_fields__)
+    optional = {"appearance_token_grid"}
+    required = fields - optional
+    if not isinstance(value, dict) or not required.issubset(value) or set(value) - fields:
         raise CacheWorkerError(
             f"VGGT contract fields mismatch: missing={sorted(required-set(value or {}))} "
-            f"unknown={sorted(set(value or {})-required)}"
+            f"unknown={sorted(set(value or {})-fields)}"
         )
     config = NativeVGGTConfig(**value)
     config.validate()
