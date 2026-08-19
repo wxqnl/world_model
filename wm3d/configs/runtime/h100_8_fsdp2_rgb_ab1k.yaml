@@ -22,7 +22,7 @@ resources:
   forbid_nccl_ib_disable: true
   minimum_memlock_bytes: 1073741824
   minimum_nofile: 1048576
-  minimum_shm_bytes: 68719476736
+  minimum_shm_bytes: 34359738368
   minimum_data_free_bytes: 53687091200
   minimum_output_free_bytes: 21474836480
   minimum_allreduce_gbps: 100
