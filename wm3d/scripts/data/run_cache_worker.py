@@ -339,6 +339,7 @@ def _encode_task(
         camera_pose=encoded["camera_pose"],
         camera_pose_mask=camera_mask,
         geometry_confidence=encoded["geometry_confidence"],
+        appearance_tokens=encoded.get("appearance_tokens"),
     )
     encoded_prepared = PreparedTask(
         task=prepared.task,

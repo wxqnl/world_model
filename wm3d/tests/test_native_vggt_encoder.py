@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 from wm3d.encoders.native_vggt import NativeVGGTConfig, NativeVGGTEncoder
 
 
 class _RecordingEncoder(torch.nn.Module):
-    def __init__(self, grid: int = 2, dim: int = 2048):
+    def __init__(self, grid: int = 2, dim: int = 2048, appearance_grid: int = 0):
         super().__init__()
         self.grid = grid
         self.dim = dim
+        self.appearance_grid = appearance_grid
         self.calls: list[torch.Tensor] = []
 
     def forward(self, images: torch.Tensor):
@@ -21,7 +24,7 @@ class _RecordingEncoder(torch.nn.Module):
         scalar = identity[..., None, None, None].expand(batch, views, 2, 2, 1)
         vector = identity[..., None, None, None].expand(batch, views, 2, 2, 3)
         pose = identity[..., None].expand(batch, views, 9)
-        return {
+        result = {
             "pooled": tokens,
             "depth": scalar,
             "depth_conf": scalar.abs().add(1),
@@ -29,6 +32,12 @@ class _RecordingEncoder(torch.nn.Module):
             "world_points_conf": scalar.abs().add(1),
             "pose_enc": pose,
         }
+        if self.appearance_grid:
+            appearance_patches = self.appearance_grid * self.appearance_grid
+            result["appearance_pooled"] = identity[..., None, None].expand(
+                batch, views, appearance_patches, self.dim
+            )
+        return result
 
 
 def _config() -> NativeVGGTConfig:
@@ -73,3 +82,22 @@ def test_changing_a_future_frame_cannot_change_an_earlier_cached_token() -> None
     second = encoder(changed, mask)["view_tokens"]
     torch.testing.assert_close(first[:, :2], second[:, :2], rtol=0, atol=0)
     assert not torch.allclose(first[:, 2], second[:, 2])
+
+
+def test_dual_grid_preserves_per_view_appearance_tokens() -> None:
+    backend = _RecordingEncoder(appearance_grid=4)
+    config = replace(
+        _config(),
+        appearance_token_grid=4,
+        input_rgb_size=56,
+    )
+    encoder = NativeVGGTEncoder(config, device="cpu", encoder=backend)
+    images = torch.rand(1, 2, 3, 3, 56, 56)
+    mask = torch.tensor([[[True, True, False], [True, False, True]]])
+
+    output = encoder(images, mask)
+
+    assert output["view_tokens"].shape == (1, 2, 3, 4, 2048)
+    assert output["appearance_tokens"].shape == (1, 2, 3, 16, 2048)
+    assert output["appearance_tokens"][:, 0, 2].eq(0).all()
+    assert output["appearance_tokens"][:, 1, 1].eq(0).all()

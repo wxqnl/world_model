@@ -484,7 +484,8 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
         "encode_batch_frames",
         "decode_workers",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    optional = {"appearance_token_grid"}
+    if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - optional:
         raise RuntimeContractError("streaming_raw closure fields mismatch")
     if value.get("schema") != STREAMING_DATA_CLOSURE_SCHEMA:
         raise RuntimeContractError("streaming_raw closure schema mismatch")
@@ -506,6 +507,13 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
     ):
         if isinstance(value[field], bool) or int(value[field]) <= 0:
             raise RuntimeContractError(f"streaming_raw {field} must be positive")
+    if "appearance_token_grid" in value and (
+        isinstance(value["appearance_token_grid"], bool)
+        or int(value["appearance_token_grid"]) <= 0
+    ):
+        raise RuntimeContractError(
+            "streaming_raw appearance_token_grid must be positive"
+        )
     for field in ("metadata_root", "task_bank_root"):
         root = Path(str(value[field]))
         if not root.is_absolute() or root.is_symlink() or not root.is_dir():
@@ -651,18 +659,46 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
         data_profile = load_data_profile(
             Path(str(closure["data_profile_path"])), verify_source_manifests=False
         )
-        validate_model_data_compatibility(model, data_profile)
+        validate_model_data_compatibility(
+            model,
+            data_profile,
+            appearance_cache_grid=int(
+                closure.get(
+                    "appearance_token_grid",
+                    data_profile.cache_representation["token_grid"],
+                )
+            ),
+        )
         metadata_seal = load_streaming_metadata_seal(
             Path(str(closure["metadata_seal_path"])),
             expected_sha256=str(closure["metadata_seal_sha256"]),
         )
-        if metadata_seal["model_profile_sha256"] != canonical_sha256(model):
+        sealed_model = load_yaml(Path(str(metadata_seal["model_profile_path"])))
+        appearance_fields = {
+            "appearance_enabled",
+            "appearance_P",
+            "appearance_context_frames",
+            "appearance_hidden",
+            "appearance_layers",
+            "appearance_heads",
+            "appearance_ff_mult",
+        }
+        sealed_core = {
+            name: item for name, item in sealed_model["model"].items()
+            if name not in appearance_fields
+        }
+        runtime_core = {
+            name: item for name, item in model["model"].items()
+            if name not in appearance_fields
+        }
+        if (
+            sealed_model.get("schema") != model.get("schema")
+            or sealed_model.get("architecture") != model.get("architecture")
+            or sealed_model.get("sampling") != model.get("sampling")
+            or sealed_core != runtime_core
+        ):
             raise RuntimeContractError(
-                "streaming metadata belongs to a different model profile"
-            )
-        if load_yaml(Path(str(metadata_seal["model_profile_path"]))) != model:
-            raise RuntimeContractError(
-                "streaming metadata model profile differs from runtime"
+                "streaming metadata model data contract differs from runtime"
             )
     else:
         validate_data_closure(closure)

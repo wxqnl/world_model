@@ -364,9 +364,14 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         verify_shard_sha_on_open: bool = True,
         jpeg_reader_cache_size: int = 8,
         robot_reader_cache_size: int = 16,
+        appearance_cache_grid: int | None = None,
         grouped_normalizer: GroupedRobotNormalizer,
     ) -> None:
-        validate_model_data_compatibility(model_profile, data_profile)
+        validate_model_data_compatibility(
+            model_profile,
+            data_profile,
+            appearance_cache_grid=appearance_cache_grid,
+        )
         self.root = Path(cache_root).resolve(strict=True)
         entries = load_cache_index(index_path, expected_sha256=index_sha256)
         if split not in {"train", "val", "test"}:
@@ -396,7 +401,10 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         self.appearance_grid = _square_grid(
             int(model["appearance_P"]), label="appearance model"
         )
-        if self.appearance_enabled and self.appearance_grid > self.cache_grid:
+        self.appearance_cache_grid = (
+            self.cache_grid if appearance_cache_grid is None else int(appearance_cache_grid)
+        )
+        if self.appearance_enabled and self.appearance_grid > self.appearance_cache_grid:
             raise CacheDataError(
                 "appearance model grid exceeds cached per-view representation"
             )
@@ -556,31 +564,35 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
 
         appearance: dict[str, torch.Tensor] = {}
         if self.appearance_enabled:
+            context_appearance_tokens = context_view_tokens
+            future_appearance_tokens = future_view_tokens
+            if self.appearance_cache_grid != self.cache_grid:
+                context_appearance_tokens = self.shards.read_quantized_many(
+                    entry.feature_shard, "appearance_tokens", context_rows
+                )
+                future_appearance_tokens = self.shards.read_quantized_many(
+                    entry.feature_shard, "appearance_tokens", future_rows
+                )
             context_start = self.T - self.appearance_context_frames
             appearance_context = _pool_tokens(
-                context_view_tokens[context_start:].contiguous(),
-                source_grid=self.cache_grid,
+                context_appearance_tokens[context_start:].contiguous(),
+                source_grid=self.appearance_cache_grid,
                 target_grid=self.appearance_grid,
             ).contiguous()
             appearance_target = _pool_tokens(
-                future_view_tokens,
-                source_grid=self.cache_grid,
+                future_appearance_tokens,
+                source_grid=self.appearance_cache_grid,
                 target_grid=self.appearance_grid,
             ).contiguous()
-            world_valid = _pool_valid_mask(
-                frame["world_token_mask"].bool(),
-                source_grid=self.cache_grid,
-                target_grid=self.appearance_grid,
-            )
             appearance["appearance_context_tokens"] = appearance_context
             appearance["appearance_context_mask"] = (
                 frame["view_mask"][context_start : self.T, :, None].bool()
-                & world_valid[context_start : self.T, None]
+                .expand(-1, -1, self.appearance_grid * self.appearance_grid)
             )
             appearance["target_appearance_tokens"] = appearance_target
             appearance["target_appearance_mask"] = (
                 frame["view_mask"][future, :, None].bool()
-                & world_valid[future, None]
+                .expand(-1, -1, self.appearance_grid * self.appearance_grid)
             )
 
         rgb_rows = torch.tensor(self.rgb_indices, dtype=torch.long) + self.T

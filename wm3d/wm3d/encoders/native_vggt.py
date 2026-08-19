@@ -21,6 +21,7 @@ class NativeVGGTConfig:
     model_name: str = "facebook/VGGT-1B"
     model_revision: str = ""
     token_grid: int = 12
+    appearance_token_grid: int = 0
     # VGGT input resolution and WM3D's stored RGB target resolution are two
     # different contracts.  518 is 37 patches at VGGT's patch size 14.
     input_rgb_size: int = 518
@@ -46,6 +47,12 @@ class NativeVGGTConfig:
             raise ValueError("token grid/input RGB/target RGB/max_views must be positive")
         if self.input_rgb_size % 14:
             raise ValueError("VGGT input_rgb_size must be divisible by patch size 14")
+        if self.appearance_token_grid < 0:
+            raise ValueError("appearance_token_grid cannot be negative")
+        if self.appearance_token_grid > self.input_rgb_size // 14:
+            raise ValueError(
+                "appearance_token_grid exceeds the native VGGT patch grid"
+            )
         if self.input_preprocess != "aspect_pad_white":
             raise ValueError(
                 "VGGT input preprocessing must preserve aspect ratio and pad white"
@@ -111,6 +118,7 @@ class NativeVGGTEncoder(torch.nn.Module):
             model_revision=config.model_revision,
             local_files_only=local_files_only,
             token_grid=config.token_grid,
+            appearance_token_grid=config.appearance_token_grid or None,
             return_depth=True,
             return_depth_conf=True,
             return_geom_extra=True,
@@ -131,6 +139,18 @@ class NativeVGGTEncoder(torch.nn.Module):
             self.config.token_dim,
         ):
             raise RuntimeError(f"VGGT token ABI drifted to {tuple(tokens.shape)}")
+        appearance_tokens = encoded.get("appearance_pooled")
+        appearance_grid = int(self.config.appearance_token_grid)
+        if appearance_grid:
+            if appearance_tokens is None or appearance_tokens.ndim != 4:
+                raise RuntimeError("VGGT appearance token output is missing")
+            if appearance_tokens.shape[-2:] != (
+                appearance_grid * appearance_grid,
+                self.config.token_dim,
+            ):
+                raise RuntimeError(
+                    f"VGGT appearance token ABI drifted to {tuple(appearance_tokens.shape)}"
+                )
         depth = _pool_scalar(encoded["depth"], grid)
         depth_conf = _pool_scalar(encoded["depth_conf"], grid)
         point = _pool_vector(encoded["world_points"], grid)
@@ -144,13 +164,16 @@ class NativeVGGTEncoder(torch.nn.Module):
         pose = encoded["pose_enc"]
         if pose.shape[-1] < 9:
             raise RuntimeError(f"VGGT pose dim {pose.shape[-1]} is below 9")
-        return {
+        result = {
             "tokens": tokens,
             "depth": depth,
             "point": point,
             "confidence": confidence,
             "pose": pose[..., :9],
         }
+        if appearance_tokens is not None:
+            result["appearance_tokens"] = appearance_tokens
+        return result
 
     @torch.inference_mode()
     def forward(
@@ -189,6 +212,15 @@ class NativeVGGTEncoder(torch.nn.Module):
 
         patches = self.config.token_grid * self.config.token_grid
         tokens = images.new_zeros(batch * times, views, patches, self.config.token_dim)
+        appearance_grid = int(self.config.appearance_token_grid)
+        appearance_tokens = None
+        if appearance_grid:
+            appearance_tokens = images.new_zeros(
+                batch * times,
+                views,
+                appearance_grid * appearance_grid,
+                self.config.token_dim,
+            )
         depth = images.new_zeros(batch * times, views, patches)
         point = images.new_zeros(batch * times, views, patches, 3)
         confidence = images.new_zeros(batch * times, views, patches)
@@ -204,18 +236,25 @@ class NativeVGGTEncoder(torch.nn.Module):
             # The second dimension is simultaneous views only.  Different
             # times remain independent batch elements.
             encoded = self._encode_pattern(selected)
-            for output, name in (
+            outputs = [
                 (tokens, "tokens"),
                 (depth, "depth"),
                 (point, "point"),
                 (confidence, "confidence"),
                 (pose, "pose"),
-            ):
+            ]
+            if appearance_tokens is not None:
+                outputs.insert(1, (appearance_tokens, "appearance_tokens"))
+            for output, name in outputs:
                 value = encoded[name].to(dtype=output.dtype)
                 for local_view, global_view in enumerate(active.tolist()):
                     output[rows, global_view] = value[:, local_view]
 
         tokens = tokens.reshape(batch, times, views, patches, -1)
+        if appearance_tokens is not None:
+            appearance_tokens = appearance_tokens.reshape(
+                batch, times, views, appearance_grid * appearance_grid, -1
+            )
         depth = depth.reshape(batch, times, views, patches)
         point = point.reshape(batch, times, views, patches, 3)
         confidence = confidence.reshape(batch, times, views, patches)
@@ -227,7 +266,7 @@ class NativeVGGTEncoder(torch.nn.Module):
             align_corners=False,
             antialias=True,
         ).reshape(batch, times, views, 3, self.config.target_rgb_size, self.config.target_rgb_size)
-        return {
+        result = {
             "view_tokens": tokens.to(torch.bfloat16),
             "view_mask": view_mask.bool(),
             "rgb": rgb.mul(255).round().clamp(0, 255).to(torch.uint8),
@@ -236,3 +275,6 @@ class NativeVGGTEncoder(torch.nn.Module):
             "geometry_confidence": confidence.to(torch.float16),
             "camera_pose": pose.to(torch.float32),
         }
+        if appearance_tokens is not None:
+            result["appearance_tokens"] = appearance_tokens.to(torch.bfloat16)
+        return result

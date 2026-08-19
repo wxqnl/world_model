@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -249,7 +250,12 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
     supervision: str,
 ) -> None:
     task = _task(supervision)
-    frames = _frames()
+    frames = replace(
+        _frames(),
+        appearance_tokens=torch.randn(
+            len(_clock()), 2, 16, 16, dtype=torch.float32
+        ),
+    )
     robot = _robot(supervision)
     first = write_cache_task(
         task=task,
@@ -330,7 +336,7 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
     dual_profile["model"].update(
         {
             "appearance_enabled": True,
-            "appearance_P": 4,
+            "appearance_P": 16,
             "appearance_context_frames": 2,
             "appearance_hidden": 16,
             "appearance_layers": 1,
@@ -345,16 +351,14 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
         data_profile=profile,
         model_profile=dual_profile,
         split="train",
+        appearance_cache_grid=4,
         grouped_normalizer=normalizer,
     )
     dual_loaded = dual_dataset[0]
-    assert dual_loaded["appearance_context_tokens"].shape == (2, 2, 4, 16)
-    assert dual_loaded["target_appearance_tokens"].shape == (2, 2, 4, 16)
-    assert dual_loaded["appearance_context_mask"].shape == (2, 2, 4)
-    assert dual_loaded["target_appearance_mask"].shape == (2, 2, 4)
-    torch.testing.assert_close(
-        dual_loaded["appearance_context_tokens"], dual_loaded["world_tokens"]
-    )
+    assert dual_loaded["appearance_context_tokens"].shape == (2, 2, 16, 16)
+    assert dual_loaded["target_appearance_tokens"].shape == (2, 2, 16, 16)
+    assert dual_loaded["appearance_context_mask"].shape == (2, 2, 16)
+    assert dual_loaded["target_appearance_mask"].shape == (2, 2, 16)
 
     assert loaded["world_tokens"].shape == (2, 2, 4, 16)
     assert loaded["target_tokens"].shape == (2, 4, 16)

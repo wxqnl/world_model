@@ -26,6 +26,7 @@ from wm3d.data.unified_cache_dataset import UnifiedCacheDataset
 from wm3d.data.streaming_raw import (
     STREAMING_DATA_CLOSURE_SCHEMA,
     StreamingRawDataset,
+    load_streaming_metadata_seal,
 )
 from wm3d.data.grouped_normalization import GroupedRobotNormalizer
 from wm3d.data.formal_cache_adapter import (
@@ -508,11 +509,18 @@ def _build_mixed_dataset(
         profile = load_data_profile(
             Path(closure["data_profile_path"]), verify_source_manifests=True
         )
+    normalization_model_sha = runtime["bindings"]["model_profile_sha256"]
+    if closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
+        metadata_seal = load_streaming_metadata_seal(
+            Path(str(closure["metadata_seal_path"])),
+            expected_sha256=str(closure["metadata_seal_sha256"]),
+        )
+        normalization_model_sha = str(metadata_seal["model_profile_sha256"])
     normalizer = GroupedRobotNormalizer.load(
         Path(closure["grouped_normalization_path"]),
         expected_sha256=closure["grouped_normalization_sha256"],
         expected_data_profile_sha256=closure["data_profile_sha256"],
-        expected_model_profile_sha256=runtime["bindings"]["model_profile_sha256"],
+        expected_model_profile_sha256=normalization_model_sha,
         expected_window_index_sha256=closure["cache_index_sha256"],
         data_profile=profile,
     )

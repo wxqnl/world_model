@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
 import json
 from pathlib import Path
 import shutil
@@ -162,6 +163,13 @@ class _StreamingEpisodeCache:
             raise StreamingRawError("streaming rank LRU root cannot be a symlink")
         self.batch_frames = int(closure["encode_batch_frames"])
         self.decode_workers = int(closure["decode_workers"])
+        self.appearance_token_grid = int(
+            closure.get(
+                "appearance_token_grid", profile.cache_representation["token_grid"]
+            )
+        )
+        if self.appearance_token_grid < int(profile.cache_representation["token_grid"]):
+            raise StreamingRawError("appearance cache grid cannot be below geometry grid")
         if self.batch_frames <= 0 or self.decode_workers <= 0:
             raise StreamingRawError("streaming encode/decode concurrency is invalid")
 
@@ -320,7 +328,15 @@ class _StreamingEpisodeCache:
             from scripts.data.run_cache_worker import _strict_encoder
             from wm3d.encoders.native_vggt import NativeVGGTEncoder
 
-            self._encoder_config = _strict_encoder(self.encoder_contract)
+            base_config = _strict_encoder(self.encoder_contract)
+            self._encoder_config = replace(
+                base_config,
+                appearance_token_grid=(
+                    self.appearance_token_grid
+                    if self.appearance_token_grid > int(base_config.token_grid)
+                    else 0
+                ),
+            )
             self._encoder = NativeVGGTEncoder(
                 self._encoder_config, device=str(self.device)
             ).eval()
@@ -479,7 +495,9 @@ class _StreamingEpisodeCache:
         }
 
 
-_MANAGER_REGISTRY: dict[tuple[str, str, str, int], _StreamingEpisodeCache] = {}
+_MANAGER_REGISTRY: dict[
+    tuple[str, str, str, int, int], _StreamingEpisodeCache
+] = {}
 
 
 def _shared_manager(
@@ -494,6 +512,7 @@ def _shared_manager(
         str(closure["lru_root"]),
         str(torch.device(device)),
         int(rank),
+        int(closure.get("appearance_token_grid", profile.cache_representation["token_grid"])),
     )
     manager = _MANAGER_REGISTRY.get(key)
     if manager is None:
@@ -530,6 +549,9 @@ class StreamingRawDataset(UnifiedCacheDataset):
             verify_shard_sha_on_open=True,
             jpeg_reader_cache_size=0,
             robot_reader_cache_size=0,
+            appearance_cache_grid=int(
+                closure.get("appearance_token_grid", data_profile.cache_representation["token_grid"])
+            ),
             grouped_normalizer=grouped_normalizer,
         )
         episode_index = load_cache_episode_index(

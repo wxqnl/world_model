@@ -105,7 +105,10 @@ def validate_model_profile(profile: Mapping[str, Any]) -> None:
 
 
 def validate_model_data_compatibility(
-    profile: Mapping[str, Any], data_profile: Any
+    profile: Mapping[str, Any],
+    data_profile: Any,
+    *,
+    appearance_cache_grid: int | None = None,
 ) -> None:
     """Reject a model/data pairing that would truncate a robot or cache.
 
@@ -131,12 +134,19 @@ def validate_model_data_compatibility(
     if model_grid > cache_grid:
         raise ValueError("model spatial grid exceeds the shared episode cache")
     if cfg.appearance_enabled:
+        available_appearance_grid = (
+            cache_grid
+            if appearance_cache_grid is None
+            else int(appearance_cache_grid)
+        )
         appearance_grid = int(round(int(cfg.appearance_P) ** 0.5))
         if (
             appearance_grid * appearance_grid != int(cfg.appearance_P)
-            or appearance_grid > cache_grid
+            or appearance_grid > available_appearance_grid
         ):
-            raise ValueError("appearance spatial grid exceeds the shared episode cache")
+            raise ValueError(
+                "appearance spatial grid exceeds the available per-view cache"
+            )
     for model_field, cache_field, label in (
         ("token_dim", "token_dim", "token dimension"),
         ("num_views", "num_views", "canonical view count"),

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -162,6 +163,16 @@ def main() -> None:
         metadata_seal = load_streaming_metadata_seal(metadata_seal_path)
         if metadata_seal["data_profile_sha256"] != data_profile.profile_sha256:
             raise RuntimeError("streaming metadata belongs to another data profile")
+        geometry_grid = int(data_profile.cache_representation["token_grid"])
+        appearance_grid = geometry_grid
+        model_config = model["model"]
+        if bool(model_config.get("appearance_enabled", False)):
+            appearance_tokens = int(model_config["appearance_P"])
+            appearance_grid = int(math.isqrt(appearance_tokens))
+            if appearance_grid * appearance_grid != appearance_tokens:
+                raise RuntimeError("appearance_P must be a square token grid")
+            if appearance_grid < geometry_grid:
+                raise RuntimeError("appearance grid cannot be below the geometry grid")
         lru_root = args.streaming_lru_root.absolute()
         if lru_root.is_symlink():
             raise RuntimeError("streaming LRU root cannot be a symlink")
@@ -197,6 +208,7 @@ def main() -> None:
             ),
             "encode_batch_frames": int(args.streaming_encode_batch_frames),
             "decode_workers": int(args.streaming_decode_workers),
+            "appearance_token_grid": appearance_grid,
         }
     value = {
         "schema": RUNTIME_CONFIG_SCHEMA,

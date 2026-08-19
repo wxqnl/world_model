@@ -51,6 +51,7 @@ class VGGTEncoder(torch.nn.Module):
         device: str = "cuda",
         model_name: str = "facebook/VGGT-1B",
         token_grid: int = 8,
+        appearance_token_grid: int | None = None,
         return_depth: bool = False,
         return_depth_conf: bool = False,
         return_geom_extra: bool = False,
@@ -90,6 +91,11 @@ class VGGTEncoder(torch.nn.Module):
 
         self.device = torch.device(device)
         self.token_grid = int(token_grid)
+        self.appearance_token_grid = (
+            0 if appearance_token_grid is None else int(appearance_token_grid)
+        )
+        if self.appearance_token_grid < 0:
+            raise ValueError("appearance token grid cannot be negative")
         self.return_depth = bool(return_depth)
         self.return_depth_conf = bool(return_depth_conf)
         self.return_geom_extra = bool(return_geom_extra)
@@ -137,8 +143,12 @@ class VGGTEncoder(torch.nn.Module):
         tokens = aggregated_tokens[-1]
         patch_start = int(patch_start_idx)
         patch_tokens = tokens[:, :, patch_start:, :]
-        pooled = self._pool_patch_tokens(patch_tokens).to(torch.float16)
+        pooled = self._pool_patch_tokens(patch_tokens, self.token_grid).to(torch.float16)
         out: dict[str, Any] = {"pooled": pooled}
+        if self.appearance_token_grid:
+            out["appearance_pooled"] = self._pool_patch_tokens(
+                patch_tokens, self.appearance_token_grid
+            ).to(torch.float16)
         missing: list[str] = []
 
         need_depth_head = (
@@ -185,13 +195,16 @@ class VGGTEncoder(torch.nn.Module):
             out["geom_extra_missing"] = missing
         return out
 
-    def _pool_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _pool_patch_tokens(
+        patch_tokens: torch.Tensor, target_grid: int
+    ) -> torch.Tensor:
         b, t, n, d = patch_tokens.shape
         grid = int(math.isqrt(n))
         if grid <= 0 or grid * grid != n:
             raise ValueError(f"cannot infer square token grid from {n} patch tokens")
         x = patch_tokens[:, :, : grid * grid, :].reshape(b * t, grid, grid, d)
         x = x.permute(0, 3, 1, 2).contiguous()
-        x = F.adaptive_avg_pool2d(x.float(), (self.token_grid, self.token_grid))
-        x = x.permute(0, 2, 3, 1).reshape(b, t, self.token_grid * self.token_grid, d)
+        x = F.adaptive_avg_pool2d(x.float(), (target_grid, target_grid))
+        x = x.permute(0, 2, 3, 1).reshape(b, t, target_grid * target_grid, d)
         return x

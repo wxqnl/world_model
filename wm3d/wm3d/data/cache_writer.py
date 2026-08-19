@@ -45,6 +45,7 @@ class UnifiedFrameCache:
     camera_pose: torch.Tensor
     camera_pose_mask: torch.Tensor
     geometry_confidence: torch.Tensor
+    appearance_tokens: torch.Tensor | None = None
 
 
 def _fsync(path: Path) -> None:
@@ -116,6 +117,19 @@ def _validate_frames(frames: UnifiedFrameCache) -> int:
         raise CacheWriterError("RGB frames must be uint8 [N,V,3,H,W]")
     if not bool(frames.view_mask.any(dim=1).all()):
         raise CacheWriterError("every frame requires at least one real view")
+    if frames.appearance_tokens is not None:
+        appearance = frames.appearance_tokens
+        if (
+            appearance.ndim != 4
+            or appearance.shape[0] != count
+            or appearance.shape[1] != views
+            or appearance.shape[-1] != frames.view_tokens.shape[-1]
+        ):
+            raise CacheWriterError(
+                "appearance_tokens must be [N,V,P_appearance,D]"
+            )
+        if not appearance.is_floating_point() or not bool(torch.isfinite(appearance).all()):
+            raise CacheWriterError("appearance_tokens must be finite floating values")
     if bool((frames.depth_mask & ~frames.view_mask[..., None]).any()) or bool(
         (frames.point_mask & ~frames.view_mask[..., None]).any()
     ):
@@ -203,24 +217,31 @@ def write_cache_task(
             raise
 
         view_q, view_scale = quantize_per_vector(frames.view_tokens)
+        feature_tensors = {
+            "view_tokens_q": view_q,
+            "view_tokens_scale": view_scale,
+            "source_observation_row": frames.source_observation_rows.cpu().contiguous(),
+            "frame_time_s": frames.frame_times_s.cpu().contiguous(),
+            "view_mask": frames.view_mask.cpu().contiguous(),
+            "world_token_mask": frames.world_token_mask.cpu().contiguous(),
+            "depth": frames.depth.cpu().contiguous(),
+            "depth_mask": frames.depth_mask.cpu().contiguous(),
+            "point": frames.point.cpu().contiguous(),
+            "point_mask": frames.point_mask.cpu().contiguous(),
+            "camera_pose": frames.camera_pose.cpu().contiguous(),
+            "camera_pose_mask": frames.camera_pose_mask.cpu().contiguous(),
+            "geometry_confidence": frames.geometry_confidence.cpu().contiguous(),
+            "rgb_offsets": torch.stack(offsets),
+            "rgb_lengths": torch.stack(lengths),
+        }
+        if frames.appearance_tokens is not None:
+            appearance_q, appearance_scale = quantize_per_vector(
+                frames.appearance_tokens
+            )
+            feature_tensors["appearance_tokens_q"] = appearance_q
+            feature_tensors["appearance_tokens_scale"] = appearance_scale
         save_file(
-            {
-                "view_tokens_q": view_q,
-                "view_tokens_scale": view_scale,
-                "source_observation_row": frames.source_observation_rows.cpu().contiguous(),
-                "frame_time_s": frames.frame_times_s.cpu().contiguous(),
-                "view_mask": frames.view_mask.cpu().contiguous(),
-                "world_token_mask": frames.world_token_mask.cpu().contiguous(),
-                "depth": frames.depth.cpu().contiguous(),
-                "depth_mask": frames.depth_mask.cpu().contiguous(),
-                "point": frames.point.cpu().contiguous(),
-                "point_mask": frames.point_mask.cpu().contiguous(),
-                "camera_pose": frames.camera_pose.cpu().contiguous(),
-                "camera_pose_mask": frames.camera_pose_mask.cpu().contiguous(),
-                "geometry_confidence": frames.geometry_confidence.cpu().contiguous(),
-                "rgb_offsets": torch.stack(offsets),
-                "rgb_lengths": torch.stack(lengths),
-            },
+            feature_tensors,
             temporary / "features.safetensors",
         )
         save_file(
