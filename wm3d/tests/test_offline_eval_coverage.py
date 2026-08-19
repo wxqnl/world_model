@@ -4,12 +4,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 import yaml
 
 from wm3d.data.manifest_contract import sha256_file
 from wm3d.training.offline_eval import (
     OfflineEvalError,
     declared_eval_coverage_lanes,
+    rgb_quality_metrics,
+    save_rgb_depth_demo,
     validate_eval_coverage,
 )
 
@@ -138,7 +141,9 @@ def _adapter(path: Path, *, group: str, supervision: str) -> SimpleNamespace:
 
 
 def test_declared_lanes_only_use_sources_active_in_eval_split(tmp_path: Path) -> None:
-    fine = _adapter(tmp_path / "fine.yaml", group="fine_arm", supervision="fine_command")
+    fine = _adapter(
+        tmp_path / "fine.yaml", group="fine_arm", supervision="fine_command"
+    )
     coarse = _adapter(
         tmp_path / "coarse.yaml", group="coarse_arm", supervision="coarse_effect"
     )
@@ -190,3 +195,40 @@ def test_declared_lanes_only_use_sources_active_in_eval_split(tmp_path: Path) ->
     assert "coarse_supervised_dimensions" in coarse_active
     with pytest.raises(OfflineEvalError, match="coarse_supervised_dimensions"):
         validate_eval_coverage(metrics, expected_lanes=coarse_active)
+
+
+def test_rgb_quality_metrics_and_demo_export(tmp_path: Path) -> None:
+    target_rgb = torch.linspace(0.0, 1.0, 16 * 16).reshape(1, 1, 1, 1, 16, 16)
+    target_rgb = target_rgb.expand(-1, 2, -1, 3, -1, -1).contiguous()
+    target_depth = torch.linspace(0.2, 2.0, 64).reshape(1, 1, 1, 64)
+    target_depth = target_depth.expand(-1, 2, -1, -1).contiguous()
+    batch = {
+        "target_rgb": target_rgb,
+        "target_rgb_mask": torch.ones(1, 2, 1, 1, 1, 1, dtype=torch.bool),
+        "target_depth": target_depth,
+    }
+    exact = {"rgb": target_rgb.clone(), "depth": target_depth.clone()}
+    exact_metrics = rgb_quality_metrics(exact, batch)
+    assert exact_metrics["rgb_psnr_db"].item() == pytest.approx(100.0)
+    assert exact_metrics["rgb_ssim"].item() == pytest.approx(1.0)
+
+    blurred = {
+        "rgb": torch.full_like(target_rgb, 0.5),
+        "depth": target_depth * 1.1,
+    }
+    blurred_metrics = rgb_quality_metrics(blurred, batch)
+    assert blurred_metrics["rgb_psnr_db"] < exact_metrics["rgb_psnr_db"]
+    assert blurred_metrics["rgb_ssim"] < exact_metrics["rgb_ssim"]
+
+    paths = save_rgb_depth_demo(
+        tmp_path,
+        output=blurred,
+        batch=batch,
+        sample_index=0,
+        file_index=0,
+    )
+    assert [Path(value).name for value in paths] == [
+        "sample_000_rgb.png",
+        "sample_000_depth.png",
+    ]
+    assert all(Path(value).is_file() for value in paths)

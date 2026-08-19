@@ -9,8 +9,10 @@ from pathlib import Path
 import re
 from typing import Any
 
+from PIL import Image, ImageDraw
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from wm3d.data.source_adapters import load_adapter_contract
 from wm3d.models.model_factory import build_world_model
@@ -110,9 +112,10 @@ def declared_eval_coverage_lanes(
         "native_token_supervised_elements",
         "current_state_supervised_dimensions",
     }
-    if getattr(objective, "appearance_mse", 0.0) > 0.0 or getattr(
-        objective, "appearance_cosine", 0.0
-    ) > 0.0:
+    if (
+        getattr(objective, "appearance_mse", 0.0) > 0.0
+        or getattr(objective, "appearance_cosine", 0.0) > 0.0
+    ):
         lanes.add("appearance_supervised_elements")
     for key, lane in (
         ("rgb_codec", "rgb_supervised_elements"),
@@ -161,7 +164,8 @@ def declared_eval_coverage_lanes(
         lane
         for lane in lanes
         if lane == "current_state_supervised_dimensions"
-        or lane in {
+        or lane
+        in {
             "fine_continuous_supervised_dimensions",
             "fine_binary_supervised_dimensions",
         }
@@ -204,9 +208,180 @@ def validate_eval_coverage(
     ):
         value = float(metrics.get(lane, 0.0))
         if lane in expected_lanes and (not math.isfinite(value) or value <= 0.0):
-            raise OfflineEvalError(f"offline eval has zero coverage for declared lane {lane}")
+            raise OfflineEvalError(
+                f"offline eval has zero coverage for declared lane {lane}"
+            )
         coverage[lane] = value
     return coverage
+
+
+def rgb_quality_metrics(
+    output: dict[str, torch.Tensor] | Any,
+    batch: dict[str, torch.Tensor] | Any,
+) -> dict[str, torch.Tensor]:
+    """Return image-weighted PSNR/SSIM for fully supervised RGB frames."""
+
+    prediction = output["rgb"].float().clamp(0.0, 1.0)
+    target = batch["target_rgb"].float().clamp(0.0, 1.0)
+    if prediction.shape != target.shape or prediction.ndim != 6:
+        raise OfflineEvalError("RGB eval tensors must align as [B,F,V,3,H,W]")
+    mask = batch.get(
+        "target_rgb_mask",
+        torch.ones_like(target[:, :, :, :1, :1, :1], dtype=torch.bool),
+    )
+    expanded = torch.broadcast_to(mask.bool(), target.shape)
+    flat_mask = expanded.reshape(-1, *target.shape[-3:])
+    image_all = flat_mask.all(dim=(1, 2, 3))
+    image_any = flat_mask.any(dim=(1, 2, 3))
+    if not bool((image_all == image_any).all()):
+        raise OfflineEvalError("RGB quality metrics require whole-image masks")
+    valid = torch.nonzero(image_all, as_tuple=False).flatten()
+    if valid.numel() == 0:
+        raise OfflineEvalError("RGB quality metrics have no supervised images")
+    prediction = prediction.reshape(-1, *prediction.shape[-3:]).index_select(0, valid)
+    target = target.reshape(-1, *target.shape[-3:]).index_select(0, valid)
+    per_image_mse = (prediction - target).square().mean(dim=(1, 2, 3))
+    psnr = -10.0 * torch.log10(per_image_mse.clamp_min(1.0e-10))
+
+    kernel = min(11, int(prediction.shape[-2]), int(prediction.shape[-1]))
+    if kernel % 2 == 0:
+        kernel -= 1
+    if kernel < 1:
+        raise OfflineEvalError("RGB images have invalid spatial dimensions")
+    mu_prediction = F.avg_pool2d(prediction, kernel, stride=1)
+    mu_target = F.avg_pool2d(target, kernel, stride=1)
+    prediction_variance = (
+        F.avg_pool2d(prediction.square(), kernel, stride=1) - mu_prediction.square()
+    ).clamp_min(0.0)
+    target_variance = (
+        F.avg_pool2d(target.square(), kernel, stride=1) - mu_target.square()
+    ).clamp_min(0.0)
+    covariance = (
+        F.avg_pool2d(prediction * target, kernel, stride=1) - mu_prediction * mu_target
+    )
+    c1 = 0.01**2
+    c2 = 0.03**2
+    ssim = ((2.0 * mu_prediction * mu_target + c1) * (2.0 * covariance + c2)) / (
+        (mu_prediction.square() + mu_target.square() + c1)
+        * (prediction_variance + target_variance + c2)
+    ).clamp_min(1.0e-12)
+    return {"rgb_psnr_db": psnr.mean(), "rgb_ssim": ssim.mean()}
+
+
+def _rgb_tile(value: torch.Tensor) -> Image.Image:
+    array = (
+        value.detach()
+        .float()
+        .clamp(0.0, 1.0)
+        .mul(255.0)
+        .round()
+        .to(torch.uint8)
+        .permute(1, 2, 0)
+        .cpu()
+        .numpy()
+    )
+    return Image.fromarray(array, mode="RGB")
+
+
+def _depth_tile(value: torch.Tensor, *, low: float, high: float) -> Image.Image:
+    side = math.isqrt(int(value.numel()))
+    if side * side != value.numel():
+        raise OfflineEvalError("depth demo expects a square native patch grid")
+    normalized = (value.detach().float().reshape(side, side) - low) / max(
+        high - low, 1.0e-6
+    )
+    array = normalized.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).cpu().numpy()
+    image = Image.fromarray(array, mode="L")
+    return image.resize((256, 256), Image.Resampling.NEAREST).convert("RGB")
+
+
+def _save_demo_grid(
+    path: Path,
+    *,
+    rows: list[tuple[str, Image.Image, Image.Image, Image.Image]],
+) -> None:
+    if path.exists():
+        raise OfflineEvalError(f"refusing to overwrite demo image: {path}")
+    label_height = 20
+    width = 3 * rows[0][1].width
+    row_height = label_height + rows[0][1].height
+    canvas = Image.new("RGB", (width, row_height * len(rows)), color="white")
+    draw = ImageDraw.Draw(canvas)
+    for row_index, (label, target, prediction, error) in enumerate(rows):
+        top = row_index * row_height
+        for column, (name, image) in enumerate(
+            (("target", target), ("prediction", prediction), ("abs error", error))
+        ):
+            left = column * image.width
+            draw.text((left + 4, top + 3), f"{label} {name}", fill="black")
+            canvas.paste(image, (left, top + label_height))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path, format="PNG")
+
+
+def save_rgb_depth_demo(
+    root: Path,
+    *,
+    output: dict[str, torch.Tensor] | Any,
+    batch: dict[str, torch.Tensor] | Any,
+    sample_index: int,
+    file_index: int,
+) -> list[str]:
+    """Save target/prediction/error panels for one deterministic val sample."""
+
+    rgb_prediction = output["rgb"][sample_index]
+    rgb_target = batch["target_rgb"][sample_index]
+    rgb_rows: list[tuple[str, Image.Image, Image.Image, Image.Image]] = []
+    for frame in range(min(4, int(rgb_prediction.shape[0]))):
+        for view in range(int(rgb_prediction.shape[1])):
+            target_tile = _rgb_tile(rgb_target[frame, view])
+            prediction_tile = _rgb_tile(rgb_prediction[frame, view])
+            error_tile = _rgb_tile(
+                (rgb_prediction[frame, view] - rgb_target[frame, view]).abs()
+            )
+            rgb_rows.append(
+                (
+                    f"future={frame} view={view}",
+                    target_tile,
+                    prediction_tile,
+                    error_tile,
+                )
+            )
+    rgb_path = root / f"sample_{file_index:03d}_rgb.png"
+    _save_demo_grid(rgb_path, rows=rgb_rows)
+
+    depth_prediction = output["depth"][sample_index]
+    depth_target = batch["target_depth"][sample_index]
+    depth_rows: list[tuple[str, Image.Image, Image.Image, Image.Image]] = []
+    for frame in range(min(4, int(depth_prediction.shape[0]))):
+        for view in range(int(depth_prediction.shape[1])):
+            target_value = depth_target[frame, view]
+            prediction_value = depth_prediction[frame, view]
+            finite = torch.cat((target_value.flatten(), prediction_value.flatten()))
+            finite = finite[torch.isfinite(finite)]
+            if finite.numel() == 0:
+                continue
+            low = float(finite.min())
+            high = float(finite.max())
+            error = (prediction_value - target_value).abs()
+            depth_rows.append(
+                (
+                    f"future={frame} view={view}",
+                    _depth_tile(target_value, low=low, high=high),
+                    _depth_tile(prediction_value, low=low, high=high),
+                    _depth_tile(
+                        error,
+                        low=0.0,
+                        high=float(error.max().clamp_min(1.0e-6)),
+                    ),
+                )
+            )
+    paths = [str(rgb_path)]
+    if depth_rows:
+        depth_path = root / f"sample_{file_index:03d}_depth.png"
+        _save_demo_grid(depth_path, rows=depth_rows)
+        paths.append(str(depth_path))
+    return paths
 
 
 def parse_args() -> argparse.Namespace:
@@ -214,11 +389,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--demo-root", type=Path)
+    parser.add_argument("--demo-samples", type=int, default=0)
+    parser.add_argument("--appearance-teacher-ratio", type=float, default=0.0)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.demo_samples < 0 or (args.demo_samples > 0) != (args.demo_root is not None):
+        raise OfflineEvalError(
+            "--demo-root and a positive --demo-samples must be supplied together"
+        )
+    if not 0.0 <= args.appearance_teacher_ratio <= 1.0:
+        raise OfflineEvalError("--appearance-teacher-ratio must lie in [0,1]")
     config, runtime_sha = load_materialized_runtime(args.runtime)
     runtime = config["runtime_profile"]
     strategy = strategy_from_mapping(runtime["distributed"])
@@ -230,7 +414,9 @@ def main() -> None:
             config, runtime_sha, context
         )
         if re.fullmatch(r"step_[0-9]{8}", args.checkpoint.name) is None:
-            raise OfflineEvalError("checkpoint must be an explicit step_XXXXXXXX directory")
+            raise OfflineEvalError(
+                "checkpoint must be an explicit step_XXXXXXXX directory"
+            )
         checkpoint_step = int(args.checkpoint.name.split("_")[1])
         validation_steps = int(runtime["train"]["validation_steps"])
         if validation_steps <= 0:
@@ -300,9 +486,10 @@ def main() -> None:
             raise OfflineEvalError(f"checkpoint inspection failed: {inspection[0]}")
         run_contract = _run_contract(config, parameter_counts, raw_model)
         run_contract_path = Path(config["run"]["output_root"]) / "run_contract.json"
-        if not run_contract_path.is_file() or json.loads(
-            run_contract_path.read_text(encoding="utf-8")
-        ) != run_contract:
+        if (
+            not run_contract_path.is_file()
+            or json.loads(run_contract_path.read_text(encoding="utf-8")) != run_contract
+        ):
             raise OfflineEvalError("stable run contract is missing or differs")
         launch_qualification_path, launch_qualification_sha256 = (
             _publish_and_validate_launch(
@@ -332,32 +519,52 @@ def main() -> None:
             world_size=context.world_size,
             start_step=0,
             num_steps=validation_steps,
-        seed=seed,
-        gradient_accumulation=1,
-        micro_batch_size=_validation_micro_batch_size(runtime),
-    )
+            seed=seed,
+            gradient_accumulation=1,
+            micro_batch_size=_validation_micro_batch_size(runtime),
+        )
         objective = objective_config_from_mapping(
             config["objective_profile"]["objective"]
         )
-        perceptual_model = build_rgb_perceptual_model(
-            objective, device=context.device
-        )
+        perceptual_model = build_rgb_perceptual_model(objective, device=context.device)
         totals: dict[str, torch.Tensor] = {}
+        demo_paths: list[str] = []
+        demo_count = 0
         model.eval()
         with torch.no_grad():
             for cpu_batch in loader:
                 batch = _batch_to_device(cpu_batch, context.device)
                 with autocast_context(strategy):
+                    model_output = _forward(
+                        model,
+                        batch,
+                        appearance_teacher_ratio=args.appearance_teacher_ratio,
+                    )
                     losses = compute_native_objective(
-                        output=_forward(model, batch),
+                        output=model_output,
                         batch=batch,
                         config=objective,
                         perceptual_model=perceptual_model,
                     )
+                losses.update(rgb_quality_metrics(model_output, batch))
                 for name, value in losses.items():
                     if not bool(torch.isfinite(value).all()):
                         raise FloatingPointError(f"non-finite eval metric {name}")
                     totals[name] = totals.get(name, torch.zeros_like(value)) + value
+                if context.is_rank0 and demo_count < args.demo_samples:
+                    for sample_index in range(int(batch["target_rgb"].shape[0])):
+                        if demo_count >= args.demo_samples:
+                            break
+                        demo_paths.extend(
+                            save_rgb_depth_demo(
+                                args.demo_root,
+                                output=model_output,
+                                batch=batch,
+                                sample_index=sample_index,
+                                file_index=demo_count,
+                            )
+                        )
+                        demo_count += 1
         metrics = reduce_metrics(
             {name: value / validation_steps for name, value in totals.items()}
         )
@@ -388,9 +595,7 @@ def main() -> None:
                     "checkpoint_manifest_content_sha256": commit[
                         "manifest_content_sha256"
                     ],
-                    "data_closure_sha256": config["bindings"][
-                        "data_closure_sha256"
-                    ],
+                    "data_closure_sha256": config["bindings"]["data_closure_sha256"],
                     # The sealed index contains every split.  Validation rows
                     # are selected deterministically from it by split="val";
                     # do not mislabel the full-index digest as a val-only file.
@@ -400,6 +605,8 @@ def main() -> None:
                     "evaluated_split": "val",
                     "validation_seed": seed,
                     "validation_steps": validation_steps,
+                    "appearance_teacher_ratio": args.appearance_teacher_ratio,
+                    "demo_paths": demo_paths,
                     "world_size": context.world_size,
                     "launch_qualification_path": launch_qualification_path,
                     "launch_qualification_sha256": launch_qualification_sha256,
@@ -411,9 +618,7 @@ def main() -> None:
                     "checkpoint_metadata": {
                         "run_lineage": metadata["run_lineage"],
                         "runtime_config_sha256": metadata["runtime_config_sha256"],
-                        "model_contract_sha256": metadata[
-                            "model_contract_sha256"
-                        ],
+                        "model_contract_sha256": metadata["model_contract_sha256"],
                     },
                 }
                 _atomic_json_no_clobber(args.output, receipt)
