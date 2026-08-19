@@ -181,6 +181,9 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "validation_micro_batch_size",
         "activation_checkpointing",
         "rgb_decode_chunk_size",
+        "appearance_teacher_start_ratio",
+        "appearance_teacher_end_ratio",
+        "appearance_teacher_decay_steps",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
@@ -232,6 +235,32 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError("dataloader worker/prefetch values are invalid")
     if float(train["gradient_clip"]) <= 0:
         raise RuntimeContractError("train.gradient_clip must be positive")
+    appearance_schedule = {
+        "appearance_teacher_start_ratio",
+        "appearance_teacher_end_ratio",
+        "appearance_teacher_decay_steps",
+    }
+    present_appearance_schedule = appearance_schedule & set(train)
+    if present_appearance_schedule and present_appearance_schedule != appearance_schedule:
+        raise RuntimeContractError(
+            "appearance teacher schedule fields must be provided together"
+        )
+    if present_appearance_schedule:
+        start_ratio = float(train["appearance_teacher_start_ratio"])
+        end_ratio = float(train["appearance_teacher_end_ratio"])
+        if not 0.0 <= end_ratio <= start_ratio <= 1.0:
+            raise RuntimeContractError(
+                "appearance teacher ratios must satisfy 0 <= end <= start <= 1"
+            )
+        decay_steps = train["appearance_teacher_decay_steps"]
+        if (
+            isinstance(decay_steps, bool)
+            or int(decay_steps) <= 0
+            or int(decay_steps) > int(train["total_steps"])
+        ):
+            raise RuntimeContractError(
+                "train.appearance_teacher_decay_steps must lie within total_steps"
+            )
     if optimizer.get("name") != "adamw":
         raise RuntimeContractError("optimizer.name must be adamw")
     if schedule.get("name") != "warmup_stable_cosine":

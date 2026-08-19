@@ -540,3 +540,131 @@ def test_model_profile_validation_reaches_native_architecture_fields() -> None:
     profile["model"]["state_heads"] = 7
     with pytest.raises(ValueError, match="divisible"):
         build_world_model(profile)
+def _tiny_dual_path_config() -> NativeWorldModelConfig:
+    return replace(
+        _tiny_config(),
+        appearance_enabled=True,
+        appearance_P=16,
+        appearance_context_frames=2,
+        appearance_hidden=16,
+        appearance_layers=1,
+        appearance_heads=4,
+        appearance_ff_mult=2.0,
+    )
+
+
+def _dual_path_batch(cfg: NativeWorldModelConfig) -> dict[str, torch.Tensor]:
+    batch = _batch(cfg)
+    batch_size = batch["world_tokens"].shape[0]
+    torch.manual_seed(29)
+    batch["appearance_context_tokens"] = torch.randn(
+        batch_size,
+        cfg.appearance_context_frames,
+        cfg.num_views,
+        cfg.appearance_P,
+        cfg.token_dim,
+    )
+    batch["appearance_context_mask"] = torch.ones(
+        batch_size,
+        cfg.appearance_context_frames,
+        cfg.num_views,
+        cfg.appearance_P,
+        dtype=torch.bool,
+    )
+    batch["target_appearance_tokens"] = torch.randn(
+        batch_size,
+        cfg.K,
+        cfg.num_views,
+        cfg.appearance_P,
+        cfg.token_dim,
+    )
+    batch["target_appearance_mask"] = torch.ones(
+        batch_size,
+        cfg.K,
+        cfg.num_views,
+        cfg.appearance_P,
+        dtype=torch.bool,
+    )
+    return batch
+
+
+def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> None:
+    cfg = _tiny_dual_path_config()
+    torch.manual_seed(31)
+    model = NativeWorldModel(cfg).train()
+    batch = _dual_path_batch(cfg)
+
+    predicted = model(**batch, appearance_teacher_ratio=0.0)
+    teacher = model(**batch, appearance_teacher_ratio=1.0)
+    assert predicted["appearance_pred_tokens"].shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        cfg.appearance_P,
+        cfg.token_dim,
+    )
+    assert predicted["appearance_pred_mask"].all()
+    assert predicted["appearance_teacher_ratio"].item() == 0.0
+    assert teacher["appearance_teacher_ratio"].item() == 1.0
+    assert not torch.allclose(predicted["rgb"], teacher["rgb"])
+
+    changed = dict(batch)
+    changed_target = batch["target_appearance_tokens"].clone()
+    changed_target[:, :, 1].add_(3.0)
+    changed["target_appearance_tokens"] = changed_target
+    changed_teacher = model(**changed, appearance_teacher_ratio=1.0)
+    torch.testing.assert_close(
+        teacher["rgb"][:, :, 0], changed_teacher["rgb"][:, :, 0], rtol=0, atol=0
+    )
+    assert not torch.allclose(teacher["rgb"][:, :, 1], changed_teacher["rgb"][:, :, 1])
+
+    loss = (
+        predicted["appearance_pred_tokens"].square().mean()
+        + predicted["rgb"].square().mean()
+    )
+    loss.backward()
+    appearance_gradients = [
+        parameter.grad
+        for name, parameter in model.named_parameters()
+        if name.startswith("appearance_dynamics")
+    ]
+    assert appearance_gradients
+    assert any(
+        gradient is not None
+        and torch.isfinite(gradient).all()
+        and gradient.abs().sum() > 0
+        for gradient in appearance_gradients
+    )
+    geometry_conditioning = model.rgb_head.image_decoder.geometry_stem
+    assert geometry_conditioning is not None
+    assert geometry_conditioning.weight.grad is not None
+    assert geometry_conditioning.weight.grad.abs().sum() > 0
+
+
+def test_dual_path_inference_uses_predicted_appearance_without_future_targets() -> None:
+    cfg = _tiny_dual_path_config()
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    batch["appearance_context_mask"][:, :, 1] = False
+    batch.pop("target_appearance_tokens")
+    batch.pop("target_appearance_mask")
+
+    output = model(**batch, appearance_teacher_ratio=0.0)
+    assert output["appearance_pred_tokens"][:, :, 1].count_nonzero() == 0
+    assert not output["appearance_pred_mask"][:, :, 1].any()
+    with pytest.raises(ValueError, match="teacher forcing"):
+        model(**batch, appearance_teacher_ratio=0.5)
+
+
+def test_dual_path_1b_and_5b_profiles_are_materializable() -> None:
+    root = Path(__file__).resolve().parents[1]
+    counts = {}
+    for name in ("native_1b_dual_path.yaml", "native_5b_dual_path.yaml"):
+        profile = yaml.safe_load((root / "configs/model" / name).read_text())
+        with torch.device("meta"):
+            model = build_world_model(profile)
+        counts[name] = sum(parameter.numel() for parameter in model.parameters())
+        assert model.cfg.appearance_enabled is True
+        assert model.cfg.appearance_P == 256
+        assert counts[name] == profile["expected_parameter_count"]
+    assert counts["native_5b_dual_path.yaml"] > 4 * counts["native_1b_dual_path.yaml"]

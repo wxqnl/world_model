@@ -21,6 +21,8 @@ class NativeObjectiveError(ValueError):
 class NativeObjectiveConfig:
     token_mse: float = 1.0
     token_cosine: float = 0.1
+    appearance_mse: float = 0.0
+    appearance_cosine: float = 0.0
     rgb_l1: float = 0.0
     rgb_charbonnier: float = 2.0
     rgb_gradient: float = 0.5
@@ -382,6 +384,49 @@ def compute_native_objective(
     token_cosine = _masked_mean(cosine, token_mask, epsilon=epsilon)
 
     zero = token_mse.new_zeros(())
+    appearance_mse = zero
+    appearance_cosine = zero
+    appearance_supervised = zero
+    has_appearance = (
+        "appearance_pred_tokens" in output
+        or "target_appearance_tokens" in batch
+    )
+    if (
+        config.appearance_mse > 0.0 or config.appearance_cosine > 0.0
+    ) and not has_appearance:
+        raise NativeObjectiveError(
+            "appearance loss is enabled but the model/data provide no appearance lane"
+        )
+    if has_appearance:
+        if (
+            "appearance_pred_tokens" not in output
+            or "target_appearance_tokens" not in batch
+            or "target_appearance_mask" not in batch
+        ):
+            raise NativeObjectiveError(
+                "appearance prediction, target and mask must be provided together"
+            )
+        appearance_prediction = output["appearance_pred_tokens"]
+        appearance_target = batch["target_appearance_tokens"]
+        if appearance_prediction.shape != appearance_target.shape:
+            raise NativeObjectiveError("appearance prediction/target shapes differ")
+        appearance_mask = batch["target_appearance_mask"].bool()
+        if "appearance_pred_mask" in output:
+            appearance_mask = appearance_mask & output["appearance_pred_mask"].bool()
+        appearance_error = appearance_prediction - appearance_target
+        appearance_mse = _masked_mean(
+            appearance_error.square(), appearance_mask[..., None], epsilon=epsilon
+        )
+        appearance_cosine = _masked_mean(
+            1.0 - F.cosine_similarity(
+                appearance_prediction.float(), appearance_target.float(), dim=-1
+            ),
+            appearance_mask,
+            epsilon=epsilon,
+        )
+        appearance_supervised = torch.broadcast_to(
+            appearance_mask[..., None], appearance_target.shape
+        ).sum().to(dtype=token_mse.dtype)
     rgb_l1 = zero
     rgb_charbonnier = zero
     rgb_gradient = zero
@@ -532,6 +577,9 @@ def compute_native_objective(
     losses = {
         "token_mse": token_mse,
         "token_cosine": token_cosine,
+        "appearance_mse": appearance_mse,
+        "appearance_cosine": appearance_cosine,
+        "appearance_teacher_ratio": output.get("appearance_teacher_ratio", zero),
         "rgb_l1": rgb_l1,
         "rgb_charbonnier": rgb_charbonnier,
         "rgb_gradient": rgb_gradient,
@@ -560,6 +608,7 @@ def compute_native_objective(
         "native_token_supervised_elements": torch.broadcast_to(
             token_mask[..., None], target_tokens.shape
         ).sum().to(dtype=token_mse.dtype),
+        "appearance_supervised_elements": appearance_supervised,
         "rgb_supervised_elements": (
             torch.broadcast_to(rgb_mask, target_rgb.shape).sum().to(dtype=token_mse.dtype)
             if "target_rgb" in batch and output["rgb"].numel()
@@ -590,6 +639,8 @@ def compute_native_objective(
     total = (
         config.token_mse * token_mse
         + config.token_cosine * token_cosine
+        + config.appearance_mse * appearance_mse
+        + config.appearance_cosine * appearance_cosine
         + config.rgb_l1 * rgb_l1
         + config.rgb_charbonnier * rgb_charbonnier
         + config.rgb_gradient * rgb_gradient

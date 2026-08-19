@@ -224,6 +224,10 @@ class FormalCacheDataset(Dataset[dict[str, torch.Tensor]]):
         self.components = codec["components"].float().contiguous()
         if tuple(self.mean.shape) != (2048,) or tuple(self.components.shape) != (384, 2048):
             raise FormalCacheError("formal PCA token codec tensor shapes mismatch")
+        if bool(self.model.get("appearance_enabled", False)):
+            raise FormalCacheError(
+                "dual-path appearance training requires the raw per-view token cache"
+            )
         required_model = {
             "T": 16,
             "P": 64,

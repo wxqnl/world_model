@@ -130,6 +130,13 @@ def validate_model_data_compatibility(
         raise ValueError("model/cache spatial token counts must be square grids")
     if model_grid > cache_grid:
         raise ValueError("model spatial grid exceeds the shared episode cache")
+    if cfg.appearance_enabled:
+        appearance_grid = int(round(int(cfg.appearance_P) ** 0.5))
+        if (
+            appearance_grid * appearance_grid != int(cfg.appearance_P)
+            or appearance_grid > cache_grid
+        ):
+            raise ValueError("appearance spatial grid exceeds the shared episode cache")
     for model_field, cache_field, label in (
         ("token_dim", "token_dim", "token dimension"),
         ("num_views", "num_views", "canonical view count"),

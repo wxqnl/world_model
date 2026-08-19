@@ -56,6 +56,7 @@ from wm3d.training.runtime_contract import load_materialized_runtime
 EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_offline_eval_v2"
 _COVERAGE_WEIGHTS = {
     "native_token_supervised_elements": ("token_mse", "token_cosine"),
+    "appearance_supervised_elements": ("appearance_mse", "appearance_cosine"),
     "rgb_supervised_elements": (
         "rgb_l1",
         "rgb_charbonnier",
@@ -109,6 +110,10 @@ def declared_eval_coverage_lanes(
         "native_token_supervised_elements",
         "current_state_supervised_dimensions",
     }
+    if getattr(objective, "appearance_mse", 0.0) > 0.0 or getattr(
+        objective, "appearance_cosine", 0.0
+    ) > 0.0:
+        lanes.add("appearance_supervised_elements")
     for key, lane in (
         ("rgb_codec", "rgb_supervised_elements"),
         ("depth_codec", "depth_supervised_elements"),
@@ -175,6 +180,12 @@ def validate_eval_coverage(
         raise OfflineEvalError(f"unknown expected coverage lanes: {sorted(unknown)}")
     coverage: dict[str, float] = {}
     for count_name in _COVERAGE_WEIGHTS:
+        if (
+            count_name == "appearance_supervised_elements"
+            and count_name not in expected_lanes
+            and count_name not in metrics
+        ):
+            continue
         count = float(metrics.get(count_name, 0.0))
         if count_name in expected_lanes and (not math.isfinite(count) or count <= 0.0):
             raise OfflineEvalError(

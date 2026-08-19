@@ -99,6 +99,17 @@ class NativeWorldModelConfig:
     rgb_decode_indices: tuple[int, ...] = tuple(range(16))
     geom_hidden: int = 768
 
+    # Optional high-resolution, per-view appearance lane.  The geometry/action
+    # trunk keeps using P fused native tokens; this lane retains the frozen
+    # encoder's unfused view tokens for rendering only.
+    appearance_enabled: bool = False
+    appearance_P: int = 256
+    appearance_context_frames: int = 4
+    appearance_hidden: int = 512
+    appearance_layers: int = 2
+    appearance_heads: int = 8
+    appearance_ff_mult: float = 2.0
+
     dropout: float = 0.0
     activation_checkpointing: bool = True
 
@@ -144,6 +155,26 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_decode_indices must be unique and increasing")
         if any(index < 0 or index >= self.K for index in self.rgb_decode_indices):
             raise ValueError("rgb_decode_indices must refer to future world-state steps")
+        if not isinstance(self.appearance_enabled, bool):
+            raise ValueError("appearance_enabled must be boolean")
+        if self.appearance_enabled:
+            appearance_grid = isqrt(self.appearance_P)
+            if appearance_grid * appearance_grid != self.appearance_P:
+                raise ValueError("appearance_P must be a square token grid")
+            if not 0 < self.appearance_context_frames <= self.T:
+                raise ValueError("appearance_context_frames must lie within T")
+            if (
+                self.appearance_hidden <= 0
+                or self.appearance_layers <= 0
+                or self.appearance_heads <= 0
+                or self.appearance_hidden % self.appearance_heads
+                or self.appearance_ff_mult <= 0
+            ):
+                raise ValueError("appearance capacity/head fields are invalid")
+            if self.appearance_P < self.P:
+                raise ValueError("appearance_P cannot be smaller than geometry P")
+            if appearance_grid > self.rgb_size:
+                raise ValueError("appearance grid cannot exceed RGB output size")
         for name in (
             "max_action_groups",
             "max_action_dim",
@@ -700,6 +731,165 @@ class DynamicsConditionBlock(nn.Module):
         return self.factorized(future_state)
 
 
+class FactorizedAppearanceBlock(nn.Module):
+    """Preserve view identity while mixing spatial and causal temporal context."""
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        dim = cfg.appearance_hidden
+        self.spatial_norm = RMSNorm(dim)
+        self.spatial = SelfAttention(dim, cfg.appearance_heads, cfg.dropout)
+        self.temporal_norm = RMSNorm(dim)
+        self.temporal = SelfAttention(dim, cfg.appearance_heads, cfg.dropout)
+        self.ff_norm = RMSNorm(dim)
+        self.ff = SwiGLU(dim, cfg.appearance_ff_mult, cfg.dropout)
+
+    def forward(self, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        batch, steps, views, patches, dim = value.shape
+        if tuple(mask.shape) != (batch, steps, views, patches):
+            raise ValueError("appearance mask must be [B,S,V,P]")
+
+        spatial = value.reshape(batch * steps * views, patches, dim)
+        spatial_valid = mask.reshape(batch * steps * views, patches)
+        spatial = spatial + self.spatial(
+            self.spatial_norm(spatial),
+            allowed_mask=spatial_valid[:, None, None, :],
+        )
+        value = spatial.view(batch, steps, views, patches, dim)
+        value = value * mask[..., None].to(dtype=value.dtype)
+
+        temporal = value.permute(0, 2, 3, 1, 4).reshape(
+            batch * views * patches, steps, dim
+        )
+        temporal_valid = mask.permute(0, 2, 3, 1).reshape(
+            batch * views * patches, steps
+        )
+        causal = torch.ones(steps, steps, dtype=torch.bool, device=value.device).tril()
+        allowed = causal[None, None] & temporal_valid[:, None, None, :]
+        temporal = temporal + self.temporal(
+            self.temporal_norm(temporal), allowed_mask=allowed
+        )
+        temporal = temporal + self.ff(self.ff_norm(temporal))
+        value = temporal.view(batch, views, patches, steps, dim).permute(0, 3, 1, 2, 4)
+        return value * mask[..., None].to(dtype=value.dtype)
+
+
+class PerViewAppearanceDynamics(nn.Module):
+    """Predict unfused future view latents from view history and 3D dynamics."""
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.geometry_grid = isqrt(cfg.P)
+        self.appearance_grid = isqrt(cfg.appearance_P)
+        self.input = nn.Linear(cfg.token_dim, cfg.appearance_hidden, bias=False)
+        self.geometry = nn.Linear(cfg.state_hidden, cfg.appearance_hidden, bias=False)
+        self.time = ContinuousTimeEmbedding(cfg.appearance_hidden, cfg)
+        self.view_embed = nn.Parameter(
+            torch.empty(1, 1, cfg.num_views, 1, cfg.appearance_hidden)
+        )
+        self.patch_embed = nn.Parameter(
+            torch.empty(1, 1, 1, cfg.appearance_P, cfg.appearance_hidden)
+        )
+        self.future_seed = nn.Parameter(
+            torch.empty(1, cfg.K, 1, cfg.appearance_P, cfg.appearance_hidden)
+        )
+        for parameter in (self.view_embed, self.patch_embed, self.future_seed):
+            nn.init.normal_(parameter, std=0.02)
+        blocks: tuple[nn.Module, ...] = tuple(
+            FactorizedAppearanceBlock(cfg) for _ in range(cfg.appearance_layers)
+        )
+        if cfg.activation_checkpointing:
+            blocks = tuple(checkpoint_wrapper(block) for block in blocks)
+        self.blocks = nn.ModuleList(blocks)
+        self.norm = RMSNorm(cfg.appearance_hidden)
+        self.output = nn.Linear(cfg.appearance_hidden, cfg.token_dim, bias=False)
+
+    def reset_parameters(self) -> None:
+        for parameter in (self.view_embed, self.patch_embed, self.future_seed):
+            nn.init.normal_(parameter, std=0.02)
+
+    def _upsample_geometry(self, future_state: torch.Tensor) -> torch.Tensor:
+        batch, horizon, patches, _ = future_state.shape
+        if (horizon, patches) != (self.cfg.K, self.cfg.P):
+            raise ValueError("future geometry shape is incompatible with appearance lane")
+        value = self.geometry(future_state)
+        value = value.reshape(
+            batch * horizon,
+            self.geometry_grid,
+            self.geometry_grid,
+            self.cfg.appearance_hidden,
+        ).permute(0, 3, 1, 2)
+        value = F.interpolate(
+            value.float(),
+            size=(self.appearance_grid, self.appearance_grid),
+            mode="bilinear",
+            align_corners=False,
+        ).to(dtype=future_state.dtype)
+        return value.permute(0, 2, 3, 1).reshape(
+            batch, horizon, self.cfg.appearance_P, self.cfg.appearance_hidden
+        )
+
+    def forward(
+        self,
+        context_tokens: torch.Tensor,
+        context_mask: torch.Tensor,
+        future_state: torch.Tensor,
+        world_times_s: torch.Tensor,
+        future_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        expected = (
+            context_tokens.shape[0],
+            cfg.appearance_context_frames,
+            cfg.num_views,
+            cfg.appearance_P,
+            cfg.token_dim,
+        )
+        if tuple(context_tokens.shape) != expected:
+            raise ValueError(f"appearance context must be {expected}")
+        if context_mask.shape != context_tokens.shape[:-1]:
+            raise ValueError("appearance context mask must align to tokens")
+        batch = context_tokens.shape[0]
+        if tuple(world_times_s.shape) != (batch, cfg.T + cfg.K):
+            raise ValueError("appearance world times are incompatible with T/K")
+        if future_mask is None:
+            future_mask = context_mask.any(dim=1)[:, None].expand(
+                -1, cfg.K, -1, -1
+            ).clone()
+        elif tuple(future_mask.shape) != (
+            batch,
+            cfg.K,
+            cfg.num_views,
+            cfg.appearance_P,
+        ):
+            raise ValueError("appearance future mask must be [B,K,V,P]")
+
+        context_time = world_times_s[:, cfg.T - cfg.appearance_context_frames : cfg.T]
+        future_time = world_times_s[:, cfg.T :]
+        context = self.input(context_tokens)
+        context = context + self.time(context_time)[:, :, None, None]
+        context = context + self.view_embed + self.patch_embed
+
+        geometry = self._upsample_geometry(future_state)[:, :, None]
+        future = self.future_seed.expand(batch, -1, cfg.num_views, -1, -1)
+        future = future + geometry + self.time(future_time)[:, :, None, None]
+        future = future + self.view_embed + self.patch_embed
+        value = torch.cat((context, future), dim=1)
+        mask = torch.cat((context_mask.bool(), future_mask.bool()), dim=1)
+        value = value * mask[..., None].to(dtype=value.dtype)
+        for block in self.blocks:
+            value = block(value, mask)
+
+        last_context = torch.zeros_like(context_tokens[:, 0])
+        for index in range(cfg.appearance_context_frames):
+            valid = context_mask[:, index, ..., None]
+            last_context = torch.where(valid, context_tokens[:, index], last_context)
+        predicted = self.output(self.norm(value[:, -cfg.K :])) + last_context[:, None]
+        predicted = predicted * future_mask[..., None].to(dtype=predicted.dtype)
+        return predicted, future_mask.bool()
+
+
 class UnifiedActionHead(nn.Module):
     """The sole policy owner; semantic decoding is a deterministic transform."""
 
@@ -828,13 +1018,20 @@ class NativeRGBImageDecoder(nn.Module):
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.grid = isqrt(cfg.P)
+        self.grid = isqrt(cfg.appearance_P if cfg.appearance_enabled else cfg.P)
+        self.geometry_grid = isqrt(cfg.P)
         self.stem = nn.Sequential(
             nn.Conv2d(cfg.token_dim, cfg.rgb_hidden, 1),
             nn.GroupNorm(min(8, cfg.rgb_hidden), cfg.rgb_hidden),
             nn.GELU(),
         )
+        self.geometry_stem = (
+            nn.Conv2d(cfg.state_hidden, cfg.rgb_hidden, 1, bias=False)
+            if cfg.appearance_enabled
+            else None
+        )
         stages = (cfg.rgb_size // self.grid).bit_length() - 1
+        self.decode_grid = cfg.rgb_size // (1 << stages)
         if stages == 5:
             channels = (
                 cfg.rgb_hidden,
@@ -878,14 +1075,51 @@ class NativeRGBImageDecoder(nn.Module):
         self.output = nn.Conv2d(channels[-1], 3, 1)
 
     def forward(
-        self, tokens: torch.Tensor, view_embedding: torch.Tensor
+        self,
+        tokens: torch.Tensor,
+        view_embedding: torch.Tensor,
+        geometry_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         value = tokens.transpose(1, 2).reshape(
             tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
         )
         value = self.stem(value) + view_embedding
+        if self.geometry_stem is not None:
+            if geometry_tokens is None or tuple(geometry_tokens.shape[1:]) != (
+                self.cfg.P,
+                self.cfg.state_hidden,
+            ):
+                raise ValueError("dual-path RGB decoder requires native geometry tokens")
+            geometry = geometry_tokens.transpose(1, 2).reshape(
+                geometry_tokens.shape[0],
+                self.cfg.state_hidden,
+                self.geometry_grid,
+                self.geometry_grid,
+            )
+            geometry = self.geometry_stem(geometry)
+            if self.geometry_grid != self.grid:
+                geometry = F.interpolate(
+                    geometry.float(), size=(self.grid, self.grid), mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=value.dtype)
+            value = value + geometry
+        if self.decode_grid != self.grid:
+            value = F.interpolate(
+                value.float(),
+                size=(self.decode_grid, self.decode_grid),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=tokens.dtype)
         for upsample in self.ups:
             value = upsample(value)
+        if tuple(value.shape[-2:]) != (self.cfg.rgb_size, self.cfg.rgb_size):
+            value = F.interpolate(
+                value.float(),
+                size=(self.cfg.rgb_size, self.cfg.rgb_size),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            ).to(dtype=tokens.dtype)
         return torch.sigmoid(self.output(value))
 
 
@@ -912,6 +1146,8 @@ class NativeRGBDecoder(nn.Module):
         future_tokens: torch.Tensor,
         frame_indices: Optional[Sequence[int]],
         target_view_mask: Optional[torch.Tensor] = None,
+        appearance_tokens: Optional[torch.Tensor] = None,
+        geometry_state: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         indices = tuple(
             self.cfg.rgb_decode_indices if frame_indices is None else frame_indices
@@ -931,11 +1167,37 @@ class NativeRGBDecoder(nn.Module):
                 self.cfg.rgb_size,
             )
             return empty, index_tensor
-        selected = future_tokens.index_select(1, index_tensor)
-        batch, frames, patches, token_dim = selected.shape
         views = self.cfg.num_views
-        expanded = selected[:, :, None].expand(-1, -1, views, -1, -1)
-        expanded = expanded.reshape(batch * frames * views, patches, token_dim)
+        expanded_geometry: Optional[torch.Tensor] = None
+        if self.cfg.appearance_enabled:
+            expected = (
+                future_tokens.shape[0],
+                self.cfg.K,
+                views,
+                self.cfg.appearance_P,
+                self.cfg.token_dim,
+            )
+            if appearance_tokens is None or tuple(appearance_tokens.shape) != expected:
+                raise ValueError(f"appearance RGB tokens must be {expected}")
+            if geometry_state is None or tuple(geometry_state.shape[1:]) != (
+                self.cfg.K,
+                self.cfg.P,
+                self.cfg.state_hidden,
+            ):
+                raise ValueError("dual-path RGB geometry state is incompatible")
+            selected = appearance_tokens.index_select(1, index_tensor)
+            batch, frames, _, patches, token_dim = selected.shape
+            expanded = selected.reshape(batch * frames * views, patches, token_dim)
+            geometry = geometry_state.index_select(1, index_tensor)
+            geometry = geometry[:, :, None].expand(-1, -1, views, -1, -1)
+            expanded_geometry = geometry.reshape(
+                batch * frames * views, self.cfg.P, self.cfg.state_hidden
+            )
+        else:
+            selected = future_tokens.index_select(1, index_tensor)
+            batch, frames, patches, token_dim = selected.shape
+            expanded = selected[:, :, None].expand(-1, -1, views, -1, -1)
+            expanded = expanded.reshape(batch * frames * views, patches, token_dim)
         view_ids = torch.arange(views, device=future_tokens.device)
         view_ids = view_ids.view(1, 1, views).expand(batch, frames, -1).reshape(-1)
         if target_view_mask is None:
@@ -964,6 +1226,10 @@ class NativeRGBDecoder(nn.Module):
                     expanded.index_select(0, chunk_indices),
                     self.view_embed.index_select(
                         0, view_ids.index_select(0, chunk_indices)
+                    ),
+                    (
+                        None if expanded_geometry is None else
+                        expanded_geometry.index_select(0, chunk_indices)
                     ),
                 )
             )
@@ -1033,6 +1299,11 @@ class NativeWorldModel(nn.Module):
         self.state_norm = RMSNorm(cfg.state_hidden)
         self.action_norm = RMSNorm(cfg.action_hidden)
         self.token_output = nn.Linear(cfg.state_hidden, cfg.token_dim, bias=False)
+        self.appearance_dynamics: Optional[PerViewAppearanceDynamics] = (
+            PerViewAppearanceDynamics(cfg)
+            if cfg.appearance_enabled
+            else None
+        )
         self.action_head = UnifiedActionHead(cfg)
         self.geometry_head = NativeGeometryHead(cfg)
         self.rgb_head = NativeRGBDecoder(cfg)
@@ -1166,6 +1437,11 @@ class NativeWorldModel(nn.Module):
         aux_type_ids: Optional[torch.Tensor] = None,
         rgb_frame_indices: Optional[Sequence[int]] = None,
         rgb_view_mask: Optional[torch.Tensor] = None,
+        appearance_context_tokens: Optional[torch.Tensor] = None,
+        appearance_context_mask: Optional[torch.Tensor] = None,
+        target_appearance_tokens: Optional[torch.Tensor] = None,
+        target_appearance_mask: Optional[torch.Tensor] = None,
+        appearance_teacher_ratio: float | torch.Tensor = 0.0,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         expected_world = (cfg.T, cfg.num_views, cfg.P, cfg.token_dim)
@@ -1324,6 +1600,63 @@ class NativeWorldModel(nn.Module):
 
         action_free_pred_tokens = self.token_output(action_free_future)
         pred_tokens = self.token_output(factual_future)
+        appearance_for_rgb: Optional[torch.Tensor] = None
+        appearance_ratio = pred_tokens.new_zeros(())
+        appearance_pred: Optional[torch.Tensor] = None
+        appearance_pred_mask: Optional[torch.Tensor] = None
+        if cfg.appearance_enabled:
+            if (
+                self.appearance_dynamics is None
+                or appearance_context_tokens is None
+                or appearance_context_mask is None
+            ):
+                raise ValueError("dual-path model requires appearance context tokens and mask")
+            appearance_pred, appearance_pred_mask = self.appearance_dynamics(
+                appearance_context_tokens,
+                appearance_context_mask,
+                factual_future,
+                relative_world_time,
+                target_appearance_mask,
+            )
+            appearance_ratio = torch.as_tensor(
+                appearance_teacher_ratio,
+                dtype=appearance_pred.dtype,
+                device=appearance_pred.device,
+            )
+            if appearance_ratio.numel() != 1 or not bool(
+                ((appearance_ratio >= 0) & (appearance_ratio <= 1)).all()
+            ):
+                raise ValueError("appearance teacher ratio must be a scalar in [0,1]")
+            if target_appearance_tokens is None:
+                if bool(appearance_ratio > 0):
+                    raise ValueError("teacher forcing requires target appearance tokens")
+                appearance_for_rgb = appearance_pred
+            else:
+                if target_appearance_tokens.shape != appearance_pred.shape:
+                    raise ValueError("target appearance tokens must align to predictions")
+                if (
+                    target_appearance_mask is None
+                    or target_appearance_mask.shape != appearance_pred.shape[:-1]
+                ):
+                    raise ValueError("target appearance mask must align to predictions")
+                appearance_for_rgb = torch.lerp(
+                    appearance_pred,
+                    target_appearance_tokens.detach().to(dtype=appearance_pred.dtype),
+                    appearance_ratio,
+                )
+                appearance_for_rgb = appearance_for_rgb * target_appearance_mask[
+                    ..., None
+                ].to(dtype=appearance_for_rgb.dtype)
+        elif any(
+            value is not None
+            for value in (
+                appearance_context_tokens,
+                appearance_context_mask,
+                target_appearance_tokens,
+                target_appearance_mask,
+            )
+        ):
+            raise ValueError("appearance tensors were supplied to a fused-only model")
         output: dict[str, torch.Tensor] = {
             "action_free_native_state": action_free_future,
             "action_free_pred_tokens": action_free_pred_tokens,
@@ -1332,7 +1665,11 @@ class NativeWorldModel(nn.Module):
             "policy_latent": policy_query.transpose(1, 2),
             "world_times_s": world_times_s,
             "policy_query_dt": policy_query_dt,
+            "appearance_teacher_ratio": appearance_ratio,
         }
+        if appearance_pred is not None and appearance_pred_mask is not None:
+            output["appearance_pred_tokens"] = appearance_pred
+            output["appearance_pred_mask"] = appearance_pred_mask
         output.update(
             self.action_head(
                 policy_query,
@@ -1348,6 +1685,8 @@ class NativeWorldModel(nn.Module):
             pred_tokens,
             rgb_frame_indices,
             rgb_view_mask,
+            appearance_for_rgb,
+            factual_future if cfg.appearance_enabled else None,
             enabled=cfg.activation_checkpointing,
         )
         output["rgb"] = rgb
@@ -1362,6 +1701,8 @@ class NativeWorldModel(nn.Module):
         yield from self.action_blocks
         yield from self.bridges
         yield from self.dynamics_blocks
+        if self.appearance_dynamics is not None:
+            yield from self.appearance_dynamics.blocks
         yield self.rgb_head.image_decoder
         yield self.geometry_head
 
@@ -1374,10 +1715,12 @@ class NativeWorldModel(nn.Module):
         yield from self.action_blocks
         yield from self.bridges
         yield from self.dynamics_blocks
+        if self.appearance_dynamics is not None:
+            yield from self.appearance_dynamics.blocks
         yield self.rgb_head.image_decoder
 
     def parameter_counts(self) -> dict[str, int]:
-        groups: Mapping[str, nn.Module] = {
+        groups: dict[str, nn.Module] = {
             "multiview_fuser": self.view_fuser,
             "state_trunk": self.state_blocks,
             "action_trunk": self.action_blocks,
@@ -1387,6 +1730,8 @@ class NativeWorldModel(nn.Module):
             "geometry_head": self.geometry_head,
             "action_head": self.action_head,
         }
+        if self.appearance_dynamics is not None:
+            groups["appearance_dynamics"] = self.appearance_dynamics
         counts = {
             name: sum(parameter.numel() for parameter in module.parameters())
             for name, module in groups.items()

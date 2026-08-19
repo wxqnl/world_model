@@ -33,7 +33,7 @@ class GradientOwnershipError(RuntimeError):
 def _required_owner_modules(model: NativeWorldModel) -> Mapping[str, tuple[nn.Module, ...]]:
     """Return disjoint, capability-level module owners required by Stage0."""
 
-    return {
+    owners: dict[str, tuple[nn.Module, ...]] = {
         "native_state_trunk": (
             model.view_fuser,
             model.state_blocks,
@@ -51,6 +51,9 @@ def _required_owner_modules(model: NativeWorldModel) -> Mapping[str, tuple[nn.Mo
         "rgb_decoder": (model.rgb_head,),
         "geometry_decoder": (model.geometry_head,),
     }
+    if model.appearance_dynamics is not None:
+        owners["appearance_dynamics"] = (model.appearance_dynamics,)
+    return owners
 
 
 def _required_owner_parameters(

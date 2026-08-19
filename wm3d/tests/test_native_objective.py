@@ -141,8 +141,13 @@ def test_coarse_only_batch_has_zero_fine_count_but_nonzero_policy_gradient() -> 
         batch_size, groups, queries, action_dim, requires_grad=True
     )
     policy_action = policy_raw.clone()
+    appearance_pred = torch.zeros(
+        batch_size, horizon, 1, patches, token_dim, requires_grad=True
+    )
     output = {
         "pred_tokens": torch.zeros(batch_size, horizon, patches, token_dim, requires_grad=True),
+        "appearance_pred_tokens": appearance_pred,
+        "appearance_pred_mask": torch.ones_like(appearance_pred[..., 0], dtype=torch.bool),
         "rgb": torch.empty(batch_size, 0, 1, 3, 4, 4),
         "depth": torch.ones(batch_size, horizon, 1, patches),
         "point": torch.zeros(batch_size, horizon, 1, patches, 3),
@@ -181,13 +186,18 @@ def test_coarse_only_batch_has_zero_fine_count_but_nonzero_policy_gradient() -> 
         ),
         "action_normalization_offset": torch.zeros(batch_size, groups, action_dim),
         "action_normalization_scale": torch.ones(batch_size, groups, action_dim),
+        "target_appearance_tokens": torch.ones_like(appearance_pred),
+        "target_appearance_mask": torch.ones_like(appearance_pred[..., 0], dtype=torch.bool),
     }
     losses = compute_native_objective(
-        output=output, batch=batch, config=NativeObjectiveConfig()
+        output=output, batch=batch, config=NativeObjectiveConfig(appearance_mse=1.0)
     )
     losses["total"].backward()
     assert losses["fine_supervised_dimensions"].item() == 0
     assert losses["coarse_supervised_dimensions"].item() > 0
     assert policy_raw.grad is not None
     assert torch.isfinite(policy_raw.grad).all()
+    assert losses["appearance_mse"].item() > 0
+    assert appearance_pred.grad is not None
+    assert appearance_pred.grad.abs().sum() > 0
     assert policy_raw.grad.abs().sum() > 0

@@ -244,6 +244,21 @@ def _pool_tokens(value: torch.Tensor, *, source_grid: int, target_grid: int) -> 
     ).to(dtype=value.dtype)
 
 
+def _pool_valid_mask(
+    value: torch.Tensor, *, source_grid: int, target_grid: int
+) -> torch.Tensor:
+    if value.shape[-1] != source_grid * source_grid:
+        raise CacheDataError("token mask disagrees with cache grid")
+    if source_grid == target_grid:
+        return value.bool()
+    leading = value.shape[:-1]
+    pooled = F.adaptive_max_pool2d(
+        value.float().reshape(-1, 1, source_grid, source_grid),
+        (target_grid, target_grid),
+    )
+    return pooled.reshape(*leading, target_grid * target_grid).bool()
+
+
 def _pool_masked(
     value: torch.Tensor,
     mask: torch.Tensor,
@@ -376,6 +391,15 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         if int(model["rgb_size"]) > int(representation["rgb_size"]):
             raise CacheDataError("model RGB target exceeds cached RGB resolution")
         self.model = model
+        self.appearance_enabled = bool(model["appearance_enabled"])
+        self.appearance_context_frames = int(model["appearance_context_frames"])
+        self.appearance_grid = _square_grid(
+            int(model["appearance_P"]), label="appearance model"
+        )
+        if self.appearance_enabled and self.appearance_grid > self.cache_grid:
+            raise CacheDataError(
+                "appearance model grid exceeds cached per-view representation"
+            )
         self.sampling = sampling
         self.rgb_size = int(model["rgb_size"])
         self.rgb_indices = tuple(int(item) for item in model["rgb_decode_indices"])
@@ -497,20 +521,20 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
                 f"sample {entry.sample_id} source observation boundaries are invalid"
             )
 
-        context_tokens = self.shards.read_quantized_many(
+        context_view_tokens = self.shards.read_quantized_many(
             entry.feature_shard, "view_tokens", context_rows
         )
         context_tokens = _pool_tokens(
-            context_tokens,
+            context_view_tokens,
             source_grid=self.cache_grid,
             target_grid=self.model_grid,
         )
-        future_tokens = self.shards.read_quantized_many(
+        future_view_tokens = self.shards.read_quantized_many(
             entry.feature_shard, "view_tokens", future_rows
         )
         future = slice(self.T, None)
         target_tokens, target_token_mask = _fuse_target_tokens(
-            future_tokens,
+            future_view_tokens,
             frame["geometry_confidence"][future],
             frame["view_mask"][future].bool(),
             frame["world_token_mask"][future].bool(),
@@ -529,6 +553,35 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             source_grid=self.cache_grid,
             target_grid=self.model_grid,
         )
+
+        appearance: dict[str, torch.Tensor] = {}
+        if self.appearance_enabled:
+            context_start = self.T - self.appearance_context_frames
+            appearance_context = _pool_tokens(
+                context_view_tokens[context_start:].contiguous(),
+                source_grid=self.cache_grid,
+                target_grid=self.appearance_grid,
+            ).contiguous()
+            appearance_target = _pool_tokens(
+                future_view_tokens,
+                source_grid=self.cache_grid,
+                target_grid=self.appearance_grid,
+            ).contiguous()
+            world_valid = _pool_valid_mask(
+                frame["world_token_mask"].bool(),
+                source_grid=self.cache_grid,
+                target_grid=self.appearance_grid,
+            )
+            appearance["appearance_context_tokens"] = appearance_context
+            appearance["appearance_context_mask"] = (
+                frame["view_mask"][context_start : self.T, :, None].bool()
+                & world_valid[context_start : self.T, None]
+            )
+            appearance["target_appearance_tokens"] = appearance_target
+            appearance["target_appearance_mask"] = (
+                frame["view_mask"][future, :, None].bool()
+                & world_valid[future, None]
+            )
 
         rgb_rows = torch.tensor(self.rgb_indices, dtype=torch.long) + self.T
         reader = self.jpeg.reader(entry.rgb_pack)
@@ -691,6 +744,7 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         aux_type_ids = torch.zeros(aux_values.shape[:-1], dtype=torch.int64)
         result = {
             **action,
+            **appearance,
             "world_tokens": context_tokens,
             "view_mask": frame["view_mask"][: self.T].bool(),
             "world_times_s": frame["frame_time_s"],

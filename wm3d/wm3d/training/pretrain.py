@@ -415,6 +415,13 @@ _MODEL_INPUTS = {
     "aux_type_ids",
 }
 
+_APPEARANCE_MODEL_INPUTS = (
+    "appearance_context_tokens",
+    "appearance_context_mask",
+    "target_appearance_tokens",
+    "target_appearance_mask",
+)
+
 
 def _relative_world_times_for_model(
     world_times_s: torch.Tensor, *, context_length: int
@@ -443,7 +450,27 @@ def _relative_world_times_for_model(
     return relative.to(dtype=torch.float32)
 
 
-def _forward(model: torch.nn.Module, batch: Mapping[str, torch.Tensor]) -> Mapping[str, torch.Tensor]:
+def _appearance_teacher_ratio(step: int, runtime: Mapping[str, Any]) -> float:
+    train = runtime["train"]
+    fields = (
+        "appearance_teacher_start_ratio",
+        "appearance_teacher_end_ratio",
+        "appearance_teacher_decay_steps",
+    )
+    if not all(name in train for name in fields):
+        return 0.0
+    start = float(train[fields[0]])
+    end = float(train[fields[1]])
+    progress = min(1.0, max(0.0, float(step) / float(train[fields[2]])))
+    return start + (end - start) * progress
+
+
+def _forward(
+    model: torch.nn.Module,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    appearance_teacher_ratio: float = 0.0,
+) -> Mapping[str, torch.Tensor]:
     indices = batch["rgb_frame_indices"]
     if indices.ndim != 2 or not bool((indices == indices[:1]).all()):
         raise PretrainError("RGB supervision indices drifted within a batch")
@@ -458,6 +485,11 @@ def _forward(model: torch.nn.Module, batch: Mapping[str, torch.Tensor]) -> Mappi
         if rgb_mask.ndim != 6 or tuple(rgb_mask.shape[-3:]) != (1, 1, 1):
             raise PretrainError("target_rgb_mask must be [B,F,V,1,1,1]")
         kwargs["rgb_view_mask"] = rgb_mask[..., 0, 0, 0]
+    for name in _APPEARANCE_MODEL_INPUTS:
+        if name in batch:
+            kwargs[name] = batch[name]
+    if "appearance_context_tokens" in batch:
+        kwargs["appearance_teacher_ratio"] = appearance_teacher_ratio
     return model(**kwargs)
 
 
@@ -1202,7 +1234,13 @@ def main() -> None:
                 with no_sync_context(model, enabled=not final_micro):
                     with autocast_context(strategy):
                         losses = compute_native_objective(
-                            output=_forward(model, batch),
+                            output=_forward(
+                                model,
+                                batch,
+                                appearance_teacher_ratio=_appearance_teacher_ratio(
+                                    step, runtime
+                                ),
+                            ),
                             batch=batch,
                             config=objective,
                             perceptual_model=perceptual_model,

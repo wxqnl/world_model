@@ -1,0 +1,22 @@
+schema: wm3d_v8_objective_profile_v1
+name: stage0_native_dual_path
+objective:
+  rgb_l1: 0.5
+  # LPIPS restores perceptual supervision; pixel and gradient terms remain
+  # explicit anchors instead of being silently replaced.
+  rgb_perceptual: 0.1
+  token_mse: 1.0
+  token_cosine: 0.1
+  appearance_mse: 1.0
+  appearance_cosine: 0.1
+  rgb_charbonnier: 1.0
+  rgb_gradient: 0.25
+  depth_log: 1.5
+  point: 0.5
+  camera_pose: 0.1
+  action_fine: 2.0
+  action_coarse: 1.0
+  # 不同 source-native cadence 及 delta/absolute semantic 没有统一速度正则定义。
+  action_velocity: 0.0
+  epsilon: 0.000001
+  huber_delta: 0.05

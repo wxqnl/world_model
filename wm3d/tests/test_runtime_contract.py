@@ -233,3 +233,22 @@ def test_batch_collate_trims_storage_padding_without_dropping_real_queries() -> 
     assert result["future_factual_fine_sample_mask"].shape[-1] == 3
     assert result["policy_query_dt"].shape[-1] == 4
     assert result["target_fine_action"].shape[-2] == 4
+def test_dual_path_teacher_schedule_is_explicit_and_fail_closed() -> None:
+    from wm3d.training.pretrain import _appearance_teacher_ratio
+
+    value = _load("h100_3_fsdp2_dual_path_pilot.yaml")
+    validate_runtime_profile(value)
+    assert _appearance_teacher_ratio(0, value) == pytest.approx(1.0)
+    assert _appearance_teacher_ratio(75, value) == pytest.approx(0.5)
+    assert _appearance_teacher_ratio(150, value) == pytest.approx(0.0)
+    assert _appearance_teacher_ratio(200, value) == pytest.approx(0.0)
+
+    partial = copy.deepcopy(value)
+    partial["train"].pop("appearance_teacher_end_ratio")
+    with pytest.raises(RuntimeContractError, match="provided together"):
+        validate_runtime_profile(partial)
+
+    reversed_schedule = copy.deepcopy(value)
+    reversed_schedule["train"]["appearance_teacher_end_ratio"] = 1.1
+    with pytest.raises(RuntimeContractError, match="0 <= end <= start <= 1"):
+        validate_runtime_profile(reversed_schedule)

@@ -325,6 +325,37 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
         grouped_normalizer=normalizer,
     )
     loaded = dataset[0]
+    dual_profile = json.loads(json.dumps(model_profile))
+    dual_profile["name"] = "tiny_dual_path"
+    dual_profile["model"].update(
+        {
+            "appearance_enabled": True,
+            "appearance_P": 4,
+            "appearance_context_frames": 2,
+            "appearance_hidden": 16,
+            "appearance_layers": 1,
+            "appearance_heads": 4,
+            "appearance_ff_mult": 2.0,
+        }
+    )
+    dual_dataset = UnifiedCacheDataset(
+        cache_root=tmp_path,
+        index_path=window_index,
+        index_sha256=sha256_file(window_index),
+        data_profile=profile,
+        model_profile=dual_profile,
+        split="train",
+        grouped_normalizer=normalizer,
+    )
+    dual_loaded = dual_dataset[0]
+    assert dual_loaded["appearance_context_tokens"].shape == (2, 2, 4, 16)
+    assert dual_loaded["target_appearance_tokens"].shape == (2, 2, 4, 16)
+    assert dual_loaded["appearance_context_mask"].shape == (2, 2, 4)
+    assert dual_loaded["target_appearance_mask"].shape == (2, 2, 4)
+    torch.testing.assert_close(
+        dual_loaded["appearance_context_tokens"], dual_loaded["world_tokens"]
+    )
+
     assert loaded["world_tokens"].shape == (2, 2, 4, 16)
     assert loaded["target_tokens"].shape == (2, 4, 16)
     assert loaded["target_rgb"].shape == (2, 2, 3, 16, 16)
