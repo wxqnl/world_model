@@ -45,6 +45,7 @@ train:
   checkpoint_interval: 20000
   checkpoint_steps: [1000, 5000, 20000]
   rgb_decode_chunk_size: 2
+  rgb_perceptual_chunk_size: 8
   appearance_teacher_start_ratio: 1.0
   appearance_teacher_end_ratio: 0.0
   appearance_teacher_decay_steps: 10000

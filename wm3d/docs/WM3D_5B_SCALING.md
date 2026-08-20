@@ -15,6 +15,10 @@ model、encoder 和 objective，拉取代码后无需手工调整。训练只解
 把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
 [原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
 
+1B 实测通过的 grouped-action 向量化实现由 1B/5B 共用，不改变动作时间语义、输出或梯度；
+5B 不需要单独维护另一份慢速实现。三套 H200 runtime 还将冻结感知网络的输入按 8 张图一组
+计算，减少小 kernel 与 Python 调度开销，同时保留 RGB decoder 的显存安全分块。
+
 整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练
 依次进行。数据访问可以使用完整 episode cache，也可以使用有容量上限的按需缓存。命令会
 自动记录和校验中间产物，使用者只需要指定数据目录、数据许可、模型目录和集群地址。
@@ -30,7 +34,8 @@ model、encoder 和 objective，拉取代码后无需手工调整。训练只解
 三套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
 和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
 
-三套 runtime 都显式使用 validation micro batch 1、RGB decode chunk 2，并从
+三套 runtime 都显式使用 validation micro batch 1、RGB decode chunk 2、RGB perceptual
+chunk 8，并从
 `appearance_teacher_start_ratio=1.0` 线性切换到
 `appearance_teacher_end_ratio=0.0`。`canary1k` 在前 750 step 完成切换，
 `validation100k` 与 `formal600k` 在前 10,000 step 完成切换。这样 decoder 先学习

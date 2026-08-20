@@ -69,6 +69,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert runtime["train"]["checkpoint_steps"] == checkpoint_steps
     assert runtime["train"]["checkpoint_interval"] == checkpoint_interval
     assert runtime["train"]["rgb_decode_chunk_size"] == 2
+    assert runtime["train"]["rgb_perceptual_chunk_size"] == 8
     assert runtime["train"]["appearance_teacher_start_ratio"] == 1.0
     assert runtime["train"]["appearance_teacher_end_ratio"] == 0.0
     assert (
