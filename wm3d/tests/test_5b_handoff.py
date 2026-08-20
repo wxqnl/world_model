@@ -17,11 +17,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    "profile,total_steps,checkpoint_steps,checkpoint_interval",
+    "profile,total_steps,checkpoint_steps,checkpoint_interval,teacher_decay_steps",
     [
-        ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000),
-        ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000),
-        ("h200_64_fsdp2.yaml", 600_000, [1_000, 5_000, 20_000], 20_000),
+        ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000, 750),
+        ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000, 10_000),
+        (
+            "h200_64_fsdp2.yaml",
+            600_000,
+            [1_000, 5_000, 20_000],
+            20_000,
+            10_000,
+        ),
     ],
 )
 def test_5b_presets_match_dual_path_5b_and_64_h200(
@@ -29,6 +35,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     total_steps: int,
     checkpoint_steps: list[int],
     checkpoint_interval: int,
+    teacher_decay_steps: int,
 ) -> None:
     model = yaml.safe_load(
         (ROOT / "configs/model/native_5b_dual_path.yaml").read_text()
@@ -55,11 +62,19 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert runtime["resources"]["gpu_name_substring"] == "H200"
     assert runtime["resources"]["minimum_ib_rate_gbps"] == 400.0
     assert runtime["train"]["micro_batch_size"] == 4
+    assert runtime["train"]["validation_micro_batch_size"] == 1
     assert runtime["train"]["gradient_accumulation"] == 1
     assert runtime["train"]["global_batch_size"] == 256
     assert runtime["train"]["total_steps"] == total_steps
     assert runtime["train"]["checkpoint_steps"] == checkpoint_steps
     assert runtime["train"]["checkpoint_interval"] == checkpoint_interval
+    assert runtime["train"]["rgb_decode_chunk_size"] == 2
+    assert runtime["train"]["appearance_teacher_start_ratio"] == 1.0
+    assert runtime["train"]["appearance_teacher_end_ratio"] == 0.0
+    assert (
+        runtime["train"]["appearance_teacher_decay_steps"]
+        == teacher_decay_steps
+    )
 
 
 def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:

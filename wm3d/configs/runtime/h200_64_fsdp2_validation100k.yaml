@@ -29,6 +29,7 @@ resources:
   maximum_preflight_age_seconds: 1800
 train:
   micro_batch_size: 4
+  validation_micro_batch_size: 1
   gradient_accumulation: 1
   global_batch_size: 256
   total_steps: 100000
@@ -43,6 +44,10 @@ train:
   validation_steps: 20
   checkpoint_interval: 1000
   checkpoint_steps: []
+  rgb_decode_chunk_size: 2
+  appearance_teacher_start_ratio: 1.0
+  appearance_teacher_end_ratio: 0.0
+  appearance_teacher_decay_steps: 10000
 optimizer:
   name: adamw
   peak_lr: 0.00012

@@ -30,6 +30,13 @@ model、encoder 和 objective，拉取代码后无需手工调整。训练只解
 三套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
 和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
 
+三套 runtime 都显式使用 validation micro batch 1、RGB decode chunk 2，并从
+`appearance_teacher_start_ratio=1.0` 线性切换到
+`appearance_teacher_end_ratio=0.0`。`canary1k` 在前 750 step 完成切换，
+`validation100k` 与 `formal600k` 在前 10,000 step 完成切换。这样 decoder 先学习
+真值 appearance latent 到 RGB 的稳定重建，再进入完全由模型预测 latent 驱动的训练；
+appearance dynamics 在整个过程中持续接受 MSE 与 cosine 监督。
+
 默认 global batch 为 256，因此 1K、100K 和 600K 分别对应约 25.6 万、2,560 万和
 1.536 亿个全局采样位置。
 
