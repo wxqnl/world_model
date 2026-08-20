@@ -13,6 +13,7 @@ from .vggt_encoder import VGGTEncoder
 
 
 NATIVE_VGGT_SCHEMA = "wm3d_native_vggt_encoder_v1"
+VGGT_CACHED_FEATURE_LAYERS = (4, 11, 17, 23)
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class NativeVGGTConfig:
     model_revision: str = ""
     token_grid: int = 12
     appearance_token_grid: int = 0
+    appearance_feature_layer: int = -1
     # VGGT input resolution and WM3D's stored RGB target resolution are two
     # different contracts.  518 is 37 patches at VGGT's patch size 14.
     input_rgb_size: int = 518
@@ -49,6 +51,22 @@ class NativeVGGTConfig:
             raise ValueError("VGGT input_rgb_size must be divisible by patch size 14")
         if self.appearance_token_grid < 0:
             raise ValueError("appearance_token_grid cannot be negative")
+        if self.appearance_feature_layer < -1:
+            raise ValueError(
+                "appearance_feature_layer must be -1 or a non-negative cached layer"
+            )
+        if (
+            self.appearance_token_grid > 0
+            and self.appearance_feature_layer not in (-1, *VGGT_CACHED_FEATURE_LAYERS)
+        ):
+            raise ValueError(
+                "appearance_feature_layer must select a VGGT cached layer: "
+                f"{VGGT_CACHED_FEATURE_LAYERS}"
+            )
+        if self.appearance_token_grid == 0 and self.appearance_feature_layer != -1:
+            raise ValueError(
+                "appearance_feature_layer requires appearance_token_grid"
+            )
         if self.appearance_token_grid > self.input_rgb_size // 14:
             raise ValueError(
                 "appearance_token_grid exceeds the native VGGT patch grid"
@@ -119,6 +137,11 @@ class NativeVGGTEncoder(torch.nn.Module):
             local_files_only=local_files_only,
             token_grid=config.token_grid,
             appearance_token_grid=config.appearance_token_grid or None,
+            appearance_feature_layer=(
+                config.appearance_feature_layer
+                if config.appearance_token_grid
+                else None
+            ),
             return_depth=True,
             return_depth_conf=True,
             return_geom_extra=True,

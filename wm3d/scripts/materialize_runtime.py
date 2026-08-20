@@ -167,6 +167,9 @@ def main() -> None:
         configured_appearance_grid = data_profile.cache_representation.get(
             "appearance_token_grid"
         )
+        configured_appearance_layer = data_profile.cache_representation.get(
+            "appearance_feature_layer"
+        )
         if configured_appearance_grid is not None:
             appearance_grid = int(configured_appearance_grid)
         elif bool(model["model"].get("appearance_enabled", False)):
@@ -215,6 +218,10 @@ def main() -> None:
             "decode_workers": int(args.streaming_decode_workers),
             "appearance_token_grid": appearance_grid,
         }
+        if configured_appearance_layer is not None:
+            closure["appearance_feature_layer"] = int(
+                configured_appearance_layer
+            )
     value = {
         "schema": RUNTIME_CONFIG_SCHEMA,
         "run": {

@@ -182,6 +182,10 @@ def main() -> None:
         "token_dim": int(representation["token_dim"]),
         "max_views": int(representation["num_views"]),
     }
+    if expected_encoder["appearance_token_grid"] > 0:
+        expected_encoder["appearance_feature_layer"] = int(
+            representation.get("appearance_feature_layer", -1)
+        )
     for name, expected in expected_encoder.items():
         if int(getattr(encoder_config, name)) != expected:
             raise StreamingMetadataError(
@@ -325,4 +329,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

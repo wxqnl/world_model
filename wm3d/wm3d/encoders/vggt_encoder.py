@@ -17,6 +17,31 @@ from typing import Any
 import torch.nn.functional as F
 
 
+def _patch_tokens_from_cached_layer(
+    aggregated_tokens: list[torch.Tensor | None],
+    *,
+    patch_start_idx: int,
+    layer: int,
+    role: str,
+) -> torch.Tensor:
+    resolved_layer = len(aggregated_tokens) - 1 if int(layer) == -1 else int(layer)
+    if not 0 <= resolved_layer < len(aggregated_tokens):
+        raise RuntimeError(
+            f"VGGT {role} feature layer {resolved_layer} is outside "
+            f"[0, {len(aggregated_tokens) - 1}]"
+        )
+    tokens = aggregated_tokens[resolved_layer]
+    if tokens is None:
+        raise RuntimeError(
+            f"VGGT {role} feature layer {resolved_layer} is not cached by the backbone"
+        )
+    if tokens.ndim != 4 or not 0 <= int(patch_start_idx) < tokens.shape[-2]:
+        raise RuntimeError(
+            f"VGGT {role} feature layout is invalid: {tuple(tokens.shape)}"
+        )
+    return tokens[:, :, int(patch_start_idx) :, :]
+
+
 def _ensure_local_vggt_on_path() -> Path:
     root = Path(
         os.environ.get(
@@ -52,6 +77,7 @@ class VGGTEncoder(torch.nn.Module):
         model_name: str = "facebook/VGGT-1B",
         token_grid: int = 8,
         appearance_token_grid: int | None = None,
+        appearance_feature_layer: int | None = None,
         return_depth: bool = False,
         return_depth_conf: bool = False,
         return_geom_extra: bool = False,
@@ -94,8 +120,13 @@ class VGGTEncoder(torch.nn.Module):
         self.appearance_token_grid = (
             0 if appearance_token_grid is None else int(appearance_token_grid)
         )
+        self.appearance_feature_layer = (
+            -1 if appearance_feature_layer is None else int(appearance_feature_layer)
+        )
         if self.appearance_token_grid < 0:
             raise ValueError("appearance token grid cannot be negative")
+        if self.appearance_feature_layer < -1:
+            raise ValueError("appearance feature layer must be -1 or non-negative")
         self.return_depth = bool(return_depth)
         self.return_depth_conf = bool(return_depth_conf)
         self.return_geom_extra = bool(return_geom_extra)
@@ -140,14 +171,32 @@ class VGGTEncoder(torch.nn.Module):
         ):
             aggregated_tokens, patch_start_idx = self.model.aggregator(images)
 
-        tokens = aggregated_tokens[-1]
         patch_start = int(patch_start_idx)
-        patch_tokens = tokens[:, :, patch_start:, :]
-        pooled = self._pool_patch_tokens(patch_tokens, self.token_grid).to(torch.float16)
+        geometry_patch_tokens = _patch_tokens_from_cached_layer(
+            aggregated_tokens,
+            patch_start_idx=patch_start,
+            layer=-1,
+            role="geometry",
+        )
+        pooled = self._pool_patch_tokens(
+            geometry_patch_tokens, self.token_grid
+        ).to(torch.float16)
         out: dict[str, Any] = {"pooled": pooled}
         if self.appearance_token_grid:
+            appearance_patch_tokens = _patch_tokens_from_cached_layer(
+                aggregated_tokens,
+                patch_start_idx=patch_start,
+                layer=self.appearance_feature_layer,
+                role="appearance",
+            )
+            if appearance_patch_tokens.shape[-1] != geometry_patch_tokens.shape[-1]:
+                raise RuntimeError(
+                    "VGGT geometry/appearance feature dimensions differ: "
+                    f"{geometry_patch_tokens.shape[-1]} != "
+                    f"{appearance_patch_tokens.shape[-1]}"
+                )
             out["appearance_pooled"] = self._pool_patch_tokens(
-                patch_tokens, self.appearance_token_grid
+                appearance_patch_tokens, self.appearance_token_grid
             ).to(torch.float16)
         missing: list[str] = []
 

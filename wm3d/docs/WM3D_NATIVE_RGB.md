@@ -29,9 +29,11 @@ latent 和 3D 条件，因此纹理不会被迫先穿过 P64/P144 的融合瓶�
 
 冻结 VGGT 的一次 forward 同时产出：
 
-- `view_tokens`：逐视角池化到 geometry grid，随后进入原有多视角融合与 3D 主干；
-- `appearance_tokens`：保持逐视角 P256，不做 PCA，不做跨视角平均，只供 appearance
+- `view_tokens`：取最深的第 23 层特征，逐视角池化到 geometry grid，随后进入原有多视角融合与 3D 主干；
+- `appearance_tokens`：取较浅且仍保持 2048 维 ABI 的第 4 层特征，保持逐视角 P256，不做 PCA、不做跨视角平均，只供 appearance
   dynamics、appearance loss 和 RGB decoder 使用。
+
+浅层 appearance 保留更多颜色、边缘和局部纹理；深层 geometry 仍保留 VGGT 的完整几何推理。两者来自同一次 forward，不会增加第二次 VGGT 编码。
 
 `streaming_raw` 会将两组 token 分别量化并写入同一个有容量上限的 episode LRU。完整
 episode cache 则必须使用双通路 encoder 合同：
@@ -39,8 +41,7 @@ episode cache 则必须使用双通路 encoder 合同：
 - 1B：`configs/encoder/vggt_native_p64_appearance_p256.yaml`；
 - 5B：`configs/encoder/vggt_native_p144_appearance_p256.yaml`。
 
-旧的 geometry-only cache 没有 P256 appearance latent，不能直接用于 dual-path 正式训练。
-它仍可用于旧结构 A/B，不会被删除或伪装成新 cache。
+旧的 geometry-only cache 没有 P256 appearance latent，不能直接用于 dual-path 正式训练；此前从 VGGT 最深层生成的 P256 appearance cache 也不能与新的第 4 层 appearance 合同混用。它们仍可用于旧结构 A/B，不会被删除或伪装成新 cache。
 
 ## Teacher 到预测 latent 的切换
 

@@ -62,7 +62,7 @@ class PreparedTask:
 def _strict_encoder(path: Path) -> NativeVGGTConfig:
     value = yaml.safe_load(path.resolve(strict=True).read_text(encoding="utf-8"))
     fields = set(NativeVGGTConfig.__dataclass_fields__)
-    optional = {"appearance_token_grid"}
+    optional = {"appearance_token_grid", "appearance_feature_layer"}
     required = fields - optional
     if not isinstance(value, dict) or not required.issubset(value) or set(value) - fields:
         raise CacheWorkerError(
@@ -511,6 +511,15 @@ def main() -> None:
         raise CacheWorkerError(
             "encoder/data representation appearance_token_grid mismatch: "
             f"{encoder_config.appearance_token_grid} != {expected_appearance_grid}"
+        )
+    expected_appearance_layer = int(
+        representation.get("appearance_feature_layer", -1)
+    )
+    if int(encoder_config.appearance_feature_layer) != expected_appearance_layer:
+        raise CacheWorkerError(
+            "encoder/data representation appearance_feature_layer mismatch: "
+            f"{encoder_config.appearance_feature_layer} != "
+            f"{expected_appearance_layer}"
         )
     task_encoder_digests = {task.task_encoder_contract_sha256 for task in tasks}
     if len(task_encoder_digests) != 1:

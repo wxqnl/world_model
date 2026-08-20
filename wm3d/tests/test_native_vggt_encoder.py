@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 
 from pathlib import Path
+import pytest
 import torch
 from scripts.data.run_cache_worker import _strict_encoder
 
 
 from wm3d.encoders.native_vggt import NativeVGGTConfig, NativeVGGTEncoder
+from wm3d.encoders.vggt_encoder import _patch_tokens_from_cached_layer
 
 
 class _RecordingEncoder(torch.nn.Module):
@@ -106,12 +108,44 @@ def test_dual_grid_preserves_per_view_appearance_tokens() -> None:
     assert output["appearance_tokens"][:, 1, 1].eq(0).all()
 
 
+def test_geometry_and_appearance_select_different_cached_vggt_layers() -> None:
+    cached: list[torch.Tensor | None] = [None] * 24
+    cached[4] = torch.full((1, 2, 7, 2048), 4.0)
+    cached[23] = torch.full((1, 2, 7, 2048), 23.0)
+
+    geometry = _patch_tokens_from_cached_layer(
+        cached, patch_start_idx=5, layer=-1, role="geometry"
+    )
+    appearance = _patch_tokens_from_cached_layer(
+        cached, patch_start_idx=5, layer=4, role="appearance"
+    )
+
+    assert geometry.shape == appearance.shape == (1, 2, 2, 2048)
+    assert geometry.eq(23).all()
+    assert appearance.eq(4).all()
+    with pytest.raises(RuntimeError, match="is not cached"):
+        _patch_tokens_from_cached_layer(
+            cached, patch_start_idx=5, layer=11, role="appearance"
+        )
+
+
 def test_existing_encoder_contract_defaults_to_geometry_only() -> None:
     config = _strict_encoder(
         Path("configs/encoder/vggt_native_p64.yaml")
     )
     assert config.token_grid == 8
     assert config.appearance_token_grid == 0
+    assert config.appearance_feature_layer == -1
+
+
+def test_dual_path_rejects_an_uncached_appearance_layer() -> None:
+    with pytest.raises(ValueError, match="cached layer"):
+        replace(
+            _config(),
+            appearance_token_grid=4,
+            appearance_feature_layer=5,
+            input_rgb_size=56,
+        ).validate()
 
 
 def test_dual_path_encoder_contracts_keep_geometry_and_appearance_grids() -> None:
@@ -124,3 +158,4 @@ def test_dual_path_encoder_contracts_keep_geometry_and_appearance_grids() -> Non
 
     assert (one_b.token_grid, one_b.appearance_token_grid) == (8, 16)
     assert (five_b.token_grid, five_b.appearance_token_grid) == (12, 16)
+    assert one_b.appearance_feature_layer == five_b.appearance_feature_layer == 4

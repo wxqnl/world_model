@@ -171,17 +171,33 @@ def test_profile_accepts_a_separate_higher_resolution_appearance_grid(
     manifest.write_text(json.dumps(_source_row(), sort_keys=True) + "\n")
     value = _profile(manifest)
     value["cache_representation"]["appearance_token_grid"] = 4  # type: ignore[index]
+    value["cache_representation"]["appearance_feature_layer"] = 4  # type: ignore[index]
     profile_path = tmp_path / "profile.yaml"
     profile_path.write_text(yaml.safe_dump(value, sort_keys=False))
 
     profile = load_data_profile(profile_path)
     assert profile.cache_representation["appearance_token_grid"] == 4
+    assert profile.cache_representation["appearance_feature_layer"] == 4
 
     value["cache_representation"]["appearance_token_grid"] = 1  # type: ignore[index]
     invalid_path = tmp_path / "invalid_profile.yaml"
     invalid_path.write_text(yaml.safe_dump(value, sort_keys=False))
     with pytest.raises(ManifestContractError, match="at least token_grid"):
         load_data_profile(invalid_path)
+
+
+def test_profile_rejects_appearance_layer_without_appearance_tokens(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "source.jsonl"
+    manifest.write_text(json.dumps(_source_row(), sort_keys=True) + "\n")
+    value = _profile(manifest)
+    value["cache_representation"]["appearance_feature_layer"] = 4  # type: ignore[index]
+    profile_path = tmp_path / "profile.yaml"
+    profile_path.write_text(yaml.safe_dump(value, sort_keys=False))
+
+    with pytest.raises(ManifestContractError, match="requires appearance tokens"):
+        load_data_profile(profile_path)
 
 
 def test_profile_rejects_a_global_resampling_mode(tmp_path: Path) -> None:

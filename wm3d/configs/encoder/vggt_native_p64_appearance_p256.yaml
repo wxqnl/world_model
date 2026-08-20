@@ -3,6 +3,7 @@ model_name: facebook/VGGT-1B
 model_revision: 860abec7937da0a4c03c41d3c269c366e82abdf9
 token_grid: 8
 appearance_token_grid: 16
+appearance_feature_layer: 4
 input_rgb_size: 518
 input_preprocess: aspect_pad_white
 target_rgb_size: 256

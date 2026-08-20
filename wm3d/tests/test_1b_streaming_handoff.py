@@ -165,6 +165,7 @@ def test_1b_oxe_mix_is_60_sources_without_agibot_or_pca() -> None:
     assert generated_data["notes"]["agibot_beta_enabled"] is False
     assert generated_data["cache_representation"]["spatial_tokens"] == 64
     assert generated_data["cache_representation"]["appearance_token_grid"] == 16
+    assert generated_data["cache_representation"]["appearance_feature_layer"] == 4
     assert generated_data["cache_representation"]["token_dim"] == 2048
     assert generated_data["cache_representation"]["rgb_size"] == 256
     assert "pca" not in json.dumps(generated_data["cache_representation"]).lower()

@@ -239,6 +239,7 @@ def _representation_from_profiles(
     grid = int(encoder["token_grid"])
     spatial_tokens = grid * grid
     appearance_grid = int(encoder.get("appearance_token_grid", 0))
+    appearance_feature_layer = int(encoder.get("appearance_feature_layer", -1))
     expected_appearance_grid = 0
     if bool(model.get("appearance_enabled", False)):
         appearance_tokens = int(model["appearance_P"])
@@ -249,6 +250,10 @@ def _representation_from_profiles(
         raise ValueError(
             "model/encoder appearance grid mismatch: "
             f"expected={expected_appearance_grid} actual={appearance_grid}"
+        )
+    if appearance_grid > 0 and appearance_feature_layer < 0:
+        raise ValueError(
+            "dual-path encoder must select an explicit appearance_feature_layer"
         )
     expected = {
         "spatial_tokens": int(model["P"]),
@@ -278,8 +283,10 @@ def _representation_from_profiles(
     )
     if appearance_grid > 0:
         result["appearance_token_grid"] = appearance_grid
+        result["appearance_feature_layer"] = appearance_feature_layer
     else:
         result.pop("appearance_token_grid", None)
+        result.pop("appearance_feature_layer", None)
     selection = result.get("state_frame_selection")
     if not isinstance(selection, dict):
         raise ValueError("base data template is missing state_frame_selection")

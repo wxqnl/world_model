@@ -443,7 +443,10 @@ def load_data_profile(path: Path, *, verify_source_manifests: bool = True) -> Da
         "missing_view_policy",
         "state_frame_selection",
     }
-    optional_representation = {"appearance_token_grid"}
+    optional_representation = {
+        "appearance_token_grid",
+        "appearance_feature_layer",
+    }
     missing_representation = sorted(required_representation - set(representation))
     unknown_representation = sorted(set(representation) - required_representation - optional_representation)
     if missing_representation or unknown_representation:
@@ -474,6 +477,17 @@ def load_data_profile(path: Path, *, verify_source_manifests: bool = True) -> Da
         ):
             raise ManifestContractError(
                 "cache_representation.appearance_token_grid must be at least token_grid"
+            )
+    if "appearance_feature_layer" in representation:
+        appearance_layer = representation["appearance_feature_layer"]
+        if (
+            "appearance_token_grid" not in representation
+            or isinstance(appearance_layer, bool)
+            or int(appearance_layer) < 0
+        ):
+            raise ManifestContractError(
+                "cache_representation.appearance_feature_layer requires "
+                "appearance tokens and must be non-negative"
             )
     if int(representation["token_grid"]) ** 2 != int(
         representation["spatial_tokens"]

@@ -484,7 +484,7 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
         "encode_batch_frames",
         "decode_workers",
     }
-    optional = {"appearance_token_grid"}
+    optional = {"appearance_token_grid", "appearance_feature_layer"}
     if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - optional:
         raise RuntimeContractError("streaming_raw closure fields mismatch")
     if value.get("schema") != STREAMING_DATA_CLOSURE_SCHEMA:
@@ -513,6 +513,15 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
     ):
         raise RuntimeContractError(
             "streaming_raw appearance_token_grid must be positive"
+        )
+    if "appearance_feature_layer" in value and (
+        "appearance_token_grid" not in value
+        or isinstance(value["appearance_feature_layer"], bool)
+        or int(value["appearance_feature_layer"]) < 0
+    ):
+        raise RuntimeContractError(
+            "streaming_raw appearance_feature_layer requires appearance tokens "
+            "and must be non-negative"
         )
     for field in ("metadata_root", "task_bank_root"):
         root = Path(str(value[field]))
@@ -573,6 +582,16 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
     profile = load_data_profile(
         Path(str(value["data_profile_path"])), verify_source_manifests=False
     )
+    for field, default in (
+        ("appearance_token_grid", profile.cache_representation["token_grid"]),
+        ("appearance_feature_layer", -1),
+    ):
+        if int(value.get(field, default)) != int(
+            profile.cache_representation.get(field, default)
+        ):
+            raise RuntimeContractError(
+                f"streaming_raw {field} differs from data profile"
+            )
     if value["source_manifest_sha256_by_name"] != {
         source.name: source.manifest_sha256 for source in profile.sources
     }:
