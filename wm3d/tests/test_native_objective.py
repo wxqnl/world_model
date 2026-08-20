@@ -19,6 +19,16 @@ class _MeanFeatureDistance(torch.nn.Module):
         return (prediction - target).abs().mean(dim=(1, 2, 3), keepdim=True)
 
 
+class _RecordingMeanFeatureDistance(_MeanFeatureDistance):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_sizes: list[int] = []
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        self.batch_sizes.append(int(prediction.shape[0]))
+        return super().forward(prediction, target)
+
+
 def test_perceptual_rgb_loss_masks_whole_views_and_backpropagates() -> None:
     prediction = torch.full((1, 2, 2, 3, 8, 8), 0.75, requires_grad=True)
     target = torch.full_like(prediction, 0.25)
@@ -38,6 +48,34 @@ def test_perceptual_rgb_loss_masks_whole_views_and_backpropagates() -> None:
     partial[..., :4, :] = True
     with pytest.raises(NativeObjectiveError, match="whole-image"):
         _masked_rgb_perceptual(prediction, target, partial, _MeanFeatureDistance())
+
+
+def test_perceptual_rgb_loss_uses_configured_execution_chunks() -> None:
+    prediction = torch.full((1, 2, 2, 3, 8, 8), 0.75)
+    target = torch.full_like(prediction, 0.25)
+    mask = torch.ones(1, 2, 2, 1, 1, 1, dtype=torch.bool)
+    model = _RecordingMeanFeatureDistance()
+
+    with torch.no_grad():
+        loss = _masked_rgb_perceptual(
+            prediction,
+            target,
+            mask,
+            model,
+            chunk_size=3,
+        )
+
+    assert model.batch_sizes == [3, 1]
+    assert loss.item() == pytest.approx(1.0)
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(NativeObjectiveError, match="chunk size"):
+            _masked_rgb_perceptual(
+                prediction,
+                target,
+                mask,
+                model,
+                chunk_size=invalid,
+            )
 
 
 def test_composition_uses_real_query_times_and_physical_operators() -> None:
@@ -115,6 +153,75 @@ def test_mixed_embodiment_batch_uses_per_sample_composition_operators() -> None:
         composition_operator_ids=operators,
     )
     torch.testing.assert_close(composed[:, 0, 0, 0], torch.tensor([6.0, 3.0]))
+    assert composed_mask.all()
+
+
+def test_composition_never_reads_per_dimension_tensor_scalars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    action = torch.arange(24, dtype=torch.float32).view(2, 2, 3, 2)
+    mask = torch.ones_like(action, dtype=torch.bool)
+    query_dt = torch.tensor(
+        [[[0.01, 0.07, 0.15], [0.01, 0.07, 0.15]]] * 2
+    )
+    boundaries = torch.tensor([[0.0, 0.2], [0.0, 0.2]])
+    operators = torch.full(
+        (2, 2, 2), COMPOSITION_OPERATOR_IDS["sum"], dtype=torch.long
+    )
+
+    def reject_item(_value: torch.Tensor) -> float:
+        raise AssertionError("composition attempted a per-dimension Tensor.item()")
+
+    monkeypatch.setattr(torch.Tensor, "item", reject_item)
+    composed, composed_mask = compose_policy_to_world_intervals(
+        policy_action=action,
+        policy_action_mask=mask,
+        policy_query_dt=query_dt,
+        future_world_boundaries_dt=boundaries,
+        composition_operator_ids=operators,
+    )
+
+    torch.testing.assert_close(composed[:, 0], action.sum(dim=2))
+    assert composed_mask.all()
+
+
+def test_adjacent_left_and_right_so3_triplets_remain_independent() -> None:
+    action = torch.tensor(
+        [[[[0.10, 0.00, 0.00, 0.10, 0.00, 0.00],
+           [0.00, 0.20, 0.00, 0.00, 0.20, 0.00],
+           [0.00, 0.00, 0.30, 0.00, 0.00, 0.30]]]]
+    )
+    mask = torch.ones_like(action, dtype=torch.bool)
+    operators = torch.tensor(
+        [[[
+            COMPOSITION_OPERATOR_IDS["so3_axis_angle_base_left"],
+            COMPOSITION_OPERATOR_IDS["so3_axis_angle_base_left"],
+            COMPOSITION_OPERATOR_IDS["so3_axis_angle_base_left"],
+            COMPOSITION_OPERATOR_IDS["so3_axis_angle_body_right"],
+            COMPOSITION_OPERATOR_IDS["so3_axis_angle_body_right"],
+            COMPOSITION_OPERATOR_IDS["so3_axis_angle_body_right"],
+        ]]]
+    )
+    composed, composed_mask = compose_policy_to_world_intervals(
+        policy_action=action,
+        policy_action_mask=mask,
+        policy_query_dt=torch.tensor([[[0.01, 0.07, 0.15]]]),
+        future_world_boundaries_dt=torch.tensor([[0.0, 0.2]]),
+        composition_operator_ids=operators,
+    )
+    left, _ = compose_axis_angle_sequence(
+        action[0, 0, :, :3].unsqueeze(0),
+        torch.ones(1, 3, dtype=torch.bool),
+        left_multiply=True,
+    )
+    right, _ = compose_axis_angle_sequence(
+        action[0, 0, :, 3:].unsqueeze(0),
+        torch.ones(1, 3, dtype=torch.bool),
+        left_multiply=False,
+    )
+
+    torch.testing.assert_close(composed[0, 0, 0, :3], left[0])
+    torch.testing.assert_close(composed[0, 0, 0, 3:], right[0])
     assert composed_mask.all()
 
 

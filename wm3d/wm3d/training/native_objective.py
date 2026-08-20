@@ -101,15 +101,27 @@ def _masked_rgb_perceptual(
     target: torch.Tensor,
     mask: torch.Tensor,
     model: nn.Module,
+    *,
+    chunk_size: int = 4,
 ) -> torch.Tensor:
+    if (
+        not isinstance(chunk_size, int)
+        or isinstance(chunk_size, bool)
+        or chunk_size <= 0
+    ):
+        raise NativeObjectiveError("RGB perceptual chunk size must be a positive integer")
     if prediction.ndim != 6 or prediction.shape[-3] != 3:
         raise NativeObjectiveError("RGB perceptual tensors must be [B,F,V,3,H,W]")
     if prediction.shape != target.shape:
         raise NativeObjectiveError("RGB prediction/target shapes differ")
-    expanded_mask = torch.broadcast_to(mask, prediction.shape)
-    flat_mask = expanded_mask.reshape(-1, *prediction.shape[-3:])
-    image_all = flat_mask.all(dim=(1, 2, 3))
-    image_any = flat_mask.any(dim=(1, 2, 3))
+    if mask.shape == prediction.shape[:3] + (1, 1, 1):
+        image_all = mask.reshape(-1).bool()
+        image_any = image_all
+    else:
+        expanded_mask = torch.broadcast_to(mask, prediction.shape)
+        flat_mask = expanded_mask.reshape(-1, *prediction.shape[-3:])
+        image_all = flat_mask.all(dim=(1, 2, 3))
+        image_any = flat_mask.any(dim=(1, 2, 3))
     if not bool((image_all == image_any).all()):
         raise NativeObjectiveError(
             "RGB perceptual supervision requires whole-image masks"
@@ -120,9 +132,9 @@ def _masked_rgb_perceptual(
     pred_images = prediction.reshape(-1, *prediction.shape[-3:]).index_select(0, valid)
     target_images = target.reshape(-1, *target.shape[-3:]).index_select(0, valid)
     total = prediction.new_zeros((), dtype=torch.float32)
-    for start in range(0, int(valid.numel()), 4):
-        pred_chunk = pred_images[start : start + 4].float().mul(2.0).sub(1.0)
-        target_chunk = target_images[start : start + 4].float().mul(2.0).sub(1.0)
+    for start in range(0, int(valid.numel()), chunk_size):
+        pred_chunk = pred_images[start : start + chunk_size].float().mul(2.0).sub(1.0)
+        target_chunk = target_images[start : start + chunk_size].float().mul(2.0).sub(1.0)
         with torch.autocast(device_type=prediction.device.type, enabled=False):
             if torch.is_grad_enabled() and pred_chunk.requires_grad:
                 distance = checkpoint(
@@ -263,102 +275,154 @@ def compose_policy_to_world_intervals(
     operator_mean = COMPOSITION_OPERATOR_IDS["time_weighted_mean"]
     operator_logical_last = COMPOSITION_OPERATOR_IDS["logical_last"]
 
-    # Mixed-embodiment batches may use different physical operators in the
-    # same padded group/dimension slot.  The loop is over small metadata axes;
-    # all action arithmetic remains differentiable torch operations.
-    for sample in range(batch):
-        for interval in range(horizon):
-            start = future_world_boundaries_dt[sample, interval]
-            stop = future_world_boundaries_dt[sample, interval + 1]
-            in_interval = (policy_query_dt[sample] >= start) & (
-                policy_query_dt[sample] < stop
-            )
-            for group in range(groups):
-                group_interval = in_interval[group]
-                dim = 0
-                while dim < action_dim:
-                    operator = int(
-                        composition_operator_ids[sample, group, dim].item()
-                    )
-                    if operator == operator_none:
-                        dim += 1
-                        continue
-                    if operator in {operator_so3_left, operator_so3_right}:
-                        if dim + 3 > action_dim or not bool(
-                            composition_operator_ids[
-                                sample, group, dim : dim + 3
-                            ]
-                            .eq(operator)
-                            .all()
-                        ):
-                            raise NativeObjectiveError(
-                                "SO(3) composition must occupy one contiguous "
-                                "three-dimension run with one multiplication convention"
-                            )
-                        value = policy_action[
-                            sample, group, :, dim : dim + 3
-                        ].unsqueeze(0)
-                        valid = (
-                            group_interval
-                            & policy_action_mask[
-                                sample, group, :, dim : dim + 3
-                            ].all(dim=-1)
-                        ).unsqueeze(0)
-                        composed, composed_valid = compose_axis_angle_sequence(
-                            value,
-                            valid,
-                            left_multiply=(operator == operator_so3_left),
-                            epsilon=epsilon,
-                        )
-                        result[
-                            sample, interval, group, dim : dim + 3
-                        ] = composed[0]
-                        result_mask[
-                            sample, interval, group, dim : dim + 3
-                        ] = composed_valid[0]
-                        dim += 3
-                        continue
+    operators = composition_operator_ids
+    supported = (
+        operators.eq(operator_none)
+        | operators.eq(operator_sum)
+        | operators.eq(operator_so3_left)
+        | operators.eq(operator_so3_right)
+        | operators.eq(operator_last)
+        | operators.eq(operator_mean)
+        | operators.eq(operator_logical_last)
+    )
+    if not bool(supported.all()):
+        raise NativeObjectiveError("unsupported composition operator id")
 
-                    value = policy_action[sample, group, :, dim]
-                    valid = (
-                        group_interval
-                        & policy_action_mask[sample, group, :, dim]
-                    )
-                    if operator == operator_sum:
-                        composed = (value * valid.to(value.dtype)).sum()
-                    elif operator in {operator_last, operator_logical_last}:
-                        indices = torch.arange(queries, device=value.device)
-                        last_index = torch.where(valid, indices, -1).max()
-                        composed = torch.where(
-                            last_index >= 0,
-                            value[last_index.clamp_min(0)],
-                            value.new_zeros(()),
-                        )
-                    elif operator == operator_mean:
-                        # Commands are zero-order held until the next command or
-                        # interval end.  Padding/invalid query slots are not real
-                        # clock events and therefore cannot truncate the hold.
-                        # This uses actual query times, not nominal Hz.
-                        times = policy_query_dt[sample, group]
-                        valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
-                        next_times = torch.full_like(times, stop)
-                        if valid_indices.numel() > 1:
-                            next_times[valid_indices[:-1]] = times[valid_indices[1:]]
-                        effective_stop = torch.minimum(next_times, stop)
-                        effective_start = torch.maximum(times, start)
-                        duration = (effective_stop - effective_start).clamp_min(0.0)
-                        duration = duration * valid.to(duration.dtype)
-                        composed = (value * duration).sum() / duration.sum().clamp_min(
-                            epsilon
-                        )
-                    else:
-                        raise NativeObjectiveError(
-                            f"unsupported composition operator id {operator}"
-                        )
-                    result[sample, interval, group, dim] = composed
-                    result_mask[sample, interval, group, dim] = valid.any()
-                    dim += 1
-    return result, result_mask
+    starts = future_world_boundaries_dt[:, :-1, None, None]
+    stops = future_world_boundaries_dt[:, 1:, None, None]
+    query_times = policy_query_dt[:, None]
+    in_interval = (query_times >= starts) & (query_times < stops)
+    valid = in_interval[..., None] & policy_action_mask[:, None]
+    values = policy_action[:, None].expand(-1, horizon, -1, -1, -1)
+    valid_any = valid.any(dim=3)
+
+    summed = (values * valid.to(dtype=values.dtype)).sum(dim=3)
+    query_indices = torch.arange(queries, device=policy_action.device).view(
+        1, 1, 1, queries, 1
+    )
+    last_indices = torch.where(valid, query_indices, -1).amax(dim=3)
+    last = values.gather(
+        3, last_indices.clamp_min(0).unsqueeze(3)
+    ).squeeze(3)
+    last = torch.where(last_indices >= 0, last, torch.zeros_like(last))
+
+    # Commands are zero-order held until the next valid command or interval
+    # end.  The only Python loop is over the real query clock; it launches
+    # batched tensor work and never reads individual CUDA scalars.
+    next_seen = stops.expand(batch, horizon, groups, action_dim)
+    durations: list[torch.Tensor] = [torch.empty(0)] * queries
+    interval_starts = starts
+    interval_stops = stops
+    for query_index in range(queries - 1, -1, -1):
+        current_valid = valid[:, :, :, query_index]
+        current_time = query_times[:, :, :, query_index, None].expand(
+            batch, horizon, groups, action_dim
+        )
+        duration = (
+            torch.minimum(next_seen, interval_stops)
+            - torch.maximum(current_time, interval_starts)
+        ).clamp_min(0.0)
+        durations[query_index] = duration * current_valid.to(duration.dtype)
+        next_seen = torch.where(current_valid, current_time, next_seen)
+    duration = torch.stack(durations, dim=3)
+    duration_sum = duration.sum(dim=3)
+    time_weighted = (values * duration).sum(dim=3) / duration_sum.clamp_min(
+        epsilon
+    )
+
+    expanded_operators = operators[:, None]
+    scalar_operator = (
+        expanded_operators.eq(operator_sum)
+        | expanded_operators.eq(operator_last)
+        | expanded_operators.eq(operator_logical_last)
+        | expanded_operators.eq(operator_mean)
+    )
+    result = torch.where(
+        expanded_operators.eq(operator_sum), summed, torch.zeros_like(summed)
+    )
+    result = torch.where(
+        expanded_operators.eq(operator_last)
+        | expanded_operators.eq(operator_logical_last),
+        last,
+        result,
+    )
+    result = torch.where(
+        expanded_operators.eq(operator_mean), time_weighted, result
+    )
+    result_mask = valid_any & scalar_operator
+
+    # SO(3) runs are uncommon but may differ per sample/group.  Walk the
+    # bounded action-dimension metadata once, while composing every batch,
+    # interval and group in parallel.  Adjacent runs are consumed in triples.
+    consumed = torch.zeros_like(operators, dtype=torch.bool)
+    invalid_so3 = torch.zeros(batch, groups, dtype=torch.bool, device=operators.device)
+    so3_result = torch.zeros_like(result)
+    so3_mask = torch.zeros_like(result_mask)
+    is_so3 = operators.eq(operator_so3_left) | operators.eq(operator_so3_right)
+    candidate_dimensions = torch.nonzero(
+        is_so3.any(dim=(0, 1)), as_tuple=False
+    ).flatten().tolist()
+    for dim in candidate_dimensions:
+        active_left = operators[..., dim].eq(operator_so3_left) & ~consumed[..., dim]
+        active_right = operators[..., dim].eq(operator_so3_right) & ~consumed[..., dim]
+        active = active_left | active_right
+        if not bool(active.any()):
+            continue
+        if dim + 3 > action_dim:
+            invalid_so3 |= active
+            continue
+        segment = operators[..., dim : dim + 3]
+        left_triplet = active_left & segment.eq(operator_so3_left).all(dim=-1)
+        right_triplet = active_right & segment.eq(operator_so3_right).all(dim=-1)
+        invalid_so3 |= active & ~(left_triplet | right_triplet)
+        triplet = left_triplet | right_triplet
+        if not bool(triplet.any()):
+            continue
+
+        rotation_values = values[..., dim : dim + 3]
+        rotation_valid = valid[..., dim : dim + 3].all(dim=-1)
+        left_value, left_valid = compose_axis_angle_sequence(
+            rotation_values,
+            rotation_valid,
+            left_multiply=True,
+            epsilon=epsilon,
+        )
+        right_value, right_valid = compose_axis_angle_sequence(
+            rotation_values,
+            rotation_valid,
+            left_multiply=False,
+            epsilon=epsilon,
+        )
+        composed = torch.where(
+            left_triplet[:, None, :, None], left_value, right_value
+        )
+        composed_valid = torch.where(
+            left_triplet[:, None, :], left_valid, right_valid
+        )
+        for offset in range(3):
+            so3_result[..., dim + offset] = torch.where(
+                triplet[:, None, :],
+                composed[..., offset],
+                so3_result[..., dim + offset],
+            )
+            so3_mask[..., dim + offset] = torch.where(
+                triplet[:, None, :],
+                composed_valid,
+                so3_mask[..., dim + offset],
+            )
+        consumed[..., dim : dim + 3] |= triplet[..., None]
+
+    invalid_so3 |= (is_so3 & ~consumed).any(dim=-1)
+    if bool(invalid_so3.any()):
+        raise NativeObjectiveError(
+            "SO(3) composition must occupy one contiguous three-dimension run "
+            "with one multiplication convention"
+        )
+    so3_dimensions = consumed[:, None]
+    return (
+        torch.where(so3_dimensions, so3_result, result),
+        torch.where(so3_dimensions, so3_mask, result_mask),
+    )
 
 
 def compute_native_objective(
@@ -367,6 +431,7 @@ def compute_native_objective(
     batch: Mapping[str, torch.Tensor],
     config: NativeObjectiveConfig,
     perceptual_model: nn.Module | None = None,
+    rgb_perceptual_chunk_size: int = 4,
 ) -> dict[str, torch.Tensor]:
     """Compute finite, mask-aware Stage0 world and policy losses."""
 
@@ -437,13 +502,14 @@ def compute_native_objective(
             "target_rgb_mask",
             torch.ones_like(target_rgb[:, :, :, :1, :1, :1], dtype=torch.bool),
         )
+        rgb_error = output["rgb"] - target_rgb
         rgb_l1 = _masked_mean(
-            (output["rgb"] - target_rgb).abs(),
+            rgb_error.abs(),
             rgb_mask,
             epsilon=epsilon,
         )
         rgb_charbonnier = _masked_mean(
-            _charbonnier(output["rgb"] - target_rgb, epsilon),
+            _charbonnier(rgb_error, epsilon),
             rgb_mask,
             epsilon=epsilon,
         )
@@ -467,7 +533,11 @@ def compute_native_objective(
                     "rgb_perceptual is enabled but no perceptual model was provided"
                 )
             rgb_perceptual = _masked_rgb_perceptual(
-                output["rgb"], target_rgb, rgb_mask, perceptual_model
+                output["rgb"],
+                target_rgb,
+                rgb_mask,
+                perceptual_model,
+                chunk_size=rgb_perceptual_chunk_size,
             )
 
     depth_log = zero

@@ -753,6 +753,9 @@ def _validate(
                 batch=batch,
                 config=objective,
                 perceptual_model=perceptual_model,
+                rgb_perceptual_chunk_size=int(
+                    runtime_profile["train"].get("rgb_perceptual_chunk_size", 4)
+                ),
             )
         for name, value in losses.items():
             totals[name] = totals.get(name, torch.zeros_like(value)) + value
@@ -1252,6 +1255,9 @@ def main() -> None:
                             batch=batch,
                             config=objective,
                             perceptual_model=perceptual_model,
+                            rgb_perceptual_chunk_size=int(
+                                runtime["train"].get("rgb_perceptual_chunk_size", 4)
+                            ),
                         )
                     (losses["total"] / accumulation).backward()
                 for name, value in losses.items():

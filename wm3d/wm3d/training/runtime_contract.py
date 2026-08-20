@@ -181,6 +181,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "validation_micro_batch_size",
         "activation_checkpointing",
         "rgb_decode_chunk_size",
+        "rgb_perceptual_chunk_size",
         "appearance_teacher_start_ratio",
         "appearance_teacher_end_ratio",
         "appearance_teacher_decay_steps",
@@ -231,6 +232,17 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         )
     ):
         raise RuntimeContractError("train.rgb_decode_chunk_size must be a positive integer")
+    if (
+        "rgb_perceptual_chunk_size" in train
+        and (
+            not isinstance(train["rgb_perceptual_chunk_size"], int)
+            or isinstance(train["rgb_perceptual_chunk_size"], bool)
+            or train["rgb_perceptual_chunk_size"] <= 0
+        )
+    ):
+        raise RuntimeContractError(
+            "train.rgb_perceptual_chunk_size must be a positive integer"
+        )
     if int(train["num_workers"]) < 0 or int(train["prefetch_factor"]) <= 0:
         raise RuntimeContractError("dataloader worker/prefetch values are invalid")
     if float(train["gradient_clip"]) <= 0:

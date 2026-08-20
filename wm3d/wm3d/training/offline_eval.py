@@ -545,6 +545,9 @@ def main() -> None:
                         batch=batch,
                         config=objective,
                         perceptual_model=perceptual_model,
+                        rgb_perceptual_chunk_size=int(
+                            runtime["train"].get("rgb_perceptual_chunk_size", 4)
+                        ),
                     )
                 losses.update(rgb_quality_metrics(model_output, batch))
                 for name, value in losses.items():
