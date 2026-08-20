@@ -582,12 +582,10 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
     profile = load_data_profile(
         Path(str(value["data_profile_path"])), verify_source_manifests=False
     )
-    for field, default in (
-        ("appearance_token_grid", profile.cache_representation["token_grid"]),
-        ("appearance_feature_layer", -1),
-    ):
-        if int(value.get(field, default)) != int(
-            profile.cache_representation.get(field, default)
+    for field in ("appearance_token_grid", "appearance_feature_layer"):
+        profile_value = profile.cache_representation.get(field)
+        if profile_value is not None and int(value.get(field, -1)) != int(
+            profile_value
         ):
             raise RuntimeContractError(
                 f"streaming_raw {field} differs from data profile"

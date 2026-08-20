@@ -168,8 +168,15 @@ class _StreamingEpisodeCache:
                 "appearance_token_grid", profile.cache_representation["token_grid"]
             )
         )
+        self.appearance_feature_layer = int(
+            closure.get("appearance_feature_layer", -1)
+        )
         if self.appearance_token_grid < int(profile.cache_representation["token_grid"]):
             raise StreamingRawError("appearance cache grid cannot be below geometry grid")
+        if self.appearance_feature_layer not in (-1, 4, 11, 17, 23):
+            raise StreamingRawError(
+                "appearance feature layer must be one of the VGGT cached layers"
+            )
         if self.batch_frames <= 0 or self.decode_workers <= 0:
             raise StreamingRawError("streaming encode/decode concurrency is invalid")
 
@@ -336,6 +343,11 @@ class _StreamingEpisodeCache:
                     if self.appearance_token_grid > int(base_config.token_grid)
                     else 0
                 ),
+                appearance_feature_layer=(
+                    self.appearance_feature_layer
+                    if self.appearance_token_grid > int(base_config.token_grid)
+                    else -1
+                ),
             )
             self._encoder = NativeVGGTEncoder(
                 self._encoder_config, device=str(self.device)
@@ -496,7 +508,7 @@ class _StreamingEpisodeCache:
 
 
 _MANAGER_REGISTRY: dict[
-    tuple[str, str, str, int, int], _StreamingEpisodeCache
+    tuple[str, str, str, int, int, int], _StreamingEpisodeCache
 ] = {}
 
 
@@ -513,6 +525,7 @@ def _shared_manager(
         str(torch.device(device)),
         int(rank),
         int(closure.get("appearance_token_grid", profile.cache_representation["token_grid"])),
+        int(closure.get("appearance_feature_layer", -1)),
     )
     manager = _MANAGER_REGISTRY.get(key)
     if manager is None:

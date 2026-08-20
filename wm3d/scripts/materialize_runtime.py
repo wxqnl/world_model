@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming-lru-gib-per-rank", type=float, default=64.0)
     parser.add_argument("--streaming-encode-batch-frames", type=int, default=16)
     parser.add_argument("--streaming-decode-workers", type=int, default=4)
+    parser.add_argument("--streaming-appearance-feature-layer", type=int)
     parser.add_argument("--environment-lock", type=Path, required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--run-lineage", required=True)
@@ -170,6 +171,20 @@ def main() -> None:
         configured_appearance_layer = data_profile.cache_representation.get(
             "appearance_feature_layer"
         )
+        if args.streaming_appearance_feature_layer is not None:
+            requested_layer = int(args.streaming_appearance_feature_layer)
+            if requested_layer not in (4, 11, 17, 23):
+                raise RuntimeError(
+                    "streaming appearance layer must be a cached VGGT layer"
+                )
+            if (
+                configured_appearance_layer is not None
+                and int(configured_appearance_layer) != requested_layer
+            ):
+                raise RuntimeError(
+                    "streaming appearance layer differs from data profile"
+                )
+            configured_appearance_layer = requested_layer
         if configured_appearance_grid is not None:
             appearance_grid = int(configured_appearance_grid)
         elif bool(model["model"].get("appearance_enabled", False)):
@@ -181,6 +196,13 @@ def main() -> None:
             appearance_grid = geometry_grid
         if appearance_grid < geometry_grid:
             raise RuntimeError("appearance grid cannot be below the geometry grid")
+        if (
+            configured_appearance_layer is not None
+            and appearance_grid == geometry_grid
+        ):
+            raise RuntimeError(
+                "streaming appearance layer requires a distinct appearance grid"
+            )
         lru_root = args.streaming_lru_root.absolute()
         if lru_root.is_symlink():
             raise RuntimeError("streaming LRU root cannot be a symlink")

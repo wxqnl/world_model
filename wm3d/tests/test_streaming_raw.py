@@ -14,6 +14,7 @@ from wm3d.data.step_sampler import (
 )
 from wm3d.data.streaming_raw import StreamingRawError, _StreamingEpisodeCache
 from wm3d.data.unified_cache_dataset import CacheDataError, _ShardStore
+from wm3d.encoders.native_vggt import NativeVGGTConfig
 from wm3d.training.pretrain import (
     PretrainError,
     _StreamingLookaheadBatchSampler,
@@ -249,6 +250,40 @@ def test_streaming_hot_hit_uses_verified_file_identity(tmp_path: Path) -> None:
     (root / payloads[0]).write_bytes(b"different")
     with pytest.raises(StreamingRawError, match="changed after"):
         cache.ensure(task)
+
+
+def test_streaming_encoder_applies_appearance_layer_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import scripts.data.run_cache_worker as cache_worker
+    import wm3d.encoders.native_vggt as native_vggt
+
+    base = NativeVGGTConfig(model_revision="pinned", token_grid=8)
+    captured: list[NativeVGGTConfig] = []
+
+    class FakeEncoder:
+        def __init__(self, config: NativeVGGTConfig, *, device: str) -> None:
+            del device
+            captured.append(config)
+
+        def eval(self) -> "FakeEncoder":
+            return self
+
+    monkeypatch.setattr(cache_worker, "_strict_encoder", lambda _path: base)
+    monkeypatch.setattr(native_vggt, "NativeVGGTEncoder", FakeEncoder)
+    cache = object.__new__(_StreamingEpisodeCache)
+    cache._encoder = None
+    cache._encoder_config = None
+    cache.encoder_contract = tmp_path / "encoder.yaml"
+    cache.appearance_token_grid = 16
+    cache.appearance_feature_layer = 4
+    cache.device = torch.device("cpu")
+
+    _encoder, config = cache._load_encoder()
+
+    assert config.appearance_token_grid == 16
+    assert config.appearance_feature_layer == 4
+    assert captured == [config]
 
 
 def test_streaming_batch_sampler_primes_two_future_batches() -> None:
