@@ -29,6 +29,19 @@ class _RecordingMeanFeatureDistance(_MeanFeatureDistance):
         return super().forward(prediction, target)
 
 
+class _FrozenNonlinearFeatureDistance(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("scale", torch.tensor(0.7))
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        prediction_features = torch.tanh(prediction * self.scale)
+        target_features = torch.tanh(target * self.scale)
+        return (prediction_features - target_features).square().mean(
+            dim=(1, 2, 3), keepdim=True
+        )
+
+
 def test_perceptual_rgb_loss_masks_whole_views_and_backpropagates() -> None:
     prediction = torch.full((1, 2, 2, 3, 8, 8), 0.75, requires_grad=True)
     target = torch.full_like(prediction, 0.25)
@@ -76,6 +89,43 @@ def test_perceptual_rgb_loss_uses_configured_execution_chunks() -> None:
                 model,
                 chunk_size=invalid,
             )
+
+
+def test_frozen_perceptual_surrogate_preserves_scalar_and_first_order_gradient() -> None:
+    generator = torch.Generator().manual_seed(712)
+    prediction = torch.rand(
+        (1, 2, 2, 3, 8, 8), generator=generator, requires_grad=True
+    )
+    reference_prediction = prediction.detach().clone().requires_grad_(True)
+    target = torch.rand(prediction.shape, generator=generator)
+    mask = torch.ones(1, 2, 2, 1, 1, 1, dtype=torch.bool)
+    model = _FrozenNonlinearFeatureDistance().eval()
+
+    optimized = _masked_rgb_perceptual(
+        prediction,
+        target,
+        mask,
+        model,
+        chunk_size=3,
+    )
+    optimized.backward()
+    reference = model(
+        reference_prediction.reshape(-1, 3, 8, 8).mul(2.0).sub(1.0),
+        target.reshape(-1, 3, 8, 8).mul(2.0).sub(1.0),
+    ).float().sum() / 4
+    reference.backward()
+
+    # Chunked accumulation can differ from one monolithic reduction by one
+    # fp32 rounding unit; the loss definition and image gradient are unchanged.
+    torch.testing.assert_close(
+        optimized.detach(), reference.detach(), rtol=1.0e-6, atol=1.0e-7
+    )
+    torch.testing.assert_close(
+        prediction.grad,
+        reference_prediction.grad,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
 
 
 def test_composition_uses_real_query_times_and_physical_operators() -> None:

@@ -73,6 +73,9 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         self.encode_calls = 0
         self.encoded_rows = 0
         self.encode_seconds = 0.0
+        self.geometry_head_rows = 0
+        self.appearance_pool_rows = 0
+        self.rgb_resize_rows = 0
         self.oom_backoffs = 0
         self.effective_chunk_rows = int(config.encode_chunk_rows)
 
@@ -111,6 +114,22 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             batch * length, views, channels, height, width
         )
         flat_mask = view_mask.reshape(batch * length, views).bool()
+        role_shape = (batch, length)
+        geometry_row_mask = torch.zeros(
+            role_shape, dtype=torch.bool, device=view_mask.device
+        )
+        geometry_row_mask[:, self.config.context_frames :] = True
+        appearance_row_mask = torch.zeros_like(geometry_row_mask)
+        appearance_start = (
+            self.config.context_frames - self.config.appearance_context_frames
+        )
+        appearance_row_mask[:, appearance_start:] = True
+        rgb_row_mask = torch.zeros_like(geometry_row_mask)
+        for future_index in self.config.rgb_decode_indices:
+            rgb_row_mask[:, self.config.context_frames + future_index] = True
+        flat_geometry_rows = geometry_row_mask.reshape(batch * length)
+        flat_appearance_rows = appearance_row_mask.reshape(batch * length)
+        flat_rgb_rows = rgb_row_mask.reshape(batch * length)
         outputs: dict[str, torch.Tensor] = {}
         output_names: tuple[str, ...] | None = None
         start = 0
@@ -130,10 +149,32 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
                 .to(self.device, non_blocking=True)
                 .unsqueeze(0)
             )
+            chunk_geometry_rows = (
+                flat_geometry_rows[start:stop]
+                .to(self.device, non_blocking=True)
+                .unsqueeze(0)
+            )
+            chunk_appearance_rows = (
+                flat_appearance_rows[start:stop]
+                .to(self.device, non_blocking=True)
+                .unsqueeze(0)
+            )
+            chunk_rgb_rows = (
+                flat_rgb_rows[start:stop]
+                .to(self.device, non_blocking=True)
+                .unsqueeze(0)
+            )
             try:
-                encoded = self.encoder(chunk_images, chunk_mask)
+                encoded = self.encoder(
+                    chunk_images,
+                    chunk_mask,
+                    geometry_row_mask=chunk_geometry_rows,
+                    appearance_row_mask=chunk_appearance_rows,
+                    rgb_row_mask=chunk_rgb_rows,
+                )
             except torch.OutOfMemoryError:
                 del chunk_images, chunk_mask
+                del chunk_geometry_rows, chunk_appearance_rows, chunk_rgb_rows
                 if effective <= self.config.minimum_chunk_rows:
                     raise
                 effective = max(
@@ -172,12 +213,18 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
                     )
                 target[start:stop].copy_(chunk)
             del encoded, chunk_images, chunk_mask
+            del chunk_geometry_rows, chunk_appearance_rows, chunk_rgb_rows
             start = stop
             self.encode_calls += 1
         self.effective_chunk_rows = min(
             self.effective_chunk_rows, effective
         )
         self.encoded_rows += batch * length
+        self.geometry_head_rows += batch * self.config.future_frames
+        self.appearance_pool_rows += batch * (
+            self.config.appearance_context_frames + self.config.future_frames
+        )
+        self.rgb_resize_rows += batch * len(self.config.rgb_decode_indices)
         self.encode_seconds += time.perf_counter() - started
         return {
             name: value.reshape(batch, length, *value.shape[1:])
@@ -304,6 +351,9 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             "encode_calls": self.encode_calls,
             "encoded_rows": self.encoded_rows,
             "encode_seconds": self.encode_seconds,
+            "geometry_head_rows": self.geometry_head_rows,
+            "appearance_pool_rows": self.appearance_pool_rows,
+            "rgb_resize_rows": self.rgb_resize_rows,
             "oom_backoffs": self.oom_backoffs,
             "effective_chunk_rows": self.effective_chunk_rows,
         }

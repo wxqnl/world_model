@@ -16,13 +16,33 @@ class _FakeNativeVGGT(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(()))
         self.maximum_rows = maximum_rows
         self.calls: list[int] = []
+        self.role_masks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
     @torch.inference_mode()
     def forward(
-        self, images: torch.Tensor, view_mask: torch.Tensor
+        self,
+        images: torch.Tensor,
+        view_mask: torch.Tensor,
+        *,
+        geometry_row_mask: torch.Tensor | None = None,
+        appearance_row_mask: torch.Tensor | None = None,
+        rgb_row_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         _batch, rows, views = images.shape[:3]
         self.calls.append(rows)
+        default = torch.ones((1, rows), dtype=torch.bool, device=images.device)
+        geometry_rows = default if geometry_row_mask is None else geometry_row_mask
+        appearance_rows = (
+            default if appearance_row_mask is None else appearance_row_mask
+        )
+        rgb_rows = default if rgb_row_mask is None else rgb_row_mask
+        self.role_masks.append(
+            (
+                geometry_rows.detach().cpu().clone(),
+                appearance_rows.detach().cpu().clone(),
+                rgb_rows.detach().cpu().clone(),
+            )
+        )
         if self.maximum_rows is not None and rows > self.maximum_rows:
             raise torch.OutOfMemoryError("fixture chunk is too large")
         identity = images.mean(dim=(3, 4, 5)) * self.weight
@@ -44,6 +64,13 @@ class _FakeNativeVGGT(torch.nn.Module):
             mode="bilinear",
             align_corners=False,
         ).reshape(1, rows, views, 3, 8, 8)
+        geometry_weight = geometry_rows[..., None, None].float()
+        depth = depth * geometry_weight
+        confidence = confidence * geometry_weight
+        point = point * geometry_weight[..., None]
+        camera = camera * geometry_rows[..., None, None].float()
+        appearance = appearance * appearance_rows[..., None, None, None].float()
+        rgb = rgb * rgb_rows[..., None, None, None, None].float()
         return {
             "view_tokens": geometry.to(torch.bfloat16),
             "view_mask": view_mask.bool(),
@@ -123,8 +150,23 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
     assert not bool(result["target_depth_mask"][0, 0, 2].any())
     assert not bool(result["target_camera_pose_mask"][1, 1, 1])
     assert backend.calls == [3, 3, 2]
+    geometry_rows = torch.cat([entry[0] for entry in backend.role_masks], dim=1)
+    appearance_rows = torch.cat([entry[1] for entry in backend.role_masks], dim=1)
+    rgb_rows = torch.cat([entry[2] for entry in backend.role_masks], dim=1)
+    torch.testing.assert_close(
+        geometry_rows,
+        torch.tensor([[False, False, True, True, False, False, True, True]]),
+    )
+    torch.testing.assert_close(
+        appearance_rows,
+        torch.tensor([[False, True, True, True, False, True, True, True]]),
+    )
+    torch.testing.assert_close(rgb_rows, geometry_rows)
     assert adapter.metrics["encoded_rows"] == 8
     assert adapter.metrics["encode_calls"] == 3
+    assert adapter.metrics["geometry_head_rows"] == 4
+    assert adapter.metrics["appearance_pool_rows"] == 6
+    assert adapter.metrics["rgb_resize_rows"] == 4
     assert all(not parameter.requires_grad for parameter in adapter.parameters())
     assert not torch.is_inference(result["world_tokens"])
 

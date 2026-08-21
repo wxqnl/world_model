@@ -85,6 +85,18 @@ def test_rgb_perceptual_chunk_size_is_an_optional_positive_execution_tuning() ->
             validate_runtime_profile(invalid_value)
 
 
+def test_cudnn_benchmark_is_an_optional_boolean_execution_tuning() -> None:
+    value = copy.deepcopy(_load("h100_8_fsdp2.yaml"))
+    value["train"]["cudnn_benchmark"] = True
+    validate_runtime_profile(value)
+
+    for invalid in (0, 1, "true", None):
+        invalid_value = copy.deepcopy(value)
+        invalid_value["train"]["cudnn_benchmark"] = invalid
+        with pytest.raises(RuntimeContractError, match="cudnn_benchmark"):
+            validate_runtime_profile(invalid_value)
+
+
 def test_runtime_does_not_contain_model_or_dataset_branch() -> None:
     value = _load("h200_128_fsdp2.yaml")
     serialized = yaml.safe_dump(value)

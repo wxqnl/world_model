@@ -181,6 +181,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
     optional_train = {
         "validation_micro_batch_size",
         "activation_checkpointing",
+        "cudnn_benchmark",
         "rgb_decode_chunk_size",
         "rgb_perceptual_chunk_size",
         "appearance_teacher_start_ratio",
@@ -224,6 +225,11 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         and not isinstance(train["activation_checkpointing"], bool)
     ):
         raise RuntimeContractError("train.activation_checkpointing must be boolean")
+    if (
+        "cudnn_benchmark" in train
+        and not isinstance(train["cudnn_benchmark"], bool)
+    ):
+        raise RuntimeContractError("train.cudnn_benchmark must be boolean")
     if (
         "rgb_decode_chunk_size" in train
         and (

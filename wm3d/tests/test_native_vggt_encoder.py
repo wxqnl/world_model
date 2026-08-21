@@ -45,6 +45,44 @@ class _RecordingEncoder(torch.nn.Module):
         return result
 
 
+class _SelectiveRecordingEncoder(_RecordingEncoder):
+    def __init__(self, *, appearance_grid: int) -> None:
+        super().__init__(appearance_grid=appearance_grid)
+        self.selections: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def forward_selective(
+        self,
+        images: torch.Tensor,
+        *,
+        geometry_batch_mask: torch.Tensor | None = None,
+        appearance_batch_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        result = super().forward(images)
+        batch = images.shape[0]
+        default = torch.ones(batch, dtype=torch.bool, device=images.device)
+        geometry = (
+            default if geometry_batch_mask is None else geometry_batch_mask.bool()
+        )
+        appearance = (
+            default if appearance_batch_mask is None else appearance_batch_mask.bool()
+        )
+        self.selections.append(
+            (geometry.detach().cpu().clone(), appearance.detach().cpu().clone())
+        )
+        geometry_scalar = geometry[:, None, None, None, None]
+        result["depth"] = result["depth"] * geometry_scalar
+        result["depth_conf"] = result["depth_conf"] * geometry_scalar
+        result["world_points"] = result["world_points"] * geometry_scalar
+        result["world_points_conf"] = (
+            result["world_points_conf"] * geometry_scalar
+        )
+        result["pose_enc"] = result["pose_enc"] * geometry[:, None, None]
+        result["appearance_pooled"] = (
+            result["appearance_pooled"] * appearance[:, None, None, None]
+        )
+        return result
+
+
 def _config() -> NativeVGGTConfig:
     return NativeVGGTConfig(
         model_revision="fixture",
@@ -106,6 +144,45 @@ def test_dual_grid_preserves_per_view_appearance_tokens() -> None:
     assert output["appearance_tokens"].shape == (1, 2, 3, 16, 2048)
     assert output["appearance_tokens"][:, 0, 2].eq(0).all()
     assert output["appearance_tokens"][:, 1, 1].eq(0).all()
+
+
+def test_selective_heads_preserve_full_abi_and_skip_unconsumed_rows() -> None:
+    backend = _SelectiveRecordingEncoder(appearance_grid=4)
+    config = replace(
+        _config(),
+        appearance_token_grid=4,
+        appearance_feature_layer=4,
+        input_rgb_size=56,
+    )
+    encoder = NativeVGGTEncoder(config, device="cpu", encoder=backend)
+    images = torch.full((1, 4, 3, 3, 56, 56), 0.5)
+    view_mask = torch.ones(1, 4, 3, dtype=torch.bool)
+    geometry_rows = torch.tensor([[False, False, True, True]])
+    appearance_rows = torch.tensor([[False, True, True, True]])
+    rgb_rows = torch.tensor([[False, False, True, False]])
+
+    output = encoder(
+        images,
+        view_mask,
+        geometry_row_mask=geometry_rows,
+        appearance_row_mask=appearance_rows,
+        rgb_row_mask=rgb_rows,
+    )
+
+    assert output["view_tokens"].shape == (1, 4, 3, 4, 2048)
+    assert output["view_tokens"].ne(0).all()
+    assert output["depth"][:, :2].eq(0).all()
+    assert output["depth"][:, 2:].gt(0).all()
+    assert output["point"][:, :2].eq(0).all()
+    assert output["camera_pose"][:, :2].eq(0).all()
+    assert output["appearance_tokens"][:, :1].eq(0).all()
+    assert output["appearance_tokens"][:, 1:].ne(0).all()
+    assert output["rgb"][:, :2].eq(0).all()
+    assert output["rgb"][:, 2].gt(0).all()
+    assert output["rgb"][:, 3:].eq(0).all()
+    assert len(backend.selections) == 1
+    torch.testing.assert_close(backend.selections[0][0], geometry_rows[0])
+    torch.testing.assert_close(backend.selections[0][1], appearance_rows[0])
 
 
 def test_geometry_and_appearance_select_different_cached_vggt_layers() -> None:

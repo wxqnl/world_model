@@ -18,6 +18,7 @@ from wm3d.training.launch_qualification import (
 )
 from wm3d.training.pretrain import _run_contract
 from wm3d.training.pretrain import (
+    _environment_flag,
     PretrainError,
     _atomic_json_no_clobber,
     _require_stable_run_contract,
@@ -388,6 +389,28 @@ def test_runtime_checkout_must_be_clean_and_exact(tmp_path: Path) -> None:
     assert verify_clean_runtime_checkout(tmp_path, head) == head
     with pytest.raises(LaunchQualificationError, match="commit mismatch"):
         verify_clean_runtime_checkout(tmp_path, "0" * 40)
+    assert (
+        verify_clean_runtime_checkout(
+            tmp_path, "0" * 40, allow_commit_mismatch=True
+        )
+        == head
+    )
     (tmp_path / "untracked.py").write_text("value = 2\n", encoding="utf-8")
     with pytest.raises(LaunchQualificationError, match="dirty"):
         verify_clean_runtime_checkout(tmp_path, head)
+    with pytest.raises(LaunchQualificationError, match="dirty"):
+        verify_clean_runtime_checkout(
+            tmp_path, "0" * 40, allow_commit_mismatch=True
+        )
+
+
+def test_environment_flag_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("WM3D_TEST_FLAG", raising=False)
+    assert not _environment_flag("WM3D_TEST_FLAG")
+    monkeypatch.setenv("WM3D_TEST_FLAG", "0")
+    assert not _environment_flag("WM3D_TEST_FLAG")
+    monkeypatch.setenv("WM3D_TEST_FLAG", "1")
+    assert _environment_flag("WM3D_TEST_FLAG")
+    monkeypatch.setenv("WM3D_TEST_FLAG", "true")
+    with pytest.raises(PretrainError, match="exactly '0' or '1'"):
+        _environment_flag("WM3D_TEST_FLAG")

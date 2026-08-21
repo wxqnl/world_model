@@ -114,14 +114,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _configure_reproducibility(seed: int) -> None:
+def _environment_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    if value not in {"0", "1"}:
+        raise PretrainError(
+            f"environment flag {name} must be exactly '0' or '1'"
+        )
+    return value == "1"
+
+
+def _configure_reproducibility(
+    seed: int, *, cudnn_benchmark: bool = False
+) -> None:
     random.seed(seed)
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
 
 
 def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
@@ -996,7 +1009,11 @@ def main() -> None:
         repo = Path(__file__).resolve().parents[2]
         try:
             verify_clean_runtime_checkout(
-                repo, str(config["run"]["code_commit"])
+                repo,
+                str(config["run"]["code_commit"]),
+                allow_commit_mismatch=_environment_flag(
+                    "WM3D_EXECUTION_HOTFIX"
+                ),
             )
         except LaunchQualificationError as exc:
             raise PretrainError("runtime code provenance failed") from exc
@@ -1082,7 +1099,13 @@ def main() -> None:
             input_adapter.eval()
 
         seed = int(runtime["train"]["seed"])
-        _configure_reproducibility(seed)
+        _configure_reproducibility(
+            seed,
+            cudnn_benchmark=bool(
+                runtime["train"].get("cudnn_benchmark", False)
+            )
+            or _environment_flag("WM3D_CUDNN_BENCHMARK"),
+        )
         # FSDP2 constructs on meta and initializes global DTensor shards after
         # wrapping.  No rank ever owns a full 5B fp32 CPU/GPU replica.
         construction_device = (

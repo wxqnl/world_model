@@ -148,8 +148,22 @@ class NativeVGGTEncoder(torch.nn.Module):
             dtype=dtype,
         )
 
-    def _encode_pattern(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
-        encoded: dict[str, Any] = self.encoder(images)
+    def _encode_pattern(
+        self,
+        images: torch.Tensor,
+        *,
+        geometry_row_mask: torch.Tensor | None,
+        appearance_row_mask: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        selective_forward = getattr(self.encoder, "forward_selective", None)
+        if callable(selective_forward):
+            encoded: dict[str, Any] = selective_forward(
+                images,
+                geometry_batch_mask=geometry_row_mask,
+                appearance_batch_mask=appearance_row_mask,
+            )
+        else:
+            encoded = self.encoder(images)
         if encoded.get("geom_extra_missing"):
             raise RuntimeError(
                 "formal native cache requires VGGT depth/point/camera heads: "
@@ -203,6 +217,10 @@ class NativeVGGTEncoder(torch.nn.Module):
         self,
         images: torch.Tensor,
         view_mask: torch.Tensor,
+        *,
+        geometry_row_mask: torch.Tensor | None = None,
+        appearance_row_mask: torch.Tensor | None = None,
+        rgb_row_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if images.ndim != 6:
             raise ValueError("images must be [B,T,V,3,H,W]")
@@ -227,8 +245,29 @@ class NativeVGGTEncoder(torch.nn.Module):
                 f"{(self.config.input_rgb_size, self.config.input_rgb_size)}"
             )
 
+        def normalize_row_mask(
+            value: torch.Tensor | None, name: str
+        ) -> torch.Tensor:
+            if value is None:
+                return torch.ones(
+                    (batch, times), dtype=torch.bool, device=images.device
+                )
+            if tuple(value.shape) != (batch, times):
+                raise ValueError(
+                    f"{name} must be [B,T], got {tuple(value.shape)}"
+                )
+            return value.to(device=images.device, dtype=torch.bool)
+
+        geometry_rows = normalize_row_mask(geometry_row_mask, "geometry_row_mask")
+        appearance_rows = normalize_row_mask(
+            appearance_row_mask, "appearance_row_mask"
+        )
+        rgb_rows = normalize_row_mask(rgb_row_mask, "rgb_row_mask")
         flat_images = images.reshape(batch * times, views, 3, height, width)
         flat_mask = view_mask.reshape(batch * times, views).bool()
+        flat_geometry_rows = geometry_rows.reshape(batch * times)
+        flat_appearance_rows = appearance_rows.reshape(batch * times)
+        flat_rgb_rows = rgb_rows.reshape(batch * times)
         partitions: dict[tuple[bool, ...], list[int]] = defaultdict(list)
         for row, pattern in enumerate(flat_mask.cpu().tolist()):
             partitions[tuple(bool(item) for item in pattern)].append(row)
@@ -258,7 +297,11 @@ class NativeVGGTEncoder(torch.nn.Module):
             selected = flat_images.index_select(0, rows).index_select(1, active)
             # The second dimension is simultaneous views only.  Different
             # times remain independent batch elements.
-            encoded = self._encode_pattern(selected)
+            encoded = self._encode_pattern(
+                selected,
+                geometry_row_mask=flat_geometry_rows.index_select(0, rows),
+                appearance_row_mask=flat_appearance_rows.index_select(0, rows),
+            )
             outputs = [
                 (tokens, "tokens"),
                 (depth, "depth"),
@@ -282,13 +325,29 @@ class NativeVGGTEncoder(torch.nn.Module):
         point = point.reshape(batch, times, views, patches, 3)
         confidence = confidence.reshape(batch, times, views, patches)
         pose = pose.reshape(batch, times, views, 9)
-        rgb = F.interpolate(
-            images.reshape(batch * times * views, 3, height, width),
-            size=(self.config.target_rgb_size, self.config.target_rgb_size),
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
-        ).reshape(batch, times, views, 3, self.config.target_rgb_size, self.config.target_rgb_size)
+        target_size = self.config.target_rgb_size
+        rgb = images.new_zeros(
+            batch * times, views, 3, target_size, target_size
+        )
+        rgb_indices = torch.nonzero(flat_rgb_rows, as_tuple=False).flatten()
+        if int(rgb_indices.numel()):
+            selected_rgb = flat_images.index_select(0, rgb_indices)
+            resized_rgb = F.interpolate(
+                selected_rgb.reshape(-1, 3, height, width),
+                size=(target_size, target_size),
+                mode="bilinear",
+                align_corners=False,
+                antialias=True,
+            ).reshape(-1, views, 3, target_size, target_size)
+            rgb.index_copy_(0, rgb_indices, resized_rgb)
+        rgb = rgb.reshape(
+            batch,
+            times,
+            views,
+            3,
+            target_size,
+            target_size,
+        )
         result = {
             "view_tokens": tokens.to(torch.bfloat16),
             "view_mask": view_mask.bool(),

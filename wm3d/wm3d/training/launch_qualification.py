@@ -42,7 +42,12 @@ def resource_contract_sha256(resources: Mapping[str, Any] | None) -> str:
     return canonical_sha256(None if resources is None else dict(resources))
 
 
-def verify_clean_runtime_checkout(repo: Path, expected_commit: str) -> str:
+def verify_clean_runtime_checkout(
+    repo: Path,
+    expected_commit: str,
+    *,
+    allow_commit_mismatch: bool = False,
+) -> str:
     """Require the exact clean repository that materialized the runtime."""
 
     repository = Path(repo).resolve(strict=True)
@@ -57,7 +62,7 @@ def verify_clean_runtime_checkout(repo: Path, expected_commit: str) -> str:
             text=True,
             stderr=subprocess.STDOUT,
         ).strip()
-        if head != expected_commit:
+        if head != expected_commit and not allow_commit_mismatch:
             raise LaunchQualificationError(
                 f"runtime code commit mismatch: {head} != {expected_commit}"
             )

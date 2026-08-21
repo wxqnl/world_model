@@ -132,20 +132,53 @@ def _masked_rgb_perceptual(
     pred_images = prediction.reshape(-1, *prediction.shape[-3:]).index_select(0, valid)
     target_images = target.reshape(-1, *target.shape[-3:]).index_select(0, valid)
     total = prediction.new_zeros((), dtype=torch.float32)
+    frozen_model = not any(parameter.requires_grad for parameter in model.parameters())
     for start in range(0, int(valid.numel()), chunk_size):
-        pred_chunk = pred_images[start : start + chunk_size].float().mul(2.0).sub(1.0)
-        target_chunk = target_images[start : start + chunk_size].float().mul(2.0).sub(1.0)
+        pred_source = pred_images[start : start + chunk_size].float()
+        target_source = target_images[start : start + chunk_size].float()
         with torch.autocast(device_type=prediction.device.type, enabled=False):
-            if torch.is_grad_enabled() and pred_chunk.requires_grad:
-                distance = checkpoint(
-                    model,
-                    pred_chunk,
-                    target_chunk,
-                    use_reentrant=False,
-                )
+            if (
+                torch.is_grad_enabled()
+                and pred_source.requires_grad
+                and not target_source.requires_grad
+                and frozen_model
+            ):
+                # LPIPS is a frozen first-order objective. Generic activation
+                # checkpointing replays both VGG branches during the outer
+                # backward even though the target branch has no gradient.
+                # Compute the exact image gradient while this small chunk is
+                # resident, then reconnect it to the world-model RGB tensor
+                # through a zero-valued surrogate. The scalar and first-order
+                # gradient are unchanged; higher-order derivatives, which the
+                # training contract never requests, are not retained.
+                leaf = pred_source.detach().requires_grad_(True)
+                with torch.enable_grad():
+                    distance = model(
+                        leaf.mul(2.0).sub(1.0),
+                        target_source.mul(2.0).sub(1.0),
+                    )
+                    chunk_value = distance.float().sum()
+                    image_gradient = torch.autograd.grad(
+                        chunk_value,
+                        leaf,
+                        create_graph=False,
+                        retain_graph=False,
+                    )[0]
+                proxy = (pred_source * image_gradient.detach()).sum()
+                total = total + chunk_value.detach() + proxy - proxy.detach()
             else:
-                distance = model(pred_chunk, target_chunk)
-        total = total + distance.float().sum()
+                pred_chunk = pred_source.mul(2.0).sub(1.0)
+                target_chunk = target_source.mul(2.0).sub(1.0)
+                if torch.is_grad_enabled() and pred_chunk.requires_grad:
+                    distance = checkpoint(
+                        model,
+                        pred_chunk,
+                        target_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    distance = model(pred_chunk, target_chunk)
+                total = total + distance.float().sum()
     return total / valid.numel()
 
 
