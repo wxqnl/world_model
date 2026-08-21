@@ -19,9 +19,11 @@ model、encoder 和 objective，拉取代码后无需手工调整。训练只解
 5B 不需要单独维护另一份慢速实现。三套 H200 runtime 还将冻结感知网络的输入按 8 张图一组
 计算，减少小 kernel 与 Python 调度开销，同时保留 RGB decoder 的显存安全分块。
 
-整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练
-依次进行。数据访问可以使用完整 episode cache，也可以使用有容量上限的按需缓存。命令会
-自动记录和校验中间产物，使用者只需要指定数据目录、数据许可、模型目录和集群地址。
+整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练依次进行。当前默认
+`direct_raw` 只解码 sealed `T+K` window，并在每个 rank 内在线运行 frozen VGGT；不生成
+episode visual cache、LRU 或 sidecar。完整 episode cache 与 `streaming_raw` 仅保留为显式
+兼容选项。命令会自动记录和校验中间产物，使用者只需要指定数据目录、数据许可、模型目录
+和集群地址。
 
 ## 1. 训练预设
 
@@ -126,7 +128,7 @@ site 文件默认配置为：
 ```bash
 DATA_FAMILY=public_robot_oxe
 INCLUDE_AGIBOT_BETA=NO
-WM3D_DATA_MODE=streaming_raw
+WM3D_DATA_MODE=direct_raw
 ```
 
 运行：
@@ -161,8 +163,9 @@ cache 估算按正式的三视角 P144 geometry + P256 appearance 表征、最�
 状态仍保留原始时间戳，不做固定频率插值。实际大小以 `plan` 对现场数据的输出为准。
 
 完整 dual-path cache 明显大于旧 geometry-only cache。把原始下载、临时文件、日志和
-checkpoint 一并计算后，完整 cache 方案建议准备约 **320–350 TB 总磁盘**。因此默认站点
-使用 `streaming_raw` 和有上限的 LRU；只有现场确认容量充足时才切到 `episode_cache`。
+checkpoint 一并计算后，完整 cache 方案建议准备约 **320–350 TB 总磁盘**。默认站点因此使用
+`direct_raw`，视觉 latent 不落盘；只有明确接受旧 LRU 状态机或现场确认容量充足时，才显式
+切到 `streaming_raw` 或 `episode_cache`。
 
 生成模板后照常执行 `lock`、`download`、schema audit、adapter audit 和 inventory。某个数据集
 的动作或状态维度超过 WM3D 容量时，生成步骤会停止并报告数据集名称。
@@ -217,10 +220,10 @@ archive、schema、adapter、inventory 命令整理。OXE 数据已经是 LeRobo
 模型 schema 是 `wm3d_native_world_model_v2`，RGB future indices 为 `0..15`；任一项不同都
 不要启动 64 卡训练。
 
-## 4. 高吞吐 episode cache
+## 4. 数据访问路径
 
-cache 是数据准备中最耗时的阶段。以下完整 cache 流程只在显式选择 `episode_cache` 时运行；
-默认 `streaming_raw` 直接进入 4.1 节。完整 cache 按 64 张 GPU 展开：每张 GPU 一个长驻 worker，
+以下完整 cache 流程只在显式选择 `episode_cache` 时运行；默认 `direct_raw` 直接进入 4.1 节。
+完整 cache 按 64 张 GPU 展开：每张 GPU 一个长驻 worker，
 每个 worker 使用 4 个视频解码线程、`batch_frames=16` 的 VGGT 前向和 2 个写盘线程。
 worker 会流水执行“准备下一个 episode、GPU 编码当前 episode、写盘上一个 episode”，避免
 解码和落盘期间 GPU 空转。
@@ -281,14 +284,55 @@ worker 可重入。任务中断后用完全相同的 worker count 重跑，已�
 ./run_wm3d.sh 5b status "$SITE"
 ```
 
-### 4.1 几十 TB 磁盘：按需缓存训练
+### 4.1 direct_raw：无视觉 latent cache 的正式默认
 
-磁盘无法容纳完整视觉 cache 时，使用 `streaming_raw`。这个模式不会在每一步重复处理
+`direct_raw` 复用 task bank、episode/window metadata 和 grouped normalization，但不创建或
+读取 episode visual payload。每个 rank 只随机访问当前 `T+K` observation ordinal，在线一次
+生成 P144 geometry、逐视角 P256 layer-4 appearance 以及 depth/point/camera 监督。Frozen
+teacher 不进入 optimizer、FSDP 或 checkpoint；推理时仍由 WM3D 自己的 heads 输出 RGB、
+depth、point、camera、action 和 state。
+
+site 默认已经写入：
+
+```bash
+WM3D_DATA_MODE=direct_raw
+DIRECT_INPUT_RGB_SIZE=518
+DIRECT_DECODE_WORKERS=4
+DIRECT_PREFETCH_WINDOWS=8
+DIRECT_VIDEO_INDEX_CACHE_ASSETS=128
+DIRECT_ENCODE_CHUNK_ROWS=32
+DIRECT_MINIMUM_CHUNK_ROWS=4
+DIRECT_APPEARANCE_FEATURE_LAYER=4
+```
+
+准备和启动命令：
+
+```bash
+./run_wm3d.sh 5b task-bank "$SITE"
+./run_wm3d.sh 5b cache-plan "$SITE"
+./run_wm3d.sh 5b streaming-prepare "$SITE"
+./run_wm3d.sh 5b runtime "$SITE"
+./run_wm3d.sh 5b preflight "$SITE"
+```
+
+`cache-plan` 与 `streaming-prepare` 是沿用的命令名；前者生成原始 episode 任务清单，后者只
+生成轻量 metadata、窗口和 normalization，二者都不执行 VGGT visual cache。训练日志中的
+`direct_raw.decode_seconds` 和 `direct_vggt.encode_seconds` 分别表示视频窗口解码与在线
+frozen VGGT 成本。`direct_raw.prefetch_pending` 有固定上限，内存不会随 step 或 episode
+长度增长。完整实现和验证证据见 [direct_raw 正式路径](WM3D_DIRECT_RAW.md)。
+
+Direct 去掉的是 cache 发布、收养、淘汰、重复编码和 sidecar/训练竞态；它仍支付在线 VGGT
+计算，因此实际排期必须由 64 卡 canary 的热态中位秒/step 外推，不能套用完整热 cache 的
+吞吐估计。
+
+### 4.2 legacy streaming_raw：按需 episode LRU
+
+只有在需要恢复旧运行合同时才显式使用 `streaming_raw`。这个模式不会在每一步重复处理
 原始视频。它先生成全量的轻量 metadata 和窗口索引，训练第一次访问某个 episode 时才解码
 视频并运行冻结的 VGGT，然后把生成的标准 episode cache 放进有容量上限的 LRU。后续窗口直接读取
 这份缓存；达到容量上限后，LRU 只淘汰最久未使用的 episode。
 
-只有几十 TB 磁盘时，使用默认数据组合并启用 `streaming_raw`。DROID、Bridge、RoboCasa、
+若选择该兼容模式，仍使用默认数据组合并启用 `streaming_raw`。DROID、Bridge、RoboCasa、
 AgiBotWorld 2026 和 OXE 都参与训练，按需缓存只改变数据访问方式。
 
 两种数据访问方式使用相同的 data profile、采样权重、模型输入和训练目标。下表是 64×H200、
@@ -459,8 +503,8 @@ run_5b eval 1000
 ## 6. 正式训练
 
 1K 通过后创建 600K site。需要观察中程曲线时可以另建 100K site，但它不是正式训练的
-前置条件。两者复用 data profile 和已选择的数据访问方式；
-`episode_cache` 复用完整 cache，`streaming_raw` 复用 metadata 和有容量上限的 LRU。每个 preset
+前置条件。两者复用 data profile 和已选择的数据访问方式；`direct_raw` 复用 metadata 并保持
+无视觉 cache，`episode_cache` 复用完整 cache，`streaming_raw` 复用 metadata 和有容量上限的 LRU。每个 preset
 仍从自己的 step 0 开始训练。
 
 ```bash

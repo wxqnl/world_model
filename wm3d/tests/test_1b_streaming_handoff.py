@@ -81,8 +81,10 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
         in payload
     )
     assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in payload
-    assert "WM3D_DATA_MODE=streaming_raw" in payload
-    assert "MINIMUM_RAW_FILESYSTEM_BYTES=25000000000000" in payload
+    assert "WM3D_DATA_MODE=direct_raw" in payload
+    assert "MINIMUM_RAW_FILESYSTEM_BYTES=0" in payload
+    assert "DIRECT_PREFETCH_WINDOWS=16" in payload
+    assert "STREAMING_LRU_ROOT=" not in payload
     site.write_text(
         payload.replace(
             "PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}"

@@ -201,6 +201,32 @@ def test_rgb_decoder_uses_native_tokens_and_skips_unsupervised_views() -> None:
     assert model.token_output.weight.grad.abs().sum() > 0
 
 
+def test_rgb_decoder_uses_rank_invariant_chunk_calls_for_sparse_views() -> None:
+    cfg = _tiny_config()
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    calls: list[int] = []
+    handle = model.rgb_head.image_decoder.register_forward_hook(
+        lambda _module, inputs, _output: calls.append(int(inputs[0].shape[0]))
+    )
+    try:
+        sparse = torch.zeros(2, cfg.K, cfg.num_views, dtype=torch.bool)
+        sparse[:, :, 0] = True
+        sparse_output = model(**batch, rgb_view_mask=sparse)
+        sparse_calls = tuple(calls)
+        calls.clear()
+
+        dense = torch.ones_like(sparse)
+        model(**batch, rgb_view_mask=dense)
+        dense_calls = tuple(calls)
+    finally:
+        handle.remove()
+
+    expected_slots = 2 * cfg.K * cfg.num_views
+    assert sparse_calls == dense_calls == (1,) * expected_slots
+    assert sparse_output["rgb"][:, :, 1].count_nonzero() == 0
+
+
 def test_future_factual_action_changes_world_but_cannot_change_policy() -> None:
     cfg = _tiny_config()
     torch.manual_seed(11)

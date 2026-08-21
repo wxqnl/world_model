@@ -28,6 +28,10 @@ from wm3d.data.streaming_raw import (
     StreamingRawDataset,
     load_streaming_metadata_seal,
 )
+from wm3d.data.direct_raw import (
+    DIRECT_RAW_DATA_CLOSURE_SCHEMA,
+    DirectRawDataset,
+)
 from wm3d.data.grouped_normalization import GroupedRobotNormalizer
 from wm3d.data.formal_cache_adapter import (
     FORMAL_CACHE_CLOSURE_SCHEMA,
@@ -35,6 +39,7 @@ from wm3d.data.formal_cache_adapter import (
 )
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.native_world_model import NativeWorldModel
+from wm3d.models.direct_vggt_builder import build_direct_vggt_teacher
 from wm3d.training.distributed_checkpoint import (
     DistributedCheckpointManager,
     ResumeExpectations,
@@ -213,7 +218,9 @@ def _resource_preflight(
     output_root = Path(config["run"]["output_root"])
     closure = config["data_closure"]
     cache_root = Path(
-        closure.get("cache_root", closure.get("lru_root", ""))
+        closure.get(
+            "cache_root", closure.get("lru_root", closure.get("metadata_root", ""))
+        )
     )
     if not cache_root.is_absolute():
         raise PretrainError("resource preflight data root is not absolute")
@@ -510,7 +517,10 @@ def _build_mixed_dataset(
             Path(closure["data_profile_path"]), verify_source_manifests=True
         )
     normalization_model_sha = runtime["bindings"]["model_profile_sha256"]
-    if closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
+    if closure.get("schema") in {
+        STREAMING_DATA_CLOSURE_SCHEMA,
+        DIRECT_RAW_DATA_CLOSURE_SCHEMA,
+    }:
         metadata_seal = load_streaming_metadata_seal(
             Path(str(closure["metadata_seal_path"])),
             expected_sha256=str(closure["metadata_seal_sha256"]),
@@ -524,6 +534,16 @@ def _build_mixed_dataset(
         expected_window_index_sha256=closure["cache_index_sha256"],
         data_profile=profile,
     )
+    if closure.get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+        dataset = DirectRawDataset(
+            closure=closure,
+            data_profile=profile,
+            model_profile=runtime["model_profile"],
+            split=split,
+            grouped_normalizer=normalizer,
+            rank=rank,
+        )
+        return dataset, profile
     if closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
         if device is None:
             raise PretrainError("streaming_raw dataset requires the current rank device")
@@ -729,6 +749,7 @@ def _validate(
     objective: Any,
     perceptual_model: torch.nn.Module | None,
     context: Any,
+    input_adapter: Any | None = None,
 ) -> dict[str, float]:
     count = int(runtime_profile["train"]["validation_steps"])
     loader = _make_loader(
@@ -746,6 +767,8 @@ def _validate(
     totals: dict[str, torch.Tensor] = {}
     model.eval()
     for cpu_batch in loader:
+        if input_adapter is not None:
+            cpu_batch = input_adapter.materialize(cpu_batch)
         batch = _batch_to_device(cpu_batch, context.device)
         with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
             losses = compute_native_objective(
@@ -1051,6 +1074,13 @@ def main() -> None:
                 )
             return
 
+        input_adapter = None
+        if config["data_closure"].get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+            input_adapter = build_direct_vggt_teacher(
+                config, device=context.device
+            )
+            input_adapter.eval()
+
         seed = int(runtime["train"]["seed"])
         _configure_reproducibility(seed)
         # FSDP2 constructs on meta and initializes global DTensor shards after
@@ -1233,6 +1263,8 @@ def main() -> None:
             for micro_step in range(accumulation):
                 final_micro = micro_step == accumulation - 1
                 cpu_batch = next(iterator)
+                if input_adapter is not None:
+                    cpu_batch = input_adapter.materialize(cpu_batch)
                 batch = _batch_to_device(cpu_batch, context.device)
                 unique = torch.unique(batch["source_id"])
                 if unique.numel() != 1:
@@ -1312,6 +1344,13 @@ def main() -> None:
                     )
                     if streaming_metrics is not None:
                         record["streaming_raw"] = dict(streaming_metrics)
+                    direct_raw_metrics = getattr(
+                        train_dataset, "direct_raw_metrics", None
+                    )
+                    if direct_raw_metrics is not None:
+                        record["direct_raw"] = dict(direct_raw_metrics)
+                    if input_adapter is not None:
+                        record["direct_vggt"] = dict(input_adapter.metrics)
                     if completed == 1:
                         record["gradient_ownership"] = gradient_ownership
                     last_log = time.monotonic()
@@ -1328,6 +1367,7 @@ def main() -> None:
                     objective,
                     perceptual_model,
                     context,
+                    input_adapter=input_adapter,
                 )
                 if context.is_rank0:
                     record = {"step": completed, "validation": validation}

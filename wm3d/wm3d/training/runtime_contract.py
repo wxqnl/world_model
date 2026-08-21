@@ -15,6 +15,7 @@ from wm3d.data.cache_tasks import (
     CACHE_WINDOW_SEAL_SCHEMA,
 )
 from wm3d.data.manifest_contract import SHA256_RE, load_data_profile, sha256_file
+from wm3d.data.direct_raw import DIRECT_RAW_DATA_CLOSURE_SCHEMA
 from wm3d.data.streaming_raw import (
     STREAMING_DATA_CLOSURE_SCHEMA,
     load_streaming_metadata_seal,
@@ -612,6 +613,98 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError("streaming_raw adapter closure mismatch")
 
 
+def validate_direct_raw_data_closure(value: Mapping[str, Any]) -> None:
+    required = {
+        "schema",
+        "name",
+        "data_profile_path",
+        "data_profile_sha256",
+        "metadata_seal_path",
+        "metadata_seal_sha256",
+        "metadata_root",
+        "episode_index_path",
+        "episode_index_sha256",
+        "cache_index_path",
+        "cache_index_sha256",
+        "grouped_normalization_path",
+        "grouped_normalization_sha256",
+        "task_manifest_path",
+        "task_manifest_sha256",
+        "encoder_contract_path",
+        "encoder_contract_sha256",
+        "task_bank_root",
+        "task_bank_index_sha256",
+        "source_manifest_sha256_by_name",
+        "adapter_contract_sha256_by_name",
+        "appearance_token_grid",
+        "appearance_feature_layer",
+        "direct_input_rgb_size",
+        "direct_decode_workers",
+        "direct_robot_cache_episodes",
+        "direct_prefetch_windows",
+        "direct_video_index_cache_assets",
+        "direct_encode_chunk_rows",
+        "direct_minimum_chunk_rows",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise RuntimeContractError("direct_raw closure fields mismatch")
+    if value.get("schema") != DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+        raise RuntimeContractError("direct_raw closure schema mismatch")
+    positive = (
+        "direct_input_rgb_size",
+        "direct_decode_workers",
+        "direct_robot_cache_episodes",
+        "direct_prefetch_windows",
+        "direct_video_index_cache_assets",
+        "direct_encode_chunk_rows",
+        "direct_minimum_chunk_rows",
+        "appearance_token_grid",
+    )
+    for field in positive:
+        if isinstance(value[field], bool) or int(value[field]) <= 0:
+            raise RuntimeContractError(f"direct_raw {field} must be positive")
+    if int(value["direct_input_rgb_size"]) % 14:
+        raise RuntimeContractError(
+            "direct_raw input RGB size must be divisible by VGGT patch size 14"
+        )
+    if int(value["direct_minimum_chunk_rows"]) > int(
+        value["direct_encode_chunk_rows"]
+    ):
+        raise RuntimeContractError(
+            "direct_raw minimum chunk rows exceed the initial chunk"
+        )
+    if (
+        isinstance(value["appearance_feature_layer"], bool)
+        or int(value["appearance_feature_layer"]) not in (4, 11, 17, 23)
+    ):
+        raise RuntimeContractError(
+            "direct_raw appearance layer must be a cached VGGT feature layer"
+        )
+
+    direct_only = {
+        "direct_input_rgb_size",
+        "direct_decode_workers",
+        "direct_robot_cache_episodes",
+        "direct_prefetch_windows",
+        "direct_video_index_cache_assets",
+        "direct_encode_chunk_rows",
+        "direct_minimum_chunk_rows",
+    }
+    compatible = {
+        name: item for name, item in value.items() if name not in direct_only
+    }
+    compatible.update(
+        {
+            "schema": STREAMING_DATA_CLOSURE_SCHEMA,
+            "lru_root": value["metadata_root"],
+            "lru_max_bytes_per_rank": 1,
+            "encode_batch_frames": value["direct_encode_chunk_rows"],
+            "decode_workers": value["direct_decode_workers"],
+        }
+    )
+    validate_streaming_data_closure(compatible)
+
+
 def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     allowed = {
         "schema",
@@ -683,8 +776,14 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
                 raise RuntimeContractError(
                     f"formal cache/model {name} mismatch: {model['model'][name]} != {expected}"
                 )
-    elif closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
-        validate_streaming_data_closure(closure)
+    elif closure.get("schema") in {
+        STREAMING_DATA_CLOSURE_SCHEMA,
+        DIRECT_RAW_DATA_CLOSURE_SCHEMA,
+    }:
+        if closure.get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+            validate_direct_raw_data_closure(closure)
+        else:
+            validate_streaming_data_closure(closure)
         data_profile = load_data_profile(
             Path(str(closure["data_profile_path"])), verify_source_manifests=False
         )

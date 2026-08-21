@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+from wm3d.encoders.native_vggt import NativeVGGTConfig
+from wm3d.models.direct_vggt_teacher import (
+    DirectVGGTTeacherAdapter,
+    DirectVGGTTeacherConfig,
+)
+
+
+class _FakeNativeVGGT(torch.nn.Module):
+    def __init__(self, *, maximum_rows: int | None = None) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(()))
+        self.maximum_rows = maximum_rows
+        self.calls: list[int] = []
+
+    @torch.inference_mode()
+    def forward(
+        self, images: torch.Tensor, view_mask: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        _batch, rows, views = images.shape[:3]
+        self.calls.append(rows)
+        if self.maximum_rows is not None and rows > self.maximum_rows:
+            raise torch.OutOfMemoryError("fixture chunk is too large")
+        identity = images.mean(dim=(3, 4, 5)) * self.weight
+        geometry = identity[..., None, None].expand(
+            1, rows, views, 4, 2048
+        )
+        appearance = identity[..., None, None].expand(
+            1, rows, views, 16, 2048
+        )
+        confidence = view_mask[..., None].float().expand(1, rows, views, 4)
+        depth = identity[..., None].expand(1, rows, views, 4).add(1.0)
+        point = identity[..., None, None].expand(
+            1, rows, views, 4, 3
+        )
+        camera = identity[..., None].expand(1, rows, views, 9)
+        rgb = F.interpolate(
+            images.reshape(rows * views, 3, 56, 56),
+            size=(8, 8),
+            mode="bilinear",
+            align_corners=False,
+        ).reshape(1, rows, views, 3, 8, 8)
+        return {
+            "view_tokens": geometry.to(torch.bfloat16),
+            "view_mask": view_mask.bool(),
+            "rgb": rgb.mul(255).round().clamp(0, 255).to(torch.uint8),
+            "depth": depth.to(torch.float16),
+            "point": point.to(torch.float16),
+            "geometry_confidence": confidence.to(torch.float16),
+            "camera_pose": camera.float(),
+            "appearance_tokens": appearance.to(torch.bfloat16),
+        }
+
+
+def _adapter(
+    backend: _FakeNativeVGGT, *, chunk_rows: int = 3
+) -> DirectVGGTTeacherAdapter:
+    encoder = NativeVGGTConfig(
+        model_revision="fixture",
+        token_grid=2,
+        appearance_token_grid=4,
+        appearance_feature_layer=4,
+        input_rgb_size=56,
+        target_rgb_size=8,
+        token_dim=2048,
+        max_views=3,
+        dtype="bf16",
+    )
+    return DirectVGGTTeacherAdapter(
+        DirectVGGTTeacherConfig(
+            encoder=encoder,
+            context_frames=2,
+            future_frames=2,
+            appearance_context_frames=1,
+            rgb_decode_indices=(0, 1),
+            encode_chunk_rows=chunk_rows,
+            minimum_chunk_rows=1,
+        ),
+        device="cpu",
+        encoder=backend,
+    )
+
+
+def _raw_batch() -> dict[str, torch.Tensor]:
+    generator = torch.Generator().manual_seed(91)
+    images = torch.randint(
+        0,
+        256,
+        (2, 4, 3, 3, 56, 56),
+        dtype=torch.uint8,
+        generator=generator,
+    )
+    mask = torch.ones(2, 4, 3, dtype=torch.bool)
+    mask[0, 2, 2] = False
+    mask[1, 3, 1] = False
+    return {
+        "direct_rgb_uint8": images,
+        "direct_view_mask": mask,
+        "source_id": torch.tensor([0, 0]),
+    }
+
+
+def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
+    backend = _FakeNativeVGGT()
+    adapter = _adapter(backend)
+    result = adapter.materialize(_raw_batch())
+
+    assert "direct_rgb_uint8" not in result
+    assert "direct_view_mask" not in result
+    assert result["world_tokens"].shape == (2, 2, 3, 4, 2048)
+    assert result["appearance_context_tokens"].shape == (2, 1, 3, 16, 2048)
+    assert result["target_appearance_tokens"].shape == (2, 2, 3, 16, 2048)
+    assert result["target_tokens"].shape == (2, 2, 4, 2048)
+    assert result["target_depth"].shape == (2, 2, 3, 4)
+    assert result["target_point"].shape == (2, 2, 3, 4, 3)
+    assert result["target_camera_pose"].shape == (2, 2, 3, 9)
+    assert result["target_rgb"].shape == (2, 2, 3, 3, 8, 8)
+    assert result["target_rgb_mask"].shape == (2, 2, 3, 1, 1, 1)
+    assert not bool(result["target_depth_mask"][0, 0, 2].any())
+    assert not bool(result["target_camera_pose_mask"][1, 1, 1])
+    assert backend.calls == [3, 3, 2]
+    assert adapter.metrics["encoded_rows"] == 8
+    assert adapter.metrics["encode_calls"] == 3
+    assert all(not parameter.requires_grad for parameter in adapter.parameters())
+    assert not torch.is_inference(result["world_tokens"])
+
+
+def test_direct_teacher_halves_only_the_encoder_chunk_after_oom() -> None:
+    backend = _FakeNativeVGGT(maximum_rows=2)
+    adapter = _adapter(backend, chunk_rows=4)
+    result = adapter.materialize(_raw_batch())
+
+    assert result["target_tokens"].shape == (2, 2, 4, 2048)
+    assert adapter.metrics["oom_backoffs"] == 1
+    assert adapter.metrics["effective_chunk_rows"] == 2
+    assert backend.calls[0] == 4
+    assert backend.calls[1:] == [2, 2, 2, 2]

@@ -10,6 +10,7 @@ import yaml
 
 from wm3d.training.runtime_contract import (
     RuntimeContractError,
+    validate_direct_raw_data_closure,
     validate_runtime_profile,
 )
 from wm3d.training.pretrain import _collate_and_trim
@@ -264,3 +265,66 @@ def test_dual_path_teacher_schedule_is_explicit_and_fail_closed() -> None:
     reversed_schedule["train"]["appearance_teacher_end_ratio"] = 1.1
     with pytest.raises(RuntimeContractError, match="0 <= end <= start <= 1"):
         validate_runtime_profile(reversed_schedule)
+
+def _direct_closure_fixture() -> dict:
+    digest = "a" * 64
+    return {
+        "schema": "wm3d_direct_raw_data_closure_v1",
+        "name": "fixture",
+        "data_profile_path": "/data/profile.yaml",
+        "data_profile_sha256": digest,
+        "metadata_seal_path": "/data/metadata.json",
+        "metadata_seal_sha256": digest,
+        "metadata_root": "/data/metadata",
+        "episode_index_path": "/data/episodes.jsonl",
+        "episode_index_sha256": digest,
+        "cache_index_path": "/data/windows.jsonl",
+        "cache_index_sha256": digest,
+        "grouped_normalization_path": "/data/normalization.npz",
+        "grouped_normalization_sha256": digest,
+        "task_manifest_path": "/data/tasks.jsonl",
+        "task_manifest_sha256": digest,
+        "encoder_contract_path": "/data/encoder.yaml",
+        "encoder_contract_sha256": digest,
+        "task_bank_root": "/data/task_bank",
+        "task_bank_index_sha256": digest,
+        "source_manifest_sha256_by_name": {"source": digest},
+        "adapter_contract_sha256_by_name": {"source": digest},
+        "appearance_token_grid": 16,
+        "appearance_feature_layer": 4,
+        "direct_input_rgb_size": 518,
+        "direct_decode_workers": 4,
+        "direct_robot_cache_episodes": 8,
+        "direct_prefetch_windows": 32,
+        "direct_video_index_cache_assets": 64,
+        "direct_encode_chunk_rows": 8,
+        "direct_minimum_chunk_rows": 1,
+    }
+
+
+def test_direct_raw_closure_translates_to_the_sealed_metadata_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict = {}
+
+    def capture(value: dict) -> None:
+        observed.update(value)
+
+    monkeypatch.setattr(
+        "wm3d.training.runtime_contract.validate_streaming_data_closure",
+        capture,
+    )
+    validate_direct_raw_data_closure(_direct_closure_fixture())
+
+    assert observed["schema"] == "wm3d_streaming_raw_data_closure_v1"
+    assert observed["lru_root"] == "/data/metadata"
+    assert observed["encode_batch_frames"] == 8
+    assert observed["decode_workers"] == 4
+    assert "direct_prefetch_windows" not in observed
+
+
+def test_direct_raw_closure_rejects_an_invalid_oom_backoff_contract() -> None:
+    value = _direct_closure_fixture()
+    value["direct_minimum_chunk_rows"] = 16
+    with pytest.raises(RuntimeContractError, match="minimum chunk"):
+        validate_direct_raw_data_closure(value)

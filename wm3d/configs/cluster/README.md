@@ -1,6 +1,6 @@
 # Cluster site configuration
 
-For single-node 1B streaming training on 8×H100:
+For single-node 1B direct training on 8×H100:
 
 ```bash
 ./run_wm3d.sh 1b init canary1k /data/wm3d_1b_oxe/control/1b_canary.env
@@ -8,9 +8,10 @@ For single-node 1B streaming training on 8×H100:
 ./run_wm3d.sh 1b doctor /data/wm3d_1b_oxe/control/1b_canary.env
 ```
 
-The 1B presets are `canary1k` and `formal100k`. The default uses P64/256px
-`streaming_raw`, all official OXE sources after DROID de-duplication, and excludes both
-AgiBot options. See `docs/WM3D_1B_STREAMING.md`.
+The 1B presets are `canary1k` and `formal100k`. The default uses the no-latent-cache
+`direct_raw` path with P64 geometry and per-view P256 appearance, all official OXE
+sources after DROID de-duplication, and no AgiBot options. See
+`docs/WM3D_DIRECT_RAW.md`.
 
 For multi-node 5B:
 
@@ -31,5 +32,6 @@ selected preset.
 The default data contract includes the official LeRobot OXE collection and excludes AgiBotWorld
 Beta. Set `INCLUDE_AGIBOT_BETA=YES` before `data-template` to include Beta.
 
-The complete procedure is in `docs/WM3D_5B_SCALING.md`. Never commit the filled site file:
+The direct data path is in `docs/WM3D_DIRECT_RAW.md`; the complete 5B procedure is in
+`docs/WM3D_5B_SCALING.md`. Never commit the filled site file:
 it can contain private filesystem and token locations.

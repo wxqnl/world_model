@@ -48,6 +48,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     validate_runtime_profile(runtime)
     assert model["expected_parameter_count"] == 5_323_627_059
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
+    assert model["model"]["P"] == 144
     assert model["model"]["appearance_P"] == 256
     assert model["model"]["rgb_hidden"] == 1536
     assert model["model"]["rgb_res_blocks"] == 2
@@ -188,7 +189,7 @@ def test_5b_lock_passes_exact_license_confirmation() -> None:
     assert "--confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES" in wrapper
 
 
-def test_5b_site_defaults_to_oxe_without_beta_and_64_gpu_saturated_cache() -> None:
+def test_5b_site_defaults_to_oxe_and_direct_p144_p256() -> None:
     site = (ROOT / "configs/cluster/h200_5b.env.example").read_text()
     assert "NNODES=8" in site
     assert "GPUS_PER_NODE=8" in site
@@ -198,7 +199,15 @@ def test_5b_site_defaults_to_oxe_without_beta_and_64_gpu_saturated_cache() -> No
     assert "CACHE_WRITER_THREADS=2" in site
     assert "DATA_FAMILY=public_robot_oxe" in site
     assert "INCLUDE_AGIBOT_BETA=NO" in site
-    assert "WM3D_DATA_MODE=streaming_raw" in site
+    assert "WM3D_DATA_MODE=direct_raw" in site
+    assert "DIRECT_INPUT_RGB_SIZE=518" in site
+    assert "DIRECT_PREFETCH_WINDOWS=8" in site
+    assert "DIRECT_VIDEO_INDEX_CACHE_ASSETS=128" in site
+    assert "DIRECT_ENCODE_CHUNK_ROWS=32" in site
+    assert "DIRECT_MINIMUM_CHUNK_ROWS=4" in site
+    assert "DIRECT_APPEARANCE_FEATURE_LAYER=4" in site
+    assert "STREAMING_LRU_ROOT=" not in site
+    assert "STREAMING_LRU_GIB_PER_RANK=" not in site
     assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
     assert (
         "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml"

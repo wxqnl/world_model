@@ -14,7 +14,9 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from wm3d.data.direct_raw import DIRECT_RAW_DATA_CLOSURE_SCHEMA
 from wm3d.data.source_adapters import load_adapter_contract
+from wm3d.models.direct_vggt_builder import build_direct_vggt_teacher
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.native_world_model import NativeWorldModel
 from wm3d.training.distributed_checkpoint import (
@@ -511,6 +513,12 @@ def main() -> None:
         dataset, profile = _build_mixed_dataset(
             config, split="val", device=context.device, rank=context.rank
         )
+        input_adapter = None
+        if config["data_closure"].get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+            input_adapter = build_direct_vggt_teacher(
+                config, device=context.device
+            )
+            input_adapter.eval()
         loader = _make_loader(
             dataset,
             profile,
@@ -533,6 +541,8 @@ def main() -> None:
         model.eval()
         with torch.no_grad():
             for cpu_batch in loader:
+                if input_adapter is not None:
+                    cpu_batch = input_adapter.materialize(cpu_batch)
                 batch = _batch_to_device(cpu_batch, context.device)
                 with autocast_context(strategy):
                     model_output = _forward(

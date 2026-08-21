@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +13,11 @@ from wm3d.data.step_sampler import (
     RankEpisodeLocalPermutation,
     StepAddressedBatchSampler,
 )
-from wm3d.data.streaming_raw import StreamingRawError, _StreamingEpisodeCache
+from wm3d.data.streaming_raw import (
+    StreamingRawError,
+    _StreamingEpisodeCache,
+    _streaming_lru_max_bytes,
+)
 from wm3d.data.unified_cache_dataset import CacheDataError, _ShardStore
 from wm3d.encoders.native_vggt import NativeVGGTConfig
 from wm3d.training.pretrain import (
@@ -250,6 +255,146 @@ def test_streaming_hot_hit_uses_verified_file_identity(tmp_path: Path) -> None:
     (root / payloads[0]).write_bytes(b"different")
     with pytest.raises(StreamingRawError, match="changed after"):
         cache.ensure(task)
+
+
+def test_streaming_external_hit_discards_redundant_prefetch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path.resolve()
+    payloads = ("feature.bin", "robot.bin", "rgb.bin")
+    for name in payloads:
+        (root / name).write_bytes(name.encode("utf-8"))
+    entry = SimpleNamespace(
+        feature_shard=payloads[0],
+        robot_shard=payloads[1],
+        rgb_pack=payloads[2],
+    )
+    task = SimpleNamespace(task_id="external-episode")
+    future: Future[bytearray] = Future()
+    future.set_result(bytearray(1024))
+    cache = object.__new__(_StreamingEpisodeCache)
+    cache.root = root
+    cache.max_bytes = 4096
+    cache._entries = OrderedDict()
+    cache._verified_payload_identity = {}
+    cache._prepare_futures = {task.task_id: future}
+    cache.prefetch_discarded = 0
+    cache.cache_hits = 0
+    cache.evicted_episodes = 0
+    monkeypatch.setattr(cache, "_load_existing", lambda _task: entry)
+
+    assert cache.ensure(task) is entry
+    assert task.task_id not in cache._prepare_futures
+    assert cache.prefetch_discarded == 1
+    assert cache.cache_hits == 1
+
+
+def test_streaming_lru_override_expands_recovery_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = 32 * 1024**3
+    expanded = 64 * 1024**3
+    monkeypatch.setenv("WM3D_STREAMING_RECOVERY_HOTFIX", "1")
+    monkeypatch.setenv("WM3D_STREAMING_LRU_MAX_BYTES_PER_RANK", str(expanded))
+
+    assert _streaming_lru_max_bytes(configured) == expanded
+
+
+@pytest.mark.parametrize("override", ["not-an-integer", str(16 * 1024**3)])
+def test_streaming_lru_override_rejects_invalid_or_smaller_budget(
+    monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    monkeypatch.setenv("WM3D_STREAMING_RECOVERY_HOTFIX", "1")
+    monkeypatch.setenv("WM3D_STREAMING_LRU_MAX_BYTES_PER_RANK", override)
+
+    with pytest.raises(StreamingRawError, match="streaming LRU override"):
+        _streaming_lru_max_bytes(32 * 1024**3)
+
+
+def test_streaming_lru_override_requires_explicit_recovery_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WM3D_STREAMING_RECOVERY_HOTFIX", raising=False)
+    monkeypatch.setenv(
+        "WM3D_STREAMING_LRU_MAX_BYTES_PER_RANK", str(64 * 1024**3)
+    )
+
+    with pytest.raises(StreamingRawError, match="requires"):
+        _streaming_lru_max_bytes(32 * 1024**3)
+
+
+def test_streaming_prefetch_is_hard_bounded(tmp_path: Path) -> None:
+    cache = object.__new__(_StreamingEpisodeCache)
+    cache.root = tmp_path.resolve()
+    cache._entries = OrderedDict()
+    cache._prepare_futures = {
+        str(index): Future()
+        for index in range(_StreamingEpisodeCache._MAX_PREPARE_FUTURES)
+    }
+    cache.prefetch_submitted = 0
+    cache.prefetch_capacity_skips = 0
+    cache._prepare_executor = SimpleNamespace(
+        submit=lambda *_args, **_kwargs: pytest.fail("capacity must skip submission")
+    )
+
+    cache.prefetch(SimpleNamespace(task_id="overflow"))
+
+    assert len(cache._prepare_futures) == _StreamingEpisodeCache._MAX_PREPARE_FUTURES
+    assert cache.prefetch_submitted == 0
+    assert cache.prefetch_capacity_skips == 1
+
+
+def test_streaming_prefetch_promotes_bootstrap_entry(tmp_path: Path) -> None:
+    cache = object.__new__(_StreamingEpisodeCache)
+    cache.root = tmp_path.resolve()
+    cache._entries = OrderedDict(
+        {
+            "scheduled": (SimpleNamespace(), 1),
+            "newer": (SimpleNamespace(), 1),
+        }
+    )
+    cache._prepare_futures = {}
+    cache.prefetch_promotions = 0
+    cache.external_adoptions = 0
+
+    cache.prefetch(SimpleNamespace(task_id="scheduled"))
+
+    assert tuple(cache._entries) == ("newer", "scheduled")
+    assert cache.prefetch_promotions == 1
+    assert cache.external_adoptions == 0
+
+
+def test_streaming_prefetch_adopts_new_sidecar_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path.resolve()
+    fragments = root / "episode_index_fragments"
+    fragments.mkdir()
+    task = SimpleNamespace(task_id="sidecar")
+    (fragments / "sidecar.jsonl").write_text("published\n", encoding="utf-8")
+    entry = SimpleNamespace()
+    future: Future[bytearray] = Future()
+    future.set_result(bytearray(1024))
+    cache = object.__new__(_StreamingEpisodeCache)
+    cache.root = root
+    cache.max_bytes = 4096
+    cache._entries = OrderedDict()
+    cache._prepare_futures = {task.task_id: future}
+    cache._verified_payload_identity = {}
+    cache.prefetch_discarded = 0
+    cache.prefetch_promotions = 0
+    cache.external_adoptions = 0
+    cache.evicted_episodes = 0
+    monkeypatch.setattr(cache, "_load_existing", lambda _task: entry)
+    monkeypatch.setattr(cache, "_entry_bytes", lambda _root, _entry: 1024)
+
+    cache.prefetch(task)
+
+    assert cache._entries == OrderedDict({task.task_id: (entry, 1024)})
+    assert task.task_id not in cache._prepare_futures
+    assert cache.prefetch_discarded == 1
+    assert cache.prefetch_promotions == 0
+    assert cache.external_adoptions == 1
 
 
 def test_streaming_encoder_applies_appearance_layer_override(

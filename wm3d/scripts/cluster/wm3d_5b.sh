@@ -9,14 +9,14 @@ case "${SCALE}" in
     SCALE_LABEL=1B
     PRESET_VAR=WM3D_1B_PRESET
     RUN_ID_VAR=WM3D_1B_RUN_ID
-    TEMPLATE="${ROOT}/configs/cluster/h100_1b_streaming.env.example"
-    GUIDE=docs/WM3D_1B_STREAMING.md
+    TEMPLATE="${ROOT}/configs/cluster/h100_1b_direct.env.example"
+    GUIDE=docs/WM3D_DIRECT_RAW.md
     ;;
   5b)
     SCALE_LABEL=5B
     PRESET_VAR=WM3D_5B_PRESET
     RUN_ID_VAR=WM3D_5B_RUN_ID
-    TEMPLATE="${ROOT}/configs/cluster/h200_5b.env.example"
+    TEMPLATE="${ROOT}/configs/cluster/h200_5b_direct.env.example"
     GUIDE=docs/WM3D_5B_SCALING.md
     ;;
   *)
@@ -158,12 +158,20 @@ load_site() {
   STREAMING_METADATA_WORKERS=${STREAMING_METADATA_WORKERS:-32}
   STREAMING_ENCODE_BATCH_FRAMES=${STREAMING_ENCODE_BATCH_FRAMES:-16}
   STREAMING_DECODE_WORKERS=${STREAMING_DECODE_WORKERS:-4}
+  DIRECT_INPUT_RGB_SIZE=${DIRECT_INPUT_RGB_SIZE:-518}
+  DIRECT_DECODE_WORKERS=${DIRECT_DECODE_WORKERS:-4}
+  DIRECT_ROBOT_CACHE_EPISODES=${DIRECT_ROBOT_CACHE_EPISODES:-8}
+  DIRECT_PREFETCH_WINDOWS=${DIRECT_PREFETCH_WINDOWS:-8}
+  DIRECT_VIDEO_INDEX_CACHE_ASSETS=${DIRECT_VIDEO_INDEX_CACHE_ASSETS:-128}
+  DIRECT_ENCODE_CHUNK_ROWS=${DIRECT_ENCODE_CHUNK_ROWS:-32}
+  DIRECT_MINIMUM_CHUNK_ROWS=${DIRECT_MINIMUM_CHUNK_ROWS:-4}
+  DIRECT_APPEARANCE_FEATURE_LAYER=${DIRECT_APPEARANCE_FEATURE_LAYER:-4}
   MINIMUM_RAW_FILESYSTEM_BYTES=${MINIMUM_RAW_FILESYSTEM_BYTES:-0}
   INCLUDE_AGIBOT_2026=${INCLUDE_AGIBOT_2026:-YES}
   INCLUDE_AGIBOT_BETA=${INCLUDE_AGIBOT_BETA:-NO}
   case "${WM3D_DATA_MODE}" in
-    episode_cache|streaming_raw) ;;
-    *) die "WM3D_DATA_MODE 必须是 episode_cache 或 streaming_raw" ;;
+    episode_cache|streaming_raw|direct_raw) ;;
+    *) die "WM3D_DATA_MODE 必须是 episode_cache、streaming_raw 或 direct_raw" ;;
   esac
   case "${INCLUDE_AGIBOT_BETA}" in
     YES|NO) ;;
@@ -342,8 +350,13 @@ PY
     [[ $# -eq 0 ]] || { usage; exit 2; }
     if [[ "${WM3D_DATA_MODE}" == streaming_raw ]]; then
       data_steps="task-bank -> cache-plan -> streaming-prepare"
+      data_detail="stream LRU ${STREAMING_LRU_ROOT} (${STREAMING_LRU_GIB_PER_RANK} GiB/rank)"
+    elif [[ "${WM3D_DATA_MODE}" == direct_raw ]]; then
+      data_steps="task-bank -> cache-plan -> streaming-prepare"
+      data_detail="direct VGGT chunk=${DIRECT_ENCODE_CHUNK_ROWS}, no latent cache"
     else
       data_steps="task-bank -> cache-plan -> cache-worker[*] -> cache-seal -> window -> normalization"
+      data_detail="episode cache ${CACHE_ROOT}"
     fi
     cat <<EOF
 WM3D ${SCALE_LABEL} site plan
@@ -353,7 +366,7 @@ WM3D ${SCALE_LABEL} site plan
   data:       ${DATA_PROFILE}
   cache:      ${CACHE_ROOT}
   data mode:  ${WM3D_DATA_MODE}
-  stream LRU: ${STREAMING_LRU_ROOT} (${STREAMING_LRU_GIB_PER_RANK} GiB/rank)
+  mode detail: ${data_detail}
   runtime:    ${RUNTIME_YAML}
   run:        ${RUN_ROOT}
   topology:   ${NNODES} nodes x ${GPUS_PER_NODE} GPUs
@@ -439,7 +452,7 @@ EOF
   cache-worker)
     [[ $# -eq 3 ]] || { usage; exit 2; }
     [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
-      die "streaming_raw 不运行 cache-worker；请运行 streaming-prepare"
+      die "${WM3D_DATA_MODE} 不运行 cache-worker；请运行 streaming-prepare"
     worker_index=$1
     worker_count=$2
     local_gpu=$3
@@ -465,7 +478,7 @@ EOF
   cache-seal)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
-      die "streaming_raw 不运行 cache-seal；请运行 streaming-prepare"
+      die "${WM3D_DATA_MODE} 不运行 cache-seal；请运行 streaming-prepare"
     "${ENTRY}" cache-seal --task-manifest "${TASK_MANIFEST}" \
       --receipt-root "${CACHE_ROOT}/receipts" \
       --episode-index-fragment-root "${CACHE_ROOT}/episode_index_fragments" \
@@ -473,8 +486,8 @@ EOF
     ;;
   streaming-prepare)
     [[ $# -eq 0 ]] || { usage; exit 2; }
-    [[ "${WM3D_DATA_MODE}" == streaming_raw ]] || \
-      die "streaming-prepare 只用于 WM3D_DATA_MODE=streaming_raw"
+    [[ "${WM3D_DATA_MODE}" != episode_cache ]] || \
+      die "streaming-prepare 只用于 streaming_raw 或 direct_raw"
     require_file "cache task manifest" "${TASK_MANIFEST}"
     require_file "task bank index" "${TASK_BANK_INDEX}"
     task_bank_sha=$(sha256 "${TASK_BANK_INDEX}")
@@ -493,7 +506,7 @@ EOF
   window)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
-      die "streaming_raw 的 window 已由 streaming-prepare 生成"
+      die "${WM3D_DATA_MODE} 的 window 已由 streaming-prepare 生成"
     "${ENTRY}" window --episode-index "${EPISODE_INDEX}" --episode-seal "${EPISODE_SEAL}" \
       --cache-root "${CACHE_ROOT}" --data-profile "${DATA_PROFILE}" \
       --model-profile "${MODEL_PROFILE}" --output-index "${WINDOW_INDEX}" \
@@ -502,7 +515,7 @@ EOF
   normalization)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     [[ "${WM3D_DATA_MODE}" == episode_cache ]] || \
-      die "streaming_raw 的 normalization 已由 streaming-prepare 生成"
+      die "${WM3D_DATA_MODE} 的 normalization 已由 streaming-prepare 生成"
     window_sha=$(sha256 "${WINDOW_INDEX}")
     "${ENTRY}" normalization --data-profile "${DATA_PROFILE}" \
       --model-profile "${MODEL_PROFILE}" --window-index "${WINDOW_INDEX}" \
@@ -525,6 +538,18 @@ EOF
         --streaming-lru-gib-per-rank "${STREAMING_LRU_GIB_PER_RANK}" \
         --streaming-encode-batch-frames "${STREAMING_ENCODE_BATCH_FRAMES}" \
         --streaming-decode-workers "${STREAMING_DECODE_WORKERS}"
+    elif [[ "${WM3D_DATA_MODE}" == direct_raw ]]; then
+      require_file "direct metadata seal" "${STREAMING_METADATA_SEAL}"
+      "${ENTRY}" "${common[@]}" --data-mode direct_raw \
+        --streaming-metadata-seal "${STREAMING_METADATA_SEAL}" \
+        --direct-input-rgb-size "${DIRECT_INPUT_RGB_SIZE}" \
+        --direct-decode-workers "${DIRECT_DECODE_WORKERS}" \
+        --direct-robot-cache-episodes "${DIRECT_ROBOT_CACHE_EPISODES}" \
+        --direct-prefetch-windows "${DIRECT_PREFETCH_WINDOWS}" \
+        --direct-video-index-cache-assets "${DIRECT_VIDEO_INDEX_CACHE_ASSETS}" \
+        --direct-encode-chunk-rows "${DIRECT_ENCODE_CHUNK_ROWS}" \
+        --direct-minimum-chunk-rows "${DIRECT_MINIMUM_CHUNK_ROWS}" \
+        --direct-appearance-feature-layer "${DIRECT_APPEARANCE_FEATURE_LAYER}"
     else
       "${ENTRY}" "${common[@]}" --data-mode episode_cache \
         --cache-root "${CACHE_ROOT}" --episode-cache-index "${EPISODE_INDEX}" \

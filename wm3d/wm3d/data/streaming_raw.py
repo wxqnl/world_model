@@ -12,6 +12,7 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -50,6 +51,27 @@ STREAMING_DATA_CLOSURE_SCHEMA = "wm3d_streaming_raw_data_closure_v1"
 
 class StreamingRawError(RuntimeError):
     pass
+
+
+def _streaming_lru_max_bytes(configured_max_bytes: int) -> int:
+    if configured_max_bytes <= 0:
+        raise StreamingRawError("streaming LRU budget must be positive")
+    raw_override = os.environ.get("WM3D_STREAMING_LRU_MAX_BYTES_PER_RANK")
+    if raw_override is None:
+        return configured_max_bytes
+    if os.environ.get("WM3D_STREAMING_RECOVERY_HOTFIX") != "1":
+        raise StreamingRawError(
+            "streaming LRU override requires WM3D_STREAMING_RECOVERY_HOTFIX=1"
+        )
+    try:
+        override = int(raw_override)
+    except ValueError as exc:
+        raise StreamingRawError("streaming LRU override must be an integer") from exc
+    if override < configured_max_bytes:
+        raise StreamingRawError(
+            "streaming LRU override cannot reduce the configured budget"
+        )
+    return override
 
 
 def _episode_row(path: Path) -> CacheEpisodeEntry:
@@ -139,6 +161,8 @@ def load_streaming_metadata_seal(
 class _StreamingEpisodeCache:
     """Generate full cache episodes lazily and keep a strict byte-bounded LRU."""
 
+    _MAX_PREPARE_FUTURES = 32
+
     def __init__(
         self,
         *,
@@ -150,9 +174,9 @@ class _StreamingEpisodeCache:
         self.profile = profile
         self.device = torch.device(device)
         self.rank = int(rank)
-        self.max_bytes = int(closure["lru_max_bytes_per_rank"])
-        if self.max_bytes <= 0:
-            raise StreamingRawError("streaming LRU budget must be positive")
+        self.max_bytes = _streaming_lru_max_bytes(
+            int(closure["lru_max_bytes_per_rank"])
+        )
         parent = Path(str(closure["lru_root"]))
         if not parent.is_absolute() or parent.is_symlink():
             raise StreamingRawError("streaming LRU root must be an absolute non-symlink")
@@ -229,9 +253,13 @@ class _StreamingEpisodeCache:
         self._prepare_futures: dict[str, Future[Any]] = {}
         self.prefetch_submitted = 0
         self.prefetch_consumed = 0
+        self.prefetch_discarded = 0
+        self.prefetch_capacity_skips = 0
         self.prefetch_wait_seconds = 0.0
         self.generated_episodes = 0
         self.cache_hits = 0
+        self.prefetch_promotions = 0
+        self.external_adoptions = 0
         self.evicted_episodes = 0
         self.prepare_seconds = 0.0
         self.encode_seconds = 0.0
@@ -381,12 +409,52 @@ class _StreamingEpisodeCache:
     def prefetch(self, task: CacheTask) -> None:
         """Queue CPU-only preparation for one future immutable episode."""
 
-        if task.task_id in self._entries or task.task_id in self._prepare_futures:
+        if task.task_id in self._entries:
+            # Sidecar entries discovered at process bootstrap retain their old
+            # LRU position. Promote them when deterministic lookahead first
+            # needs them so normal churn cannot evict a correctly precomputed
+            # episode immediately before ensure() consumes it.
+            self._entries.move_to_end(task.task_id)
+            self.prefetch_promotions += 1
+            return
+        fragment = self.root / "episode_index_fragments" / f"{task.task_id}.jsonl"
+        if fragment.is_file():
+            # Adopt sidecar output into the live LRU at lookahead time. Merely
+            # noticing the fragment is insufficient because an untracked entry
+            # has no recency in the long-running process.
+            entry = self._load_existing(task)
+            if entry is None:
+                raise StreamingRawError("streaming sidecar fragment disappeared")
+            self._discard_prefetch(task.task_id)
+            size = self._entry_bytes(self.root, entry)
+            self._entries[task.task_id] = (entry, size)
+            self._trim(protected=task.task_id)
+            self.external_adoptions += 1
+            return
+        if task.task_id in self._prepare_futures:
+            return
+        if len(self._prepare_futures) >= self._MAX_PREPARE_FUTURES:
+            # Two lookahead batches at micro-batch 16 need at most 32 unique
+            # episodes.  A hard cap makes malformed or externally satisfied
+            # lookahead incapable of retaining unbounded decoded episodes.
+            self.prefetch_capacity_skips += 1
             return
         self._prepare_futures[task.task_id] = self._prepare_executor.submit(
             self._prepare_task_data, task
         )
         self.prefetch_submitted += 1
+
+    def _discard_prefetch(self, task_id: str) -> None:
+        """Drop redundant preparation after an external cache hit."""
+
+        futures = getattr(self, "_prepare_futures", None)
+        if not futures:
+            return
+        future = futures.pop(task_id, None)
+        if future is None:
+            return
+        future.cancel()
+        self.prefetch_discarded = getattr(self, "prefetch_discarded", 0) + 1
 
     def _prepared(self, task: CacheTask) -> Any:
         future = self._prepare_futures.pop(task.task_id, None)
@@ -466,6 +534,7 @@ class _StreamingEpisodeCache:
     def ensure(self, task: CacheTask) -> CacheEpisodeEntry:
         cached = self._entries.pop(task.task_id, None)
         if cached is not None:
+            self._discard_prefetch(task.task_id)
             entry, size = cached
             verified_identity = self._verified_payload_identity.get(task.task_id)
             if verified_identity is None:
@@ -484,6 +553,11 @@ class _StreamingEpisodeCache:
         if entry is None:
             entry = self._materialize(task)
         else:
+            # A sidecar can publish between prefetch() and ensure().  Without
+            # this pop, the completed Future retains the entire decoded and
+            # resized episode indefinitely even though the sealed cache entry
+            # is used, growing every rank by hundreds of GB over time.
+            self._discard_prefetch(task.task_id)
             self.cache_hits += 1
         size = self._entry_bytes(self.root, entry)
         self._entries[task.task_id] = (entry, size)
@@ -496,12 +570,17 @@ class _StreamingEpisodeCache:
             "generated_episodes": self.generated_episodes,
             "cache_hits": self.cache_hits,
             "evicted_episodes": self.evicted_episodes,
+            "prefetch_promotions": self.prefetch_promotions,
+            "external_adoptions": self.external_adoptions,
             "prepare_seconds": self.prepare_seconds,
             "encode_seconds": self.encode_seconds,
             "prefetch_submitted": self.prefetch_submitted,
             "prefetch_consumed": self.prefetch_consumed,
+            "prefetch_discarded": self.prefetch_discarded,
+            "prefetch_capacity_skips": self.prefetch_capacity_skips,
             "prefetch_pending": len(self._prepare_futures),
             "prefetch_wait_seconds": self.prefetch_wait_seconds,
+            "lru_max_bytes": self.max_bytes,
             "resident_bytes": sum(size for _entry, size in self._entries.values()),
             "resident_episodes": len(self._entries),
         }

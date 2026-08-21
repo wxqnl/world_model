@@ -35,8 +35,10 @@ latent 和 3D 条件，因此纹理不会被迫先穿过 P64/P144 的融合瓶�
 
 浅层 appearance 保留更多颜色、边缘和局部纹理；深层 geometry 仍保留 VGGT 的完整几何推理。两者来自同一次 forward，不会增加第二次 VGGT 编码。
 
-`streaming_raw` 会将两组 token 分别量化并写入同一个有容量上限的 episode LRU。完整
-episode cache 则必须使用双通路 encoder 合同：
+当前正式 `direct_raw` 路径只为当前 `T+K` window 在线生成两组 token，不量化、不落盘，
+也没有 episode LRU 或 sidecar。`streaming_raw` 仅作为兼容旧运行的可选路径；它会将两组
+token 量化后写入有容量上限的 episode LRU。若显式使用完整 episode cache，则必须使用
+双通路 encoder 合同：
 
 - 1B：`configs/encoder/vggt_native_p64_appearance_p256.yaml`；
 - 5B：`configs/encoder/vggt_native_p144_appearance_p256.yaml`。
@@ -79,10 +81,12 @@ LPIPS 输入传回 native RGB decoder 与 token 输出层。LPIPS 必须来自�
 
 ## 已完成的真实链路验证
 
-node42 的三卡真实 raw/no-PCA pilot 已从原始 RoboCasa 与 OXE 视频完成：同一次 VGGT
-前向生成 P64 geometry 与 P256 appearance、20 个完整优化 step、全部 owner 的有限非零
-梯度，以及三分片 checkpoint 提交。appearance、RGB、geometry、action 和 state loss
-同时有限。该短跑验证实现和训练链路，不用于宣称最终图像质量；清晰度结论必须来自相同
+`direct_raw` 已在真实 RoboCasa 与 OXE 视频上验证：RoboCasa 的 direct/full decode RGB
+逐像素一致；OXE 的大 PTS offset 半开区间与旧 sealed decoder 选择完全相同；AV1 长 episode
+会走有界 PyAV keyframe fallback。真实 VGGT 输出的 P64 geometry、P256 appearance、RGB、
+depth、point 和 camera 全部有限。node42 的两卡 1.327B FSDP2 pilot 已完成完整 objective、
+backward、optimizer、两分片 COMMITTED checkpoint 和独立 exact-resume 读取。该短跑验证实现、
+分布式保存与恢复链路，不用于宣称最终图像质量；清晰度结论必须来自相同
 数据预算下 geometry-only 与 dual-path 的固定样本对比。
 
 ## 验收原则

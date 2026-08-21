@@ -1208,36 +1208,43 @@ class NativeRGBDecoder(nn.Module):
             if tuple(target_view_mask.shape) != (batch, frames, views):
                 raise ValueError("target_view_mask must be [B,F,V]")
             valid = target_view_mask.reshape(-1).bool()
-        valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
-        if valid_indices.numel() == 0:
-            empty = future_tokens.new_zeros(
-                batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
-            )
-            return empty, index_tensor
+        # ``image_decoder`` is an FSDP unit.  Every rank must therefore call it
+        # the same number of times in the same order.  Chunking only the valid
+        # views made that call count data-dependent: a rank with one additional
+        # visible camera entered an extra all-gather while its peers had already
+        # moved on to gradient reduction, eventually deadlocking NCCL.
+        #
+        # Decode the fixed dense slot layout and mask invalid slots afterwards.
+        # The layout depends only on the sealed batch/model shape, so collective
+        # ordering is identical across ranks while invalid RGB outputs and their
+        # gradients remain exactly zero.
+        dense_indices = torch.arange(
+            batch * frames * views, device=future_tokens.device
+        )
         decoded_chunks: list[torch.Tensor] = []
         for start in range(
-            0, int(valid_indices.numel()), self.cfg.rgb_decode_chunk_size
+            0, int(dense_indices.numel()), self.cfg.rgb_decode_chunk_size
         ):
-            chunk_indices = valid_indices[
+            chunk_indices = dense_indices[
                 start : start + self.cfg.rgb_decode_chunk_size
             ]
+            decoded = self.image_decoder(
+                expanded.index_select(0, chunk_indices),
+                self.view_embed.index_select(
+                    0, view_ids.index_select(0, chunk_indices)
+                ),
+                (
+                    None if expanded_geometry is None else
+                    expanded_geometry.index_select(0, chunk_indices)
+                ),
+            )
             decoded_chunks.append(
-                self.image_decoder(
-                    expanded.index_select(0, chunk_indices),
-                    self.view_embed.index_select(
-                        0, view_ids.index_select(0, chunk_indices)
-                    ),
-                    (
-                        None if expanded_geometry is None else
-                        expanded_geometry.index_select(0, chunk_indices)
-                    ),
+                decoded
+                * valid.index_select(0, chunk_indices)[:, None, None, None].to(
+                    dtype=decoded.dtype
                 )
             )
-        decoded = torch.cat(decoded_chunks, dim=0)
-        dense = decoded.new_zeros(
-            batch * frames * views, 3, self.cfg.rgb_size, self.cfg.rgb_size
-        )
-        dense = dense.index_copy(0, valid_indices, decoded)
+        dense = torch.cat(decoded_chunks, dim=0)
         return (
             dense.view(
                 batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size

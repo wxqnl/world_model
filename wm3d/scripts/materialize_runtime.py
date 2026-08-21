@@ -14,6 +14,7 @@ import uuid
 import yaml
 
 from wm3d.data.manifest_contract import load_data_profile, sha256_file
+from wm3d.data.direct_raw import DIRECT_RAW_DATA_CLOSURE_SCHEMA
 from wm3d.data.streaming_raw import (
     STREAMING_DATA_CLOSURE_SCHEMA,
     load_streaming_metadata_seal,
@@ -58,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--objective", type=Path, required=True)
     parser.add_argument(
         "--data-mode",
-        choices=("episode_cache", "streaming_raw"),
+        choices=("episode_cache", "streaming_raw", "direct_raw"),
         default="episode_cache",
     )
     parser.add_argument("--cache-root", type=Path)
@@ -73,6 +74,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming-encode-batch-frames", type=int, default=16)
     parser.add_argument("--streaming-decode-workers", type=int, default=4)
     parser.add_argument("--streaming-appearance-feature-layer", type=int)
+    parser.add_argument("--direct-input-rgb-size", type=int, default=518)
+    parser.add_argument("--direct-decode-workers", type=int, default=4)
+    parser.add_argument("--direct-robot-cache-episodes", type=int, default=8)
+    parser.add_argument("--direct-prefetch-windows", type=int, default=8)
+    parser.add_argument("--direct-video-index-cache-assets", type=int, default=128)
+    parser.add_argument("--direct-encode-chunk-rows", type=int, default=32)
+    parser.add_argument("--direct-minimum-chunk-rows", type=int, default=4)
+    parser.add_argument("--direct-appearance-feature-layer", type=int, default=4)
     parser.add_argument("--environment-lock", type=Path, required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--run-lineage", required=True)
@@ -149,17 +158,39 @@ def main() -> None:
             "adapter_contract_sha256_by_name": adapter_contract_sha256_by_name,
         }
     else:
-        if args.streaming_metadata_seal is None or args.streaming_lru_root is None:
+        if args.streaming_metadata_seal is None:
             raise RuntimeError(
-                "streaming_raw requires --streaming-metadata-seal and "
-                "--streaming-lru-root"
+                f"{args.data_mode} requires --streaming-metadata-seal"
             )
-        if (
-            args.streaming_lru_gib_per_rank <= 0
-            or args.streaming_encode_batch_frames <= 0
-            or args.streaming_decode_workers <= 0
-        ):
-            raise RuntimeError("streaming_raw LRU/encode/decode values must be positive")
+        if args.data_mode == "streaming_raw":
+            if args.streaming_lru_root is None:
+                raise RuntimeError(
+                    "streaming_raw requires --streaming-lru-root"
+                )
+            if (
+                args.streaming_lru_gib_per_rank <= 0
+                or args.streaming_encode_batch_frames <= 0
+                or args.streaming_decode_workers <= 0
+            ):
+                raise RuntimeError(
+                    "streaming_raw LRU/encode/decode values must be positive"
+                )
+        else:
+            direct_positive = (
+                args.direct_input_rgb_size,
+                args.direct_decode_workers,
+                args.direct_robot_cache_episodes,
+                args.direct_prefetch_windows,
+                args.direct_video_index_cache_assets,
+                args.direct_encode_chunk_rows,
+                args.direct_minimum_chunk_rows,
+            )
+            if any(value <= 0 for value in direct_positive):
+                raise RuntimeError("direct_raw decode/queue/chunk values must be positive")
+            if args.direct_input_rgb_size % 14:
+                raise RuntimeError("direct_raw RGB size must be divisible by 14")
+            if args.direct_minimum_chunk_rows > args.direct_encode_chunk_rows:
+                raise RuntimeError("direct_raw minimum chunk exceeds initial chunk")
         metadata_seal_path = args.streaming_metadata_seal.resolve(strict=True)
         metadata_seal = load_streaming_metadata_seal(metadata_seal_path)
         if metadata_seal["data_profile_sha256"] != data_profile.profile_sha256:
@@ -171,18 +202,23 @@ def main() -> None:
         configured_appearance_layer = data_profile.cache_representation.get(
             "appearance_feature_layer"
         )
-        if args.streaming_appearance_feature_layer is not None:
-            requested_layer = int(args.streaming_appearance_feature_layer)
+        requested_appearance_layer = (
+            args.streaming_appearance_feature_layer
+            if args.data_mode == "streaming_raw"
+            else args.direct_appearance_feature_layer
+        )
+        if requested_appearance_layer is not None:
+            requested_layer = int(requested_appearance_layer)
             if requested_layer not in (4, 11, 17, 23):
                 raise RuntimeError(
-                    "streaming appearance layer must be a cached VGGT layer"
+                    "appearance layer must be a cached VGGT feature layer"
                 )
             if (
                 configured_appearance_layer is not None
                 and int(configured_appearance_layer) != requested_layer
             ):
                 raise RuntimeError(
-                    "streaming appearance layer differs from data profile"
+                    "appearance layer differs from the data profile"
                 )
             configured_appearance_layer = requested_layer
         if configured_appearance_grid is not None:
@@ -203,11 +239,7 @@ def main() -> None:
             raise RuntimeError(
                 "streaming appearance layer requires a distinct appearance grid"
             )
-        lru_root = args.streaming_lru_root.absolute()
-        if lru_root.is_symlink():
-            raise RuntimeError("streaming LRU root cannot be a symlink")
         closure = {
-            "schema": STREAMING_DATA_CLOSURE_SCHEMA,
             "name": data_profile.name,
             "data_profile_path": str(data_profile.path),
             "data_profile_sha256": data_profile.profile_sha256,
@@ -232,17 +264,51 @@ def main() -> None:
             "task_bank_index_sha256": metadata_seal["task_bank_index_sha256"],
             "source_manifest_sha256_by_name": source_manifest_sha256_by_name,
             "adapter_contract_sha256_by_name": adapter_contract_sha256_by_name,
-            "lru_root": str(lru_root),
-            "lru_max_bytes_per_rank": int(
-                args.streaming_lru_gib_per_rank * 1024**3
-            ),
-            "encode_batch_frames": int(args.streaming_encode_batch_frames),
-            "decode_workers": int(args.streaming_decode_workers),
             "appearance_token_grid": appearance_grid,
         }
         if configured_appearance_layer is not None:
             closure["appearance_feature_layer"] = int(
                 configured_appearance_layer
+            )
+        if args.data_mode == "streaming_raw":
+            lru_root = args.streaming_lru_root.absolute()
+            if lru_root.is_symlink():
+                raise RuntimeError("streaming LRU root cannot be a symlink")
+            closure.update(
+                {
+                    "schema": STREAMING_DATA_CLOSURE_SCHEMA,
+                    "lru_root": str(lru_root),
+                    "lru_max_bytes_per_rank": int(
+                        args.streaming_lru_gib_per_rank * 1024**3
+                    ),
+                    "encode_batch_frames": int(
+                        args.streaming_encode_batch_frames
+                    ),
+                    "decode_workers": int(args.streaming_decode_workers),
+                }
+            )
+        else:
+            if configured_appearance_layer is None:
+                raise RuntimeError("direct_raw requires an appearance feature layer")
+            closure.update(
+                {
+                    "schema": DIRECT_RAW_DATA_CLOSURE_SCHEMA,
+                    "direct_input_rgb_size": int(args.direct_input_rgb_size),
+                    "direct_decode_workers": int(args.direct_decode_workers),
+                    "direct_robot_cache_episodes": int(
+                        args.direct_robot_cache_episodes
+                    ),
+                    "direct_prefetch_windows": int(args.direct_prefetch_windows),
+                    "direct_video_index_cache_assets": int(
+                        args.direct_video_index_cache_assets
+                    ),
+                    "direct_encode_chunk_rows": int(
+                        args.direct_encode_chunk_rows
+                    ),
+                    "direct_minimum_chunk_rows": int(
+                        args.direct_minimum_chunk_rows
+                    ),
+                }
             )
     value = {
         "schema": RUNTIME_CONFIG_SCHEMA,
