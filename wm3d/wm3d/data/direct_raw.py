@@ -62,6 +62,92 @@ from .window_video import (
 DIRECT_RAW_DATA_CLOSURE_SCHEMA = "wm3d_direct_raw_data_closure_v1"
 
 
+def _apply_ignored_action_dimensions(
+    action: dict[str, torch.Tensor],
+    ignored_by_slot: Mapping[int, Sequence[int]],
+) -> None:
+    """Remove source metadata fields that are not executable robot actions."""
+
+    fine_fields = (
+        ("history_fine_action_mask", 1),
+        ("future_factual_fine_action_mask", 1),
+        ("target_fine_action_mask", 0),
+    )
+    coarse_fields = (
+        ("history_coarse_action_mask", 1),
+        ("future_factual_coarse_action_mask", 1),
+        ("target_coarse_action_mask", 1),
+    )
+    for raw_slot, raw_dimensions in ignored_by_slot.items():
+        slot = int(raw_slot)
+        dimensions = tuple(int(value) for value in raw_dimensions)
+        for name, group_axis in (*fine_fields, *coarse_fields):
+            mask = action[name]
+            for dimension in dimensions:
+                index = [slice(None)] * mask.ndim
+                index[group_axis] = slot
+                index[-1] = dimension
+                mask[tuple(index)] = False
+        for dimension in dimensions:
+            action["action_semantic_ids"][slot, dimension] = 0
+            action["composition_operator_ids"][slot, dimension] = 0
+
+
+def _ignored_action_slots(
+    raw: Any,
+    *,
+    data_profile: DataProfile,
+) -> dict[str, dict[int, tuple[int, ...]]]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, list):
+        raise CacheDataError("direct ignored action dimensions must be a list")
+    result: dict[str, dict[int, tuple[int, ...]]] = {}
+    source_by_name = {source.name: source for source in data_profile.sources}
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"source", "group", "dimensions"}:
+            raise CacheDataError("direct ignored action dimension entry is invalid")
+        source_name = str(item["source"])
+        source = source_by_name.get(source_name)
+        if source is None:
+            raise CacheDataError(f"ignored action source is unknown: {source_name}")
+        embodiment = data_profile.embodiments[source.embodiment]
+        group_name = str(item["group"])
+        matches = [
+            (slot, group)
+            for slot, group in enumerate(embodiment.groups)
+            if group.name == group_name
+        ]
+        if len(matches) != 1:
+            raise CacheDataError(
+                f"ignored action group is unknown: {source_name}/{group_name}"
+            )
+        slot, group = matches[0]
+        dimensions = item["dimensions"]
+        if (
+            not isinstance(dimensions, list)
+            or not dimensions
+            or any(isinstance(value, bool) for value in dimensions)
+        ):
+            raise CacheDataError(
+                "ignored action dimensions must be a non-empty integer list"
+            )
+        normalized = tuple(sorted({int(value) for value in dimensions}))
+        if len(normalized) != len(dimensions) or any(
+            not 0 <= value < group.action_dim for value in normalized
+        ):
+            raise CacheDataError(
+                "ignored action dimensions are duplicate or out of range"
+            )
+        source_slots = result.setdefault(source_name, {})
+        if slot in source_slots:
+            raise CacheDataError(
+                f"ignored action group is duplicated: {source_name}/{group_name}"
+            )
+        source_slots[slot] = normalized
+    return result
+
+
 @dataclass(frozen=True)
 class _DirectEpisode:
     selected_rows: np.ndarray
@@ -643,6 +729,10 @@ class DirectRawDataset(UnifiedCacheDataset):
             name: tuple(value) for name, value in episode_spans.items()
         }
         self.rank = int(rank)
+        self._ignored_action_slots = _ignored_action_slots(
+            closure.get("direct_ignored_action_dimensions"),
+            data_profile=data_profile,
+        )
         self.max_prefetch_windows = int(
             closure.get("direct_prefetch_windows", 32)
         )
@@ -740,6 +830,9 @@ class DirectRawDataset(UnifiedCacheDataset):
             action_semantic_ids=action["action_semantic_ids"],
             state_semantic_ids=action["state_semantic_ids"],
         )
+        ignored = self._ignored_action_slots.get(entry.source)
+        if ignored:
+            _apply_ignored_action_dimensions(action, ignored)
         for slot, (group, series) in enumerate(
             zip(embodiment.groups, prepared_robot.action_series)
         ):

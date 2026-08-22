@@ -335,6 +335,36 @@ def test_direct_raw_closure_translates_to_the_sealed_metadata_contract(
     assert "direct_prefetch_windows" not in observed
 
 
+def test_direct_raw_closure_seals_ignored_action_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict = {}
+
+    def capture(value: dict) -> None:
+        observed.update(value)
+
+    monkeypatch.setattr(
+        "wm3d.training.runtime_contract.validate_streaming_data_closure",
+        capture,
+    )
+    value = _direct_closure_fixture()
+    value["direct_ignored_action_dimensions"] = [
+        {"source": "source", "group": "controller", "dimensions": [7, 14]}
+    ]
+    validate_direct_raw_data_closure(value)
+
+    assert "direct_ignored_action_dimensions" not in observed
+
+
+def test_direct_raw_closure_rejects_duplicate_ignored_action_dimensions() -> None:
+    value = _direct_closure_fixture()
+    value["direct_ignored_action_dimensions"] = [
+        {"source": "source", "group": "controller", "dimensions": [7, 7]}
+    ]
+    with pytest.raises(RuntimeContractError, match="sorted unique"):
+        validate_direct_raw_data_closure(value)
+
+
 def test_direct_raw_closure_rejects_an_invalid_oom_backoff_contract() -> None:
     value = _direct_closure_fixture()
     value["direct_minimum_chunk_rows"] = 16

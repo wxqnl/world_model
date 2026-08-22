@@ -355,10 +355,16 @@ def build_grouped_normalization_artifact(
                         assembled["future_factual_fine_action_values"][
                             :, slot, :, : group.action_dim
                         ].reshape(-1, group.action_dim),
+                        assembled["target_fine_action"][
+                            slot, :, : group.action_dim
+                        ].reshape(-1, group.action_dim),
                     )
                 ).numpy()
                 action_mask = torch.cat(
-                    tuple(mask.reshape(-1, group.action_dim) for mask in fine_mask_tensors[:2])
+                    tuple(
+                        mask.reshape(-1, group.action_dim)
+                        for mask in fine_mask_tensors
+                    )
                 ).numpy()
             elif lane == ACTION_COARSE_LANE:
                 if any(bool(mask.any()) for mask in fine_mask_tensors):

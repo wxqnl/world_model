@@ -652,7 +652,9 @@ def validate_direct_raw_data_closure(value: Mapping[str, Any]) -> None:
         "direct_encode_chunk_rows",
         "direct_minimum_chunk_rows",
     }
-    if not isinstance(value, dict) or set(value) != required:
+    optional = {"direct_ignored_action_dimensions"}
+    fields = frozenset(value) if isinstance(value, dict) else frozenset()
+    if fields not in {frozenset(required), frozenset(required | optional)}:
         raise RuntimeContractError("direct_raw closure fields mismatch")
     if value.get("schema") != DIRECT_RAW_DATA_CLOSURE_SCHEMA:
         raise RuntimeContractError("direct_raw closure schema mismatch")
@@ -687,7 +689,48 @@ def validate_direct_raw_data_closure(value: Mapping[str, Any]) -> None:
             "direct_raw appearance layer must be a cached VGGT feature layer"
         )
 
+    ignored = value.get("direct_ignored_action_dimensions", [])
+    if not isinstance(ignored, list):
+        raise RuntimeContractError(
+            "direct_raw ignored action dimensions must be a list"
+        )
+    known_sources = set(value["source_manifest_sha256_by_name"])
+    seen_ignored: set[tuple[str, str]] = set()
+    for item in ignored:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"source", "group", "dimensions"}
+        ):
+            raise RuntimeContractError(
+                "direct_raw ignored action dimension entry is invalid"
+            )
+        source = str(item["source"])
+        group = str(item["group"])
+        dimensions = item["dimensions"]
+        identity = (source, group)
+        if (
+            source not in known_sources
+            or not group
+            or identity in seen_ignored
+            or not isinstance(dimensions, list)
+            or not dimensions
+            or any(isinstance(value, bool) for value in dimensions)
+        ):
+            raise RuntimeContractError(
+                "direct_raw ignored action dimension identity is invalid"
+            )
+        normalized = [int(value) for value in dimensions]
+        if (
+            normalized != sorted(set(normalized))
+            or any(value < 0 for value in normalized)
+        ):
+            raise RuntimeContractError(
+                "direct_raw ignored action dimensions must be sorted unique non-negative integers"
+            )
+        seen_ignored.add(identity)
+
     direct_only = {
+        "direct_ignored_action_dimensions",
         "direct_input_rgb_size",
         "direct_decode_workers",
         "direct_robot_cache_episodes",

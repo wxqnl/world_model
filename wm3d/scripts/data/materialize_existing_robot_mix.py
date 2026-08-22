@@ -46,6 +46,7 @@ class SourcePlan:
     weight: int
     views: tuple[str, ...]
     bgr_views: tuple[str, ...] = ()
+    ignored_action_columns: tuple[int, ...] = ()
 
 
 OXE = (
@@ -90,12 +91,24 @@ OXE = (
                ("observation.images.image",)),
     SourcePlan("oxe_austin_buds", "oxe", "lerobot/austin_buds_dataset", 7,
                ("observation.images.image", "observation.images.wrist_image")),
-    SourcePlan("oxe_nyu_franka", "oxe", "lerobot/nyu_franka_play_dataset", 10,
-               ("observation.images.image", "observation.images.image_additional_view")),
+    SourcePlan(
+        "oxe_nyu_franka",
+        "oxe",
+        "lerobot/nyu_franka_play_dataset",
+        10,
+        ("observation.images.image", "observation.images.image_additional_view"),
+        ignored_action_columns=(14,),
+    ),
     SourcePlan("oxe_nyu_door", "oxe", "lerobot/nyu_door_opening_surprising_effectiveness", 10,
                ("observation.images.image",)),
-    SourcePlan("oxe_cmu_stretch", "oxe", "lerobot/cmu_stretch", 5,
-               ("observation.images.image",)),
+    SourcePlan(
+        "oxe_cmu_stretch",
+        "oxe",
+        "lerobot/cmu_stretch",
+        5,
+        ("observation.images.image",),
+        ignored_action_columns=(7,),
+    ),
     SourcePlan("oxe_furniture_bench", "oxe", "tailong-wu/furniture_bench_dataset_lerobot_v30", 71,
                ("observation.images.image", "observation.images.wrist_image")),
     SourcePlan("oxe_bc_z", "oxe", "tailong-wu/bc_z_lerobot_v30", 208,
@@ -171,7 +184,20 @@ def _adapter(plan: SourcePlan, info: dict) -> tuple[dict, dict]:
     features = info.get("features")
     if not isinstance(features, dict):
         raise RuntimeError(f"{plan.name}: missing features")
-    action_dim = _width(features, "action", 16)
+    raw_action_dim = _width(features, "action", 16)
+    ignored_action_columns = tuple(sorted(set(plan.ignored_action_columns)))
+    if (
+        len(ignored_action_columns) != len(plan.ignored_action_columns)
+        or any(not 0 <= value < raw_action_dim for value in ignored_action_columns)
+    ):
+        raise RuntimeError(f"{plan.name}: ignored action columns are invalid")
+    action_columns = [
+        value for value in range(raw_action_dim)
+        if value not in ignored_action_columns
+    ]
+    if not action_columns:
+        raise RuntimeError(f"{plan.name}: every action column was ignored")
+    action_dim = len(action_columns)
     state_dim = _width(features, "observation.state", 32)
     missing = set(plan.views) - set(features)
     if missing:
@@ -195,7 +221,7 @@ def _adapter(plan: SourcePlan, info: dict) -> tuple[dict, dict]:
                 "supervision": "fine_command",
                 "action": [{
                     "key": "action",
-                    "columns": list(range(action_dim)),
+                    "columns": action_columns,
                     "scale": [1.0] * action_dim,
                     "offset": [0.0] * action_dim,
                 }],
@@ -757,6 +783,7 @@ def main() -> None:
             "adapter_sha256": sha256_file(adapter_path.absolute()),
             "episode_index_sha256": sha256_file(episode_path.absolute()),
             "selected_episode_indices": list(selected),
+            "ignored_action_columns": list(plan.ignored_action_columns),
             "selection_window_evidence": selection_evidence,
         })
     template = {

@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import subprocess
+from typing import Any
 import uuid
 
 import yaml
@@ -51,6 +52,54 @@ def _publish_no_clobber(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _direct_ignored_action_dimensions(
+    values: list[str],
+    data_profile: Any,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], set[int]] = {}
+    source_by_name = {source.name: source for source in data_profile.sources}
+    for value in values:
+        parts = str(value).split(":")
+        if len(parts) != 3:
+            raise RuntimeError(
+                "direct ignored action dimension must be SOURCE:GROUP:DIMENSION"
+            )
+        source_name, group_name, raw_dimension = parts
+        source = source_by_name.get(source_name)
+        if source is None:
+            raise RuntimeError(
+                f"direct ignored action source is unknown: {source_name}"
+            )
+        embodiment = data_profile.embodiments[source.embodiment]
+        group = next(
+            (item for item in embodiment.groups if item.name == group_name),
+            None,
+        )
+        try:
+            dimension = int(raw_dimension)
+        except ValueError as exc:
+            raise RuntimeError(
+                "direct ignored action dimension must be an integer"
+            ) from exc
+        if group is None or not 0 <= dimension < group.action_dim:
+            raise RuntimeError(
+                f"direct ignored action coordinate is invalid: {value}"
+            )
+        key = (source_name, group_name)
+        dimensions = grouped.setdefault(key, set())
+        if dimension in dimensions:
+            raise RuntimeError(f"duplicate direct ignored action coordinate: {value}")
+        dimensions.add(dimension)
+    return [
+        {
+            "source": source,
+            "group": group,
+            "dimensions": sorted(dimensions),
+        }
+        for (source, group), dimensions in sorted(grouped.items())
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
@@ -81,6 +130,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--direct-video-index-cache-assets", type=int, default=128)
     parser.add_argument("--direct-encode-chunk-rows", type=int, default=32)
     parser.add_argument("--direct-minimum-chunk-rows", type=int, default=4)
+    parser.add_argument(
+        "--direct-ignore-action-dimension",
+        action="append",
+        default=[],
+        metavar="SOURCE:GROUP:DIMENSION",
+    )
     parser.add_argument("--direct-appearance-feature-layer", type=int, default=4)
     parser.add_argument("--environment-lock", type=Path, required=True)
     parser.add_argument("--run-name", required=True)
@@ -293,6 +348,12 @@ def main() -> None:
             closure.update(
                 {
                     "schema": DIRECT_RAW_DATA_CLOSURE_SCHEMA,
+                    "direct_ignored_action_dimensions": (
+                        _direct_ignored_action_dimensions(
+                            args.direct_ignore_action_dimension,
+                            data_profile,
+                        )
+                    ),
                     "direct_input_rgb_size": int(args.direct_input_rgb_size),
                     "direct_decode_workers": int(args.direct_decode_workers),
                     "direct_robot_cache_episodes": int(
