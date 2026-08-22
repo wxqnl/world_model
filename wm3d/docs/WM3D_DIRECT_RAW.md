@@ -64,7 +64,7 @@ Canary 通过后，用新的 site 文件执行 `formal100k`。不要复用 canar
 ## 5B
 
 ```bash
-./run_wm3d.sh 5b init canary1k /data/wm3d/control/direct_5b_canary.env
+./run_wm3d.sh 5b init canary1k /data/wm3d/control/direct_5b_canary.env direct_raw
 # 编辑 8 节点共享路径和 rendezvous
 ./run_wm3d.sh 5b doctor /data/wm3d/control/direct_5b_canary.env
 ./run_wm3d.sh 5b task-bank /data/wm3d/control/direct_5b_canary.env

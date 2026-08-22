@@ -70,13 +70,17 @@ cd world_model/wm3d
 
 ```bash
 SITE=/data/wm3d/control/5b_canary1k.env
-./run_wm3d.sh 5b init canary1k "$SITE"
+./run_wm3d.sh 5b init canary1k "$SITE" direct_raw
 vim "$SITE"
 ./run_wm3d.sh 5b env "$SITE"
 ./run_wm3d.sh 5b data-template "$SITE"
 ./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b plan "$SITE"
 ```
+
+`init` 的最后一个参数明确选择数据访问方式，可选 `direct_raw`、`streaming_raw` 或
+`episode_cache`；省略时仍默认 `direct_raw`。选择会直接写入 site 文件，后续
+`canary1k`、`validation100k` 和 `formal600k` 使用完全相同的入口。
 
 站点文件至少需要修改：
 
@@ -465,7 +469,7 @@ checkpoint、独立进程恢复和离线评测。
 
 ```bash
 SITE=/data/wm3d/control/5b_canary1k.env
-./run_wm3d.sh 5b init canary1k "$SITE"
+./run_wm3d.sh 5b init canary1k "$SITE" direct_raw
 vim "$SITE"
 ./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b runtime "$SITE"

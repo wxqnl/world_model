@@ -100,6 +100,51 @@ def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "data_mode,detail",
+    [
+        ("direct_raw", "direct VGGT"),
+        ("streaming_raw", "stream LRU"),
+        ("episode_cache", "episode cache"),
+    ],
+)
+def test_5b_init_selects_data_mode(
+    tmp_path: Path, data_mode: str, detail: str
+) -> None:
+    site = tmp_path / f"{data_mode}.env"
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/cluster/wm3d_5b.sh"),
+            "init",
+            "canary1k",
+            str(site),
+            data_mode,
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = site.read_text()
+    assert f"WM3D_DATA_MODE={data_mode}" in payload
+    payload = payload.replace(
+        "PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}"
+    )
+    site.write_text(payload)
+    plan = subprocess.run(
+        ["bash", str(ROOT / "scripts/cluster/wm3d_5b.sh"), "plan", str(site)],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert plan.returncode == 0, plan.stderr
+    assert f"data mode:  {data_mode}" in plan.stdout
+    assert detail in plan.stdout
+
+
+@pytest.mark.parametrize(
     "preset,runtime,steps",
     [
         ("canary1k", "h200_64_fsdp2_canary1k.yaml", "1000"),
@@ -201,6 +246,8 @@ def test_5b_site_defaults_to_oxe_and_direct_p144_p256() -> None:
     assert "INCLUDE_AGIBOT_BETA=NO" in site
     assert "WM3D_DATA_MODE=direct_raw" in site
     assert "DIRECT_INPUT_RGB_SIZE=518" in site
+    assert "DIRECT_DECODE_WORKERS=1" in site
+    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
     assert "DIRECT_PREFETCH_WINDOWS=8" in site
     assert "DIRECT_VIDEO_INDEX_CACHE_ASSETS=128" in site
     assert "DIRECT_ENCODE_CHUNK_ROWS=32" in site
@@ -216,6 +263,15 @@ def test_5b_site_defaults_to_oxe_and_direct_p144_p256() -> None:
     assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in site
     assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
     assert "DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe.template.yaml" in site
+
+
+def test_5b_direct_template_has_optimized_runtime_defaults() -> None:
+    site = (ROOT / "configs/cluster/h200_5b_direct.env.example").read_text()
+    assert "WM3D_DATA_MODE=direct_raw" in site
+    assert "DIRECT_DECODE_WORKERS=1" in site
+    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
+    assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
 
 
 def _oxe_info(action_dim: int, state_dim: int, views: int = 1) -> dict:

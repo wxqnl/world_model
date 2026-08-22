@@ -29,7 +29,7 @@ usage() {
   cat <<EOF
 WM3D ${SCALE_LABEL} 集群操作入口：
 
-  ./run_wm3d.sh ${SCALE} init <preset> <site.env>
+  ./run_wm3d.sh ${SCALE} init <preset> <site.env> [direct_raw|streaming_raw|episode_cache]
   ./run_wm3d.sh ${SCALE} env <site.env>
   ./run_wm3d.sh ${SCALE} data-template <site.env>
   ./run_wm3d.sh ${SCALE} doctor <site.env>
@@ -268,16 +268,22 @@ shift || true
 
 case "${action}" in
   init)
-    [[ $# -eq 2 ]] || { usage; exit 2; }
+    [[ $# -ge 2 && $# -le 3 ]] || { usage; exit 2; }
     preset=$1
     target=$2
+    data_mode=${3:-direct_raw}
     validate_preset "${preset}"
+    case "${data_mode}" in
+      direct_raw|streaming_raw|episode_cache) ;;
+      *) die "未知数据访问方式：${data_mode}（可选 direct_raw、streaming_raw、episode_cache）" ;;
+    esac
     [[ "${target}" == /* ]] || die "init 目标必须是绝对路径"
     [[ ! -e "${target}" && ! -L "${target}" ]] || die "拒绝覆盖已有 site 文件：${target}"
     mkdir -p "$(dirname "${target}")"
     install -m 600 "${TEMPLATE}" "${target}"
     sed -i "s/^${PRESET_VAR}=.*/${PRESET_VAR}=${preset}/" "${target}"
-    echo "已创建 ${target}（preset=${preset}）；编辑站点路径后运行 doctor。"
+    sed -i "s/^WM3D_DATA_MODE=.*/WM3D_DATA_MODE=${data_mode}/" "${target}"
+    echo "已创建 ${target}（preset=${preset}, data_mode=${data_mode}）；编辑站点路径后运行 doctor。"
     exit 0
     ;;
   -h|--help|help)

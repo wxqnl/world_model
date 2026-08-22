@@ -84,6 +84,8 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
     assert "WM3D_DATA_MODE=direct_raw" in payload
     assert "MINIMUM_RAW_FILESYSTEM_BYTES=0" in payload
     assert "DIRECT_PREFETCH_WINDOWS=16" in payload
+    assert "DIRECT_DECODE_WORKERS=1" in payload
+    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in payload
     assert "STREAMING_LRU_ROOT=" not in payload
     site.write_text(
         payload.replace(
