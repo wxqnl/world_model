@@ -71,7 +71,9 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         self.encoder.requires_grad_(False)
         self.encoder.eval()
         self.encode_calls = 0
+        self.input_rows = 0
         self.encoded_rows = 0
+        self.deduplicated_rows = 0
         self.encode_seconds = 0.0
         self.geometry_head_rows = 0
         self.appearance_pool_rows = 0
@@ -88,6 +90,7 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         self,
         images_u8: torch.Tensor,
         view_mask: torch.Tensor,
+        frame_keys: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if images_u8.ndim != 6:
             raise ValueError("direct RGB must be [B,L,V,3,H,W]")
@@ -108,6 +111,8 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             raise ValueError("direct RGB shape differs from sealed adapter contract")
         if tuple(view_mask.shape) != (batch, length, views):
             raise ValueError("direct RGB view mask shape is invalid")
+        if frame_keys is not None and tuple(frame_keys.shape) != (batch, length):
+            raise ValueError("direct frame keys must be [B,L]")
         if not bool(view_mask.any(dim=-1).all()):
             raise ValueError("every direct RGB timestamp requires a real view")
         flat_images = images_u8.reshape(
@@ -130,6 +135,68 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         flat_geometry_rows = geometry_row_mask.reshape(batch * length)
         flat_appearance_rows = appearance_row_mask.reshape(batch * length)
         flat_rgb_rows = rgb_row_mask.reshape(batch * length)
+        total_rows = batch * length
+        inverse: torch.Tensor | None = None
+        if frame_keys is not None:
+            flat_keys = frame_keys.reshape(total_rows).to(
+                device=flat_images.device,
+                dtype=torch.int64,
+            )
+            _unique_keys, candidate_inverse = torch.unique(
+                flat_keys,
+                sorted=True,
+                return_inverse=True,
+            )
+            unique_rows = int(_unique_keys.numel())
+            if unique_rows < total_rows:
+                positions = torch.arange(
+                    total_rows,
+                    dtype=torch.long,
+                    device=candidate_inverse.device,
+                )
+                representatives = torch.full(
+                    (unique_rows,),
+                    total_rows,
+                    dtype=torch.long,
+                    device=candidate_inverse.device,
+                )
+                representatives.scatter_reduce_(
+                    0,
+                    candidate_inverse,
+                    positions,
+                    reduce="amin",
+                    include_self=True,
+                )
+                original_mask = flat_mask
+                flat_images = flat_images.index_select(0, representatives)
+                flat_mask = flat_mask.index_select(0, representatives)
+                if not torch.equal(
+                    flat_mask.index_select(0, candidate_inverse),
+                    original_mask,
+                ):
+                    raise ValueError(
+                        "duplicate direct frame keys changed view availability"
+                    )
+
+                def reduce_role(value: torch.Tensor) -> torch.Tensor:
+                    result = torch.zeros(
+                        unique_rows,
+                        dtype=torch.uint8,
+                        device=value.device,
+                    )
+                    result.scatter_reduce_(
+                        0,
+                        candidate_inverse,
+                        value.to(torch.uint8),
+                        reduce="amax",
+                        include_self=True,
+                    )
+                    return result.bool()
+
+                flat_geometry_rows = reduce_role(flat_geometry_rows)
+                flat_appearance_rows = reduce_role(flat_appearance_rows)
+                flat_rgb_rows = reduce_role(flat_rgb_rows)
+                inverse = candidate_inverse
         outputs: dict[str, torch.Tensor] = {}
         output_names: tuple[str, ...] | None = None
         start = 0
@@ -219,13 +286,22 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         self.effective_chunk_rows = min(
             self.effective_chunk_rows, effective
         )
-        self.encoded_rows += batch * length
-        self.geometry_head_rows += batch * self.config.future_frames
-        self.appearance_pool_rows += batch * (
-            self.config.appearance_context_frames + self.config.future_frames
-        )
-        self.rgb_resize_rows += batch * len(self.config.rgb_decode_indices)
+        encoded_rows = len(flat_images)
+        self.input_rows += total_rows
+        self.encoded_rows += encoded_rows
+        self.deduplicated_rows += total_rows - encoded_rows
+        self.geometry_head_rows += int(flat_geometry_rows.sum().item())
+        self.appearance_pool_rows += int(flat_appearance_rows.sum().item())
+        self.rgb_resize_rows += int(flat_rgb_rows.sum().item())
         self.encode_seconds += time.perf_counter() - started
+        if inverse is not None:
+            outputs = {
+                name: value.index_select(
+                    0,
+                    inverse.to(device=value.device, non_blocking=True),
+                )
+                for name, value in outputs.items()
+            }
         return {
             name: value.reshape(batch, length, *value.shape[1:])
             for name, value in outputs.items()
@@ -259,7 +335,8 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
     ) -> dict[str, Any]:
         images = batch["direct_rgb_uint8"]
         view_mask = batch["direct_view_mask"].bool()
-        encoded = self._encode(images, view_mask)
+        frame_keys = batch.get("direct_frame_keys")
+        encoded = self._encode(images, view_mask, frame_keys)
         context = slice(0, self.config.context_frames)
         future = slice(self.config.context_frames, None)
         future_tokens = encoded["view_tokens"][:, future]
@@ -307,6 +384,7 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         result = dict(batch)
         result.pop("direct_rgb_uint8", None)
         result.pop("direct_view_mask", None)
+        result.pop("direct_frame_keys", None)
         result.update(
             {
                 "world_tokens": encoded["view_tokens"][:, context],
@@ -349,7 +427,12 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
     def metrics(self) -> Mapping[str, float | int]:
         return {
             "encode_calls": self.encode_calls,
+            "input_rows": self.input_rows,
             "encoded_rows": self.encoded_rows,
+            "deduplicated_rows": self.deduplicated_rows,
+            "deduplication_ratio": (
+                self.deduplicated_rows / max(self.input_rows, 1)
+            ),
             "encode_seconds": self.encode_seconds,
             "geometry_head_rows": self.geometry_head_rows,
             "appearance_pool_rows": self.appearance_pool_rows,

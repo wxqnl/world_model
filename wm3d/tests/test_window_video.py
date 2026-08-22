@@ -124,14 +124,33 @@ def test_window_decoder_reads_only_requested_entire_file_ordinals(
         decode_workers=1,
     )
 
-    assert batch_calls == [[1, 4, 8]]
+    single, _single_evidence = decode_episode_window_views(
+        task=_task(
+            video,
+            observations=10,
+            segment=("entire_file", None, None),
+        ),
+        source_root=tmp_path,
+        canonical_view_slots=("head",),
+        selected_observation_rows=(5,),
+        asset_verifier=VerifiedAssetStore(),
+        timestamp_indices=store,
+        decode_workers=1,
+    )
+
+    assert batch_calls == [[1, 4, 8], [5]]
     np.testing.assert_array_equal(
         decoded["head"].frames[:, 0, 0, 0],
         [1, 4, 8],
     )
+    np.testing.assert_array_equal(
+        single["head"].frames[:, 0, 0, 0],
+        [5],
+    )
     assert evidence["head"]["random_access_decoded_frame_count"] == 3
     assert timestamp_calls == []
     assert store.metrics["video_index_builds"] == 1
+    assert store.metrics["video_index_hits"] == 1
 
 
 def test_window_decoder_maps_recorded_segment_rows_without_full_decode(

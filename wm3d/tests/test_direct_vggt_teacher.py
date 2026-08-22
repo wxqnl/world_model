@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -46,17 +47,11 @@ class _FakeNativeVGGT(torch.nn.Module):
         if self.maximum_rows is not None and rows > self.maximum_rows:
             raise torch.OutOfMemoryError("fixture chunk is too large")
         identity = images.mean(dim=(3, 4, 5)) * self.weight
-        geometry = identity[..., None, None].expand(
-            1, rows, views, 4, 2048
-        )
-        appearance = identity[..., None, None].expand(
-            1, rows, views, 16, 2048
-        )
+        geometry = identity[..., None, None].expand(1, rows, views, 4, 2048)
+        appearance = identity[..., None, None].expand(1, rows, views, 16, 2048)
         confidence = view_mask[..., None].float().expand(1, rows, views, 4)
         depth = identity[..., None].expand(1, rows, views, 4).add(1.0)
-        point = identity[..., None, None].expand(
-            1, rows, views, 4, 3
-        )
+        point = identity[..., None, None].expand(1, rows, views, 4, 3)
         camera = identity[..., None].expand(1, rows, views, 9)
         rgb = F.interpolate(
             images.reshape(rows * views, 3, 56, 56),
@@ -181,3 +176,47 @@ def test_direct_teacher_halves_only_the_encoder_chunk_after_oom() -> None:
     assert adapter.metrics["effective_chunk_rows"] == 2
     assert backend.calls[0] == 4
     assert backend.calls[1:] == [2, 2, 2, 2]
+
+
+def test_direct_teacher_deduplicates_exact_frame_rows_without_abi_drift() -> None:
+    deduplicated_batch = _raw_batch()
+    deduplicated_batch["direct_rgb_uint8"][1, 2:] = deduplicated_batch[
+        "direct_rgb_uint8"
+    ][0, 2:]
+    deduplicated_batch["direct_view_mask"][1, 2:] = deduplicated_batch[
+        "direct_view_mask"
+    ][0, 2:]
+    baseline_batch = {name: value.clone() for name, value in deduplicated_batch.items()}
+    baseline_backend = _FakeNativeVGGT()
+    baseline = _adapter(baseline_backend).materialize(baseline_batch)
+
+    deduplicated_batch["direct_frame_keys"] = torch.tensor(
+        [[10, 11, 12, 13], [14, 15, 12, 13]],
+        dtype=torch.int64,
+    )
+    deduplicated_backend = _FakeNativeVGGT()
+    adapter = _adapter(deduplicated_backend)
+    result = adapter.materialize(deduplicated_batch)
+
+    assert set(result) == set(baseline)
+    for name in result:
+        torch.testing.assert_close(result[name], baseline[name])
+    assert "direct_frame_keys" not in result
+    assert deduplicated_backend.calls == [3, 3]
+    assert adapter.metrics["input_rows"] == 8
+    assert adapter.metrics["encoded_rows"] == 6
+    assert adapter.metrics["deduplicated_rows"] == 2
+    assert adapter.metrics["deduplication_ratio"] == 0.25
+
+
+def test_direct_teacher_rejects_duplicate_keys_with_different_views() -> None:
+    batch = _raw_batch()
+    batch["direct_frame_keys"] = torch.tensor(
+        [[10, 11, 12, 13], [14, 15, 16, 13]],
+        dtype=torch.int64,
+    )
+    with pytest.raises(
+        ValueError,
+        match="duplicate direct frame keys changed view availability",
+    ):
+        _adapter(_FakeNativeVGGT()).materialize(batch)

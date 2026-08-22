@@ -297,7 +297,8 @@ site 默认已经写入：
 ```bash
 WM3D_DATA_MODE=direct_raw
 DIRECT_INPUT_RGB_SIZE=518
-DIRECT_DECODE_WORKERS=4
+DIRECT_DECODE_WORKERS=1
+DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1
 DIRECT_PREFETCH_WINDOWS=8
 DIRECT_VIDEO_INDEX_CACHE_ASSETS=128
 DIRECT_ENCODE_CHUNK_ROWS=32
@@ -318,7 +319,9 @@ DIRECT_APPEARANCE_FEATURE_LAYER=4
 `cache-plan` 与 `streaming-prepare` 是沿用的命令名；前者生成原始 episode 任务清单，后者只
 生成轻量 metadata、窗口和 normalization，二者都不执行 VGGT visual cache。训练日志中的
 `direct_raw.decode_seconds` 和 `direct_vggt.encode_seconds` 分别表示视频窗口解码与在线
-frozen VGGT 成本。`direct_raw.prefetch_pending` 有固定上限，内存不会随 step 或 episode
+frozen VGGT 成本。相邻 window 的预处理 RGB 行由每 rank 1 GiB 内存 LRU 重用，同一
+micro batch 的重复 observation 只进入一次 VGGT，然后恢复固定输出形状。
+`direct_raw.prefetch_pending` 和两级 LRU 都有固定上限，内存不会随 step 或 episode
 长度增长。完整实现和验证证据见 [direct_raw 正式路径](WM3D_DIRECT_RAW.md)。
 
 Direct 去掉的是 cache 发布、收养、淘汰、重复编码和 sidecar/训练竞态；它仍支付在线 VGGT

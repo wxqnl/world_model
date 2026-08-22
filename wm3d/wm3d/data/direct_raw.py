@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -74,6 +74,100 @@ class _DirectTaskRecord:
     byte_offset: int
 
 
+class _PreparedViewRowStore:
+    """Thread-safe byte-bounded LRU of fully preprocessed camera rows."""
+
+    def __init__(self, maximum_bytes: int = 0) -> None:
+        if int(maximum_bytes) < 0:
+            raise CacheDataError("prepared row cache bytes cannot be negative")
+        self.maximum_bytes = int(maximum_bytes)
+        self._values: OrderedDict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = OrderedDict()
+        self._bytes = 0
+        self._lock = threading.RLock()
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def get_many(
+        self,
+        keys: Sequence[int],
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        if self.maximum_bytes == 0:
+            return {}
+        result: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        with self._lock:
+            for key in dict.fromkeys(int(value) for value in keys):
+                cached = self._values.pop(key, None)
+                if cached is None:
+                    self.misses += 1
+                    continue
+                self._values[key] = cached
+                self.hits += 1
+                result[key] = cached
+        return result
+
+    def put_many(
+        self,
+        keys: Sequence[int],
+        images_u8: torch.Tensor,
+        view_mask: torch.Tensor,
+    ) -> None:
+        if self.maximum_bytes == 0:
+            return
+        if (
+            images_u8.device.type != "cpu"
+            or view_mask.device.type != "cpu"
+            or images_u8.dtype != torch.uint8
+            or view_mask.dtype != torch.bool
+            or images_u8.ndim != 5
+            or view_mask.ndim != 2
+            or images_u8.shape[:2] != view_mask.shape
+            or len(keys) != images_u8.shape[0]
+        ):
+            raise CacheDataError("prepared row cache received an invalid batch")
+        with self._lock:
+            for key_value, image_value, mask_value in zip(
+                keys, images_u8, view_mask
+            ):
+                key = int(key_value)
+                image = image_value.contiguous().clone()
+                mask = mask_value.contiguous().clone()
+                size = (
+                    image.numel() * image.element_size()
+                    + mask.numel() * mask.element_size()
+                )
+                previous = self._values.pop(key, None)
+                if previous is not None:
+                    self._bytes -= (
+                        previous[0].numel() * previous[0].element_size()
+                        + previous[1].numel() * previous[1].element_size()
+                    )
+                if size > self.maximum_bytes:
+                    continue
+                self._values[key] = (image, mask)
+                self._bytes += size
+                while self._bytes > self.maximum_bytes:
+                    _old_key, old = self._values.popitem(last=False)
+                    self._bytes -= (
+                        old[0].numel() * old[0].element_size()
+                        + old[1].numel() * old[1].element_size()
+                    )
+                    self.evictions += 1
+
+    @property
+    def metrics(self) -> Mapping[str, int]:
+        with self._lock:
+            return {
+                "prepared_row_cache_bytes": self._bytes,
+                "prepared_row_cache_entries": len(self._values),
+                "prepared_row_cache_hits": self.hits,
+                "prepared_row_cache_misses": self.misses,
+                "prepared_row_cache_evictions": self.evictions,
+            }
+
+
 _TASK_ID_RE = re.compile(rb'"task_id"\s*:\s*"([0-9a-f]{64})"')
 _TASK_SOURCE_RE = re.compile(rb'"source"\s*:\s*"([^"]+)"')
 _TASK_EPISODE_RE = re.compile(rb'"episode_id"\s*:\s*"([^"]+)"')
@@ -116,6 +210,7 @@ class _DirectWindowSource:
         self._task_record_by_episode: dict[
             tuple[str, str], _DirectTaskRecord
         ] = {}
+        self._task_ordinal_by_id: dict[str, int] = {}
         self._task_offset_by_id: dict[str, int] = {}
         first_task: CacheTask | None = None
         with self.task_manifest_path.open("rb") as handle:
@@ -143,6 +238,7 @@ class _DirectWindowSource:
                         "direct raw task manifest has duplicate episodes"
                     )
                 self._task_offset_by_id[task_id] = byte_offset
+                self._task_ordinal_by_id[task_id] = line_number - 1
                 self._task_record_by_episode[episode_key] = record
                 if first_task is None:
                     first_task = cache_task_from_mapping(
@@ -177,7 +273,12 @@ class _DirectWindowSource:
         )
         self.asset_verifier = VerifiedAssetStore()
         self.input_rgb_size = int(closure["direct_input_rgb_size"])
-        self.decode_workers = int(closure.get("direct_decode_workers", 4))
+        self.decode_workers = int(
+            os.environ.get(
+                "WM3D_DIRECT_DECODE_WORKERS",
+                closure.get("direct_decode_workers", 4),
+            )
+        )
         self.robot_cache_episodes = int(
             closure.get("direct_robot_cache_episodes", 8)
         )
@@ -185,6 +286,15 @@ class _DirectWindowSource:
             maximum_assets=int(
                 closure.get("direct_video_index_cache_assets", 64)
             )
+        )
+        prepared_cache_bytes = int(
+            os.environ.get(
+                "WM3D_DIRECT_PREPARED_ROW_CACHE_BYTES_PER_RANK",
+                closure.get("direct_prepared_row_cache_bytes_per_rank", 0),
+            )
+        )
+        self.prepared_rows = _PreparedViewRowStore(
+            maximum_bytes=prepared_cache_bytes
         )
         if (
             self.input_rgb_size <= 0
@@ -310,7 +420,13 @@ class _DirectWindowSource:
         *,
         entry: CacheIndexEntry,
         task_id: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, PreparedEpisodeRobot]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        PreparedEpisodeRobot,
+    ]:
         started = time.perf_counter()
         with self._metadata_lock:
             task = self._load_task(task_id)
@@ -328,37 +444,93 @@ class _DirectWindowSource:
         ]
         if np.any(np.diff(boundary_rows) <= 0):
             raise CacheDataError("direct raw window boundaries are not increasing")
-        source = self.sources[task.source]
-        adapter = self.adapters[task.source]
-        slots = tuple(
-            str(item) for item in self.profile.cache_representation["view_slots"]
+        task_ordinal = self._task_ordinal_by_id[task_id]
+        if (
+            task_ordinal < 0
+            or task_ordinal >= 2**31
+            or raw_rows.min() < 0
+            or raw_rows.max() >= 2**32
+        ):
+            raise CacheDataError("direct raw frame identity exceeds int64 packing")
+        frame_keys = (
+            (np.int64(task_ordinal) << np.int64(32))
+            | raw_rows.astype(np.int64, copy=False)
         )
-        decoded, _evidence = decode_episode_window_views(
-            task=task,
-            source_root=source.raw_root,
-            canonical_view_slots=slots,
-            selected_observation_rows=raw_rows,
-            asset_verifier=self.asset_verifier,
-            timestamp_indices=self.video_indices,
-            decode_workers=self.decode_workers,
+        key_values = tuple(int(value) for value in frame_keys)
+        prepared = self.prepared_rows.get_many(key_values)
+        missing_positions = tuple(
+            index
+            for index, key in enumerate(key_values)
+            if key not in prepared
         )
-        from scripts.data.run_cache_worker import _view_batch
+        if missing_positions:
+            source = self.sources[task.source]
+            adapter = self.adapters[task.source]
+            slots = tuple(
+                str(item)
+                for item in self.profile.cache_representation["view_slots"]
+            )
+            missing_rows = raw_rows[
+                np.asarray(missing_positions, dtype=np.int64)
+            ]
+            decoded, _evidence = decode_episode_window_views(
+                task=task,
+                source_root=source.raw_root,
+                canonical_view_slots=slots,
+                selected_observation_rows=missing_rows,
+                asset_verifier=self.asset_verifier,
+                timestamp_indices=self.video_indices,
+                decode_workers=self.decode_workers,
+            )
+            from scripts.data.run_cache_worker import _view_batch
 
-        images, view_mask = _view_batch(
-            decoded=decoded,
-            slots=slots,
-            input_size=self.input_rgb_size,
-            color_order_by_view={
-                view.name: view.color_order for view in adapter.views
-            },
+            missing_images, missing_mask = _view_batch(
+                decoded=decoded,
+                slots=slots,
+                input_size=self.input_rgb_size,
+                color_order_by_view={
+                    view.name: view.color_order for view in adapter.views
+                },
+            )
+            missing_images_u8 = (
+                missing_images.mul(255)
+                .round()
+                .clamp(0, 255)
+                .to(torch.uint8)
+            )
+            missing_keys = tuple(
+                key_values[index] for index in missing_positions
+            )
+            self.prepared_rows.put_many(
+                missing_keys,
+                missing_images_u8,
+                missing_mask.bool(),
+            )
+            prepared.update(
+                {
+                    key: (image, mask)
+                    for key, image, mask in zip(
+                        missing_keys,
+                        missing_images_u8,
+                        missing_mask.bool(),
+                    )
+                }
+            )
+        images_u8 = torch.stack(
+            [prepared[key][0] for key in key_values],
+            dim=0,
         )
-        images_u8 = images.mul(255).round().clamp(0, 255).to(torch.uint8)
+        view_mask = torch.stack(
+            [prepared[key][1] for key in key_values],
+            dim=0,
+        )
         with self._metadata_lock:
             self.windows_decoded += 1
             self.decode_seconds += time.perf_counter() - started
         return (
             images_u8,
             view_mask,
+            torch.from_numpy(frame_keys.copy()).to(torch.int64),
             torch.from_numpy(boundary_rows.copy()).to(torch.int64),
             episode.prepared_robot,
         )
@@ -366,6 +538,7 @@ class _DirectWindowSource:
     def metrics(self) -> Mapping[str, float | int]:
         return {
             **self.video_indices.metrics,
+            **self.prepared_rows.metrics,
             "task_loads": self.task_loads,
             "task_hits": self.task_hits,
             "task_resident": len(self._task_cache),
@@ -673,7 +846,13 @@ class DirectRawDataset(UnifiedCacheDataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         entry = self.entries[int(index)]
-        images, view_mask, boundary_source, prepared_robot = self._window(index)
+        (
+            images,
+            view_mask,
+            frame_keys,
+            boundary_source,
+            prepared_robot,
+        ) = self._window(index)
         action, task_embedding = self._robot_fields(
             entry=entry,
             boundary_source=boundary_source,
@@ -695,6 +874,7 @@ class DirectRawDataset(UnifiedCacheDataset):
             **action,
             "direct_rgb_uint8": images,
             "direct_view_mask": view_mask.bool(),
+            "direct_frame_keys": frame_keys,
             "world_times_s": world_times,
             "task_embedding": task_embedding.to(torch.float32),
             "aux_values": aux_values,

@@ -86,13 +86,18 @@ Canary 通过后，用新的 site 文件执行 `formal100k`。不要复用 canar
   5B 默认 8，分别覆盖两个 micro-batch。它不是 latent cache，内存上限不随训练步数增长。
 - `DIRECT_VIDEO_INDEX_CACHE_ASSETS=128`：只缓存小型 PTS 数组，不缓存 RGB 或
   latent。
-- `DIRECT_DECODE_WORKERS=4`：同一个 episode 内相机解码并行度。
+- `DIRECT_DECODE_WORKERS=1`：每个 rank 顺序解码相机；多 rank 已经提供节点级并行，
+  避免嵌套线程争抢 CPU 和视频盘。
+- `DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1`：只在内存中保留近期完成 resize 的
+  uint8 相机行；相邻 window 重用后立即按字节 LRU 淘汰，不写视觉 latent。
 - `DIRECT_APPEARANCE_FEATURE_LAYER=4`：清晰 RGB 路径使用浅层逐视角特征。
 
 ## 稳定性边界
 
-Direct 路径的内存随 `batch × (T+K) × views` 有界，不随训练步数或 episode
-长度增长。encoder OOM 只降低 frozen VGGT chunk，不改变 micro batch、global
+Direct 路径先按稳定的 episode/observation identity 合并同一 batch 的重叠行，
+VGGT 输出再恢复为原来的固定 `B×(T+K)` 形状；RGB 解码和 resize 结果也仅在 rank
+本地做有界 LRU 重用。两项复用都不改变采样、监督或模型输入形状。内存由显式字节上限
+约束，不随训练步数或 episode 长度增长。encoder OOM 只降低 frozen VGGT chunk，不改变 micro batch、global
 batch、模型、数据或 loss。Checkpoint 仍由既有分布式 checkpoint 合同管理；
 direct adapter 没有可训练参数，不进入 optimizer 或 checkpoint。VGGT 的各 chunk
 直接写入一份预分配输出，避免先保留全部 chunk 再 `cat` 所产生的双份峰值显存。

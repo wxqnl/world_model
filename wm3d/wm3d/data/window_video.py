@@ -342,7 +342,7 @@ def decode_episode_window_views(
     rows = np.asarray(selected_observation_rows, dtype=np.int64)
     if (
         rows.ndim != 1
-        or rows.size < 2
+        or rows.size < 1
         or rows[0] < 0
         or rows[-1] >= task.observation_samples
         or np.any(np.diff(rows) <= 0)
