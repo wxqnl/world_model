@@ -12,8 +12,10 @@ from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Mapping
 
@@ -149,6 +151,9 @@ class _DirectWindowSource:
         if first_task is None:
             raise CacheDataError("direct raw task manifest is empty")
         self._task_cache: OrderedDict[str, CacheTask] = OrderedDict()
+        # Multiple future windows may decode concurrently.  Serialize only
+        # metadata/LRU mutation; immutable video reads remain parallel.
+        self._metadata_lock = threading.RLock()
         self.task_loads = 0
         self.task_hits = 0
         self.sources = {source.name: source for source in profile.sources}
@@ -307,8 +312,9 @@ class _DirectWindowSource:
         task_id: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, PreparedEpisodeRobot]:
         started = time.perf_counter()
-        task = self._load_task(task_id)
-        episode = self._load_episode(task)
+        with self._metadata_lock:
+            task = self._load_task(task_id)
+            episode = self._load_episode(task)
         feature_rows = entry.context_feature_rows + entry.future_feature_rows
         boundary_feature_rows = (entry.leading_feature_row,) + feature_rows
         if (
@@ -347,8 +353,9 @@ class _DirectWindowSource:
             },
         )
         images_u8 = images.mul(255).round().clamp(0, 255).to(torch.uint8)
-        self.windows_decoded += 1
-        self.decode_seconds += time.perf_counter() - started
+        with self._metadata_lock:
+            self.windows_decoded += 1
+            self.decode_seconds += time.perf_counter() - started
         return (
             images_u8,
             view_mask,
@@ -468,8 +475,16 @@ class DirectRawDataset(UnifiedCacheDataset):
         )
         if self.max_prefetch_windows <= 0:
             raise CacheDataError("direct raw prefetch window count must be positive")
+        self.prefetch_workers = int(
+            os.environ.get("WM3D_DIRECT_PREFETCH_WORKERS", "1")
+        )
+        if not 0 < self.prefetch_workers <= self.max_prefetch_windows:
+            raise CacheDataError(
+                "WM3D_DIRECT_PREFETCH_WORKERS must be in "
+                f"[1,{self.max_prefetch_windows}]"
+            )
         self._executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=self.prefetch_workers,
             thread_name_prefix=f"wm3d-direct-rank-{self.rank}",
         )
         self._futures: dict[int, Future[Any]] = {}
@@ -491,6 +506,7 @@ class DirectRawDataset(UnifiedCacheDataset):
             "prefetch_capacity_skips": self.prefetch_capacity_skips,
             "prefetch_pending": len(self._futures),
             "prefetch_wait_seconds": self.prefetch_wait_seconds,
+            "prefetch_workers": self.prefetch_workers,
         }
 
     def _decode_index(self, index: int) -> tuple[Any, ...]:

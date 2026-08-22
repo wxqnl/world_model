@@ -40,6 +40,7 @@ from wm3d.data.formal_cache_adapter import (
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.native_world_model import NativeWorldModel
 from wm3d.models.direct_vggt_builder import build_direct_vggt_teacher
+from wm3d.training.async_input import AsyncCudaInputPipeline
 from wm3d.training.distributed_checkpoint import (
     DistributedCheckpointManager,
     ResumeExpectations,
@@ -995,6 +996,7 @@ def main() -> None:
     runtime = config["runtime_profile"]
     strategy = strategy_from_mapping(runtime["distributed"])
     context = initialize_distributed(strategy)
+    async_pipeline: AsyncCudaInputPipeline | None = None
     try:
         if int(runtime["expected_world_size"]) != context.world_size:
             raise PretrainError(
@@ -1266,6 +1268,17 @@ def main() -> None:
             gradient_accumulation=int(runtime["train"]["gradient_accumulation"]),
         )
         iterator = iter(loader)
+        if input_adapter is not None and _environment_flag(
+            "WM3D_DIRECT_ASYNC_PIPELINE"
+        ):
+            async_pipeline = AsyncCudaInputPipeline(
+                iterator=iterator,
+                adapter=input_adapter,
+                transfer=_batch_to_device,
+                device=context.device,
+            )
+            async_pipeline.submit()
+        validate_every = int(runtime["train"]["validate_every"])
         checkpoint_steps = _checkpoint_steps(runtime["train"])
         if stop_after_step not in checkpoint_steps:
             raise PretrainError(
@@ -1283,12 +1296,24 @@ def main() -> None:
                 group["lr"] = lr
             accumulated: dict[str, torch.Tensor] = {}
             source_id: int | None = None
+            completed_candidate = step + 1
+            serialize_after_step = (
+                completed_candidate in checkpoint_steps
+                or completed_candidate == stop_after_step
+                or (
+                    validate_every > 0
+                    and completed_candidate % validate_every == 0
+                )
+            )
             for micro_step in range(accumulation):
                 final_micro = micro_step == accumulation - 1
-                cpu_batch = next(iterator)
-                if input_adapter is not None:
-                    cpu_batch = input_adapter.materialize(cpu_batch)
-                batch = _batch_to_device(cpu_batch, context.device)
+                if async_pipeline is None:
+                    cpu_batch = next(iterator)
+                    if input_adapter is not None:
+                        cpu_batch = input_adapter.materialize(cpu_batch)
+                    batch = _batch_to_device(cpu_batch, context.device)
+                else:
+                    batch = async_pipeline.consume()
                 unique = torch.unique(batch["source_id"])
                 if unique.numel() != 1:
                     raise PretrainError("one micro-batch mixed multiple sources")
@@ -1297,6 +1322,10 @@ def main() -> None:
                     source_id = current_source
                 elif source_id != current_source:
                     raise PretrainError("one optimizer step mixed multiple sources")
+                if async_pipeline is not None and not (
+                    final_micro and serialize_after_step
+                ):
+                    async_pipeline.submit()
                 with no_sync_context(model, enabled=not final_micro):
                     with autocast_context(strategy):
                         losses = compute_native_objective(
@@ -1374,12 +1403,13 @@ def main() -> None:
                         record["direct_raw"] = dict(direct_raw_metrics)
                     if input_adapter is not None:
                         record["direct_vggt"] = dict(input_adapter.metrics)
+                    if async_pipeline is not None:
+                        record["direct_pipeline"] = dict(async_pipeline.metrics)
                     if completed == 1:
                         record["gradient_ownership"] = gradient_ownership
                     last_log = time.monotonic()
                     print(json.dumps(record, sort_keys=True), flush=True)
                     _append_jsonl(log_path, record)
-            validate_every = int(runtime["train"]["validate_every"])
             if validate_every > 0 and completed % validate_every == 0:
                 assert validation_dataset is not None
                 validation = _validate(
@@ -1419,8 +1449,16 @@ def main() -> None:
                     },
                     rank_state={"next_optimizer_step": completed},
                 )
+            if (
+                async_pipeline is not None
+                and completed < stop_after_step
+                and not async_pipeline.pending
+            ):
+                async_pipeline.submit()
         dist.barrier()
     finally:
+        if async_pipeline is not None:
+            async_pipeline.close()
         destroy_distributed()
 
 
