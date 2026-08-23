@@ -19,6 +19,13 @@ model、encoder 和 objective，拉取代码后无需手工调整。训练只解
 5B 不需要单独维护另一份慢速实现。三套 H200 runtime 还将冻结感知网络的输入按 8 张图一组
 计算，减少小 kernel 与 Python 调度开销，同时保留 RGB decoder 的显存安全分块。
 
+direct_raw 的批量解码加速同样由 1B/5B 共用：一个 micro batch 内属于同一 task/episode 的
+window 先合并，按有序唯一 observation 行只做一次视频解码和 resize，再严格重建原来的每个
+window。lookahead 在当前 batch 被消费后才补入 future，避免尚未释放的 future 占满有界队列；
+每 rank 默认只开一个 prefetch worker，避免并发重复解码重叠帧和随机读取竞争。这些改动只减少
+重复的数据准备，不改变采样顺序、输入张量、VGGT 输出、模型、loss、optimizer 或 checkpoint
+合同。
+
 整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练依次进行。当前默认
 `direct_raw` 只解码 sealed `T+K` window，并在每个 rank 内在线运行 frozen VGGT；不生成
 episode visual cache、LRU 或 sidecar。完整 episode cache 与 `streaming_raw` 仅保留为显式
@@ -302,6 +309,7 @@ site 默认已经写入：
 WM3D_DATA_MODE=direct_raw
 DIRECT_INPUT_RGB_SIZE=518
 DIRECT_DECODE_WORKERS=1
+DIRECT_PREFETCH_WORKERS=1
 DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1
 DIRECT_PREFETCH_WINDOWS=8
 DIRECT_VIDEO_INDEX_CACHE_ASSETS=128
@@ -324,7 +332,9 @@ DIRECT_APPEARANCE_FEATURE_LAYER=4
 生成轻量 metadata、窗口和 normalization，二者都不执行 VGGT visual cache。训练日志中的
 `direct_raw.decode_seconds` 和 `direct_vggt.encode_seconds` 分别表示视频窗口解码与在线
 frozen VGGT 成本。相邻 window 的预处理 RGB 行由每 rank 1 GiB 内存 LRU 重用，同一
-micro batch 的重复 observation 只进入一次 VGGT，然后恢复固定输出形状。
+micro batch 的重复 observation 只进入一次 VGGT，然后恢复固定输出形状。operator report
+同时给出 `coalesced_requested_rows`、`coalesced_unique_rows`、`decode_calls` 和
+`prefetch_capacity_skips`；前两项用于计算去重比例，正常稳态下 capacity skips 应保持为 0。
 `direct_raw.prefetch_pending` 和两级 LRU 都有固定上限，内存不会随 step 或 episode
 长度增长。完整实现和验证证据见 [direct_raw 正式路径](WM3D_DIRECT_RAW.md)。
 
