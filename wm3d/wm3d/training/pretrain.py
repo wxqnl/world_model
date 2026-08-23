@@ -657,6 +657,11 @@ class _StreamingLookaheadBatchSampler:
             self.dataset.prefetch_indices(batch)
         while pending:
             current = pending.popleft()
+            # Resume here only after DataLoader has consumed the current batch.
+            # Direct/streaming datasets retain one future per window, so
+            # replenishing before the yield sees the old batch still resident
+            # and periodically rejects the next batch at bounded capacity.
+            yield current
             try:
                 future = next(iterator)
             except StopIteration:
@@ -664,7 +669,6 @@ class _StreamingLookaheadBatchSampler:
             if future is not None:
                 pending.append(future)
                 self.dataset.prefetch_indices(future)
-            yield current
 
 
 def _make_loader(

@@ -431,13 +431,20 @@ def test_streaming_encoder_applies_appearance_layer_override(
     assert captured == [config]
 
 
-def test_streaming_batch_sampler_primes_two_future_batches() -> None:
+def test_streaming_batch_sampler_replenishes_after_current_is_consumed() -> None:
     class Dataset:
         def __init__(self) -> None:
             self.prefetched: list[tuple[int, ...]] = []
+            self.inflight: set[tuple[int, ...]] = set()
 
         def prefetch_indices(self, indices: list[int]) -> None:
-            self.prefetched.append(tuple(indices))
+            batch = tuple(indices)
+            self.inflight.add(batch)
+            assert len(self.inflight) <= 2
+            self.prefetched.append(batch)
+
+        def consume(self, indices: list[int]) -> None:
+            self.inflight.remove(tuple(indices))
 
     dataset = Dataset()
     sampler = _StreamingLookaheadBatchSampler(
@@ -445,9 +452,26 @@ def test_streaming_batch_sampler_primes_two_future_batches() -> None:
     )
     iterator = iter(sampler)
 
-    assert next(iterator) == [0, 1]
+    first = next(iterator)
+    assert first == [0, 1]
+    assert dataset.prefetched == [(0, 1), (2, 3)]
+    dataset.consume(first)
+
+    second = next(iterator)
+    assert second == [2, 3]
     assert dataset.prefetched == [(0, 1), (2, 3), (4, 5)]
-    assert list(iterator) == [[2, 3], [4, 5], [6, 7]]
+    dataset.consume(second)
+
+    third = next(iterator)
+    assert third == [4, 5]
+    assert dataset.prefetched == [(0, 1), (2, 3), (4, 5), (6, 7)]
+    dataset.consume(third)
+
+    fourth = next(iterator)
+    assert fourth == [6, 7]
+    dataset.consume(fourth)
+    with pytest.raises(StopIteration):
+        next(iterator)
     assert dataset.prefetched == [(0, 1), (2, 3), (4, 5), (6, 7)]
 
 

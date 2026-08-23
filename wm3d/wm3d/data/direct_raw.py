@@ -160,6 +160,15 @@ class _DirectTaskRecord:
     byte_offset: int
 
 
+@dataclass(frozen=True)
+class _DirectWindowPlan:
+    raw_rows: np.ndarray
+    boundary_rows: np.ndarray
+    frame_keys: np.ndarray
+    key_values: tuple[int, ...]
+    prepared_robot: PreparedEpisodeRobot
+
+
 class _PreparedViewRowStore:
     """Thread-safe byte-bounded LRU of fully preprocessed camera rows."""
 
@@ -336,6 +345,10 @@ class _DirectWindowSource:
         # Multiple future windows may decode concurrently.  Serialize only
         # metadata/LRU mutation; immutable video reads remain parallel.
         self._metadata_lock = threading.RLock()
+        # Multiple prefetch batches may run concurrently. Windows from the
+        # same episode share a stripe so overlapping frames are never decoded
+        # twice, while unrelated videos may still progress in parallel.
+        self._decode_locks = tuple(threading.Lock() for _ in range(64))
         self.task_loads = 0
         self.task_hits = 0
         self.sources = {source.name: source for source in profile.sources}
@@ -393,6 +406,10 @@ class _DirectWindowSource:
         self.episode_loads = 0
         self.episode_hits = 0
         self.windows_decoded = 0
+        self.decode_calls = 0
+        self.coalesced_batches = 0
+        self.coalesced_requested_rows = 0
+        self.coalesced_unique_rows = 0
         self.decode_seconds = 0.0
 
     def task_id_for_episode(self, source: str, episode_id: str) -> str:
@@ -501,22 +518,13 @@ class _DirectWindowSource:
         self.episode_loads += 1
         return result
 
-    def decode_window(
+    def _plan_window(
         self,
         *,
         entry: CacheIndexEntry,
         task_id: str,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        PreparedEpisodeRobot,
-    ]:
-        started = time.perf_counter()
-        with self._metadata_lock:
-            task = self._load_task(task_id)
-            episode = self._load_episode(task)
+        episode: _DirectEpisode,
+    ) -> _DirectWindowPlan:
         feature_rows = entry.context_feature_rows + entry.future_feature_rows
         boundary_feature_rows = (entry.leading_feature_row,) + feature_rows
         if (
@@ -542,84 +550,181 @@ class _DirectWindowSource:
             (np.int64(task_ordinal) << np.int64(32))
             | raw_rows.astype(np.int64, copy=False)
         )
-        key_values = tuple(int(value) for value in frame_keys)
-        prepared = self.prepared_rows.get_many(key_values)
-        missing_positions = tuple(
-            index
-            for index, key in enumerate(key_values)
-            if key not in prepared
+        return _DirectWindowPlan(
+            raw_rows=raw_rows,
+            boundary_rows=boundary_rows,
+            frame_keys=frame_keys,
+            key_values=tuple(int(value) for value in frame_keys),
+            prepared_robot=episode.prepared_robot,
         )
-        if missing_positions:
-            source = self.sources[task.source]
-            adapter = self.adapters[task.source]
-            slots = tuple(
-                str(item)
-                for item in self.profile.cache_representation["view_slots"]
-            )
-            missing_rows = raw_rows[
-                np.asarray(missing_positions, dtype=np.int64)
-            ]
-            decoded, _evidence = decode_episode_window_views(
-                task=task,
-                source_root=source.raw_root,
-                canonical_view_slots=slots,
-                selected_observation_rows=missing_rows,
-                asset_verifier=self.asset_verifier,
-                timestamp_indices=self.video_indices,
-                decode_workers=self.decode_workers,
-            )
-            from scripts.data.run_cache_worker import _view_batch
 
-            missing_images, missing_mask = _view_batch(
-                decoded=decoded,
-                slots=slots,
-                input_size=self.input_rgb_size,
-                color_order_by_view={
-                    view.name: view.color_order for view in adapter.views
-                },
-            )
-            missing_images_u8 = (
-                missing_images.mul(255)
-                .round()
-                .clamp(0, 255)
-                .to(torch.uint8)
-            )
-            missing_keys = tuple(
-                key_values[index] for index in missing_positions
-            )
-            self.prepared_rows.put_many(
-                missing_keys,
-                missing_images_u8,
-                missing_mask.bool(),
-            )
-            prepared.update(
-                {
-                    key: (image, mask)
-                    for key, image, mask in zip(
+    def decode_windows(
+        self,
+        requests: Sequence[tuple[int, CacheIndexEntry, str]],
+    ) -> dict[
+        int,
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            PreparedEpisodeRobot,
+        ],
+    ]:
+        """Decode one prefetch batch after coalescing episode-local frames."""
+
+        if not requests:
+            return {}
+        started = time.perf_counter()
+        grouped: OrderedDict[
+            str, list[tuple[int, CacheIndexEntry]]
+        ] = OrderedDict()
+        seen: set[int] = set()
+        for raw_index, entry, task_id in requests:
+            index = int(raw_index)
+            if index in seen:
+                raise CacheDataError(
+                    "direct raw coalesced request duplicated an index"
+                )
+            seen.add(index)
+            grouped.setdefault(str(task_id), []).append((index, entry))
+
+        result: dict[
+            int,
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                PreparedEpisodeRobot,
+            ],
+        ] = {}
+        decode_calls = 0
+        requested_rows = 0
+        unique_rows = 0
+        for task_id, items in grouped.items():
+            with self._metadata_lock:
+                task = self._load_task(task_id)
+                episode = self._load_episode(task)
+            plans = {
+                index: self._plan_window(
+                    entry=entry,
+                    task_id=task_id,
+                    episode=episode,
+                )
+                for index, entry in items
+            }
+            key_to_raw_row: OrderedDict[int, int] = OrderedDict()
+            for plan in plans.values():
+                requested_rows += len(plan.key_values)
+                for key, row in zip(plan.key_values, plan.raw_rows):
+                    key_to_raw_row.setdefault(int(key), int(row))
+            unique_rows += len(key_to_raw_row)
+
+            stripe = self._decode_locks[
+                self._task_ordinal_by_id[task_id] % len(self._decode_locks)
+            ]
+            with stripe:
+                prepared = self.prepared_rows.get_many(tuple(key_to_raw_row))
+                missing = sorted(
+                    (
+                        (raw_row, key)
+                        for key, raw_row in key_to_raw_row.items()
+                        if key not in prepared
+                    ),
+                    key=lambda item: item[0],
+                )
+                if missing:
+                    source = self.sources[task.source]
+                    adapter = self.adapters[task.source]
+                    slots = tuple(
+                        str(item)
+                        for item in self.profile.cache_representation["view_slots"]
+                    )
+                    decoded, _evidence = decode_episode_window_views(
+                        task=task,
+                        source_root=source.raw_root,
+                        canonical_view_slots=slots,
+                        selected_observation_rows=np.asarray(
+                            [raw_row for raw_row, _key in missing],
+                            dtype=np.int64,
+                        ),
+                        asset_verifier=self.asset_verifier,
+                        timestamp_indices=self.video_indices,
+                        decode_workers=self.decode_workers,
+                    )
+                    from scripts.data.run_cache_worker import _view_batch
+
+                    missing_images, missing_mask = _view_batch(
+                        decoded=decoded,
+                        slots=slots,
+                        input_size=self.input_rgb_size,
+                        color_order_by_view={
+                            view.name: view.color_order for view in adapter.views
+                        },
+                    )
+                    missing_images_u8 = (
+                        missing_images.mul(255)
+                        .round()
+                        .clamp(0, 255)
+                        .to(torch.uint8)
+                    )
+                    missing_keys = tuple(key for _raw_row, key in missing)
+                    missing_mask_bool = missing_mask.bool()
+                    self.prepared_rows.put_many(
                         missing_keys,
                         missing_images_u8,
-                        missing_mask.bool(),
+                        missing_mask_bool,
                     )
-                }
-            )
-        images_u8 = torch.stack(
-            [prepared[key][0] for key in key_values],
-            dim=0,
-        )
-        view_mask = torch.stack(
-            [prepared[key][1] for key in key_values],
-            dim=0,
-        )
+                    prepared.update(
+                        {
+                            key: (image, mask)
+                            for key, image, mask in zip(
+                                missing_keys,
+                                missing_images_u8,
+                                missing_mask_bool,
+                            )
+                        }
+                    )
+                    decode_calls += 1
+
+            for index, plan in plans.items():
+                result[index] = (
+                    torch.stack(
+                        [prepared[key][0] for key in plan.key_values],
+                        dim=0,
+                    ),
+                    torch.stack(
+                        [prepared[key][1] for key in plan.key_values],
+                        dim=0,
+                    ),
+                    torch.from_numpy(plan.frame_keys.copy()).to(torch.int64),
+                    torch.from_numpy(plan.boundary_rows.copy()).to(torch.int64),
+                    plan.prepared_robot,
+                )
+
         with self._metadata_lock:
-            self.windows_decoded += 1
+            self.windows_decoded += len(requests)
+            self.decode_calls += decode_calls
+            self.coalesced_batches += 1
+            self.coalesced_requested_rows += requested_rows
+            self.coalesced_unique_rows += unique_rows
             self.decode_seconds += time.perf_counter() - started
-        return (
-            images_u8,
-            view_mask,
-            torch.from_numpy(frame_keys.copy()).to(torch.int64),
-            torch.from_numpy(boundary_rows.copy()).to(torch.int64),
-            episode.prepared_robot,
-        )
+        return result
+
+    def decode_window(
+        self,
+        *,
+        entry: CacheIndexEntry,
+        task_id: str,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        PreparedEpisodeRobot,
+    ]:
+        return self.decode_windows(((0, entry, task_id),))[0]
 
     def metrics(self) -> Mapping[str, float | int]:
         return {
@@ -632,6 +737,10 @@ class _DirectWindowSource:
             "episode_hits": self.episode_hits,
             "robot_resident_episodes": len(self._episodes),
             "windows_decoded": self.windows_decoded,
+            "decode_calls": self.decode_calls,
+            "coalesced_batches": self.coalesced_batches,
+            "coalesced_requested_rows": self.coalesced_requested_rows,
+            "coalesced_unique_rows": self.coalesced_unique_rows,
             "decode_seconds": self.decode_seconds,
         }
 
@@ -780,26 +889,47 @@ class DirectRawDataset(UnifiedCacheDataset):
             task_id=task_id,
         )
 
+    def _decode_indices(
+        self, indices: Sequence[int]
+    ) -> dict[int, tuple[Any, ...]]:
+        requests = tuple(
+            (
+                int(index),
+                self.entries[int(index)],
+                self._task_id_by_feature[
+                    self.entries[int(index)].feature_shard
+                ],
+            )
+            for index in indices
+        )
+        return self._source.decode_windows(requests)
+
     def prefetch_indices(self, indices: list[int]) -> None:
+        selected: list[int] = []
+        selected_set: set[int] = set()
         for raw_index in indices:
             index = int(raw_index)
-            if index in self._futures:
+            if index in self._futures or index in selected_set:
                 continue
-            if len(self._futures) >= self.max_prefetch_windows:
+            if len(self._futures) + len(selected) >= self.max_prefetch_windows:
                 self.prefetch_capacity_skips += 1
-                return
-            self._futures[index] = self._executor.submit(
-                self._decode_index, index
-            )
-            self.prefetch_submitted += 1
+                break
+            selected.append(index)
+            selected_set.add(index)
+        if not selected:
+            return
+        future = self._executor.submit(self._decode_indices, tuple(selected))
+        for index in selected:
+            self._futures[index] = future
+        self.prefetch_submitted += len(selected)
 
     def _window(self, index: int) -> tuple[Any, ...]:
         future = self._futures.pop(int(index), None)
         if future is None:
-            future = self._executor.submit(self._decode_index, int(index))
+            future = self._executor.submit(self._decode_indices, (int(index),))
             self.prefetch_submitted += 1
         started = time.perf_counter()
-        result = future.result()
+        result = future.result()[int(index)]
         self.prefetch_wait_seconds += time.perf_counter() - started
         self.prefetch_consumed += 1
         return result
