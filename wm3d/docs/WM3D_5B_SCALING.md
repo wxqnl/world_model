@@ -40,7 +40,7 @@ episode visual cache、LRU 或 sidecar。完整 episode cache 与 `streaming_raw
 chunk 8，并从
 `appearance_teacher_start_ratio=1.0` 线性切换到
 `appearance_teacher_end_ratio=0.0`。`canary1k` 在前 750 step 完成切换，
-`validation100k` 与 `formal600k` 在前 10,000 step 完成切换。这样 decoder 先学习
+`validation100k` 与 `formal600k` 在前 1,000 step 完成切换。这样 decoder 先学习
 真值 appearance latent 到 RGB 的稳定重建，再进入完全由模型预测 latent 驱动的训练；
 appearance dynamics 在整个过程中持续接受 MSE 与 cosine 监督。
 

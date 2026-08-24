@@ -14,7 +14,7 @@ head serves single-arm, bimanual, mobile-manipulator, and whole-body profiles.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from math import isqrt, log
+from math import isfinite, isqrt, log
 from typing import Iterable, Mapping, Optional, Sequence
 
 import torch
@@ -60,6 +60,14 @@ class NativeWorldModelConfig:
     bridge_layers_state: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29)
     bridge_heads: int = 16
     dynamics_layers: int = 4
+    # A parameter-free, per-horizon residual that preserves the factual action
+    # value before cross-attention.  It is applied only to the world branch;
+    # the action-free prior and policy branch remain structurally isolated.
+    factual_action_residual_scale: float = 0.0
+    # A second parameter-free skip reaches the future appearance query just
+    # before token projection.  This prevents the RGB path from erasing a
+    # valid factual-action response learned by the geometry state.
+    appearance_action_residual_scale: float = 0.0
 
     # Multi-view input.
     view_hidden: int = 1024
@@ -141,6 +149,18 @@ class NativeWorldModelConfig:
             raise ValueError("bridge layer index is outside state trunk")
         if self.dynamics_layers <= 0:
             raise ValueError("dynamics_layers must be positive")
+        if (
+            not isfinite(self.factual_action_residual_scale)
+            or self.factual_action_residual_scale < 0.0
+        ):
+            raise ValueError("factual_action_residual_scale must be finite and non-negative")
+        if (
+            not isfinite(self.appearance_action_residual_scale)
+            or self.appearance_action_residual_scale < 0.0
+        ):
+            raise ValueError(
+                "appearance_action_residual_scale must be finite and non-negative"
+            )
         if (
             self.rgb_hidden <= 0
             or self.rgb_res_blocks <= 0
@@ -837,6 +857,7 @@ class PerViewAppearanceDynamics(nn.Module):
         future_state: torch.Tensor,
         world_times_s: torch.Tensor,
         future_mask: Optional[torch.Tensor] = None,
+        factual_action_summary: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         expected = (
@@ -867,6 +888,15 @@ class PerViewAppearanceDynamics(nn.Module):
 
         context_time = world_times_s[:, cfg.T - cfg.appearance_context_frames : cfg.T]
         future_time = world_times_s[:, cfg.T :]
+        action_skip: Optional[torch.Tensor] = None
+        if cfg.appearance_action_residual_scale > 0.0:
+            if factual_action_summary is None or tuple(
+                factual_action_summary.shape
+            ) != (batch, cfg.K, cfg.state_hidden):
+                raise ValueError(
+                    "appearance action residual requires factual [B,K,state_hidden]"
+                )
+            action_skip = self.geometry(factual_action_summary)[:, :, None, None]
         context = self.input(context_tokens)
         context = context + self.time(context_time)[:, :, None, None]
         context = context + self.view_embed + self.patch_embed
@@ -885,7 +915,12 @@ class PerViewAppearanceDynamics(nn.Module):
         for index in range(cfg.appearance_context_frames):
             valid = context_mask[:, index, ..., None]
             last_context = torch.where(valid, context_tokens[:, index], last_context)
-        predicted = self.output(self.norm(value[:, -cfg.K :])) + last_context[:, None]
+        future_value = value[:, -cfg.K :]
+        if action_skip is not None:
+            future_value = future_value + (
+                cfg.appearance_action_residual_scale * action_skip
+            )
+        predicted = self.output(self.norm(future_value)) + last_context[:, None]
         predicted = predicted * future_mask[..., None].to(dtype=predicted.dtype)
         return predicted, future_mask.bool()
 
@@ -1595,6 +1630,19 @@ class NativeWorldModel(nn.Module):
         )
         action_free_future = prior_state[:, cfg.T :]
         factual_future = action_free_future
+        factual_summary: Optional[torch.Tensor] = None
+        if (
+            cfg.factual_action_residual_scale > 0.0
+            or cfg.appearance_action_residual_scale > 0.0
+        ):
+            factual_weight = factual_mask[..., None].to(dtype=factual.dtype)
+            factual_summary = (factual * factual_weight).sum(dim=2)
+            factual_summary = factual_summary / factual_weight.sum(dim=2).clamp_min(1.0)
+        if cfg.factual_action_residual_scale > 0.0:
+            assert factual_summary is not None
+            factual_future = factual_future + (
+                cfg.factual_action_residual_scale * factual_summary[:, :, None, :]
+            )
         for dynamics_block in self.dynamics_blocks:
             factual_future = self._run(
                 dynamics_block,
@@ -1624,6 +1672,7 @@ class NativeWorldModel(nn.Module):
                 factual_future,
                 relative_world_time,
                 target_appearance_mask,
+                factual_summary,
             )
             appearance_ratio = torch.as_tensor(
                 appearance_teacher_ratio,

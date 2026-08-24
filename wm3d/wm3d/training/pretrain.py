@@ -515,6 +515,54 @@ def _forward(
     return model(**kwargs)
 
 
+def _action_counterfactual_enabled(objective: Any) -> bool:
+    return bool(
+        objective.action_counterfactual_token_advantage > 0.0
+        or objective.action_counterfactual_rgb_advantage > 0.0
+    )
+
+
+def _zero_future_factual_action(
+    batch: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    zero_batch = dict(batch)
+    for name in (
+        "future_factual_fine_action_values",
+        "future_factual_coarse_action_values",
+    ):
+        if name not in batch:
+            raise PretrainError(f"action counterfactual requires {name}")
+        zero_batch[name] = torch.zeros_like(batch[name])
+    return zero_batch
+
+
+def _forward_with_action_counterfactual(
+    model: torch.nn.Module,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    appearance_teacher_ratio: float,
+    objective: Any,
+) -> Mapping[str, torch.Tensor]:
+    output = dict(
+        _forward(
+            model,
+            batch,
+            appearance_teacher_ratio=appearance_teacher_ratio,
+        )
+    )
+    if not _action_counterfactual_enabled(objective):
+        return output
+    with torch.no_grad():
+        zero_output = _forward(
+            model,
+            _zero_future_factual_action(batch),
+            appearance_teacher_ratio=appearance_teacher_ratio,
+        )
+    output["zero_action_pred_tokens"] = zero_output["pred_tokens"].detach()
+    output["zero_action_rgb"] = zero_output["rgb"].detach()
+    return output
+
+
 def _build_mixed_dataset(
     runtime: Mapping[str, Any],
     *,
@@ -805,10 +853,11 @@ def _validate(
         for label, ratio in settings:
             with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
                 losses = compute_native_objective(
-                    output=_forward(
+                    output=_forward_with_action_counterfactual(
                         model,
                         batch,
                         appearance_teacher_ratio=ratio,
+                        objective=objective,
                     ),
                     batch=batch,
                     config=objective,
@@ -1366,12 +1415,13 @@ def main() -> None:
                 with no_sync_context(model, enabled=not final_micro):
                     with autocast_context(strategy):
                         losses = compute_native_objective(
-                            output=_forward(
+                            output=_forward_with_action_counterfactual(
                                 model,
                                 batch,
                                 appearance_teacher_ratio=_appearance_teacher_ratio(
                                     step, runtime
                                 ),
+                                objective=objective,
                             ),
                             batch=batch,
                             config=objective,

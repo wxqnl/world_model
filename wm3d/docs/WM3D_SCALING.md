@@ -309,10 +309,14 @@ WM3D 可以交付 5B 集群前，至少完成以下验收：
 
 ## 10. Factual action 条件约束
 
-Stage0 同时产出 factual-action 与 action-free native token 预测时，训练目标对每个有
-效样本比较两条分支的 masked token MSE。factual 分支必须以封存 margin 优于
-stop-gradient 的 action-free 基线，否则施加 ranking penalty。该约束复用一次前向中
-已有的两组 token，不增加第二次模型前向，也不把 factual action 泄漏进 policy lane。
-训练日志必须同时记录 action-free MSE、conditioning gain 与 advantage penalty；任何
-改变 margin 或权重的运行都属于新的 objective contract，必须先走 canary，不能冒充
-旧 checkpoint 的同合同 exact resume。
+action-free native prior 是 policy 隔离分支，不是“零 action 的同模型反事实”；两者的
+误差量级相差过大，不能拿来证明 world dynamics 使用了 factual action。Stage0 必须在
+同一模型、同一 dynamics、同一 mask/时间语义下，把 future factual action value 置零并
+做一次 stop-gradient 对照前向。token 用 masked MSE、RGB 用 masked L1 比较 factual 与
+zero-action 目标误差，factual 未达到封存 margin 时施加 ranking penalty。模型同时把
+factual action 的逐 horizon 摘要作为 parameter-free residual 送入 world state 和
+appearance query；这两个 residual 都位于 policy 分支之后，所以 future action 仍不可能
+写回 policy lane。日志必须记录 zero-action token/RGB error、target gain、advantage 和
+factual-zero response RMS。第二次无梯度前向属于 objective contract 的显式计算成本；
+任何改动其权重、margin 或 residual scale 的运行都必须重新走 canary，不能冒充旧
+checkpoint 的同合同 exact resume。

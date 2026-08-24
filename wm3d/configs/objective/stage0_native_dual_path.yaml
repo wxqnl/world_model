@@ -19,10 +19,13 @@ objective:
   camera_pose: 0.1
   action_fine: 2.0
   action_coarse: 1.0
-  # The observed factual-action branch must beat the action-free world prior;
-  # this prevents a valid-but-ignored action path without a second forward.
-  action_condition_advantage: 0.25
-  action_condition_margin: 0.01
+  # Compare the factual world with the same model/dynamics under zero future
+  # action values.  The detached zero branch is a real counterfactual; the
+  # action-free policy prior is not a valid control for this ranking.
+  action_counterfactual_token_advantage: 1.0
+  action_counterfactual_token_margin: 0.005
+  action_counterfactual_rgb_advantage: 1.0
+  action_counterfactual_rgb_margin: 0.002
   # 不同 source-native cadence 及 delta/absolute semantic 没有统一速度正则定义。
   action_velocity: 0.0
   epsilon: 0.000001

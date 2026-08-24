@@ -55,6 +55,9 @@ appearance dynamics 都持续接受 MSE 与 cosine 监督，不会因为 teacher
 验证在同一批固定样本上同时记录 teacher0、当前线性 schedule 和 teacher1，直接量化
 appearance inference gap。step5000 的同样本探针没有支持“latent lerp 导致模糊”的假设：
 ratio=0.5 的结果优于按样本随机选两个 endpoint 的期望，因此正式 schedule 保留 lerp。
+另一方面，step5000 固定样本的 teacher0 短程训练能快速改善真实推理路径，所以 1B 正式
+profile 在前 500 step、5B 正式 profile 在前 1,000 step 完成 teacher1 到 teacher0 的
+切换，不再让 decoder 到 step10000 才完全暴露于预测 appearance latent。
 
 正式模型与目标配置为：
 

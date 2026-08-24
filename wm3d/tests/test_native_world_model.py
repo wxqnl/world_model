@@ -254,6 +254,61 @@ def test_future_factual_action_changes_world_but_cannot_change_policy() -> None:
     assert not torch.allclose(baseline["pred_tokens"], counterfactual["pred_tokens"])
 
 
+def test_factual_action_residual_reaches_world_before_dynamics_only() -> None:
+    cfg = replace(_tiny_config(), factual_action_residual_scale=0.25)
+    torch.manual_seed(111)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    changed = dict(batch)
+    changed["future_factual_fine_action_values"] = (
+        batch["future_factual_fine_action_values"] + 3.0
+    )
+    dynamics_inputs: list[torch.Tensor] = []
+    handle = model.dynamics_blocks[0].register_forward_pre_hook(
+        lambda _module, inputs: dynamics_inputs.append(inputs[0].detach().clone())
+    )
+    try:
+        baseline = model(**batch)
+        counterfactual = model(**changed)
+    finally:
+        handle.remove()
+
+    assert len(dynamics_inputs) == 2
+    assert not torch.allclose(dynamics_inputs[0], dynamics_inputs[1])
+    torch.testing.assert_close(
+        baseline["action_free_pred_tokens"],
+        counterfactual["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        baseline["policy_action_raw"],
+        counterfactual["policy_action_raw"],
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("value", (-0.1, float("nan"), float("inf")))
+def test_factual_action_residual_scale_fails_closed(value: float) -> None:
+    with pytest.raises(
+        ValueError,
+        match="factual_action_residual_scale must be finite and non-negative",
+    ):
+        NativeWorldModel(replace(_tiny_config(), factual_action_residual_scale=value))
+
+
+@pytest.mark.parametrize("value", (-0.1, float("nan"), float("inf")))
+def test_appearance_action_residual_scale_fails_closed(value: float) -> None:
+    with pytest.raises(
+        ValueError,
+        match="appearance_action_residual_scale must be finite and non-negative",
+    ):
+        NativeWorldModel(
+            replace(_tiny_config(), appearance_action_residual_scale=value)
+        )
+
+
 def test_swapping_commands_between_real_substep_times_changes_dynamics() -> None:
     """The encoder must retain command/timestamp pairing inside an interval."""
 
@@ -665,6 +720,42 @@ def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> No
     assert geometry_conditioning is not None
     assert geometry_conditioning.weight.grad is not None
     assert geometry_conditioning.weight.grad.abs().sum() > 0
+
+
+def test_appearance_action_residual_changes_rgb_without_policy_leakage() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        appearance_action_residual_scale=0.25,
+    )
+    torch.manual_seed(131)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    zero_action = dict(batch)
+    zero_action["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    zero_action["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+
+    factual = model(**batch, appearance_teacher_ratio=0.0)
+    zero = model(**zero_action, appearance_teacher_ratio=0.0)
+    torch.testing.assert_close(
+        factual["action_free_pred_tokens"],
+        zero["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        factual["policy_action_raw"],
+        zero["policy_action_raw"],
+        rtol=0,
+        atol=0,
+    )
+    assert not torch.allclose(
+        factual["appearance_pred_tokens"], zero["appearance_pred_tokens"]
+    )
+    assert not torch.allclose(factual["rgb"], zero["rgb"])
 
 
 def test_dual_path_inference_uses_predicted_appearance_without_future_targets() -> None:
