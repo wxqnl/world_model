@@ -354,6 +354,7 @@ def test_streaming_data_contract_ignores_action_conditioning_residual_scales() -
     runtime = copy.deepcopy(sealed)
     runtime["model"].update(
         {
+            "factual_dynamics_repeats": 3,
             "factual_action_residual_scale": 0.2,
             "appearance_action_residual_scale": 0.5,
         }

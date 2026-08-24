@@ -50,6 +50,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "appearance_heads",
     "appearance_ff_mult",
     "appearance_action_residual_scale",
+    "factual_dynamics_repeats",
     "factual_action_residual_scale",
 }
 

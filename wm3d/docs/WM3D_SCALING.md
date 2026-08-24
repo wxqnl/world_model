@@ -61,7 +61,7 @@ objective profile   决定 Stage0/Stage1 loss 及其权重
 | action layers | 14 | 24 |
 | action heads | 16 | 16 |
 | state/action bridge | 配置项 | 10 |
-| factual dynamics refinement | 1 | 1 |
+| factual dynamics refinement | 1 block × 2 次共享执行 | 1 block × 2 次共享执行 |
 | max action groups | 8 | 8 |
 | max action dim/group | 16 | 16 |
 | max action substeps/interval | 容量上限 128 | 容量上限 128；batch 使用真实较短 S |
@@ -86,8 +86,11 @@ objective profile   决定 Stage0/Stage1 loss 及其权重
 | 其余 embedding/norm/projection | 34,631,040 | 79,371,264 | task、连续时间、group、semantic、embodiment、current-state 等合同参数 |
 | **总计** | **1,327,691,187** | **5,323,627,059** | 与两份 dual-path profile 的 `expected_parameter_count` 精确一致 |
 
-`dynamics_layers=1` 是显式的架构取舍，不是为了凑参数：32 层 action-free state
-trunk 负责主要未来建模，一层 factual refinement 只注入真实已执行动作的物理影响。
+`dynamics_layers=1` 保持参数量与 checkpoint lane 不变；`factual_dynamics_repeats=2`
+让同一个 factual-only block 共享权重执行两次，只加深真实动作对 world state 的修正，
+不改 action-free state 或 policy。step500 固定 10 样本扫描中，两次执行把 mean token gain
+从 `0.000173` 提高到 `0.000739`，8/10 样本为正；三次执行没有进一步改善，因此正式
+profile 固定为两次。该改动仍必须通过从零 canary 验证 RGB 与训练稳定性。
 若后续消融表明动作条件动力学不足，应通过 model profile 同时调整 state/dynamics
 预算，并重新封存精确参数数；不能在训练脚本中按“5B”名字偷偷加层。
 
@@ -316,7 +319,8 @@ action-free native prior 是 policy 隔离分支，不是“零 action 的同模
 zero-action 目标误差，factual 未达到封存 margin 时施加 ranking penalty。模型同时把
 factual action 的逐 horizon 摘要作为 parameter-free residual 送入 world state 和
 appearance query；这两个 residual 都位于 policy 分支之后，所以 future action 仍不可能
-写回 policy lane。日志必须记录 zero-action token/RGB error、target gain、advantage 和
+写回 policy lane；factual-only refinement 使用同一 block 两次共享执行。日志必须记录
+zero-action token/RGB error、target gain、advantage 和
 factual-zero response RMS。第二次无梯度前向属于 objective contract 的显式计算成本；
 任何改动其权重、margin 或 residual scale 的运行都必须重新走 canary，不能冒充旧
 checkpoint 的同合同 exact resume。

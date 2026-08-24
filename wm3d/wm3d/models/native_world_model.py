@@ -60,6 +60,10 @@ class NativeWorldModelConfig:
     bridge_layers_state: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29)
     bridge_heads: int = 16
     dynamics_layers: int = 4
+    # Reuse the factual-only refinement stack several times. This deepens
+    # action conditioning without adding parameters or exposing future action
+    # to the action-free state/policy trunks.
+    factual_dynamics_repeats: int = 1
     # A parameter-free, per-horizon residual that preserves the factual action
     # value before cross-attention.  It is applied only to the world branch;
     # the action-free prior and policy branch remain structurally isolated.
@@ -149,6 +153,8 @@ class NativeWorldModelConfig:
             raise ValueError("bridge layer index is outside state trunk")
         if self.dynamics_layers <= 0:
             raise ValueError("dynamics_layers must be positive")
+        if self.factual_dynamics_repeats <= 0:
+            raise ValueError("factual_dynamics_repeats must be positive")
         if (
             not isfinite(self.factual_action_residual_scale)
             or self.factual_action_residual_scale < 0.0
@@ -1643,14 +1649,15 @@ class NativeWorldModel(nn.Module):
             factual_future = factual_future + (
                 cfg.factual_action_residual_scale * factual_summary[:, :, None, :]
             )
-        for dynamics_block in self.dynamics_blocks:
-            factual_future = self._run(
-                dynamics_block,
-                factual_future,
-                factual,
-                factual_mask,
-                enabled=cfg.activation_checkpointing,
-            )
+        for _ in range(cfg.factual_dynamics_repeats):
+            for dynamics_block in self.dynamics_blocks:
+                factual_future = self._run(
+                    dynamics_block,
+                    factual_future,
+                    factual,
+                    factual_mask,
+                    enabled=cfg.activation_checkpointing,
+                )
         factual_future = self.state_norm(factual_future)
 
         action_free_pred_tokens = self.token_output(action_free_future)

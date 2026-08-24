@@ -31,6 +31,7 @@ model:
   bridge_layers_state: [2, 5, 8, 11, 14, 17, 20, 23, 26, 29]
   bridge_heads: 16
   dynamics_layers: 1
+  factual_dynamics_repeats: 2
   factual_action_residual_scale: 0.3
   appearance_action_residual_scale: 0.1
   view_hidden: 1024

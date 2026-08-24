@@ -15,6 +15,9 @@ model、encoder 和 objective，拉取代码后无需手工调整。训练只解
 把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
 [原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
 
+1B/5B 还共用 `factual_dynamics_repeats=2`：单个 factual-only dynamics block 共享权重
+执行两次，增强动作条件深度，但不增加参数，也不把 future action 写回 policy lane。
+
 1B 实测通过的 grouped-action 向量化实现由 1B/5B 共用，不改变动作时间语义、输出或梯度；
 5B 不需要单独维护另一份慢速实现。三套 H200 runtime 还将冻结感知网络的输入按 8 张图一组
 计算，减少小 kernel 与 Python 调度开销，同时保留 RGB decoder 的显存安全分块。

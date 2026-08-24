@@ -785,3 +785,34 @@ def test_dual_path_1b_and_5b_profiles_are_materializable() -> None:
         assert model.cfg.appearance_P == 256
         assert counts[name] == profile["expected_parameter_count"]
     assert counts["native_5b_dual_path.yaml"] > 4 * counts["native_1b_dual_path.yaml"]
+
+def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
+    cfg = replace(_tiny_config(), factual_dynamics_repeats=3)
+    torch.manual_seed(41)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    calls = 0
+
+    def record(_module, _inputs) -> None:
+        nonlocal calls
+        calls += 1
+
+    handle = model.dynamics_blocks[0].register_forward_pre_hook(record)
+    try:
+        baseline = model(**batch)
+        changed = dict(batch)
+        changed["future_factual_fine_action_values"] = (
+            batch["future_factual_fine_action_values"] + 2.0
+        )
+        counterfactual = model(**changed)
+    finally:
+        handle.remove()
+
+    assert calls == 6
+    torch.testing.assert_close(
+        baseline["policy_action_raw"],
+        counterfactual["policy_action_raw"],
+        rtol=0,
+        atol=0,
+    )
+    assert not torch.allclose(baseline["pred_tokens"], counterfactual["pred_tokens"])
