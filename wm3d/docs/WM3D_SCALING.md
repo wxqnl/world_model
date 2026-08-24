@@ -306,3 +306,13 @@ WM3D 可以交付 5B 集群前，至少完成以下验收：
 10. 从空服务器按中文 README 执行 `smoke-real`，无需修改源码或手工补路径，且总 receipt 绑定代码 commit 与全部输入/输出 SHA。
 
 在这些证据完成前，配置可以标记为 `candidate`，不能标记为 `release-ready`。
+
+## 10. Factual action 条件约束
+
+Stage0 同时产出 factual-action 与 action-free native token 预测时，训练目标对每个有
+效样本比较两条分支的 masked token MSE。factual 分支必须以封存 margin 优于
+stop-gradient 的 action-free 基线，否则施加 ranking penalty。该约束复用一次前向中
+已有的两组 token，不增加第二次模型前向，也不把 factual action 泄漏进 policy lane。
+训练日志必须同时记录 action-free MSE、conditioning gain 与 advantage penalty；任何
+改变 margin 或权重的运行都属于新的 objective contract，必须先走 canary，不能冒充
+旧 checkpoint 的同合同 exact resume。

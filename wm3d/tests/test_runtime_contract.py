@@ -267,6 +267,7 @@ def test_dual_path_teacher_schedule_is_explicit_and_fail_closed() -> None:
     assert _appearance_teacher_ratio(75, value) == pytest.approx(0.5)
     assert _appearance_teacher_ratio(150, value) == pytest.approx(0.0)
     assert _appearance_teacher_ratio(200, value) == pytest.approx(0.0)
+    assert value["train"]["appearance_validation_three_way"] is True
 
     partial = copy.deepcopy(value)
     partial["train"].pop("appearance_teacher_end_ratio")
@@ -277,6 +278,11 @@ def test_dual_path_teacher_schedule_is_explicit_and_fail_closed() -> None:
     reversed_schedule["train"]["appearance_teacher_end_ratio"] = 1.1
     with pytest.raises(RuntimeContractError, match="0 <= end <= start <= 1"):
         validate_runtime_profile(reversed_schedule)
+
+    invalid_validation = copy.deepcopy(value)
+    invalid_validation["train"]["appearance_validation_three_way"] = 1
+    with pytest.raises(RuntimeContractError, match="appearance_validation_three_way"):
+        validate_runtime_profile(invalid_validation)
 
 def _direct_closure_fixture() -> dict:
     digest = "a" * 64

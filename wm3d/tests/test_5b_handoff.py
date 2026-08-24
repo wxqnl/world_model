@@ -54,7 +54,11 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert model["model"]["rgb_res_blocks"] == 2
     assert model["model"]["rgb_decode_chunk_size"] == 2
     assert model["model"]["rgb_decode_indices"] == list(range(16))
-    assert objective["objective"]["rgb_l1"] == 0.5
+    assert objective["objective"]["rgb_l1"] == 0.0
+    assert objective["objective"]["rgb_charbonnier"] == 1.5
+    assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.001
+    assert objective["objective"]["action_condition_advantage"] == 0.25
+    assert objective["objective"]["action_condition_margin"] == 0.01
     assert objective["objective"]["rgb_perceptual"] == 0.1
     assert objective["objective"]["appearance_mse"] == 1.0
     assert objective["objective"]["appearance_cosine"] == 0.1
@@ -73,6 +77,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert runtime["train"]["rgb_perceptual_chunk_size"] == 8
     assert runtime["train"]["appearance_teacher_start_ratio"] == 1.0
     assert runtime["train"]["appearance_teacher_end_ratio"] == 0.0
+    assert runtime["train"]["appearance_validation_three_way"] is True
     assert (
         runtime["train"]["appearance_teacher_decay_steps"]
         == teacher_decay_steps

@@ -768,7 +768,8 @@ def _validate(
     perceptual_model: torch.nn.Module | None,
     context: Any,
     input_adapter: Any | None = None,
-) -> dict[str, float]:
+    training_step: int = 0,
+) -> dict[str, Any]:
     count = int(runtime_profile["train"]["validation_steps"])
     loader = _make_loader(
         dataset,
@@ -782,26 +783,58 @@ def _validate(
         gradient_accumulation=1,
         micro_batch_size=_validation_micro_batch_size(runtime_profile),
     )
-    totals: dict[str, torch.Tensor] = {}
+    settings = [("teacher0", 0.0)]
+    if bool(runtime_profile["train"].get("appearance_validation_three_way", False)):
+        settings.extend(
+            (
+                (
+                    "scheduled",
+                    _appearance_teacher_ratio(training_step, runtime_profile),
+                ),
+                ("teacher1", 1.0),
+            )
+        )
+    totals: dict[str, dict[str, torch.Tensor]] = {
+        label: {} for label, _ratio in settings
+    }
     model.eval()
     for cpu_batch in loader:
         if input_adapter is not None:
             cpu_batch = input_adapter.materialize(cpu_batch)
         batch = _batch_to_device(cpu_batch, context.device)
-        with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
-            losses = compute_native_objective(
-                output=_forward(model, batch),
-                batch=batch,
-                config=objective,
-                perceptual_model=perceptual_model,
-                rgb_perceptual_chunk_size=int(
-                    runtime_profile["train"].get("rgb_perceptual_chunk_size", 4)
-                ),
-            )
-        for name, value in losses.items():
-            totals[name] = totals.get(name, torch.zeros_like(value)) + value
+        for label, ratio in settings:
+            with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
+                losses = compute_native_objective(
+                    output=_forward(
+                        model,
+                        batch,
+                        appearance_teacher_ratio=ratio,
+                    ),
+                    batch=batch,
+                    config=objective,
+                    perceptual_model=perceptual_model,
+                    rgb_perceptual_chunk_size=int(
+                        runtime_profile["train"].get("rgb_perceptual_chunk_size", 4)
+                    ),
+                )
+            for name, value in losses.items():
+                totals[label][name] = (
+                    totals[label].get(name, torch.zeros_like(value)) + value
+                )
     model.train()
-    return reduce_metrics({name: value / count for name, value in totals.items()})
+    reduced = {
+        label: reduce_metrics(
+            {name: value / count for name, value in label_totals.items()}
+        )
+        for label, label_totals in totals.items()
+    }
+    result: dict[str, Any] = dict(reduced["teacher0"])
+    if len(settings) > 1:
+        result["appearance_three_way"] = {
+            label: {"teacher_ratio": ratio, "metrics": reduced[label]}
+            for label, ratio in settings
+        }
+    return result
 
 
 def _run_contract(
@@ -1425,6 +1458,7 @@ def main() -> None:
                     perceptual_model,
                     context,
                     input_adapter=input_adapter,
+                    training_step=completed,
                 )
                 if context.is_rank0:
                     record = {"step": completed, "validation": validation}

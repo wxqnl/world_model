@@ -33,12 +33,15 @@ class NativeObjectiveConfig:
     action_fine: float = 2.0
     action_coarse: float = 1.0
     action_velocity: float = 0.0
+    action_condition_advantage: float = 0.0
+    action_condition_margin: float = 0.0
     epsilon: float = 1.0e-6
+    rgb_charbonnier_epsilon: float = 1.0e-3
     huber_delta: float = 0.05
 
     def validate(self) -> None:
         for name, value in self.__dict__.items():
-            if name in {"epsilon", "huber_delta"}:
+            if name in {"epsilon", "rgb_charbonnier_epsilon", "huber_delta"}:
                 if value <= 0:
                     raise NativeObjectiveError(f"{name} must be positive")
             elif value < 0:
@@ -47,6 +50,10 @@ class NativeObjectiveConfig:
             raise NativeObjectiveError(
                 "action_velocity must remain 0: mixed delta/absolute semantics and "
                 "source-native cadences have no shared physical smoothness invariant"
+            )
+        if self.action_condition_advantage > 0.0 and self.action_condition_margin <= 0.0:
+            raise NativeObjectiveError(
+                "action_condition_margin must be positive when factual advantage is enabled"
             )
 
 
@@ -86,6 +93,64 @@ def _masked_mean(
         mask = torch.broadcast_to(mask, value.shape)
     weight = mask.to(dtype=value.dtype)
     return (value * weight).sum() / weight.sum().clamp_min(epsilon)
+
+
+def _masked_per_sample_mean(
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    epsilon: float,
+) -> torch.Tensor:
+    if mask.shape != value.shape:
+        mask = torch.broadcast_to(mask, value.shape)
+    weight = mask.to(dtype=value.dtype)
+    numerator = (value * weight).flatten(1).sum(dim=1)
+    denominator = weight.flatten(1).sum(dim=1).clamp_min(epsilon)
+    return numerator / denominator
+
+
+def _factual_action_advantage(
+    *,
+    factual_tokens: torch.Tensor,
+    action_free_tokens: torch.Tensor,
+    target_tokens: torch.Tensor,
+    token_mask: torch.Tensor,
+    margin: float,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if factual_tokens.shape != target_tokens.shape:
+        raise NativeObjectiveError("factual prediction and target token shapes differ")
+    if action_free_tokens.shape != target_tokens.shape:
+        raise NativeObjectiveError("action-free prediction and target token shapes differ")
+    factual_per_sample = _masked_per_sample_mean(
+        (factual_tokens - target_tokens).square(),
+        token_mask[..., None],
+        epsilon=epsilon,
+    )
+    action_free_per_sample = _masked_per_sample_mean(
+        (action_free_tokens - target_tokens).square(),
+        token_mask[..., None],
+        epsilon=epsilon,
+    )
+    sample_valid = torch.broadcast_to(
+        token_mask[..., None], target_tokens.shape
+    ).flatten(1).any(dim=1)
+    action_free_mse = _masked_mean(
+        action_free_per_sample,
+        sample_valid,
+        epsilon=epsilon,
+    )
+    gain = _masked_mean(
+        action_free_per_sample.detach() - factual_per_sample.detach(),
+        sample_valid,
+        epsilon=epsilon,
+    )
+    advantage = _masked_mean(
+        torch.relu(margin + factual_per_sample - action_free_per_sample.detach()),
+        sample_valid,
+        epsilon=epsilon,
+    )
+    return action_free_mse, gain, advantage
 
 
 def _charbonnier(value: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -482,6 +547,26 @@ def compute_native_objective(
     token_cosine = _masked_mean(cosine, token_mask, epsilon=epsilon)
 
     zero = token_mse.new_zeros(())
+    action_free_token_mse = zero
+    action_condition_gain = zero
+    action_condition_advantage = zero
+    if config.action_condition_advantage > 0.0:
+        if "action_free_pred_tokens" not in output:
+            raise NativeObjectiveError(
+                "factual action advantage requires action_free_pred_tokens"
+            )
+        (
+            action_free_token_mse,
+            action_condition_gain,
+            action_condition_advantage,
+        ) = _factual_action_advantage(
+            factual_tokens=output["pred_tokens"],
+            action_free_tokens=output["action_free_pred_tokens"],
+            target_tokens=target_tokens,
+            token_mask=token_mask,
+            margin=config.action_condition_margin,
+            epsilon=epsilon,
+        )
     appearance_mse = zero
     appearance_cosine = zero
     appearance_supervised = zero
@@ -542,7 +627,7 @@ def compute_native_objective(
             epsilon=epsilon,
         )
         rgb_charbonnier = _masked_mean(
-            _charbonnier(rgb_error, epsilon),
+            _charbonnier(rgb_error, config.rgb_charbonnier_epsilon),
             rgb_mask,
             epsilon=epsilon,
         )
@@ -550,12 +635,16 @@ def compute_native_objective(
         target_dy, target_dx = _image_gradient(target_rgb)
         rgb_gradient = 0.5 * (
             _masked_mean(
-                _charbonnier(pred_dy - target_dy, epsilon),
+                _charbonnier(
+                    pred_dy - target_dy, config.rgb_charbonnier_epsilon
+                ),
                 rgb_mask,
                 epsilon=epsilon,
             )
             + _masked_mean(
-                _charbonnier(pred_dx - target_dx, epsilon),
+                _charbonnier(
+                    pred_dx - target_dx, config.rgb_charbonnier_epsilon
+                ),
                 rgb_mask,
                 epsilon=epsilon,
             )
@@ -680,6 +769,9 @@ def compute_native_objective(
     losses = {
         "token_mse": token_mse,
         "token_cosine": token_cosine,
+        "action_free_token_mse": action_free_token_mse,
+        "action_condition_gain": action_condition_gain,
+        "action_condition_advantage": action_condition_advantage,
         "appearance_mse": appearance_mse,
         "appearance_cosine": appearance_cosine,
         "appearance_teacher_ratio": output.get("appearance_teacher_ratio", zero),
@@ -754,6 +846,7 @@ def compute_native_objective(
         + config.action_fine * action_fine
         + config.action_coarse * action_coarse
         + config.action_velocity * action_velocity
+        + config.action_condition_advantage * action_condition_advantage
     )
     if not bool(torch.isfinite(total)):
         raise FloatingPointError("WM3D native objective is non-finite")

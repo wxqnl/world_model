@@ -7,11 +7,71 @@ from wm3d.data.grouped_robot import COMPOSITION_OPERATOR_IDS
 from wm3d.training.native_objective import (
     NativeObjectiveConfig,
     NativeObjectiveError,
+    _charbonnier,
+    _factual_action_advantage,
     _masked_rgb_perceptual,
     compose_axis_angle_sequence,
     compose_policy_to_world_intervals,
     compute_native_objective,
 )
+
+
+def test_rgb_charbonnier_uses_its_own_meaningful_epsilon() -> None:
+    value = torch.tensor([0.0, 1.0e-4, 0.1])
+    legacy = _charbonnier(value, 1.0e-6)
+    configured = _charbonnier(value, 1.0e-3)
+    assert legacy[0].item() == pytest.approx(1.0e-6)
+    assert configured[0].item() == pytest.approx(1.0e-3)
+    assert configured[1] > legacy[1]
+    assert configured[2].item() == pytest.approx(legacy[2].item(), rel=1.0e-4)
+    with pytest.raises(NativeObjectiveError, match="rgb_charbonnier_epsilon"):
+        NativeObjectiveConfig(rgb_charbonnier_epsilon=0.0).validate()
+
+
+def test_factual_action_advantage_only_updates_the_factual_branch() -> None:
+    factual = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)
+    action_free = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)
+    target = torch.zeros_like(factual)
+    mask = torch.ones(2, 1, 1, dtype=torch.bool)
+
+    action_free_mse, gain, advantage = _factual_action_advantage(
+        factual_tokens=factual,
+        action_free_tokens=action_free,
+        target_tokens=target,
+        token_mask=mask,
+        margin=0.01,
+        epsilon=1.0e-6,
+    )
+
+    assert action_free_mse.item() == pytest.approx(0.04)
+    assert gain.item() == pytest.approx(0.0)
+    assert advantage.item() == pytest.approx(0.01)
+    advantage.backward()
+    assert factual.grad is not None
+    assert factual.grad.abs().sum() > 0
+    assert action_free.grad is None
+
+
+def test_factual_action_advantage_rewards_a_real_conditioning_gain() -> None:
+    factual = torch.zeros(2, 1, 1, 2)
+    action_free = torch.ones_like(factual)
+    target = torch.zeros_like(factual)
+    mask = torch.tensor([[[True]], [[False]]])
+
+    action_free_mse, gain, advantage = _factual_action_advantage(
+        factual_tokens=factual,
+        action_free_tokens=action_free,
+        target_tokens=target,
+        token_mask=mask,
+        margin=0.01,
+        epsilon=1.0e-6,
+    )
+
+    assert action_free_mse.item() == pytest.approx(1.0)
+    assert gain.item() == pytest.approx(1.0)
+    assert advantage.item() == pytest.approx(0.0)
+    with pytest.raises(NativeObjectiveError, match="action_condition_margin"):
+        NativeObjectiveConfig(action_condition_advantage=0.25).validate()
 
 
 class _MeanFeatureDistance(torch.nn.Module):

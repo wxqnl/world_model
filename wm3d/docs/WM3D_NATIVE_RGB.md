@@ -52,6 +52,9 @@ appearance-to-RGB 重建；随后按照 runtime 中的
 `appearance_teacher_start_ratio`、`appearance_teacher_end_ratio` 和
 `appearance_teacher_decay_steps` 线性切换到模型预测 latent。无论 teacher ratio 是多少，
 appearance dynamics 都持续接受 MSE 与 cosine 监督，不会因为 teacher forcing 而没有梯度。
+验证在同一批固定样本上同时记录 teacher0、当前线性 schedule 和 teacher1，直接量化
+appearance inference gap。step5000 的同样本探针没有支持“latent lerp 导致模糊”的假设：
+ratio=0.5 的结果优于按样本随机选两个 endpoint 的期望，因此正式 schedule 保留 lerp。
 
 正式模型与目标配置为：
 
@@ -63,12 +66,15 @@ appearance dynamics 都持续接受 MSE 与 cosine 监督，不会因为 teacher
 
 ## RGB 目标
 
-正式目标同时包含：
+正式目标包含：
 
-- L1：保持颜色和绝对像素结构；
-- Charbonnier：对少量异常像素保持稳健；
+- Charbonnier（权重 1.5、epsilon 1e-3）：保持颜色和绝对像素结构；
 - spatial gradient：约束边缘；
 - VGG LPIPS：约束人眼感知的纹理与结构清晰度。
+
+RGB L1 仍逐步报告用于可比性，但优化权重为 0；旧的 `0.5*L1 + 1.0*Charbonnier`
+在 epsilon 1e-6 下几乎把同一绝对残差计算两遍，现配置用一个独立 epsilon 的
+Charbonnier 保留近似相同的像素梯度总尺度。
 
 LPIPS 网络被冻结，不属于世界模型参数，也不进入 optimizer 或 checkpoint；梯度只从
 LPIPS 输入传回 native RGB decoder 与 token 输出层。LPIPS 必须来自封存的运行环境，

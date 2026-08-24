@@ -187,6 +187,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "appearance_teacher_start_ratio",
         "appearance_teacher_end_ratio",
         "appearance_teacher_decay_steps",
+        "appearance_validation_three_way",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
@@ -280,6 +281,17 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             raise RuntimeContractError(
                 "train.appearance_teacher_decay_steps must lie within total_steps"
             )
+    appearance_validation_three_way = train.get(
+        "appearance_validation_three_way", False
+    )
+    if not isinstance(appearance_validation_three_way, bool):
+        raise RuntimeContractError(
+            "train.appearance_validation_three_way must be boolean"
+        )
+    if appearance_validation_three_way and not present_appearance_schedule:
+        raise RuntimeContractError(
+            "three-way appearance validation requires an appearance teacher schedule"
+        )
     if optimizer.get("name") != "adamw":
         raise RuntimeContractError("optimizer.name must be adamw")
     if schedule.get("name") != "warmup_stable_cosine":
