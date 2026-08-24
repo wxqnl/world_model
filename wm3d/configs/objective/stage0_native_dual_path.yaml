@@ -20,11 +20,14 @@ objective:
   action_fine: 2.0
   action_coarse: 1.0
   # Compare the factual world with the same model/dynamics under zero future
-  # action values.  The detached zero branch is a real counterfactual; the
-  # action-free policy prior is not a valid control for this ranking.
+  # action values.  Both token branches stay in the graph, so the hinge learns
+  # their relative action-conditioned difference while sharing the action-free
+  # trunk.  The policy prior is not a valid control for this ranking.
   action_counterfactual_token_advantage: 1.0
   action_counterfactual_token_margin: 0.005
-  action_counterfactual_rgb_advantage: 1.0
+  # Scheduled teacher appearance can reveal the true future to RGB.  Keep RGB
+  # quality training unchanged and measure RGB action causality at teacher=0.
+  action_counterfactual_rgb_advantage: 0.0
   action_counterfactual_rgb_margin: 0.002
   # 不同 source-native cadence 及 delta/absolute semantic 没有统一速度正则定义。
   action_velocity: 0.0

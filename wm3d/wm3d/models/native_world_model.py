@@ -1490,6 +1490,7 @@ class NativeWorldModel(nn.Module):
         target_appearance_tokens: Optional[torch.Tensor] = None,
         target_appearance_mask: Optional[torch.Tensor] = None,
         appearance_teacher_ratio: float | torch.Tensor = 0.0,
+        compute_zero_action_control: bool = False,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         expected_world = (cfg.T, cfg.num_views, cfg.P, cfg.token_dim)
@@ -1622,43 +1623,60 @@ class NativeWorldModel(nn.Module):
         policy_query = self.action_norm(policy_query)
         policy_query = policy_query * query_token_mask[..., None].to(policy_query.dtype)
 
-        factual, factual_mask = self.factual_action(
-            fine_values=future_factual_fine_action_values,
-            fine_dim_mask=future_factual_fine_action_mask,
-            fine_dt=future_factual_fine_action_dt,
-            fine_sample_mask=future_factual_fine_sample_mask,
-            coarse_values=future_factual_coarse_action_values,
-            coarse_dim_mask=future_factual_coarse_action_mask,
-            action_semantic_ids=action_semantic_ids,
-            group_ids=action_group_ids,
-            group_mask=action_group_mask,
-            embodiment_ids=embodiment_ids,
-        )
         action_free_future = prior_state[:, cfg.T :]
-        factual_future = action_free_future
-        factual_summary: Optional[torch.Tensor] = None
-        if (
-            cfg.factual_action_residual_scale > 0.0
-            or cfg.appearance_action_residual_scale > 0.0
-        ):
-            factual_weight = factual_mask[..., None].to(dtype=factual.dtype)
-            factual_summary = (factual * factual_weight).sum(dim=2)
-            factual_summary = factual_summary / factual_weight.sum(dim=2).clamp_min(1.0)
-        if cfg.factual_action_residual_scale > 0.0:
-            assert factual_summary is not None
-            factual_future = factual_future + (
-                cfg.factual_action_residual_scale * factual_summary[:, :, None, :]
+
+        def refine_factual(
+            fine_values: torch.Tensor,
+            coarse_values: torch.Tensor,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            encoded, encoded_mask = self.factual_action(
+                fine_values=fine_values,
+                fine_dim_mask=future_factual_fine_action_mask,
+                fine_dt=future_factual_fine_action_dt,
+                fine_sample_mask=future_factual_fine_sample_mask,
+                coarse_values=coarse_values,
+                coarse_dim_mask=future_factual_coarse_action_mask,
+                action_semantic_ids=action_semantic_ids,
+                group_ids=action_group_ids,
+                group_mask=action_group_mask,
+                embodiment_ids=embodiment_ids,
             )
-        for _ in range(cfg.factual_dynamics_repeats):
-            for dynamics_block in self.dynamics_blocks:
-                factual_future = self._run(
-                    dynamics_block,
-                    factual_future,
-                    factual,
-                    factual_mask,
-                    enabled=cfg.activation_checkpointing,
+            refined = action_free_future
+            summary: Optional[torch.Tensor] = None
+            if (
+                cfg.factual_action_residual_scale > 0.0
+                or cfg.appearance_action_residual_scale > 0.0
+            ):
+                weight = encoded_mask[..., None].to(dtype=encoded.dtype)
+                summary = (encoded * weight).sum(dim=2)
+                summary = summary / weight.sum(dim=2).clamp_min(1.0)
+            if cfg.factual_action_residual_scale > 0.0:
+                assert summary is not None
+                refined = refined + (
+                    cfg.factual_action_residual_scale * summary[:, :, None, :]
                 )
-        factual_future = self.state_norm(factual_future)
+            for _ in range(cfg.factual_dynamics_repeats):
+                for dynamics_block in self.dynamics_blocks:
+                    refined = self._run(
+                        dynamics_block,
+                        refined,
+                        encoded,
+                        encoded_mask,
+                        enabled=cfg.activation_checkpointing,
+                    )
+            return self.state_norm(refined), summary
+
+        factual_future, factual_summary = refine_factual(
+            future_factual_fine_action_values,
+            future_factual_coarse_action_values,
+        )
+        zero_action_pred_tokens: Optional[torch.Tensor] = None
+        if compute_zero_action_control:
+            zero_action_future, _ = refine_factual(
+                torch.zeros_like(future_factual_fine_action_values),
+                torch.zeros_like(future_factual_coarse_action_values),
+            )
+            zero_action_pred_tokens = self.token_output(zero_action_future)
 
         action_free_pred_tokens = self.token_output(action_free_future)
         pred_tokens = self.token_output(factual_future)
@@ -1730,6 +1748,8 @@ class NativeWorldModel(nn.Module):
             "policy_query_dt": policy_query_dt,
             "appearance_teacher_ratio": appearance_ratio,
         }
+        if zero_action_pred_tokens is not None:
+            output["zero_action_pred_tokens"] = zero_action_pred_tokens
         if appearance_pred is not None and appearance_pred_mask is not None:
             output["appearance_pred_tokens"] = appearance_pred
             output["appearance_pred_mask"] = appearance_pred_mask

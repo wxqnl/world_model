@@ -91,6 +91,10 @@ objective profile   决定 Stage0/Stage1 loss 及其权重
 不改 action-free state 或 policy。step500 固定 10 样本扫描中，两次执行把 mean token gain
 从 `0.000173` 提高到 `0.000739`，8/10 样本为正；三次执行没有进一步改善，因此正式
 profile 固定为两次。该改动仍必须通过从零 canary 验证 RGB 与训练稳定性。
+训练期的 token counterfactual 使用同一 action-free trunk、同一 factual dynamics 和两组
+可导的 factual/zero-future-action 输出做相对排序；zero 分支不能 detach，否则排序项会
+退化为重复 factual 重建。RGB 在 teacher ratio 大于零时可直接看到未来 appearance，因而
+不在该阶段施加 RGB counterfactual 排序；RGB 动作因果性统一在 `teacher=0` 验证中测量。
 若后续消融表明动作条件动力学不足，应通过 model profile 同时调整 state/dynamics
 预算，并重新封存精确参数数；不能在训练脚本中按“5B”名字偷偷加层。
 

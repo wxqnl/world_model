@@ -161,7 +161,7 @@ def _factual_zero_advantage(
         epsilon=epsilon,
     )
     advantage = _masked_mean(
-        torch.relu(margin + factual_per_sample - zero_per_sample.detach()),
+        torch.relu(margin + factual_per_sample - zero_per_sample),
         sample_valid,
         epsilon=epsilon,
     )

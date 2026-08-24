@@ -28,7 +28,7 @@ def test_rgb_charbonnier_uses_its_own_meaningful_epsilon() -> None:
         NativeObjectiveConfig(rgb_charbonnier_epsilon=0.0).validate()
 
 
-def test_factual_zero_advantage_only_updates_the_factual_branch() -> None:
+def test_factual_zero_advantage_updates_both_sides_of_the_ranking() -> None:
     factual = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)
     zero_action = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)
     target = torch.zeros_like(factual)
@@ -50,8 +50,14 @@ def test_factual_zero_advantage_only_updates_the_factual_branch() -> None:
     assert response_rms.item() == pytest.approx(0.0)
     advantage.backward()
     assert factual.grad is not None
-    assert factual.grad.abs().sum() > 0
-    assert zero_action.grad is None
+    assert zero_action.grad is not None
+    assert bool((factual.grad > 0).all())
+    assert bool((zero_action.grad < 0).all())
+    with torch.no_grad():
+        updated_factual = factual - 0.1 * factual.grad
+        updated_zero = zero_action - 0.1 * zero_action.grad
+        updated_gain = updated_zero.square().mean() - updated_factual.square().mean()
+    assert updated_gain > 0
 
 
 def test_factual_zero_advantage_rewards_a_real_conditioning_gain() -> None:

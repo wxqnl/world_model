@@ -492,6 +492,7 @@ def _forward(
     batch: Mapping[str, torch.Tensor],
     *,
     appearance_teacher_ratio: float = 0.0,
+    compute_zero_action_control: bool = False,
 ) -> Mapping[str, torch.Tensor]:
     indices = batch["rgb_frame_indices"]
     if indices.ndim != 2 or not bool((indices == indices[:1]).all()):
@@ -512,6 +513,8 @@ def _forward(
             kwargs[name] = batch[name]
     if "appearance_context_tokens" in batch:
         kwargs["appearance_teacher_ratio"] = appearance_teacher_ratio
+    if compute_zero_action_control:
+        kwargs["compute_zero_action_control"] = True
     return model(**kwargs)
 
 
@@ -548,18 +551,24 @@ def _forward_with_action_counterfactual(
             model,
             batch,
             appearance_teacher_ratio=appearance_teacher_ratio,
+            compute_zero_action_control=(
+                objective.action_counterfactual_token_advantage > 0.0
+            ),
         )
     )
     if not _action_counterfactual_enabled(objective):
         return output
-    with torch.no_grad():
-        zero_output = _forward(
-            model,
-            _zero_future_factual_action(batch),
-            appearance_teacher_ratio=appearance_teacher_ratio,
-        )
-    output["zero_action_pred_tokens"] = zero_output["pred_tokens"].detach()
-    output["zero_action_rgb"] = zero_output["rgb"].detach()
+    if objective.action_counterfactual_token_advantage > 0.0:
+        if "zero_action_pred_tokens" not in output:
+            raise PretrainError("model did not return the zero-action token control")
+    if objective.action_counterfactual_rgb_advantage > 0.0:
+        with torch.no_grad():
+            zero_output = _forward(
+                model,
+                _zero_future_factual_action(batch),
+                appearance_teacher_ratio=appearance_teacher_ratio,
+            )
+        output["zero_action_rgb"] = zero_output["rgb"].detach()
     return output
 
 

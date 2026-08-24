@@ -17,6 +17,9 @@ model、encoder 和 objective，拉取代码后无需手工调整。训练只解
 
 1B/5B 还共用 `factual_dynamics_repeats=2`：单个 factual-only dynamics block 共享权重
 执行两次，增强动作条件深度，但不增加参数，也不把 future action 写回 policy lane。
+两种规模也共用可导的 zero-future-action token 对照：真实动作与零动作分支复用同一个
+action-free trunk，并以相对排序梯度学习动作差异。训练期 RGB 保持原质量目标，动作因果
+响应只在 `appearance_teacher_ratio=0` 的验证中比较，避免 teacher future latent 污染对照。
 
 1B 实测通过的 grouped-action 向量化实现由 1B/5B 共用，不改变动作时间语义、输出或梯度；
 5B 不需要单独维护另一份慢速实现。三套 H200 runtime 还将冻结感知网络的输入按 8 张图一组

@@ -62,7 +62,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
     assert objective["objective"]["action_counterfactual_token_advantage"] == 1.0
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
-    assert objective["objective"]["action_counterfactual_rgb_advantage"] == 1.0
+    assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
     assert objective["objective"]["rgb_perceptual"] == 0.1
     assert objective["objective"]["appearance_mse"] == 1.0

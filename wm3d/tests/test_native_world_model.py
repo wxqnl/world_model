@@ -816,3 +816,33 @@ def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
         atol=0,
     )
     assert not torch.allclose(baseline["pred_tokens"], counterfactual["pred_tokens"])
+
+def test_zero_action_control_reuses_the_exact_factual_path() -> None:
+    cfg = replace(_tiny_config(), factual_dynamics_repeats=2, dropout=0.0)
+    torch.manual_seed(43)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+
+    output = model(**batch, compute_zero_action_control=True)
+    zero_batch = dict(batch)
+    zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    zero_batch["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+    explicit = model(**zero_batch)
+
+    assert output["zero_action_pred_tokens"].requires_grad
+    torch.testing.assert_close(
+        output["zero_action_pred_tokens"],
+        explicit["pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        output["policy_action_raw"],
+        explicit["policy_action_raw"],
+        rtol=0,
+        atol=0,
+    )
