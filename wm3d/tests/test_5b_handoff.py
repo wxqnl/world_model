@@ -56,7 +56,9 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert model["model"]["rgb_decode_indices"] == list(range(16))
     assert model["model"]["factual_dynamics_repeats"] == 2
     assert model["model"]["factual_action_residual_scale"] == 0.3
-    assert model["model"]["appearance_action_residual_scale"] == 0.1
+    assert model["model"]["render_factual_dynamics_repeats"] == 1
+    assert model["model"]["render_factual_action_residual_scale"] == 0.0
+    assert model["model"]["appearance_action_residual_scale"] == 0.0
     assert objective["objective"]["rgb_l1"] == 0.5
     assert objective["objective"]["rgb_charbonnier"] == 1.0
     assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001

@@ -33,7 +33,9 @@ model:
   dynamics_layers: 1
   factual_dynamics_repeats: 2
   factual_action_residual_scale: 0.3
-  appearance_action_residual_scale: 0.1
+  render_factual_dynamics_repeats: 1
+  render_factual_action_residual_scale: 0.0
+  appearance_action_residual_scale: 0.0
   view_hidden: 768
   view_heads: 12
   view_ff_mult: 2.5

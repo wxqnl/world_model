@@ -68,6 +68,12 @@ class NativeWorldModelConfig:
     # value before cross-attention.  It is applied only to the world branch;
     # the action-free prior and policy branch remain structurally isolated.
     factual_action_residual_scale: float = 0.0
+    # Rendering can use a shallower, lower-amplitude pass through the same
+    # factual stack. This keeps the token lane strongly action-causal without
+    # forcing RGB/geometry to consume an over-refined state. None preserves
+    # the historical shared-lane behavior.
+    render_factual_dynamics_repeats: Optional[int] = None
+    render_factual_action_residual_scale: Optional[float] = None
     # A second parameter-free skip reaches the future appearance query just
     # before token projection.  This prevents the RGB path from erasing a
     # valid factual-action response learned by the geometry state.
@@ -156,10 +162,22 @@ class NativeWorldModelConfig:
         if self.factual_dynamics_repeats <= 0:
             raise ValueError("factual_dynamics_repeats must be positive")
         if (
+            self.render_factual_dynamics_repeats is not None
+            and self.render_factual_dynamics_repeats <= 0
+        ):
+            raise ValueError("render_factual_dynamics_repeats must be positive")
+        if (
             not isfinite(self.factual_action_residual_scale)
             or self.factual_action_residual_scale < 0.0
         ):
             raise ValueError("factual_action_residual_scale must be finite and non-negative")
+        if self.render_factual_action_residual_scale is not None and (
+            not isfinite(self.render_factual_action_residual_scale)
+            or self.render_factual_action_residual_scale < 0.0
+        ):
+            raise ValueError(
+                "render_factual_action_residual_scale must be finite and non-negative"
+            )
         if (
             not isfinite(self.appearance_action_residual_scale)
             or self.appearance_action_residual_scale < 0.0
@@ -1625,10 +1643,10 @@ class NativeWorldModel(nn.Module):
 
         action_free_future = prior_state[:, cfg.T :]
 
-        def refine_factual(
+        def encode_factual(
             fine_values: torch.Tensor,
             coarse_values: torch.Tensor,
-        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
             encoded, encoded_mask = self.factual_action(
                 fine_values=fine_values,
                 fine_dim_mask=future_factual_fine_action_mask,
@@ -1641,21 +1659,32 @@ class NativeWorldModel(nn.Module):
                 group_mask=action_group_mask,
                 embodiment_ids=embodiment_ids,
             )
-            refined = action_free_future
             summary: Optional[torch.Tensor] = None
             if (
                 cfg.factual_action_residual_scale > 0.0
+                or cfg.render_factual_action_residual_scale is not None
                 or cfg.appearance_action_residual_scale > 0.0
             ):
                 weight = encoded_mask[..., None].to(dtype=encoded.dtype)
                 summary = (encoded * weight).sum(dim=2)
                 summary = summary / weight.sum(dim=2).clamp_min(1.0)
-            if cfg.factual_action_residual_scale > 0.0:
+            return encoded, encoded_mask, summary
+
+        def refine_factual(
+            encoded: torch.Tensor,
+            encoded_mask: torch.Tensor,
+            summary: Optional[torch.Tensor],
+            *,
+            repeats: int,
+            residual_scale: float,
+        ) -> torch.Tensor:
+            refined = action_free_future
+            if residual_scale > 0.0:
                 assert summary is not None
                 refined = refined + (
-                    cfg.factual_action_residual_scale * summary[:, :, None, :]
+                    residual_scale * summary[:, :, None, :]
                 )
-            for _ in range(cfg.factual_dynamics_repeats):
+            for _ in range(repeats):
                 for dynamics_block in self.dynamics_blocks:
                     refined = self._run(
                         dynamics_block,
@@ -1664,22 +1693,64 @@ class NativeWorldModel(nn.Module):
                         encoded_mask,
                         enabled=cfg.activation_checkpointing,
                     )
-            return self.state_norm(refined), summary
+            return self.state_norm(refined)
 
-        factual_future, factual_summary = refine_factual(
+        factual_encoded, factual_encoded_mask, factual_summary = encode_factual(
             future_factual_fine_action_values,
             future_factual_coarse_action_values,
         )
+        factual_future = refine_factual(
+            factual_encoded,
+            factual_encoded_mask,
+            factual_summary,
+            repeats=cfg.factual_dynamics_repeats,
+            residual_scale=cfg.factual_action_residual_scale,
+        )
+        render_repeats = (
+            cfg.factual_dynamics_repeats
+            if cfg.render_factual_dynamics_repeats is None
+            else cfg.render_factual_dynamics_repeats
+        )
+        render_residual_scale = (
+            cfg.factual_action_residual_scale
+            if cfg.render_factual_action_residual_scale is None
+            else cfg.render_factual_action_residual_scale
+        )
+        if (
+            render_repeats == cfg.factual_dynamics_repeats
+            and render_residual_scale == cfg.factual_action_residual_scale
+        ):
+            render_future = factual_future
+        else:
+            render_future = refine_factual(
+                factual_encoded,
+                factual_encoded_mask,
+                factual_summary,
+                repeats=render_repeats,
+                residual_scale=render_residual_scale,
+            )
         zero_action_pred_tokens: Optional[torch.Tensor] = None
         if compute_zero_action_control:
-            zero_action_future, _ = refine_factual(
+            zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
                 torch.zeros_like(future_factual_fine_action_values),
                 torch.zeros_like(future_factual_coarse_action_values),
+            )
+            zero_action_future = refine_factual(
+                zero_encoded,
+                zero_encoded_mask,
+                zero_summary,
+                repeats=cfg.factual_dynamics_repeats,
+                residual_scale=cfg.factual_action_residual_scale,
             )
             zero_action_pred_tokens = self.token_output(zero_action_future)
 
         action_free_pred_tokens = self.token_output(action_free_future)
         pred_tokens = self.token_output(factual_future)
+        render_pred_tokens = (
+            pred_tokens
+            if render_future is factual_future
+            else self.token_output(render_future)
+        )
         appearance_for_rgb: Optional[torch.Tensor] = None
         appearance_ratio = pred_tokens.new_zeros(())
         appearance_pred: Optional[torch.Tensor] = None
@@ -1694,7 +1765,7 @@ class NativeWorldModel(nn.Module):
             appearance_pred, appearance_pred_mask = self.appearance_dynamics(
                 appearance_context_tokens,
                 appearance_context_mask,
-                factual_future,
+                render_future,
                 relative_world_time,
                 target_appearance_mask,
                 factual_summary,
@@ -1762,14 +1833,14 @@ class NativeWorldModel(nn.Module):
                 action_normalization_scale,
             )
         )
-        output.update(self.geometry_head(factual_future))
+        output.update(self.geometry_head(render_future))
         rgb, rgb_indices = self._run(
             self.rgb_head,
-            pred_tokens,
+            render_pred_tokens,
             rgb_frame_indices,
             rgb_view_mask,
             appearance_for_rgb,
-            factual_future if cfg.appearance_enabled else None,
+            render_future if cfg.appearance_enabled else None,
             enabled=cfg.activation_checkpointing,
         )
         output["rgb"] = rgb

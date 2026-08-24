@@ -356,6 +356,8 @@ def test_streaming_data_contract_ignores_action_conditioning_residual_scales() -
         {
             "factual_dynamics_repeats": 3,
             "factual_action_residual_scale": 0.2,
+            "render_factual_dynamics_repeats": 1,
+            "render_factual_action_residual_scale": 0.0,
             "appearance_action_residual_scale": 0.5,
         }
     )

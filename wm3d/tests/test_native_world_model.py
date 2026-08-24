@@ -846,3 +846,40 @@ def test_zero_action_control_reuses_the_exact_factual_path() -> None:
         rtol=0,
         atol=0,
     )
+
+
+def test_render_refinement_is_stable_while_token_refinement_stays_causal() -> None:
+    reference_cfg = replace(
+        _tiny_config(),
+        factual_dynamics_repeats=1,
+        factual_action_residual_scale=0.0,
+        dropout=0.0,
+    )
+    split_cfg = replace(
+        reference_cfg,
+        factual_dynamics_repeats=2,
+        factual_action_residual_scale=0.3,
+        render_factual_dynamics_repeats=1,
+        render_factual_action_residual_scale=0.0,
+    )
+    torch.manual_seed(47)
+    reference = NativeWorldModel(reference_cfg).eval()
+    split = NativeWorldModel(split_cfg).eval()
+    split.load_state_dict(reference.state_dict(), strict=True)
+    batch = _batch(reference_cfg)
+
+    reference_output = reference(**batch)
+    split_output = split(**batch)
+
+    torch.testing.assert_close(split_output["rgb"], reference_output["rgb"])
+    torch.testing.assert_close(split_output["depth"], reference_output["depth"])
+    torch.testing.assert_close(split_output["point"], reference_output["point"])
+    torch.testing.assert_close(
+        split_output["camera_pose"], reference_output["camera_pose"]
+    )
+    torch.testing.assert_close(
+        split_output["policy_action_raw"], reference_output["policy_action_raw"]
+    )
+    assert not torch.allclose(
+        split_output["pred_tokens"], reference_output["pred_tokens"]
+    )
