@@ -41,8 +41,30 @@ DATA_CLOSURE_SCHEMA = "wm3d_v8_dataset_closure_v2"
 _PLACEHOLDER = re.compile(r"PENDING|MATERIALIZE_REQUIRED|__")
 
 
+_STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
+    "appearance_enabled",
+    "appearance_P",
+    "appearance_context_frames",
+    "appearance_hidden",
+    "appearance_layers",
+    "appearance_heads",
+    "appearance_ff_mult",
+    "appearance_action_residual_scale",
+    "factual_action_residual_scale",
+}
+
+
 class RuntimeContractError(ValueError):
     pass
+
+
+def _streaming_model_data_core(model_profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Return model fields that constrain an existing streaming-data seal."""
+    return {
+        name: item
+        for name, item in model_profile["model"].items()
+        if name not in _STREAMING_MODEL_DATA_NON_BINDING_FIELDS
+    }
 
 
 def canonical_sha256(value: object) -> str:
@@ -863,23 +885,8 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
             expected_sha256=str(closure["metadata_seal_sha256"]),
         )
         sealed_model = load_yaml(Path(str(metadata_seal["model_profile_path"])))
-        appearance_fields = {
-            "appearance_enabled",
-            "appearance_P",
-            "appearance_context_frames",
-            "appearance_hidden",
-            "appearance_layers",
-            "appearance_heads",
-            "appearance_ff_mult",
-        }
-        sealed_core = {
-            name: item for name, item in sealed_model["model"].items()
-            if name not in appearance_fields
-        }
-        runtime_core = {
-            name: item for name, item in model["model"].items()
-            if name not in appearance_fields
-        }
+        sealed_core = _streaming_model_data_core(sealed_model)
+        runtime_core = _streaming_model_data_core(model)
         if (
             sealed_model.get("schema") != model.get("schema")
             or sealed_model.get("architecture") != model.get("architecture")

@@ -10,6 +10,7 @@ import yaml
 
 from wm3d.training.runtime_contract import (
     RuntimeContractError,
+    _streaming_model_data_core,
     validate_direct_raw_data_closure,
     validate_runtime_profile,
 )
@@ -339,6 +340,29 @@ def test_direct_raw_closure_translates_to_the_sealed_metadata_contract(
     assert observed["encode_batch_frames"] == 8
     assert observed["decode_workers"] == 4
     assert "direct_prefetch_windows" not in observed
+
+
+def test_streaming_data_contract_ignores_action_conditioning_residual_scales() -> None:
+    sealed = {
+        "model": {
+            "T": 16,
+            "P": 256,
+            "K": 8,
+            "hidden_size": 1536,
+        }
+    }
+    runtime = copy.deepcopy(sealed)
+    runtime["model"].update(
+        {
+            "factual_action_residual_scale": 0.2,
+            "appearance_action_residual_scale": 0.5,
+        }
+    )
+
+    assert _streaming_model_data_core(sealed) == _streaming_model_data_core(runtime)
+
+    runtime["model"]["T"] = 32
+    assert _streaming_model_data_core(sealed) != _streaming_model_data_core(runtime)
 
 
 def test_direct_raw_closure_seals_ignored_action_dimensions(
