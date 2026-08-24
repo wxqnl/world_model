@@ -20,13 +20,13 @@ ROOT = Path(__file__).resolve().parents[1]
     "profile,total_steps,checkpoint_steps,checkpoint_interval,teacher_decay_steps",
     [
         ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000, 750),
-        ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000, 1_000),
+        ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000, 10_000),
         (
             "h200_64_fsdp2.yaml",
             600_000,
             [1_000, 5_000, 20_000],
             20_000,
-            1_000,
+            10_000,
         ),
     ],
 )
@@ -54,11 +54,11 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert model["model"]["rgb_res_blocks"] == 2
     assert model["model"]["rgb_decode_chunk_size"] == 2
     assert model["model"]["rgb_decode_indices"] == list(range(16))
-    assert model["model"]["factual_action_residual_scale"] == 0.2
-    assert model["model"]["appearance_action_residual_scale"] == 0.5
-    assert objective["objective"]["rgb_l1"] == 0.0
-    assert objective["objective"]["rgb_charbonnier"] == 1.5
-    assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.001
+    assert model["model"]["factual_action_residual_scale"] == 0.3
+    assert model["model"]["appearance_action_residual_scale"] == 0.1
+    assert objective["objective"]["rgb_l1"] == 0.5
+    assert objective["objective"]["rgb_charbonnier"] == 1.0
+    assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
     assert objective["objective"]["action_counterfactual_token_advantage"] == 1.0
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 1.0

@@ -48,7 +48,7 @@ train:
   rgb_perceptual_chunk_size: 8
   appearance_teacher_start_ratio: 1.0
   appearance_teacher_end_ratio: 0.0
-  appearance_teacher_decay_steps: 1000
+  appearance_teacher_decay_steps: 10000
   appearance_validation_three_way: true
 optimizer:
   name: adamw

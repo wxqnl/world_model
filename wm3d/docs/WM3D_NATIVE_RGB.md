@@ -55,9 +55,10 @@ appearance dynamics 都持续接受 MSE 与 cosine 监督，不会因为 teacher
 验证在同一批固定样本上同时记录 teacher0、当前线性 schedule 和 teacher1，直接量化
 appearance inference gap。step5000 的同样本探针没有支持“latent lerp 导致模糊”的假设：
 ratio=0.5 的结果优于按样本随机选两个 endpoint 的期望，因此正式 schedule 保留 lerp。
-另一方面，step5000 固定样本的 teacher0 短程训练能快速改善真实推理路径，所以 1B 正式
-profile 在前 500 step、5B 正式 profile 在前 1,000 step 完成 teacher1 到 teacher0 的
-切换，不再让 decoder 到 step10000 才完全暴露于预测 appearance latent。
+但 step5000 warm-start 探针不能决定从零训练的退火长度。从零 step500 对照中，500 步内
+退火到 teacher0 使同 seed validation 的 RGB L1 比 10,000 步退火差 11.2%，appearance
+MSE 约为 2.5 倍。因此 1B 正式 profile、5B validation 与 5B 正式 profile 均恢复在前
+10,000 step 完成 teacher1 到 teacher0 的切换；短 canary 仍用自己的显式短退火合同。
 
 正式模型与目标配置为：
 
@@ -71,13 +72,13 @@ profile 在前 500 step、5B 正式 profile 在前 1,000 step 完成 teacher1 �
 
 正式目标包含：
 
-- Charbonnier（权重 1.5、epsilon 1e-3）：保持颜色和绝对像素结构；
+- L1（权重 0.5）：直接约束颜色和绝对像素结构；
+- Charbonnier（权重 1.0、epsilon 1e-6）：提供稳定的鲁棒像素锚点；
 - spatial gradient：约束边缘；
 - VGG LPIPS：约束人眼感知的纹理与结构清晰度。
 
-RGB L1 仍逐步报告用于可比性，但优化权重为 0；旧的 `0.5*L1 + 1.0*Charbonnier`
-在 epsilon 1e-6 下几乎把同一绝对残差计算两遍，现配置用一个独立 epsilon 的
-Charbonnier 保留近似相同的像素梯度总尺度。
+从零 conditioning canary 没有提供同时改写像素目标的独立证据，因此正式配置保留已验证的
+`0.5*L1 + 1.0*Charbonnier`，避免把 RGB 目标变化与 action 因果干预混为一个实验变量。
 
 LPIPS 网络被冻结，不属于世界模型参数，也不进入 optimizer 或 checkpoint；梯度只从
 LPIPS 输入传回 native RGB decoder 与 token 输出层。LPIPS 必须来自封存的运行环境，

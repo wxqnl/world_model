@@ -1,9 +1,9 @@
 schema: wm3d_v8_objective_profile_v1
 name: stage0_native_dual_path
 objective:
-  # Keep L1 as a reported diagnostic, but avoid counting the same pixel
-  # residual twice in the optimized total.
-  rgb_l1: 0.0
+  # Retain the validated direct pixel anchor. A from-scratch step500 canary
+  # did not justify changing this jointly with the conditioning intervention.
+  rgb_l1: 0.5
   # LPIPS restores perceptual supervision; pixel and gradient terms remain
   # explicit anchors instead of being silently replaced.
   rgb_perceptual: 0.1
@@ -11,8 +11,8 @@ objective:
   token_cosine: 0.1
   appearance_mse: 1.0
   appearance_cosine: 0.1
-  rgb_charbonnier: 1.5
-  rgb_charbonnier_epsilon: 0.001
+  rgb_charbonnier: 1.0
+  rgb_charbonnier_epsilon: 0.000001
   rgb_gradient: 0.25
   depth_log: 1.5
   point: 0.5
