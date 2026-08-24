@@ -46,7 +46,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_323_627_059
+    assert model["expected_parameter_count"] == 5_536_215_416
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_P"] == 256
@@ -56,9 +56,12 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert model["model"]["rgb_decode_indices"] == list(range(16))
     assert model["model"]["factual_dynamics_repeats"] == 2
     assert model["model"]["factual_action_residual_scale"] == 0.3
-    assert model["model"]["render_factual_dynamics_repeats"] == 1
-    assert model["model"]["render_factual_action_residual_scale"] == 0.0
+    assert "render_factual_dynamics_repeats" not in model["model"]
+    assert "render_factual_action_residual_scale" not in model["model"]
     assert model["model"]["appearance_action_residual_scale"] == 0.0
+    assert model["model"]["rgb_context_enabled"] is True
+    assert model["model"]["rgb_context_residual_scale"] == 0.75
+    assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
     assert objective["objective"]["rgb_l1"] == 0.5
     assert objective["objective"]["rgb_charbonnier"] == 1.0
     assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
@@ -67,6 +70,9 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
     assert objective["objective"]["rgb_perceptual"] == 0.1
+    assert objective["objective"]["rgb_motion_l1"] == 1.0
+    assert objective["objective"]["rgb_motion_bce"] == 0.03
+    assert objective["objective"]["rgb_motion_dice"] == 0.03
     assert objective["objective"]["appearance_mse"] == 1.0
     assert objective["objective"]["appearance_cosine"] == 0.1
     assert runtime["expected_world_size"] == 64

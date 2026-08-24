@@ -197,6 +197,28 @@ def test_declared_lanes_only_use_sources_active_in_eval_split(tmp_path: Path) ->
         validate_eval_coverage(metrics, expected_lanes=coarse_active)
 
 
+def test_rgb_quality_metrics_report_static_and_motion_regions_separately() -> None:
+    context = torch.zeros(1, 1, 3, 16, 16)
+    target = context[:, None].clone()
+    target[..., 4:8, 4:8] = 1.0
+    batch = {
+        "context_rgb": context,
+        "context_rgb_mask": torch.ones(1, 1, dtype=torch.bool),
+        "target_rgb": target,
+        "target_rgb_mask": torch.ones(1, 1, 1, 1, 1, 1, dtype=torch.bool),
+    }
+
+    unchanged = rgb_quality_metrics({"rgb": context[:, None]}, batch)
+
+    assert unchanged["rgb_eval_motion_fraction"].item() == pytest.approx(0.0625)
+    assert unchanged["rgb_eval_motion_l1"].item() == pytest.approx(1.0)
+    assert unchanged["rgb_eval_static_l1"].item() == pytest.approx(0.0)
+    exact = rgb_quality_metrics({"rgb": target.clone()}, batch)
+    assert exact["rgb_eval_motion_l1"].item() == pytest.approx(0.0)
+    assert exact["rgb_eval_static_l1"].item() == pytest.approx(0.0)
+    assert exact["rgb_eval_motion_psnr_db"].item() == pytest.approx(100.0)
+
+
 def test_rgb_quality_metrics_and_demo_export(tmp_path: Path) -> None:
     target_rgb = torch.linspace(0.0, 1.0, 16 * 16).reshape(1, 1, 1, 1, 16, 16)
     target_rgb = target_rgb.expand(-1, 2, -1, 3, -1, -1).contiguous()

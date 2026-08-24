@@ -54,6 +54,9 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "factual_action_residual_scale",
     "render_factual_dynamics_repeats",
     "render_factual_action_residual_scale",
+    "rgb_context_enabled",
+    "rgb_context_residual_scale",
+    "rgb_context_motion_blend_gain",
 }
 
 

@@ -115,6 +115,9 @@ class NativeWorldModelConfig:
     rgb_decode_chunk_size: int = 4
     rgb_size: int = 384
     rgb_decode_indices: tuple[int, ...] = tuple(range(16))
+    rgb_context_enabled: bool = False
+    rgb_context_residual_scale: float = 0.75
+    rgb_context_motion_blend_gain: float = 0.5
     geom_hidden: int = 768
 
     # Optional high-resolution, per-view appearance lane.  The geometry/action
@@ -199,6 +202,20 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_decode_indices must be unique and increasing")
         if any(index < 0 or index >= self.K for index in self.rgb_decode_indices):
             raise ValueError("rgb_decode_indices must refer to future world-state steps")
+        if not isinstance(self.rgb_context_enabled, bool):
+            raise ValueError("rgb_context_enabled must be boolean")
+        if (
+            not isfinite(self.rgb_context_residual_scale)
+            or self.rgb_context_residual_scale <= 0.0
+        ):
+            raise ValueError("rgb_context_residual_scale must be finite and positive")
+        if (
+            not isfinite(self.rgb_context_motion_blend_gain)
+            or self.rgb_context_motion_blend_gain < 0.0
+        ):
+            raise ValueError(
+                "rgb_context_motion_blend_gain must be finite and non-negative"
+            )
         if not isinstance(self.appearance_enabled, bool):
             raise ValueError("appearance_enabled must be boolean")
         if self.appearance_enabled:
@@ -1182,6 +1199,208 @@ class NativeRGBImageDecoder(nn.Module):
         return torch.sigmoid(self.output(value))
 
 
+def _rgb_norm_groups(channels: int) -> int:
+    for groups in (32, 16, 8, 4, 2):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class _RGBConvBlock(nn.Module):
+    def __init__(self, input_channels: int, output_channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(input_channels, output_channels, 3, padding=1),
+            nn.GroupNorm(_rgb_norm_groups(output_channels), output_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(output_channels, output_channels, 3, padding=1),
+            nn.GroupNorm(_rgb_norm_groups(output_channels), output_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.net(value)
+
+
+class _RGBDownBlock(nn.Module):
+    def __init__(self, input_channels: int, output_channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(
+                input_channels, output_channels, 3, stride=2, padding=1
+            ),
+            nn.GroupNorm(_rgb_norm_groups(output_channels), output_channels),
+            nn.SiLU(inplace=True),
+            _RGBConvBlock(output_channels, output_channels),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.net(value)
+
+
+class _RGBUpBlock(nn.Module):
+    def __init__(self, input_channels: int, output_channels: int):
+        super().__init__()
+        self.conv = _RGBConvBlock(input_channels, output_channels)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        value = F.interpolate(
+            value, scale_factor=2.0, mode="bilinear", align_corners=False
+        )
+        return self.conv(value)
+
+
+class NativeContextRGBImageDecoder(nn.Module):
+    """Preserve observed detail and learn only future RGB changes."""
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.grid = isqrt(cfg.appearance_P if cfg.appearance_enabled else cfg.P)
+        self.geometry_grid = isqrt(cfg.P)
+        stages = (cfg.rgb_size // self.grid).bit_length() - 1
+        self.decode_grid = cfg.rgb_size // (1 << stages)
+        if stages == 5:
+            channels = (
+                cfg.rgb_hidden,
+                cfg.rgb_hidden,
+                cfg.rgb_hidden // 2,
+                cfg.rgb_hidden // 4,
+                cfg.rgb_hidden // 4,
+                cfg.rgb_hidden // 8,
+            )
+        elif stages == 4:
+            channels = (
+                cfg.rgb_hidden,
+                cfg.rgb_hidden,
+                cfg.rgb_hidden // 2,
+                cfg.rgb_hidden // 4,
+                cfg.rgb_hidden // 8,
+            )
+        else:
+            channels = tuple(
+                [cfg.rgb_hidden]
+                + [
+                    max(cfg.rgb_hidden >> index, cfg.rgb_hidden // 8)
+                    for index in range(stages)
+                ]
+            )
+        self.token_stem = nn.Sequential(
+            nn.Conv2d(cfg.token_dim, channels[0], 1),
+            nn.GroupNorm(_rgb_norm_groups(channels[0]), channels[0]),
+            nn.SiLU(inplace=True),
+            _RGBConvBlock(channels[0], channels[0]),
+        )
+        self.geometry_stem = (
+            nn.Conv2d(cfg.state_hidden, channels[0], 1, bias=False)
+            if cfg.appearance_enabled
+            else None
+        )
+        context_channels = tuple(reversed(channels))
+        self.context_stem = _RGBConvBlock(3, context_channels[0])
+        self.context_downs = nn.ModuleList(
+            _RGBDownBlock(input_channels, output_channels)
+            for input_channels, output_channels in zip(
+                context_channels, context_channels[1:]
+            )
+        )
+        self.bottleneck_fuse = _RGBConvBlock(
+            channels[0] + context_channels[-1], channels[0]
+        )
+        self.ups = nn.ModuleList(
+            _RGBUpBlock(input_channels, output_channels)
+            for input_channels, output_channels in zip(channels, channels[1:])
+        )
+        self.skip_fuses = nn.ModuleList(
+            _RGBConvBlock(output_channels * 2, output_channels)
+            for output_channels in channels[1:]
+        )
+        self.head = nn.Conv2d(channels[-1], 7, 3, padding=1)
+        self.motion_head = nn.Conv2d(channels[-1], 1, 3, padding=1)
+        nn.init.zeros_(self.motion_head.weight)
+        nn.init.constant_(self.motion_head.bias, -4.0)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        view_embedding: torch.Tensor,
+        geometry_tokens: Optional[torch.Tensor],
+        context_rgb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if tuple(context_rgb.shape[1:]) != (
+            3,
+            self.cfg.rgb_size,
+            self.cfg.rgb_size,
+        ):
+            raise ValueError("context RGB must be [N,3,rgb_size,rgb_size]")
+        value = tokens.transpose(1, 2).reshape(
+            tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
+        )
+        value = self.token_stem(value) + view_embedding
+        if self.geometry_stem is not None:
+            if geometry_tokens is None or tuple(geometry_tokens.shape[1:]) != (
+                self.cfg.P,
+                self.cfg.state_hidden,
+            ):
+                raise ValueError("dual-path RGB decoder requires native geometry tokens")
+            geometry = geometry_tokens.transpose(1, 2).reshape(
+                geometry_tokens.shape[0],
+                self.cfg.state_hidden,
+                self.geometry_grid,
+                self.geometry_grid,
+            )
+            geometry = self.geometry_stem(geometry)
+            if self.geometry_grid != self.grid:
+                geometry = F.interpolate(
+                    geometry.float(),
+                    size=(self.grid, self.grid),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=value.dtype)
+            value = value + geometry
+        if self.decode_grid != self.grid:
+            value = F.interpolate(
+                value.float(),
+                size=(self.decode_grid, self.decode_grid),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=tokens.dtype)
+
+        context = context_rgb.to(dtype=value.dtype)
+        skips = [self.context_stem(context)]
+        for downsample in self.context_downs:
+            skips.append(downsample(skips[-1]))
+        if skips[-1].shape[-2:] != value.shape[-2:]:
+            raise ValueError("context pyramid does not align with RGB token grid")
+        value = self.bottleneck_fuse(torch.cat((value, skips[-1]), dim=1))
+        for upsample, fuse, skip in zip(
+            self.ups, self.skip_fuses, reversed(skips[:-1])
+        ):
+            value = upsample(value)
+            value = fuse(torch.cat((value, skip), dim=1))
+
+        raw = self.head(value)
+        direct = torch.sigmoid(raw[:, :3])
+        residual = (
+            torch.tanh(raw[:, 3:6])
+            * float(self.cfg.rgb_context_residual_scale)
+        )
+        motion_logit = self.motion_head(value)
+        motion_hint = torch.sigmoid(motion_logit)
+        blend = torch.sigmoid(raw[:, 6:7])
+        if self.cfg.rgb_context_motion_blend_gain > 0.0:
+            blend = torch.clamp(
+                blend
+                + motion_hint.to(dtype=blend.dtype)
+                * float(self.cfg.rgb_context_motion_blend_gain),
+                0.0,
+                1.0,
+            )
+        residual_rgb = torch.clamp(context + residual, 0.0, 1.0)
+        rgb = blend * direct + (1.0 - blend) * residual_rgb
+        return rgb, motion_logit, blend
+
+
 class NativeRGBDecoder(nn.Module):
     """Restore the V7 native token-to-pixel path with bounded image chunks."""
 
@@ -1192,7 +1411,11 @@ class NativeRGBDecoder(nn.Module):
             torch.empty(cfg.num_views, cfg.rgb_hidden, 1, 1)
         )
         nn.init.normal_(self.view_embed, std=0.02)
-        image_decoder: nn.Module = NativeRGBImageDecoder(cfg)
+        image_decoder: nn.Module
+        if cfg.rgb_context_enabled:
+            image_decoder = NativeContextRGBImageDecoder(cfg)
+        else:
+            image_decoder = NativeRGBImageDecoder(cfg)
         if cfg.activation_checkpointing:
             image_decoder = checkpoint_wrapper(image_decoder)
         self.image_decoder = image_decoder
@@ -1207,7 +1430,9 @@ class NativeRGBDecoder(nn.Module):
         target_view_mask: Optional[torch.Tensor] = None,
         appearance_tokens: Optional[torch.Tensor] = None,
         geometry_state: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        context_rgb: Optional[torch.Tensor] = None,
+        context_rgb_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         indices = tuple(
             self.cfg.rgb_decode_indices if frame_indices is None else frame_indices
         )
@@ -1225,7 +1450,15 @@ class NativeRGBDecoder(nn.Module):
                 self.cfg.rgb_size,
                 self.cfg.rgb_size,
             )
-            return empty, index_tensor
+            empty_aux = future_tokens.new_empty(
+                future_tokens.shape[0],
+                0,
+                self.cfg.num_views,
+                1,
+                self.cfg.rgb_size,
+                self.cfg.rgb_size,
+            )
+            return empty, index_tensor, empty_aux, empty_aux
         views = self.cfg.num_views
         expanded_geometry: Optional[torch.Tensor] = None
         if self.cfg.appearance_enabled:
@@ -1259,6 +1492,36 @@ class NativeRGBDecoder(nn.Module):
             expanded = expanded.reshape(batch * frames * views, patches, token_dim)
         view_ids = torch.arange(views, device=future_tokens.device)
         view_ids = view_ids.view(1, 1, views).expand(batch, frames, -1).reshape(-1)
+        expanded_context: Optional[torch.Tensor] = None
+        context_valid: Optional[torch.Tensor] = None
+        if self.cfg.rgb_context_enabled:
+            expected_context = (
+                batch,
+                views,
+                3,
+                self.cfg.rgb_size,
+                self.cfg.rgb_size,
+            )
+            if context_rgb is None or tuple(context_rgb.shape) != expected_context:
+                raise ValueError(f"context_rgb must be {expected_context}")
+            if context_rgb_mask is None or tuple(context_rgb_mask.shape) != (
+                batch,
+                views,
+            ):
+                raise ValueError("context_rgb_mask must be [B,V]")
+            expanded_context = context_rgb[:, None].expand(
+                -1, frames, -1, -1, -1, -1
+            ).reshape(
+                batch * frames * views,
+                3,
+                self.cfg.rgb_size,
+                self.cfg.rgb_size,
+            )
+            context_valid = context_rgb_mask[:, None].expand(
+                -1, frames, -1
+            ).reshape(-1).bool()
+        elif context_rgb is not None or context_rgb_mask is not None:
+            raise ValueError("context RGB was supplied to a non-context renderer")
         if target_view_mask is None:
             valid = torch.ones(
                 batch * frames * views, dtype=torch.bool, device=future_tokens.device
@@ -1267,6 +1530,8 @@ class NativeRGBDecoder(nn.Module):
             if tuple(target_view_mask.shape) != (batch, frames, views):
                 raise ValueError("target_view_mask must be [B,F,V]")
             valid = target_view_mask.reshape(-1).bool()
+        if context_valid is not None:
+            valid = valid & context_valid
         # ``image_decoder`` is an FSDP unit.  Every rank must therefore call it
         # the same number of times in the same order.  Chunking only the valid
         # views made that call count data-dependent: a rank with one additional
@@ -1281,13 +1546,15 @@ class NativeRGBDecoder(nn.Module):
             batch * frames * views, device=future_tokens.device
         )
         decoded_chunks: list[torch.Tensor] = []
+        motion_chunks: list[torch.Tensor] = []
+        blend_chunks: list[torch.Tensor] = []
         for start in range(
             0, int(dense_indices.numel()), self.cfg.rgb_decode_chunk_size
         ):
             chunk_indices = dense_indices[
                 start : start + self.cfg.rgb_decode_chunk_size
             ]
-            decoded = self.image_decoder(
+            decoder_inputs = (
                 expanded.index_select(0, chunk_indices),
                 self.view_embed.index_select(
                     0, view_ids.index_select(0, chunk_indices)
@@ -1297,18 +1564,40 @@ class NativeRGBDecoder(nn.Module):
                     expanded_geometry.index_select(0, chunk_indices)
                 ),
             )
-            decoded_chunks.append(
-                decoded
-                * valid.index_select(0, chunk_indices)[:, None, None, None].to(
-                    dtype=decoded.dtype
+            if self.cfg.rgb_context_enabled:
+                assert expanded_context is not None
+                decoded, motion_logit, blend = self.image_decoder(
+                    *decoder_inputs,
+                    expanded_context.index_select(0, chunk_indices),
                 )
+            else:
+                decoded = self.image_decoder(*decoder_inputs)
+                motion_logit = decoded.new_zeros(
+                    decoded.shape[0], 1, decoded.shape[-2], decoded.shape[-1]
+                )
+                blend = torch.zeros_like(motion_logit)
+            chunk_valid = valid.index_select(0, chunk_indices)[
+                :, None, None, None
+            ]
+            decoded_chunks.append(decoded * chunk_valid.to(dtype=decoded.dtype))
+            motion_chunks.append(
+                motion_logit * chunk_valid.to(dtype=motion_logit.dtype)
             )
+            blend_chunks.append(blend * chunk_valid.to(dtype=blend.dtype))
         dense = torch.cat(decoded_chunks, dim=0)
+        dense_motion = torch.cat(motion_chunks, dim=0)
+        dense_blend = torch.cat(blend_chunks, dim=0)
         return (
             dense.view(
                 batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
             ),
             index_tensor,
+            dense_motion.view(
+                batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            ),
+            dense_blend.view(
+                batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            ),
         )
 
 
@@ -1503,6 +1792,8 @@ class NativeWorldModel(nn.Module):
         aux_type_ids: Optional[torch.Tensor] = None,
         rgb_frame_indices: Optional[Sequence[int]] = None,
         rgb_view_mask: Optional[torch.Tensor] = None,
+        context_rgb: Optional[torch.Tensor] = None,
+        context_rgb_mask: Optional[torch.Tensor] = None,
         appearance_context_tokens: Optional[torch.Tensor] = None,
         appearance_context_mask: Optional[torch.Tensor] = None,
         target_appearance_tokens: Optional[torch.Tensor] = None,
@@ -1834,17 +2125,22 @@ class NativeWorldModel(nn.Module):
             )
         )
         output.update(self.geometry_head(render_future))
-        rgb, rgb_indices = self._run(
+        rgb, rgb_indices, rgb_motion_logit, rgb_blend = self._run(
             self.rgb_head,
             render_pred_tokens,
             rgb_frame_indices,
             rgb_view_mask,
             appearance_for_rgb,
             render_future if cfg.appearance_enabled else None,
+            context_rgb,
+            context_rgb_mask,
             enabled=cfg.activation_checkpointing,
         )
         output["rgb"] = rgb
         output["rgb_frame_indices"] = rgb_indices
+        if cfg.rgb_context_enabled:
+            output["rgb_motion_logit"] = rgb_motion_logit
+            output["rgb_blend"] = rgb_blend
         return output
 
     def iter_fsdp_units(self) -> Iterable[nn.Module]:

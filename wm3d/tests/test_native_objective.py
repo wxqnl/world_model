@@ -28,6 +28,80 @@ def test_rgb_charbonnier_uses_its_own_meaningful_epsilon() -> None:
         NativeObjectiveConfig(rgb_charbonnier_epsilon=0.0).validate()
 
 
+def test_rgb_motion_objective_separates_static_and_changed_pixels() -> None:
+    rgb = torch.zeros(1, 1, 1, 3, 2, 2, requires_grad=True)
+    motion_logit = torch.zeros(1, 1, 1, 1, 2, 2, requires_grad=True)
+    target_rgb = torch.zeros_like(rgb)
+    target_rgb[..., 0, 0] = 1.0
+    policy = torch.zeros(1, 1, 1, 1)
+    output = {
+        "pred_tokens": torch.zeros(1, 1, 1, 2),
+        "rgb": rgb,
+        "rgb_motion_logit": motion_logit,
+        "depth": torch.ones(1, 1, 1, 1),
+        "point": torch.zeros(1, 1, 1, 1, 3),
+        "camera_pose": torch.zeros(1, 1, 1, 9),
+        "policy_action_raw": policy,
+        "policy_action_normalized": policy,
+        "policy_action": policy,
+        "policy_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "policy_gripper_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_binary_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_query_dt": torch.tensor([[[0.5]]]),
+    }
+    batch = {
+        "target_tokens": torch.zeros(1, 1, 1, 2),
+        "target_rgb": target_rgb,
+        "target_rgb_mask": torch.ones(1, 1, 1, 1, 1, 1, dtype=torch.bool),
+        "context_rgb": torch.zeros(1, 1, 3, 2, 2),
+        "context_rgb_mask": torch.ones(1, 1, dtype=torch.bool),
+        "target_fine_action": torch.zeros_like(policy),
+        "target_fine_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "future_world_boundaries_dt": torch.tensor([[0.0, 1.0]]),
+        "composition_operator_ids": torch.tensor(
+            [[[COMPOSITION_OPERATOR_IDS["last"]]]]
+        ),
+        "target_coarse_action_normalized": torch.zeros(1, 1, 1, 1),
+        "target_coarse_action_mask": torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        "action_normalization_offset": torch.zeros(1, 1, 1),
+        "action_normalization_scale": torch.ones(1, 1, 1),
+    }
+    losses = compute_native_objective(
+        output=output,
+        batch=batch,
+        config=NativeObjectiveConfig(
+            token_mse=0.0,
+            token_cosine=0.0,
+            rgb_l1=0.0,
+            rgb_charbonnier=0.0,
+            rgb_gradient=0.0,
+            rgb_motion_l1=1.0,
+            rgb_motion_bce=1.0,
+            rgb_motion_dice=1.0,
+            rgb_motion_pos_weight=2.0,
+            rgb_motion_threshold=0.03,
+            rgb_motion_gain=3.0,
+            depth_log=0.0,
+            point=0.0,
+            camera_pose=0.0,
+            action_fine=0.0,
+            action_coarse=0.0,
+        ),
+    )
+
+    assert losses["rgb_motion_fraction"].item() == pytest.approx(0.25)
+    assert losses["rgb_motion_region_l1"].item() == pytest.approx(1.0)
+    assert losses["rgb_static_region_l1"].item() == pytest.approx(0.0)
+    assert losses["rgb_motion_l1"].item() == pytest.approx(1.0)
+    assert losses["rgb_motion_bce"].item() == pytest.approx(
+        1.25 * torch.log(torch.tensor(2.0)).item()
+    )
+    assert losses["rgb_motion_dice"].item() == pytest.approx(2.0 / 3.0)
+    losses["total"].backward()
+    assert rgb.grad is not None and rgb.grad.abs().sum() > 0
+    assert motion_logit.grad is not None and motion_logit.grad.abs().sum() > 0
+
+
 def test_factual_zero_advantage_updates_both_sides_of_the_ranking() -> None:
     factual = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)
     zero_action = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)

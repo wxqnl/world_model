@@ -438,6 +438,8 @@ _MODEL_INPUTS = {
 }
 
 _APPEARANCE_MODEL_INPUTS = (
+    "context_rgb",
+    "context_rgb_mask",
     "appearance_context_tokens",
     "appearance_context_mask",
     "target_appearance_tokens",

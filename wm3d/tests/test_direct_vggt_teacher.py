@@ -129,7 +129,8 @@ def _raw_batch() -> dict[str, torch.Tensor]:
 def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
     backend = _FakeNativeVGGT()
     adapter = _adapter(backend)
-    result = adapter.materialize(_raw_batch())
+    batch = _raw_batch()
+    result = adapter.materialize(batch)
 
     assert "direct_rgb_uint8" not in result
     assert "direct_view_mask" not in result
@@ -140,8 +141,19 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
     assert result["target_depth"].shape == (2, 2, 3, 4)
     assert result["target_point"].shape == (2, 2, 3, 4, 3)
     assert result["target_camera_pose"].shape == (2, 2, 3, 9)
+    assert result["context_rgb"].shape == (2, 3, 3, 8, 8)
+    assert result["context_rgb_mask"].shape == (2, 3)
+    assert bool(result["context_rgb_mask"].all())
     assert result["target_rgb"].shape == (2, 2, 3, 3, 8, 8)
     assert result["target_rgb_mask"].shape == (2, 2, 3, 1, 1, 1)
+    expected_context = F.interpolate(
+        batch["direct_rgb_uint8"][:, 1].reshape(6, 3, 56, 56).float().div(255.0),
+        size=(8, 8),
+        mode="bilinear",
+        align_corners=False,
+    ).reshape(2, 3, 3, 8, 8)
+    expected_context = expected_context.mul(255).round().div(255)
+    torch.testing.assert_close(result["context_rgb"], expected_context)
     assert not bool(result["target_depth_mask"][0, 0, 2].any())
     assert not bool(result["target_camera_pose_mask"][1, 1, 1])
     assert backend.calls == [3, 3, 2]
@@ -156,14 +168,34 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
         appearance_rows,
         torch.tensor([[False, True, True, True, False, True, True, True]]),
     )
-    torch.testing.assert_close(rgb_rows, geometry_rows)
+    torch.testing.assert_close(rgb_rows, torch.ones_like(rgb_rows))
     assert adapter.metrics["encoded_rows"] == 8
     assert adapter.metrics["encode_calls"] == 3
     assert adapter.metrics["geometry_head_rows"] == 4
     assert adapter.metrics["appearance_pool_rows"] == 6
-    assert adapter.metrics["rgb_resize_rows"] == 4
+    assert adapter.metrics["rgb_resize_rows"] == 8
     assert all(not parameter.requires_grad for parameter in adapter.parameters())
     assert not torch.is_inference(result["world_tokens"])
+
+
+def test_direct_teacher_uses_latest_available_context_per_view() -> None:
+    batch = _raw_batch()
+    batch["direct_view_mask"][0, 1, 2] = False
+    batch["direct_view_mask"][1, :2, 1] = False
+    result = _adapter(_FakeNativeVGGT()).materialize(batch)
+
+    assert bool(result["context_rgb_mask"][0, 2])
+    assert not bool(result["context_rgb_mask"][1, 1])
+    assert not bool(result["target_rgb_mask"][1, :, 1].any())
+    expected_fallback = F.interpolate(
+        batch["direct_rgb_uint8"][0, 0, 2].float().div(255.0)[None],
+        size=(8, 8),
+        mode="bilinear",
+        align_corners=False,
+    )[0]
+    expected_fallback = expected_fallback.mul(255).round().div(255)
+    torch.testing.assert_close(result["context_rgb"][0, 2], expected_fallback)
+    assert result["context_rgb"][1, 1].count_nonzero() == 0
 
 
 def test_direct_teacher_halves_only_the_encoder_chunk_after_oom() -> None:

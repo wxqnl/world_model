@@ -130,6 +130,7 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         )
         appearance_row_mask[:, appearance_start:] = True
         rgb_row_mask = torch.zeros_like(geometry_row_mask)
+        rgb_row_mask[:, : self.config.context_frames] = True
         for future_index in self.config.rgb_decode_indices:
             rgb_row_mask[:, self.config.context_frames + future_index] = True
         flat_geometry_rows = geometry_row_mask.reshape(batch * length)
@@ -342,6 +343,32 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         future_tokens = encoded["view_tokens"][:, future]
         future_confidence = encoded["geometry_confidence"][:, future]
         future_view_mask = encoded["view_mask"][:, future].bool()
+        context_view_mask = encoded["view_mask"][:, context].bool()
+        context_positions = torch.arange(
+            self.config.context_frames,
+            dtype=torch.long,
+            device=context_view_mask.device,
+        )[None, :, None]
+        latest_context_index = torch.where(
+            context_view_mask,
+            context_positions,
+            -1,
+        ).amax(dim=1)
+        context_rgb_mask = latest_context_index >= 0
+        context_rgb_source = encoded["rgb"][:, context]
+        context_rgb_gather = latest_context_index.clamp_min(0)[
+            :, None, :, None, None, None
+        ].expand(
+            -1,
+            1,
+            -1,
+            3,
+            context_rgb_source.shape[-2],
+            context_rgb_source.shape[-1],
+        )
+        context_rgb = context_rgb_source.gather(1, context_rgb_gather).squeeze(1)
+        context_rgb = context_rgb.float().div_(255.0)
+        context_rgb = context_rgb * context_rgb_mask[..., None, None, None]
         target_tokens, target_token_mask = self._fuse_future_tokens(
             future_tokens,
             future_confidence,
@@ -380,7 +407,9 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         future_rgb = encoded["rgb"][:, future].index_select(
             1, rgb_indices
         )
-        future_rgb_mask = future_view_mask.index_select(1, rgb_indices)
+        future_rgb_mask = future_view_mask.index_select(
+            1, rgb_indices
+        ) & context_rgb_mask[:, None]
         result = dict(batch)
         result.pop("direct_rgb_uint8", None)
         result.pop("direct_view_mask", None)
@@ -415,6 +444,8 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
                 "target_point_mask": point_mask,
                 "target_camera_pose": target_camera,
                 "target_camera_pose_mask": camera_mask,
+                "context_rgb": context_rgb,
+                "context_rgb_mask": context_rgb_mask,
                 "target_rgb": future_rgb.float().div_(255.0),
                 "target_rgb_mask": future_rgb_mask[
                     ..., None, None, None

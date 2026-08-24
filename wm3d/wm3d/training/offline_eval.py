@@ -66,6 +66,9 @@ _COVERAGE_WEIGHTS = {
         "rgb_charbonnier",
         "rgb_gradient",
         "rgb_perceptual",
+        "rgb_motion_l1",
+        "rgb_motion_bce",
+        "rgb_motion_dice",
     ),
     "depth_supervised_elements": ("depth_log",),
     "point_supervised_elements": ("point",),
@@ -220,6 +223,8 @@ def validate_eval_coverage(
 def rgb_quality_metrics(
     output: dict[str, torch.Tensor] | Any,
     batch: dict[str, torch.Tensor] | Any,
+    *,
+    motion_threshold: float = 0.03,
 ) -> dict[str, torch.Tensor]:
     """Return image-weighted PSNR/SSIM for fully supervised RGB frames."""
 
@@ -240,6 +245,36 @@ def rgb_quality_metrics(
     valid = torch.nonzero(image_all, as_tuple=False).flatten()
     if valid.numel() == 0:
         raise OfflineEvalError("RGB quality metrics have no supervised images")
+    motion_mask: torch.Tensor | None = None
+    if "context_rgb" in batch:
+        context_rgb = batch["context_rgb"].float().clamp(0.0, 1.0)
+        expected_context = (
+            target.shape[0],
+            target.shape[2],
+            *target.shape[3:],
+        )
+        if tuple(context_rgb.shape) != expected_context:
+            raise OfflineEvalError("context RGB does not align to RGB eval targets")
+        context_rgb_mask = batch.get(
+            "context_rgb_mask",
+            torch.ones(
+                target.shape[0],
+                target.shape[2],
+                dtype=torch.bool,
+                device=target.device,
+            ),
+        ).bool()
+        if tuple(context_rgb_mask.shape) != target.shape[:1] + target.shape[2:3]:
+            raise OfflineEvalError("context RGB mask must be [B,V]")
+        motion_mask = (target - context_rgb[:, None]).abs().mean(
+            dim=3, keepdim=True
+        ) > motion_threshold
+        motion_mask = (
+            motion_mask & mask.bool() & context_rgb_mask[:, None, :, None, None, None]
+        )
+        motion_mask = motion_mask.reshape(
+            -1, 1, target.shape[-2], target.shape[-1]
+        ).index_select(0, valid)
     prediction = prediction.reshape(-1, *prediction.shape[-3:]).index_select(0, valid)
     target = target.reshape(-1, *target.shape[-3:]).index_select(0, valid)
     per_image_mse = (prediction - target).square().mean(dim=(1, 2, 3))
@@ -267,7 +302,62 @@ def rgb_quality_metrics(
         (mu_prediction.square() + mu_target.square() + c1)
         * (prediction_variance + target_variance + c2)
     ).clamp_min(1.0e-12)
-    return {"rgb_psnr_db": psnr.mean(), "rgb_ssim": ssim.mean()}
+    metrics = {"rgb_psnr_db": psnr.mean(), "rgb_ssim": ssim.mean()}
+    if motion_mask is None:
+        return metrics
+
+    def region_mean(value: torch.Tensor, region: torch.Tensor) -> torch.Tensor:
+        weight = torch.broadcast_to(region, value.shape).to(dtype=value.dtype)
+        numerator = (value * weight).flatten(1).sum(dim=1)
+        denominator = weight.flatten(1).sum(dim=1)
+        sample_valid = denominator > 0
+        if not bool(sample_valid.any()):
+            return value.new_zeros(())
+        return (numerator[sample_valid] / denominator[sample_valid]).mean()
+
+    static_mask = ~motion_mask
+    absolute_error = (prediction - target).abs()
+    squared_error = (prediction - target).square()
+    motion_mse = region_mean(squared_error, motion_mask)
+    static_mse = region_mean(squared_error, static_mask)
+    motion_ssim_mask = F.avg_pool2d(motion_mask.float(), kernel, stride=1) > 0.0
+    static_ssim_mask = F.avg_pool2d(motion_mask.float(), kernel, stride=1) == 0.0
+    pred_dy, pred_dx = (
+        prediction[..., 1:, :] - prediction[..., :-1, :],
+        prediction[..., :, 1:] - prediction[..., :, :-1],
+    )
+    target_dy, target_dx = (
+        target[..., 1:, :] - target[..., :-1, :],
+        target[..., :, 1:] - target[..., :, :-1],
+    )
+    motion_dy = motion_mask[..., 1:, :] | motion_mask[..., :-1, :]
+    motion_dx = motion_mask[..., :, 1:] | motion_mask[..., :, :-1]
+    static_dy = (~motion_mask[..., 1:, :]) & (~motion_mask[..., :-1, :])
+    static_dx = (~motion_mask[..., :, 1:]) & (~motion_mask[..., :, :-1])
+    metrics.update(
+        {
+            "rgb_eval_motion_fraction": motion_mask.float().mean(),
+            "rgb_eval_motion_l1": region_mean(absolute_error, motion_mask),
+            "rgb_eval_static_l1": region_mean(absolute_error, static_mask),
+            "rgb_eval_motion_psnr_db": -10.0
+            * torch.log10(motion_mse.clamp_min(1.0e-10)),
+            "rgb_eval_static_psnr_db": -10.0
+            * torch.log10(static_mse.clamp_min(1.0e-10)),
+            "rgb_eval_motion_ssim": region_mean(ssim, motion_ssim_mask),
+            "rgb_eval_static_ssim": region_mean(ssim, static_ssim_mask),
+            "rgb_eval_motion_gradient": 0.5
+            * (
+                region_mean((pred_dy - target_dy).abs(), motion_dy)
+                + region_mean((pred_dx - target_dx).abs(), motion_dx)
+            ),
+            "rgb_eval_static_gradient": 0.5
+            * (
+                region_mean((pred_dy - target_dy).abs(), static_dy)
+                + region_mean((pred_dx - target_dx).abs(), static_dx)
+            ),
+        }
+    )
+    return metrics
 
 
 def _rgb_tile(value: torch.Tensor) -> Image.Image:
@@ -515,9 +605,7 @@ def main() -> None:
         )
         input_adapter = None
         if config["data_closure"].get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
-            input_adapter = build_direct_vggt_teacher(
-                config, device=context.device
-            )
+            input_adapter = build_direct_vggt_teacher(config, device=context.device)
             input_adapter.eval()
         loader = _make_loader(
             dataset,
@@ -559,7 +647,13 @@ def main() -> None:
                             runtime["train"].get("rgb_perceptual_chunk_size", 4)
                         ),
                     )
-                losses.update(rgb_quality_metrics(model_output, batch))
+                losses.update(
+                    rgb_quality_metrics(
+                        model_output,
+                        batch,
+                        motion_threshold=objective.rgb_motion_threshold,
+                    )
+                )
                 for name, value in losses.items():
                     if not bool(torch.isfinite(value).all()):
                         raise FloatingPointError(f"non-finite eval metric {name}")

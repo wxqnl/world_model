@@ -27,6 +27,12 @@ class NativeObjectiveConfig:
     rgb_charbonnier: float = 2.0
     rgb_gradient: float = 0.5
     rgb_perceptual: float = 0.0
+    rgb_motion_l1: float = 0.0
+    rgb_motion_bce: float = 0.0
+    rgb_motion_dice: float = 0.0
+    rgb_motion_pos_weight: float = 1.0
+    rgb_motion_threshold: float = 0.03
+    rgb_motion_gain: float = 3.0
     depth_log: float = 1.5
     point: float = 0.5
     camera_pose: float = 0.1
@@ -48,6 +54,10 @@ class NativeObjectiveConfig:
                     raise NativeObjectiveError(f"{name} must be positive")
             elif value < 0:
                 raise NativeObjectiveError(f"{name} cannot be negative")
+        if self.rgb_motion_pos_weight <= 0.0:
+            raise NativeObjectiveError("rgb_motion_pos_weight must be positive")
+        if self.rgb_motion_threshold <= 0.0:
+            raise NativeObjectiveError("rgb_motion_threshold must be positive")
         if self.action_velocity != 0.0:
             raise NativeObjectiveError(
                 "action_velocity must remain 0: mixed delta/absolute semantics and "
@@ -637,6 +647,12 @@ def compute_native_objective(
     rgb_charbonnier = zero
     rgb_gradient = zero
     rgb_perceptual = zero
+    rgb_motion_l1 = zero
+    rgb_motion_region_l1 = zero
+    rgb_static_region_l1 = zero
+    rgb_motion_bce = zero
+    rgb_motion_dice = zero
+    rgb_motion_fraction = zero
     zero_action_rgb_l1 = zero
     action_counterfactual_rgb_gain = zero
     action_counterfactual_rgb_advantage = zero
@@ -648,6 +664,121 @@ def compute_native_objective(
             torch.ones_like(target_rgb[:, :, :, :1, :1, :1], dtype=torch.bool),
         )
         rgb_error = output["rgb"] - target_rgb
+        motion_objective_enabled = (
+            config.rgb_motion_l1 > 0.0
+            or config.rgb_motion_bce > 0.0
+            or config.rgb_motion_dice > 0.0
+        )
+        if "context_rgb" in batch:
+            context_rgb = batch["context_rgb"]
+            expected_context_shape = (
+                target_rgb.shape[0],
+                target_rgb.shape[2],
+                *target_rgb.shape[3:],
+            )
+            if tuple(context_rgb.shape) != expected_context_shape:
+                raise NativeObjectiveError(
+                    "context_rgb must be [B,V,3,H,W] and align to target RGB"
+                )
+            context_rgb_mask = batch.get(
+                "context_rgb_mask",
+                torch.ones(
+                    target_rgb.shape[0],
+                    target_rgb.shape[2],
+                    dtype=torch.bool,
+                    device=target_rgb.device,
+                ),
+            ).bool()
+            if (
+                tuple(context_rgb_mask.shape)
+                != target_rgb.shape[:1] + target_rgb.shape[2:3]
+            ):
+                raise NativeObjectiveError("context_rgb_mask must be [B,V]")
+            valid_rgb_mask = (
+                rgb_mask.bool()
+                & context_rgb_mask[:, None, :, None, None, None]
+            )
+            expanded_context_rgb = context_rgb[:, None].expand(
+                -1, target_rgb.shape[1], -1, -1, -1, -1
+            )
+            motion_value = (
+                target_rgb.float() - expanded_context_rgb.float()
+            ).abs().mean(dim=3, keepdim=True)
+            motion_mask = (
+                motion_value > config.rgb_motion_threshold
+            ) & valid_rgb_mask
+            static_mask = (~motion_mask) & valid_rgb_mask
+            rgb_motion_fraction = _masked_mean(
+                motion_mask.float(), valid_rgb_mask, epsilon=epsilon
+            )
+            rgb_motion_region_l1 = _masked_mean(
+                rgb_error.abs(), motion_mask, epsilon=epsilon
+            )
+            rgb_static_region_l1 = _masked_mean(
+                rgb_error.abs(), static_mask, epsilon=epsilon
+            )
+            motion_weight = 1.0 + config.rgb_motion_gain * motion_mask.to(
+                dtype=rgb_error.dtype
+            )
+            rgb_motion_l1 = _masked_mean(
+                rgb_error.abs() * motion_weight,
+                valid_rgb_mask,
+                epsilon=epsilon,
+            )
+            if config.rgb_motion_bce > 0.0 or config.rgb_motion_dice > 0.0:
+                if "rgb_motion_logit" not in output:
+                    raise NativeObjectiveError(
+                        "motion-mask supervision requires rgb_motion_logit"
+                    )
+                motion_logit = output["rgb_motion_logit"].float()
+                if motion_logit.shape != motion_mask.shape:
+                    raise NativeObjectiveError(
+                        "rgb_motion_logit must align to the RGB motion mask"
+                    )
+                motion_target = motion_mask.to(dtype=motion_logit.dtype)
+                motion_valid = torch.broadcast_to(
+                    valid_rgb_mask, motion_logit.shape
+                )
+                if config.rgb_motion_bce > 0.0:
+                    motion_bce = F.binary_cross_entropy_with_logits(
+                        motion_logit,
+                        motion_target,
+                        pos_weight=torch.as_tensor(
+                            config.rgb_motion_pos_weight,
+                            dtype=motion_logit.dtype,
+                            device=motion_logit.device,
+                        ),
+                        reduction="none",
+                    )
+                    rgb_motion_bce = _masked_mean(
+                        motion_bce, motion_valid, epsilon=epsilon
+                    )
+                if config.rgb_motion_dice > 0.0:
+                    motion_weight_valid = motion_valid.to(
+                        dtype=motion_logit.dtype
+                    )
+                    motion_probability = torch.sigmoid(motion_logit)
+                    intersection = (
+                        motion_probability
+                        * motion_target
+                        * motion_weight_valid
+                    ).flatten(1).sum(dim=1)
+                    denominator = (
+                        (motion_probability + motion_target)
+                        * motion_weight_valid
+                    ).flatten(1).sum(dim=1)
+                    valid_sample = motion_valid.flatten(1).any(dim=1)
+                    dice_per_sample = 1.0 - (
+                        (2.0 * intersection + epsilon)
+                        / (denominator + epsilon)
+                    )
+                    rgb_motion_dice = _masked_mean(
+                        dice_per_sample, valid_sample, epsilon=epsilon
+                    )
+        elif motion_objective_enabled:
+            raise NativeObjectiveError(
+                "RGB motion supervision requires context_rgb"
+            )
         rgb_l1 = _masked_mean(
             rgb_error.abs(),
             rgb_mask,
@@ -707,6 +838,14 @@ def compute_native_objective(
                 perceptual_model,
                 chunk_size=rgb_perceptual_chunk_size,
             )
+    elif (
+        config.rgb_motion_l1 > 0.0
+        or config.rgb_motion_bce > 0.0
+        or config.rgb_motion_dice > 0.0
+    ):
+        raise NativeObjectiveError(
+            "RGB motion objective is enabled but RGB supervision is absent"
+        )
     elif config.action_counterfactual_rgb_advantage > 0.0:
         raise NativeObjectiveError(
             "RGB counterfactual is enabled but RGB supervision is absent"
@@ -834,6 +973,12 @@ def compute_native_objective(
         "rgb_charbonnier": rgb_charbonnier,
         "rgb_gradient": rgb_gradient,
         "rgb_perceptual": rgb_perceptual,
+        "rgb_motion_l1": rgb_motion_l1,
+        "rgb_motion_region_l1": rgb_motion_region_l1,
+        "rgb_static_region_l1": rgb_static_region_l1,
+        "rgb_motion_bce": rgb_motion_bce,
+        "rgb_motion_dice": rgb_motion_dice,
+        "rgb_motion_fraction": rgb_motion_fraction,
         "zero_action_rgb_l1": zero_action_rgb_l1,
         "action_counterfactual_rgb_gain": action_counterfactual_rgb_gain,
         "action_counterfactual_rgb_advantage": (
@@ -903,6 +1048,9 @@ def compute_native_objective(
         + config.rgb_charbonnier * rgb_charbonnier
         + config.rgb_gradient * rgb_gradient
         + config.rgb_perceptual * rgb_perceptual
+        + config.rgb_motion_l1 * rgb_motion_l1
+        + config.rgb_motion_bce * rgb_motion_bce
+        + config.rgb_motion_dice * rgb_motion_dice
         + config.depth_log * depth_log
         + config.point * point
         + config.camera_pose * camera_pose

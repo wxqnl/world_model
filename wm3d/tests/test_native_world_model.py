@@ -722,6 +722,45 @@ def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> No
     assert geometry_conditioning.weight.grad.abs().sum() > 0
 
 
+def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views() -> (
+    None
+):
+    cfg = replace(_tiny_dual_path_config(), rgb_context_enabled=True)
+    torch.manual_seed(37)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.tensor(
+        [[True, False], [True, True]], dtype=torch.bool
+    )
+    decoder = model.rgb_head.image_decoder
+    with torch.no_grad():
+        decoder.head.weight.zero_()
+        decoder.head.bias.zero_()
+        decoder.head.bias[6] = -20.0
+        decoder.motion_head.bias.fill_(-20.0)
+
+    output = model(**batch, appearance_teacher_ratio=0.0)
+
+    expected = batch["context_rgb"][:, None].expand(-1, cfg.K, -1, -1, -1, -1)
+    torch.testing.assert_close(
+        output["rgb"][0, :, 0],
+        expected[0, :, 0],
+        rtol=0,
+        atol=1.0e-6,
+    )
+    assert output["rgb"][0, :, 1].count_nonzero() == 0
+    assert output["rgb_motion_logit"].shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        1,
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+    assert output["rgb_blend"][0, :, 1].count_nonzero() == 0
+
+
 def test_appearance_action_residual_changes_rgb_without_policy_leakage() -> None:
     cfg = replace(
         _tiny_dual_path_config(),
@@ -784,7 +823,8 @@ def test_dual_path_1b_and_5b_profiles_are_materializable() -> None:
         assert model.cfg.appearance_enabled is True
         assert model.cfg.appearance_P == 256
         assert counts[name] == profile["expected_parameter_count"]
-    assert counts["native_5b_dual_path.yaml"] > 4 * counts["native_1b_dual_path.yaml"]
+    assert 1_000_000_000 < counts["native_1b_dual_path.yaml"] < 2_000_000_000
+    assert counts["native_5b_dual_path.yaml"] > 5_000_000_000
 
 def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
     cfg = replace(_tiny_config(), factual_dynamics_repeats=3)

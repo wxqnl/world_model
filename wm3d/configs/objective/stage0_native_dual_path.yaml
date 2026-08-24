@@ -14,6 +14,13 @@ objective:
   rgb_charbonnier: 1.0
   rgb_charbonnier_epsilon: 0.000001
   rgb_gradient: 0.25
+  # V7-proven motion-region emphasis and learned change mask.
+  rgb_motion_l1: 1.0
+  rgb_motion_bce: 0.03
+  rgb_motion_dice: 0.03
+  rgb_motion_pos_weight: 2.0
+  rgb_motion_threshold: 0.03
+  rgb_motion_gain: 3.0
   depth_log: 1.5
   point: 0.5
   camera_pose: 0.1
