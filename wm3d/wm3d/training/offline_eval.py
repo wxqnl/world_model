@@ -42,6 +42,7 @@ from wm3d.training.pretrain import (
     _batch_to_device,
     _build_mixed_dataset,
     _configure_reproducibility,
+    _environment_flag,
     _forward_with_action_counterfactual,
     _make_loader,
     _validation_micro_batch_size,
@@ -516,7 +517,11 @@ def main() -> None:
         repo = Path(__file__).resolve().parents[2]
         try:
             current_commit = verify_clean_runtime_checkout(
-                repo, str(config["run"]["code_commit"])
+                repo,
+                str(config["run"]["code_commit"]),
+                allow_commit_mismatch=_environment_flag(
+                    "WM3D_EXECUTION_HOTFIX"
+                ),
             )
         except LaunchQualificationError as exc:
             raise OfflineEvalError("runtime code provenance failed") from exc
