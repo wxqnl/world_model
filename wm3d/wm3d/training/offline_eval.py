@@ -42,7 +42,7 @@ from wm3d.training.pretrain import (
     _batch_to_device,
     _build_mixed_dataset,
     _configure_reproducibility,
-    _forward,
+    _forward_with_action_counterfactual,
     _make_loader,
     _validation_micro_batch_size,
     _require_recent_resource_preflight,
@@ -633,10 +633,11 @@ def main() -> None:
                     cpu_batch = input_adapter.materialize(cpu_batch)
                 batch = _batch_to_device(cpu_batch, context.device)
                 with autocast_context(strategy):
-                    model_output = _forward(
+                    model_output = _forward_with_action_counterfactual(
                         model,
                         batch,
                         appearance_teacher_ratio=args.appearance_teacher_ratio,
+                        objective=objective,
                     )
                     losses = compute_native_objective(
                         output=model_output,
