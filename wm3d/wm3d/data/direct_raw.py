@@ -969,12 +969,12 @@ class DirectRawDataset(UnifiedCacheDataset):
             fine_available = bool(
                 normalization.fine_action_available[
                     slot, : group.action_dim
-                ].all()
+                ].any()
             )
             coarse_available = bool(
                 normalization.coarse_action_available[
                     slot, : group.action_dim
-                ].all()
+                ].any()
             )
             if (
                 (series.supervision == "fine_command") != fine_available

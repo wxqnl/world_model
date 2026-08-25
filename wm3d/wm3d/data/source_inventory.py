@@ -8,6 +8,7 @@ is converted into state or action timestamps.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -37,6 +38,45 @@ class SourceInventoryError(RuntimeError):
     pass
 
 
+def _normalize_task_text(value: Any) -> str:
+    """Return the real instruction text without converter debug wrappers."""
+
+    if value is None:
+        return ""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="strict").strip()
+    text = str(value).strip()
+    if not text:
+        return ""
+    # Some converted OXE metadata contains TensorFlow's repr rather than the
+    # scalar string itself: ``tf.Tensor(b"instruction", shape=(),
+    # dtype=string)``.  Parse only the literal first argument; never evaluate
+    # the wrapper expression.
+    try:
+        expression = ast.parse(text, mode="eval").body
+    except (SyntaxError, ValueError):
+        expression = None
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and isinstance(expression.func.value, ast.Name)
+        and expression.func.value.id == "tf"
+        and expression.func.attr == "Tensor"
+        and expression.args
+        and isinstance(expression.args[0], ast.Constant)
+        and isinstance(expression.args[0].value, (str, bytes))
+    ):
+        scalar = expression.args[0].value
+        return (
+            scalar.decode("utf-8", errors="strict").strip()
+            if isinstance(scalar, bytes)
+            else scalar.strip()
+        )
+    return text
+
+
 def deterministic_split(
     source: str,
     episode_id: str,
@@ -51,10 +91,13 @@ def deterministic_split(
         raise SourceInventoryError(
             "train_fraction must leave non-empty validation and test ranges"
         )
-    unit = int.from_bytes(
-        hashlib.sha256(f"{source}\x1f{episode_id}\x1f{seed}".encode()).digest()[:8],
-        "big",
-    ) / 2**64
+    unit = (
+        int.from_bytes(
+            hashlib.sha256(f"{source}\x1f{episode_id}\x1f{seed}".encode()).digest()[:8],
+            "big",
+        )
+        / 2**64
+    )
     if unit < train_fraction:
         return "train"
     if unit < train_fraction + validation_fraction:
@@ -70,7 +113,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise SourceInventoryError(f"{path}:{line_number}: blank row")
             value = json.loads(line)
             if not isinstance(value, dict):
-                raise SourceInventoryError(f"{path}:{line_number}: row is not an object")
+                raise SourceInventoryError(
+                    f"{path}:{line_number}: row is not an object"
+                )
             rows.append(value)
     return rows
 
@@ -101,9 +146,11 @@ def _task_lookup(root: Path) -> dict[int, str]:
     result: dict[int, str] = {}
     for row in rows:
         index = int(row.get("task_index", row.get("index", len(result))))
-        text = row.get("task", row.get("language_instruction", row.get("name")))
+        text = _normalize_task_text(
+            row.get("task", row.get("language_instruction", row.get("name")))
+        )
         if text:
-            result[index] = str(text)
+            result[index] = text
     return result
 
 
@@ -134,7 +181,9 @@ def _existing_relative(root: Path, candidates: Iterable[str]) -> str:
 
 
 def _path_values(row: Mapping[str, Any], episode_index: int) -> dict[str, int]:
-    chunk = int(row.get("chunk_index", row.get("data/chunk_index", episode_index // 1000)))
+    chunk = int(
+        row.get("chunk_index", row.get("data/chunk_index", episode_index // 1000))
+    )
     return {
         "episode_index": episode_index,
         "episode_chunk": chunk,
@@ -146,23 +195,32 @@ def _path_values(row: Mapping[str, Any], episode_index: int) -> dict[str, int]:
 def _task_text(
     row: Mapping[str, Any], tasks: Mapping[int, str], default_task: str
 ) -> str:
-    direct = row.get("task", row.get("language_instruction"))
+    direct = _normalize_task_text(row.get("task", row.get("language_instruction")))
     if direct:
-        return str(direct)
+        return direct
     values = row.get("tasks")
     if isinstance(values, Sequence) and not isinstance(values, str) and values:
         first = values[0]
-        if isinstance(first, str):
-            if first.strip():
-                return first
-        elif int(first) in tasks:
-            return tasks[int(first)]
+        if isinstance(first, (str, bytes, np.str_, np.bytes_)):
+            text = _normalize_task_text(first)
+            if text:
+                return text
+        else:
+            try:
+                index = int(first)
+            except (TypeError, ValueError):
+                index = -1
+            if index in tasks:
+                return tasks[index]
     task_index = row.get("task_index")
     if task_index is not None and int(task_index) in tasks:
         return tasks[int(task_index)]
-    if not default_task.strip():
-        raise SourceInventoryError("episode task text is unavailable and default is empty")
-    return default_task
+    default = _normalize_task_text(default_task)
+    if not default:
+        raise SourceInventoryError(
+            "episode task text is unavailable and default is empty"
+        )
+    return default
 
 
 def _slice_column(
@@ -204,6 +262,8 @@ def _slice_column(
 
 
 def _term_width(array: np.ndarray, term: MappingTerm, label: str) -> None:
+    if array.ndim == 1:
+        array = array[:, None]
     if array.ndim != 2 or max(term.columns) >= array.shape[1]:
         raise SourceInventoryError(
             f"{label}: mapping requests columns {term.columns} from shape {array.shape}"
@@ -224,6 +284,161 @@ def _clock(
         raise SourceInventoryError(f"{label}: {exc}") from exc
 
 
+def _normalize_episode_ranges(
+    episode_ranges: Optional[Mapping[int | str, Sequence[Sequence[int]]]],
+) -> Optional[dict[int, tuple[tuple[int, int], ...]]]:
+    if episode_ranges is None:
+        return None
+    if not isinstance(episode_ranges, Mapping) or not episode_ranges:
+        raise SourceInventoryError("episode_ranges must be a non-empty mapping")
+    normalized: dict[int, tuple[tuple[int, int], ...]] = {}
+    for raw_index, raw_ranges in episode_ranges.items():
+        try:
+            episode_index = int(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise SourceInventoryError("episode_ranges keys must be integers") from exc
+        if episode_index < 0 or episode_index in normalized:
+            raise SourceInventoryError(
+                "episode_ranges keys must be unique non-negative integers"
+            )
+        if (
+            not isinstance(raw_ranges, Sequence)
+            or isinstance(raw_ranges, (str, bytes))
+            or not raw_ranges
+        ):
+            raise SourceInventoryError(
+                f"episode {episode_index} must contain at least one keep range"
+            )
+        ranges: list[tuple[int, int]] = []
+        previous_stop = -1
+        for raw_range in raw_ranges:
+            if (
+                not isinstance(raw_range, Sequence)
+                or isinstance(raw_range, (str, bytes))
+                or len(raw_range) != 2
+            ):
+                raise SourceInventoryError(
+                    f"episode {episode_index} keep ranges must be [start, stop] pairs"
+                )
+            try:
+                start, stop = int(raw_range[0]), int(raw_range[1])
+            except (TypeError, ValueError) as exc:
+                raise SourceInventoryError(
+                    f"episode {episode_index} keep range bounds must be integers"
+                ) from exc
+            if start < 0 or stop - start < 2 or start < previous_stop:
+                raise SourceInventoryError(
+                    f"episode {episode_index} keep ranges must be sorted, "
+                    "non-overlapping, and contain at least two rows"
+                )
+            ranges.append((start, stop))
+            previous_stop = stop
+        normalized[episode_index] = tuple(ranges)
+    return normalized
+
+
+def _selected_metadata_rows(
+    metadata_rows: Sequence[Mapping[str, Any]],
+    *,
+    adapter: AdapterContract,
+    episode_indices: Optional[frozenset[int]],
+    episode_ranges: Optional[Mapping[int, tuple[tuple[int, int], ...]]],
+    file_origin: Mapping[tuple[int, int, str], int],
+) -> list[dict[str, Any]]:
+    """Select episodes and expand audited non-idle ranges into video-aligned segments."""
+
+    available: set[int] = set()
+    selected: list[dict[str, Any]] = []
+    for raw_metadata in metadata_rows:
+        metadata = dict(raw_metadata)
+        episode_index = int(metadata["episode_index"])
+        if episode_index in available:
+            raise SourceInventoryError(f"duplicate episode_index {episode_index}")
+        available.add(episode_index)
+        if episode_indices is not None and episode_index not in episode_indices:
+            continue
+        if episode_ranges is None:
+            selected.append(metadata)
+            continue
+        ranges = episode_ranges.get(episode_index)
+        if ranges is None:
+            continue
+        length = int(metadata.get("length", metadata.get("episode_length", 0)))
+        if length < 2:
+            raise SourceInventoryError(
+                f"episode {episode_index} has fewer than two rows"
+            )
+        values = _path_values(metadata, episode_index)
+        explicit_start = metadata.get("data/from_index")
+        explicit_stop = metadata.get("data/to_index")
+        if (explicit_start is None) != (explicit_stop is None):
+            raise SourceInventoryError(
+                f"episode {episode_index} has partial row bounds"
+            )
+        if explicit_start is not None:
+            base_row_start = int(explicit_start)
+            base_row_stop = int(explicit_stop)
+        else:
+            dataset_start = int(metadata.get("dataset_from_index", 0))
+            dataset_stop = int(metadata.get("dataset_to_index", dataset_start + length))
+            key = (
+                values["chunk_index"],
+                values["file_index"],
+                str(metadata.get("data_path", "")),
+            )
+            base_row_start = dataset_start - file_origin[key]
+            base_row_stop = dataset_stop - file_origin[key]
+        if base_row_start < 0 or base_row_stop - base_row_start != length:
+            raise SourceInventoryError(f"episode {episode_index} has invalid row slice")
+        for segment_index, (start, stop) in enumerate(ranges):
+            if stop > length:
+                raise SourceInventoryError(
+                    f"episode {episode_index} keep range [{start}, {stop}) "
+                    f"exceeds episode length {length}"
+                )
+            segment = dict(metadata)
+            segment["length"] = stop - start
+            segment["data/from_index"] = base_row_start + start
+            segment["data/to_index"] = base_row_start + stop
+            segment["_wm3d_segment_index"] = segment_index
+            for view in adapter.views:
+                start_key = f"videos/{view.key}/from_timestamp"
+                stop_key = f"videos/{view.key}/to_timestamp"
+                video_start = metadata.get(start_key)
+                video_stop = metadata.get(stop_key)
+                if video_start is None or video_stop is None:
+                    raise SourceInventoryError(
+                        f"episode {episode_index}/{view.name}: range filtering "
+                        "requires a recorded video PTS range"
+                    )
+                video_start = float(video_start)
+                video_stop = float(video_stop)
+                if (
+                    not np.isfinite([video_start, video_stop]).all()
+                    or video_stop <= video_start
+                ):
+                    raise SourceInventoryError(
+                        f"episode {episode_index}/{view.name}: invalid video PTS range"
+                    )
+                duration = video_stop - video_start
+                segment[start_key] = video_start + duration * start / length
+                segment[stop_key] = video_start + duration * stop / length
+            selected.append(segment)
+    requested = (
+        set(episode_ranges or ()) if episode_indices is None else set(episode_indices)
+    )
+    missing = sorted(requested - available)
+    if missing:
+        raise SourceInventoryError(f"requested episode indices are absent: {missing}")
+    if episode_ranges is not None and episode_indices is not None:
+        missing_ranges = sorted(set(episode_indices) - set(episode_ranges))
+        if missing_ranges:
+            raise SourceInventoryError(
+                f"requested episodes lack required keep ranges: {missing_ranges}"
+            )
+    return selected
+
+
 def _episode_rows(
     *,
     root: Path,
@@ -235,6 +450,7 @@ def _episode_rows(
     validation_fraction: float,
     default_task: str,
     episode_indices: Optional[frozenset[int]],
+    episode_ranges: Optional[Mapping[int, tuple[tuple[int, int], ...]]],
 ) -> list[dict[str, Any]]:
     info_path = root / "meta" / "info.json"
     if info_path.is_symlink() or not info_path.is_file():
@@ -263,7 +479,9 @@ def _episode_rows(
         explicit_start = metadata.get("data/from_index")
         explicit_stop = metadata.get("data/to_index")
         if (explicit_start is None) != (explicit_stop is None):
-            raise SourceInventoryError(f"episode {episode_index} has partial row bounds")
+            raise SourceInventoryError(
+                f"episode {episode_index} has partial row bounds"
+            )
         if explicit_start is None:
             values = _path_values(metadata, episode_index)
             key = (
@@ -284,23 +502,25 @@ def _episode_rows(
             observed = sha256_file(root / relative)
             digest_cache[relative] = observed
         return observed
+
     payload_cache_path: str | None = None
     payload_cache_rows = 0
     payload_cache: dict[str, np.ndarray] = {}
 
-    seen_episode_indices: set[int] = set()
-    available_episode_indices: set[int] = set()
+    metadata_rows = _selected_metadata_rows(
+        metadata_rows,
+        adapter=adapter,
+        episode_indices=episode_indices,
+        episode_ranges=episode_ranges,
+        file_origin=file_origin,
+    )
     for metadata in metadata_rows:
         episode_index = int(metadata["episode_index"])
-        available_episode_indices.add(episode_index)
-        if episode_index in seen_episode_indices:
-            raise SourceInventoryError(f"duplicate episode_index {episode_index}")
-        seen_episode_indices.add(episode_index)
-        if episode_indices is not None and episode_index not in episode_indices:
-            continue
-        length = int(metadata.get("length", 0))
+        length = int(metadata.get("length", metadata.get("episode_length", 0)))
         if length < 2:
-            raise SourceInventoryError(f"episode {episode_index} has fewer than two rows")
+            raise SourceInventoryError(
+                f"episode {episode_index} has fewer than two rows"
+            )
         values = _path_values(metadata, episode_index)
         candidates = []
         if metadata.get("data_path"):
@@ -316,7 +536,9 @@ def _episode_rows(
         explicit_start = metadata.get("data/from_index")
         explicit_stop = metadata.get("data/to_index")
         if (explicit_start is None) != (explicit_stop is None):
-            raise SourceInventoryError(f"episode {episode_index} has partial row bounds")
+            raise SourceInventoryError(
+                f"episode {episode_index} has partial row bounds"
+            )
         if explicit_start is not None:
             row_start, row_stop = int(explicit_start), int(explicit_stop)
         else:
@@ -346,11 +568,10 @@ def _episode_rows(
             payload_cache_rows = table.num_rows
             payload_cache_path = payload
         if row_stop > payload_cache_rows:
-            raise SourceInventoryError(f"episode {episode_index} row slice exceeds payload")
-        arrays = {
-            key: payload_cache[key][row_start:row_stop]
-            for key in payload_cache
-        }
+            raise SourceInventoryError(
+                f"episode {episode_index} row slice exceeds payload"
+            )
+        arrays = {key: payload_cache[key][row_start:row_stop] for key in payload_cache}
         observation_clock = _clock(
             arrays,
             adapter.observation_time_key,
@@ -360,7 +581,9 @@ def _episode_rows(
         robot_groups: dict[str, Any] = {}
         for mapping in adapter.groups:
             for term in (*mapping.action, *mapping.state):
-                _term_width(arrays[term.key], term, f"episode {episode_index}/{mapping.group}")
+                _term_width(
+                    arrays[term.key], term, f"episode {episode_index}/{mapping.group}"
+                )
             action_count = len(arrays[mapping.action[0].key])
             state_count = len(arrays[mapping.state[0].key]) if mapping.state else 0
             action_clock = None
@@ -373,7 +596,9 @@ def _episode_rows(
                     f"episode {episode_index}/{mapping.group}/action",
                 )
             else:
-                interval = np.asarray(arrays[str(interval_key)], dtype=np.int64).reshape(-1)
+                interval = np.asarray(
+                    arrays[str(interval_key)], dtype=np.int64
+                ).reshape(-1)
                 if interval.shape != (action_count,) or bool((interval < 0).any()):
                     raise SourceInventoryError(
                         f"episode {episode_index}/{mapping.group}: invalid world intervals"
@@ -404,9 +629,7 @@ def _episode_rows(
         for view in adapter.views:
             direct = metadata.get(f"videos/{view.key}/path")
             video_chunk_index = int(
-                metadata.get(
-                    f"videos/{view.key}/chunk_index", values["chunk_index"]
-                )
+                metadata.get(f"videos/{view.key}/chunk_index", values["chunk_index"])
             )
             video_file_index = int(
                 metadata.get(f"videos/{view.key}/file_index", values["file_index"])
@@ -466,7 +689,13 @@ def _episode_rows(
                     clock_ends.append(float(clock["end_s"]))
                     clock_max_dt.append(float(clock["max_dt_s"]))
         duration = max(clock_ends) - min(clock_starts) + max(clock_max_dt)
-        episode_id = f"{source}:{episode_index:09d}"
+        base_episode_id = f"{source}:{episode_index:09d}"
+        segment_index = metadata.get("_wm3d_segment_index")
+        episode_id = (
+            base_episode_id
+            if segment_index is None
+            else f"{base_episode_id}:segment{int(segment_index):03d}"
+        )
         rows.append(
             {
                 "schema": SOURCE_MANIFEST_SCHEMA,
@@ -482,7 +711,7 @@ def _episode_rows(
                 "embodiment": embodiment.name,
                 "split": deterministic_split(
                     source,
-                    episode_id,
+                    base_episode_id,
                     seed=split_seed,
                     train_fraction=train_fraction,
                     validation_fraction=validation_fraction,
@@ -493,12 +722,6 @@ def _episode_rows(
                 "robot_groups": robot_groups,
             }
         )
-    if episode_indices is not None:
-        missing_episode_indices = sorted(episode_indices - available_episode_indices)
-        if missing_episode_indices:
-            raise SourceInventoryError(
-                f"requested episode indices are absent: {missing_episode_indices}"
-            )
     if not rows:
         raise SourceInventoryError(f"source {source!r} produced no episodes")
     return rows
@@ -515,6 +738,7 @@ def scan_lerobot_source(
     validation_fraction: float,
     default_task: str,
     episode_indices: Optional[Sequence[int]] = None,
+    episode_ranges: Optional[Mapping[int | str, Sequence[Sequence[int]]]] = None,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
     """Scan one file-per-episode/shared-file LeRobot source into WM3D ABI."""
 
@@ -539,6 +763,7 @@ def scan_lerobot_source(
         if len(normalized) != len(set(normalized)):
             raise SourceInventoryError("episode_indices contains duplicates")
         selected_indices = frozenset(normalized)
+    normalized_ranges = _normalize_episode_ranges(episode_ranges)
     rows = _episode_rows(
         root=root,
         source=source,
@@ -549,6 +774,7 @@ def scan_lerobot_source(
         validation_fraction=validation_fraction,
         default_task=default_task,
         episode_indices=selected_indices,
+        episode_ranges=normalized_ranges,
     )
     manifest_digest = canonical_sha256(rows)
     receipt = {
@@ -563,15 +789,37 @@ def scan_lerobot_source(
         },
         "duration_s": sum(float(row["duration_s"]) for row in rows),
         "canonical_rows_sha256": manifest_digest,
-        "selection": (
-            {"mode": "all_episodes"}
-            if selected_indices is None
-            else {
-                "mode": "explicit_episode_indices",
-                "episode_indices": sorted(selected_indices),
-                "episode_indices_sha256": canonical_sha256(sorted(selected_indices)),
-            }
-        ),
+        "selection": {
+            "mode": (
+                "all_episodes"
+                if selected_indices is None and normalized_ranges is None
+                else "explicit_episode_indices"
+                if normalized_ranges is None
+                else "nonidle_episode_ranges"
+            ),
+            "episode_indices": (
+                None if selected_indices is None else sorted(selected_indices)
+            ),
+            "episode_indices_sha256": (
+                None
+                if selected_indices is None
+                else canonical_sha256(sorted(selected_indices))
+            ),
+            "range_episode_count": (
+                0 if normalized_ranges is None else len(normalized_ranges)
+            ),
+            "selected_segment_count": len(rows),
+            "episode_ranges_sha256": (
+                None
+                if normalized_ranges is None
+                else canonical_sha256(
+                    {
+                        str(index): [list(bounds) for bounds in ranges]
+                        for index, ranges in sorted(normalized_ranges.items())
+                    }
+                )
+            ),
+        },
     }
     return tuple(rows), receipt
 

@@ -30,7 +30,9 @@ def _episode_indices(path: Path | None) -> tuple[tuple[int, ...] | None, str | N
     if safe.is_symlink() or not safe.is_file():
         raise RuntimeError("episode index file must be a regular file")
     result: list[int] = []
-    for line_number, line in enumerate(safe.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        safe.read_text(encoding="utf-8").splitlines(), 1
+    ):
         value = line.strip()
         if not value or value.startswith("#"):
             continue
@@ -46,6 +48,18 @@ def _episode_indices(path: Path | None) -> tuple[tuple[int, ...] | None, str | N
     if not result or len(result) != len(set(result)):
         raise RuntimeError("episode index file must contain unique non-negative values")
     return tuple(result), sha256_file(safe)
+
+
+def _episode_ranges(path: Path | None) -> tuple[dict | None, str | None]:
+    if path is None:
+        return None, None
+    safe = path.resolve(strict=True)
+    if safe.is_symlink() or not safe.is_file():
+        raise RuntimeError("episode range file must be a regular file")
+    value = json.loads(safe.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not value:
+        raise RuntimeError("episode range file must contain a non-empty JSON mapping")
+    return value, sha256_file(safe)
 
 
 def _publish(path: Path, payload: bytes) -> None:
@@ -66,7 +80,9 @@ def _publish(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _embodiment_from_template(path: Path, source_name: str) -> tuple[EmbodimentSpec, str]:
+def _embodiment_from_template(
+    path: Path, source_name: str
+) -> tuple[EmbodimentSpec, str]:
     safe = path.resolve(strict=True)
     value = yaml.safe_load(safe.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("schema") != "wm3d_v8_data_profile_v4":
@@ -74,9 +90,15 @@ def _embodiment_from_template(path: Path, source_name: str) -> tuple[EmbodimentS
     sources = value.get("sources")
     if not isinstance(sources, list):
         raise RuntimeError("data template sources must be a list")
-    matches = [row for row in sources if isinstance(row, dict) and row.get("name") == source_name]
+    matches = [
+        row
+        for row in sources
+        if isinstance(row, dict) and row.get("name") == source_name
+    ]
     if len(matches) != 1:
-        raise RuntimeError(f"data template must contain source {source_name!r} exactly once")
+        raise RuntimeError(
+            f"data template must contain source {source_name!r} exactly once"
+        )
     embodiment_name = str(matches[0].get("embodiment", ""))
     raw_embodiments = value.get("embodiments")
     if not isinstance(raw_embodiments, list):
@@ -87,14 +109,21 @@ def _embodiment_from_template(path: Path, source_name: str) -> tuple[EmbodimentS
         if isinstance(row, dict) and row.get("name") == embodiment_name
     ]
     if len(candidates) != 1:
-        raise RuntimeError(f"source embodiment {embodiment_name!r} is missing/duplicated")
+        raise RuntimeError(
+            f"source embodiment {embodiment_name!r} is missing/duplicated"
+        )
     raw = candidates[0]
     if set(raw) != {"name", "embodiment_id", "groups"}:
         raise RuntimeError("embodiment fields mismatch")
     groups = []
     required = {
-        "name", "group_id", "action_semantics", "state_semantics",
-        "action_frame", "state_frame", "composition_operators",
+        "name",
+        "group_id",
+        "action_semantics",
+        "state_semantics",
+        "action_frame",
+        "state_frame",
+        "composition_operators",
     }
     for group in raw["groups"]:
         if not isinstance(group, dict) or set(group) != required:
@@ -144,6 +173,14 @@ def main() -> None:
             "会写入 receipt，正式全量训练应省略。"
         ),
     )
+    parser.add_argument(
+        "--episode-range-file",
+        type=Path,
+        help=(
+            "可选的 episode_index→[[start,stop),...] JSON；用于 DROID "
+            "非 idle 片段，文件 SHA 会写入 receipt，指定后对所选 episode fail closed。"
+        ),
+    )
     args = parser.parse_args()
 
     embodiment, template_sha = _embodiment_from_template(
@@ -172,6 +209,7 @@ def main() -> None:
     ):
         raise RuntimeError("adapter audit receipt does not authorize this inventory")
     episode_indices, episode_indices_sha = _episode_indices(args.episode_index_file)
+    episode_ranges, episode_ranges_sha = _episode_ranges(args.episode_range_file)
     rows, receipt = scan_lerobot_source(
         root=root,
         source=args.source,
@@ -182,9 +220,11 @@ def main() -> None:
         validation_fraction=args.validation_fraction,
         default_task=args.default_task,
         episode_indices=episode_indices,
+        episode_ranges=episode_ranges,
     )
     manifest_payload = "".join(
-        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
         for row in rows
     ).encode("utf-8")
     _publish(args.output_manifest, manifest_payload)
@@ -212,6 +252,12 @@ def main() -> None:
             else str(args.episode_index_file.resolve(strict=True))
         ),
         "episode_index_file_sha256": episode_indices_sha,
+        "episode_range_file_path": (
+            None
+            if args.episode_range_file is None
+            else str(args.episode_range_file.resolve(strict=True))
+        ),
+        "episode_range_file_sha256": episode_ranges_sha,
     }
     _publish(
         args.output_receipt,

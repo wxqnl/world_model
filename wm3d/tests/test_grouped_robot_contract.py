@@ -21,6 +21,12 @@ def _panda_state(timestamp: float = 0.0) -> RawStateSnapshot:
     return RawStateSnapshot("arm", timestamp, np.arange(10, dtype=np.float32))
 
 
+def test_panda_policy_abi_uses_close_positive_gripper() -> None:
+    group = panda_single_arm_spec().groups[0]
+    assert group.action_semantics[-1] == "absolute_gripper_close01"
+    assert group.state_semantics[-1] == "gripper_close01"
+
+
 def test_native_20hz_commands_remain_four_real_substeps_per_world_interval() -> None:
     limits = GroupedRobotLimits(max_substeps=6)
     timestamps = np.arange(8, dtype=np.float64) / 20.0
@@ -126,7 +132,9 @@ def test_packer_rejects_over_capacity_instead_of_dropping_or_resampling() -> Non
 def test_packer_rejects_non_exact_current_state_instead_of_interpolation() -> None:
     timestamps = np.arange(4, dtype=np.float64) / 20.0
     values = np.zeros((4, 7), dtype=np.float32)
-    with pytest.raises(GroupedRobotContractError, match="interpolation/fallback is forbidden"):
+    with pytest.raises(
+        GroupedRobotContractError, match="interpolation/fallback is forbidden"
+    ):
         pack_grouped_robot_window(
             embodiment=panda_single_arm_spec(),
             limits=GroupedRobotLimits(timestamp_tolerance_s=1.0e-6),

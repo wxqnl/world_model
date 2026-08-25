@@ -70,12 +70,18 @@ def _raw_fixture(root: Path, *, duplicate_time: bool = False) -> Path:
                 "group": name,
                 "supervision": "fine_command",
                 "action": [
-                    {"key": "action", "columns": columns, "scale": [1] * 7, "offset": [0] * 7}
+                    {
+                        "key": "action",
+                        "columns": columns,
+                        "scale": [1] * 7,
+                        "offset": [0] * 7,
+                    }
                 ],
                 "state": [
                     {
                         "key": "observation.state",
-                        "columns": list(range(start, start + 7)) + [start, start, start],
+                        "columns": list(range(start, start + 7))
+                        + [start, start, start],
                         "scale": [1] * 10,
                         "offset": [0] * 10,
                     }
@@ -101,7 +107,9 @@ def _raw_fixture(root: Path, *, duplicate_time: bool = False) -> Path:
     return adapter
 
 
-def test_inventory_preserves_both_arms_and_recorded_irregular_clock(tmp_path: Path) -> None:
+def test_inventory_preserves_both_arms_and_recorded_irregular_clock(
+    tmp_path: Path,
+) -> None:
     adapter_path = _raw_fixture(tmp_path)
     adapter = load_adapter_contract(adapter_path, expected_sha256=_sha(adapter_path))
     rows, receipt = scan_lerobot_source(
@@ -128,6 +136,17 @@ def test_inventory_preserves_both_arms_and_recorded_irregular_clock(tmp_path: Pa
 
 def test_blank_inline_task_falls_back_to_explicit_default() -> None:
     assert _task_text({"tasks": [""]}, {}, "fallback") == "fallback"
+
+
+def test_task_text_decodes_bytes_and_tensorflow_scalar_repr() -> None:
+    assert (
+        _task_text({"tasks": [b"open the drawer"]}, {}, "fallback") == "open the drawer"
+    )
+    wrapped = 'tf.Tensor(b"close the cabinet", shape=(), dtype=string)'
+    assert (
+        _task_text({"language_instruction": wrapped}, {}, "fallback")
+        == "close the cabinet"
+    )
 
 
 def test_inventory_rejects_non_monotonic_recorded_clock(tmp_path: Path) -> None:
@@ -265,6 +284,114 @@ def test_explicit_shared_file_selection_uses_global_file_origin(
     assert rows[0]["payload_row_stop"] == 8
     assert rows[0]["observation_clock"]["start_s"] == pytest.approx(10.0)
     assert payload_reads == 1
-    assert next(
-        asset["path"] for asset in rows[0]["assets"] if asset["role"] == "rgb/overhead"
-    ) == "videos/observation.images.top/chunk-000/file-003.mp4"
+    assert (
+        next(
+            asset["path"]
+            for asset in rows[0]["assets"]
+            if asset["role"] == "rgb/overhead"
+        )
+        == "videos/observation.images.top/chunk-000/file-003.mp4"
+    )
+
+
+def test_nonidle_ranges_slice_payload_and_camera_pts_without_split_leakage(
+    tmp_path: Path,
+) -> None:
+    adapter_path = _raw_fixture(tmp_path)
+    (tmp_path / "meta/episodes.jsonl").unlink()
+    (tmp_path / "data/chunk-000/episode_000000.parquet").unlink()
+    (tmp_path / "meta/episodes/chunk-000").mkdir(parents=True)
+    (tmp_path / "videos/chunk-000/observation.images.top/episode_000000.mp4").unlink()
+    (tmp_path / "videos/observation.images.top/chunk-000").mkdir(parents=True)
+    (tmp_path / "videos/observation.images.top/chunk-000/file-000.mp4").write_bytes(
+        b"shared-video-container"
+    )
+    (tmp_path / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
+                "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+            }
+        )
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [0],
+                "length": [6],
+                "data/chunk_index": [0],
+                "data/file_index": [0],
+                "dataset_from_index": [100],
+                "dataset_to_index": [106],
+                "tasks": pa.array([["move the arm"]], type=pa.list_(pa.string())),
+                "videos/observation.images.top/chunk_index": [0],
+                "videos/observation.images.top/file_index": [0],
+                "videos/observation.images.top/from_timestamp": [20.0],
+                "videos/observation.images.top/to_timestamp": [20.6],
+            }
+        ),
+        tmp_path / "meta/episodes/chunk-000/file-000.parquet",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "timestamp": np.arange(6, dtype=np.float64) / 10.0,
+                "action": pa.array(
+                    np.arange(84, dtype=np.float32).reshape(6, 14).tolist(),
+                    type=pa.list_(pa.float32(), 14),
+                ),
+                "observation.state": pa.array(
+                    np.arange(84, dtype=np.float32).reshape(6, 14).tolist(),
+                    type=pa.list_(pa.float32(), 14),
+                ),
+            }
+        ),
+        tmp_path / "data/chunk-000/file-000.parquet",
+    )
+    adapter = load_adapter_contract(adapter_path, expected_sha256=_sha(adapter_path))
+    rows, receipt = scan_lerobot_source(
+        root=tmp_path,
+        source="aloha",
+        embodiment=bimanual_arm_spec(),
+        adapter=adapter,
+        split_seed=7,
+        train_fraction=0.8,
+        validation_fraction=0.1,
+        default_task="fallback",
+        episode_indices=[0],
+        episode_ranges={"0": [[1, 3], [4, 6]]},
+    )
+    assert [row["episode_id"] for row in rows] == [
+        "aloha:000000000:segment000",
+        "aloha:000000000:segment001",
+    ]
+    assert [(row["payload_row_start"], row["payload_row_stop"]) for row in rows] == [
+        (1, 3),
+        (4, 6),
+    ]
+    assert [row["split"] for row in rows] == [rows[0]["split"], rows[0]["split"]]
+    assert rows[0]["observation_clock"]["start_s"] == pytest.approx(0.1)
+    assert rows[0]["views"][0]["start_s"] == pytest.approx(20.1)
+    assert rows[0]["views"][0]["stop_s"] == pytest.approx(20.3)
+    assert receipt["selection"]["mode"] == "nonidle_episode_ranges"
+    assert receipt["selection"]["selected_segment_count"] == 2
+
+
+def test_nonidle_ranges_fail_closed_when_selected_episode_has_no_ranges(
+    tmp_path: Path,
+) -> None:
+    adapter_path = _raw_fixture(tmp_path)
+    adapter = load_adapter_contract(adapter_path, expected_sha256=_sha(adapter_path))
+    with pytest.raises(SourceInventoryError, match="lack required keep ranges"):
+        scan_lerobot_source(
+            root=tmp_path,
+            source="aloha",
+            embodiment=bimanual_arm_spec(),
+            adapter=adapter,
+            split_seed=7,
+            train_fraction=0.8,
+            validation_fraction=0.1,
+            default_task="fallback",
+            episode_indices=[0],
+            episode_ranges={1: [[0, 2]]},
+        )

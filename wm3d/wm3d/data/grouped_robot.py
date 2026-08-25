@@ -90,7 +90,9 @@ class ActionGroupSpec:
         if self.group_id <= 0:
             raise GroupedRobotContractError("group_id=0 is reserved for padding")
         if not self.action_semantics:
-            raise GroupedRobotContractError(f"group {self.name!r} has no action dimensions")
+            raise GroupedRobotContractError(
+                f"group {self.name!r} has no action dimensions"
+            )
         unknown_action = sorted(set(self.action_semantics) - set(ACTION_SEMANTIC_IDS))
         unknown_state = sorted(set(self.state_semantics) - set(STATE_SEMANTIC_IDS))
         unknown_operators = sorted(
@@ -144,9 +146,13 @@ class EmbodimentSpec:
         if not self.name:
             raise GroupedRobotContractError("embodiment name must be non-empty")
         if self.embodiment_id <= 0:
-            raise GroupedRobotContractError("embodiment_id=0 is reserved for padding/unknown")
+            raise GroupedRobotContractError(
+                "embodiment_id=0 is reserved for padding/unknown"
+            )
         if not self.groups:
-            raise GroupedRobotContractError("embodiment must contain at least one action group")
+            raise GroupedRobotContractError(
+                "embodiment must contain at least one action group"
+            )
         names = [group.name for group in self.groups]
         ids = [group.group_id for group in self.groups]
         if len(names) != len(set(names)):
@@ -170,11 +176,20 @@ class GroupedRobotLimits:
     timestamp_tolerance_s: float = 1.0e-6
 
     def __post_init__(self) -> None:
-        for field_name in ("max_groups", "max_substeps", "max_action_dim", "max_state_dim"):
+        for field_name in (
+            "max_groups",
+            "max_substeps",
+            "max_action_dim",
+            "max_state_dim",
+        ):
             if int(getattr(self, field_name)) <= 0:
                 raise GroupedRobotContractError(f"{field_name} must be positive")
-        if self.timestamp_tolerance_s < 0 or not np.isfinite(self.timestamp_tolerance_s):
-            raise GroupedRobotContractError("timestamp_tolerance_s must be finite and non-negative")
+        if self.timestamp_tolerance_s < 0 or not np.isfinite(
+            self.timestamp_tolerance_s
+        ):
+            raise GroupedRobotContractError(
+                "timestamp_tolerance_s must be finite and non-negative"
+            )
 
 
 @dataclass(frozen=True)
@@ -261,27 +276,37 @@ class GroupedRobotWindow:
 def _as_finite_float_array(value: object, *, name: str, ndim: int) -> np.ndarray:
     array = np.asarray(value, dtype=np.float32)
     if array.ndim != ndim:
-        raise GroupedRobotContractError(f"{name} must be rank {ndim}, got {array.shape}")
+        raise GroupedRobotContractError(
+            f"{name} must be rank {ndim}, got {array.shape}"
+        )
     if not np.all(np.isfinite(array)):
         raise GroupedRobotContractError(f"{name} contains non-finite values")
     return array
 
 
-def _as_mask(value: Optional[np.ndarray], shape: Tuple[int, ...], *, name: str) -> np.ndarray:
+def _as_mask(
+    value: Optional[np.ndarray], shape: Tuple[int, ...], *, name: str
+) -> np.ndarray:
     if value is None:
         return np.ones(shape, dtype=np.bool_)
     mask = np.asarray(value, dtype=np.bool_)
     if mask.shape != shape:
-        raise GroupedRobotContractError(f"{name} must have shape {shape}, got {mask.shape}")
+        raise GroupedRobotContractError(
+            f"{name} must have shape {shape}, got {mask.shape}"
+        )
     return mask
 
 
 def _validate_boundaries(boundaries: object) -> np.ndarray:
     result = np.asarray(boundaries, dtype=np.float64)
     if result.ndim != 1 or result.size < 2:
-        raise GroupedRobotContractError("world_boundaries_s must be rank-1 with at least two values")
+        raise GroupedRobotContractError(
+            "world_boundaries_s must be rank-1 with at least two values"
+        )
     if not np.all(np.isfinite(result)) or np.any(np.diff(result) <= 0):
-        raise GroupedRobotContractError("world_boundaries_s must be finite and strictly increasing")
+        raise GroupedRobotContractError(
+            "world_boundaries_s must be finite and strictly increasing"
+        )
     return result
 
 
@@ -306,7 +331,9 @@ def _group_lookup(
     action_semantics = np.zeros(
         (limits.max_groups, limits.max_action_dim), dtype=np.int64
     )
-    state_semantics = np.zeros((limits.max_groups, limits.max_state_dim), dtype=np.int64)
+    state_semantics = np.zeros(
+        (limits.max_groups, limits.max_state_dim), dtype=np.int64
+    )
     composition = np.zeros((limits.max_groups, limits.max_action_dim), dtype=np.int64)
     for slot, group in enumerate(embodiment.groups):
         if group.action_dim > limits.max_action_dim:
@@ -373,11 +400,15 @@ def slice_fine_action_series(
     if not np.isfinite(start_s) or not np.isfinite(stop_s) or stop_s <= start_s:
         raise GroupedRobotContractError("fine-command slice bounds are invalid")
     timestamps = np.asarray(series.timestamps_s, dtype=np.float64)
-    values = _as_finite_float_array(series.values, name=f"{series.group}.values", ndim=2)
+    values = _as_finite_float_array(
+        series.values, name=f"{series.group}.values", ndim=2
+    )
     if timestamps.shape != (values.shape[0],):
         raise GroupedRobotContractError("fine-command timestamp cardinality mismatch")
     if not np.all(np.isfinite(timestamps)) or np.any(np.diff(timestamps) <= 0):
-        raise GroupedRobotContractError("fine-command timestamps must be strictly increasing")
+        raise GroupedRobotContractError(
+            "fine-command timestamps must be strictly increasing"
+        )
     keep = (timestamps >= np.float64(start_s)) & (timestamps < np.float64(stop_s))
     mask = _as_mask(series.value_mask, values.shape, name=f"{series.group}.value_mask")
     return RawActionSeries(
@@ -475,14 +506,18 @@ def compose_coarse_effects_for_observed_window(
         raise GroupedRobotContractError(
             "selected_boundary_indices must be valid strictly increasing source rows"
         )
-    values = _as_finite_float_array(series.values, name=f"{series.group}.values", ndim=2)
+    values = _as_finite_float_array(
+        series.values, name=f"{series.group}.values", ndim=2
+    )
     if values.shape[1] != group.action_dim:
         raise GroupedRobotContractError(
             f"{series.group}.values action_dim={values.shape[1]}, expected {group.action_dim}"
         )
     indices = np.asarray(series.world_interval_indices, dtype=np.int64)
-    if indices.shape != (values.shape[0],) or np.any(indices < 0) or np.any(
-        indices >= clock.size - 1
+    if (
+        indices.shape != (values.shape[0],)
+        or np.any(indices < 0)
+        or np.any(indices >= clock.size - 1)
     ):
         raise GroupedRobotContractError("coarse source interval indices are invalid")
     if np.unique(indices).size != indices.size:
@@ -491,7 +526,9 @@ def compose_coarse_effects_for_observed_window(
     indices = indices[order]
     values = values[order]
     raw_mask = _as_mask(
-        series.value_mask, np.asarray(series.values).shape, name=f"{series.group}.value_mask"
+        series.value_mask,
+        np.asarray(series.values).shape,
+        name=f"{series.group}.value_mask",
     )[order]
 
     output_values = np.zeros((boundaries.size - 1, group.action_dim), dtype=np.float32)
@@ -511,7 +548,10 @@ def compose_coarse_effects_for_observed_window(
                 f"group {group.name!r} SO(3) composition dimensions must be contiguous triples"
             )
         operator = group.composition_operators[start]
-        if any(group.composition_operators[start + offset] != operator for offset in range(3)):
+        if any(
+            group.composition_operators[start + offset] != operator
+            for offset in range(3)
+        ):
             raise GroupedRobotContractError(
                 f"group {group.name!r} SO(3) triple must use one multiplication convention"
             )
@@ -538,7 +578,9 @@ def compose_coarse_effects_for_observed_window(
                 continue
             column = interval_values[:, dimension]
             if operator == "sum":
-                output_values[output_interval, dimension] = np.float32(column.sum(dtype=np.float64))
+                output_values[output_interval, dimension] = np.float32(
+                    column.sum(dtype=np.float64)
+                )
             elif operator in {"last", "logical_last"}:
                 output_values[output_interval, dimension] = column[-1]
             elif operator == "time_weighted_mean":
@@ -562,12 +604,14 @@ def compose_coarse_effects_for_observed_window(
             valid = bool(interval_mask[:, start : start + 3].all())
             output_mask[output_interval, start : start + 3] = valid
             if valid:
-                output_values[output_interval, start : start + 3] = _compose_axis_angle_rows(
-                    interval_values[:, start : start + 3],
-                    left_multiply=(
-                        group.composition_operators[start]
-                        == "so3_axis_angle_base_left"
-                    ),
+                output_values[output_interval, start : start + 3] = (
+                    _compose_axis_angle_rows(
+                        interval_values[:, start : start + 3],
+                        left_multiply=(
+                            group.composition_operators[start]
+                            == "so3_axis_angle_base_left"
+                        ),
+                    )
                 )
     return RawActionSeries(
         group=series.group,
@@ -623,7 +667,9 @@ def pack_grouped_robot_window(
         (interval_count, limits.max_groups, limits.max_action_dim), dtype=np.float32
     )
     coarse_mask = np.zeros_like(coarse_values, dtype=np.bool_)
-    current_values = np.zeros((limits.max_groups, limits.max_state_dim), dtype=np.float32)
+    current_values = np.zeros(
+        (limits.max_groups, limits.max_state_dim), dtype=np.float32
+    )
     current_mask = np.zeros_like(current_values, dtype=np.bool_)
 
     seen_series: set[Tuple[str, FineOrCoarse]] = set()
@@ -637,12 +683,16 @@ def pack_grouped_robot_window(
             raise GroupedRobotContractError(f"duplicate action series {identity}")
         seen_series.add(identity)
         group_slot, group = group_lookup[series.group]
-        values = _as_finite_float_array(series.values, name=f"{series.group}.values", ndim=2)
+        values = _as_finite_float_array(
+            series.values, name=f"{series.group}.values", ndim=2
+        )
         if values.shape[1] != group.action_dim:
             raise GroupedRobotContractError(
                 f"{series.group}.values action_dim={values.shape[1]}, expected {group.action_dim}"
             )
-        value_mask = _as_mask(series.value_mask, values.shape, name=f"{series.group}.value_mask")
+        value_mask = _as_mask(
+            series.value_mask, values.shape, name=f"{series.group}.value_mask"
+        )
 
         if series.supervision == "fine_command":
             if series.timestamps_s is None:
@@ -675,8 +725,12 @@ def pack_grouped_robot_window(
                         "of dropping or resampling them"
                     )
                 next_slot[interval] += 1
-                fine_values[interval, group_slot, substep, : group.action_dim] = values[row]
-                fine_mask[interval, group_slot, substep, : group.action_dim] = value_mask[row]
+                fine_values[interval, group_slot, substep, : group.action_dim] = values[
+                    row
+                ]
+                fine_mask[interval, group_slot, substep, : group.action_dim] = (
+                    value_mask[row]
+                )
                 fine_dt[interval, group_slot, substep] = np.float32(
                     timestamp_s - float(boundaries[interval])
                 )
@@ -745,12 +799,16 @@ def pack_grouped_robot_window(
                 f"{snapshot.group}.current_state dim={values.shape[0]}, expected {group.state_dim}"
             )
         value_mask = _as_mask(
-            snapshot.value_mask, values.shape, name=f"{snapshot.group}.current_state_mask"
+            snapshot.value_mask,
+            values.shape,
+            name=f"{snapshot.group}.current_state_mask",
         )
         current_values[group_slot, : group.state_dim] = values
         current_mask[group_slot, : group.state_dim] = value_mask
 
-    required_state_groups = {group.name for group in embodiment.groups if group.state_dim > 0}
+    required_state_groups = {
+        group.name for group in embodiment.groups if group.state_dim > 0
+    }
     missing_state = sorted(required_state_groups - seen_state_groups)
     if missing_state:
         raise GroupedRobotContractError(
@@ -795,7 +853,7 @@ def panda_single_arm_spec(*, embodiment_id: int = 1) -> EmbodimentSpec:
                     "delta_rotation_axis_angle_rad",
                     "delta_rotation_axis_angle_rad",
                     "delta_rotation_axis_angle_rad",
-                    "absolute_gripper_open01",
+                    "absolute_gripper_close01",
                 ),
                 state_semantics=(
                     "eef_position_m",
@@ -860,7 +918,15 @@ def bimanual_arm_spec(*, embodiment_id: int = 2) -> EmbodimentSpec:
                 state_semantics,
                 "robot_base",
                 "robot_base",
-                ("sum", "sum", "sum", "so3_axis_angle_base_left", "so3_axis_angle_base_left", "so3_axis_angle_base_left", "logical_last"),
+                (
+                    "sum",
+                    "sum",
+                    "sum",
+                    "so3_axis_angle_base_left",
+                    "so3_axis_angle_base_left",
+                    "so3_axis_angle_base_left",
+                    "logical_last",
+                ),
             ),
             ActionGroupSpec(
                 "right_arm",
@@ -869,7 +935,15 @@ def bimanual_arm_spec(*, embodiment_id: int = 2) -> EmbodimentSpec:
                 state_semantics,
                 "robot_base",
                 "robot_base",
-                ("sum", "sum", "sum", "so3_axis_angle_base_left", "so3_axis_angle_base_left", "so3_axis_angle_base_left", "logical_last"),
+                (
+                    "sum",
+                    "sum",
+                    "sum",
+                    "so3_axis_angle_base_left",
+                    "so3_axis_angle_base_left",
+                    "so3_axis_angle_base_left",
+                    "logical_last",
+                ),
             ),
         ),
     )

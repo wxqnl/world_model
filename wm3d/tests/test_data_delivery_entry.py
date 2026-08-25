@@ -17,7 +17,10 @@ import yaml
 
 from scripts.data import materialize_existing_robot_mix
 from scripts.data.materialize_existing_robot_mix import (
+    ROBOCASA,
+    ROBOCASA_ACTION_SCALES,
     _episode_candidates,
+    _robocasa_adapter,
     _segment_has_video_coverage,
     _window_evidence,
 )
@@ -197,6 +200,32 @@ def test_existing_robot_mix_binds_video_template_to_camera_file_metadata(
     assert observed_candidates[0] == (
         "videos/observation.images.head/chunk-000/file-003.mp4"
     )
+
+
+def test_robocasa_partitions_keep_their_audited_controller_scales() -> None:
+    features = {
+        "action": {"shape": [12]},
+        "observation.state": {"shape": [16]},
+        "observation.images.robot0_agentview_left": {},
+        "observation.images.robot0_eye_in_hand": {},
+    }
+    observed_scales: set[tuple[float, ...]] = set()
+    for plan in ROBOCASA:
+        adapter, embodiment = _robocasa_adapter(plan, {"features": features})
+        arm = next(group for group in adapter["groups"] if group["group"] == "arm")
+        translation, rotation = ROBOCASA_ACTION_SCALES[plan.name]
+        assert tuple(arm["action"][0]["scale"]) == translation
+        assert tuple(arm["action"][1]["scale"]) == rotation
+        assert arm["action"][2]["scale"] == [1.0]
+        assert embodiment["name"] == "panda_robocasa_libero"
+        assert embodiment["embodiment_id"] == 2
+        arm_group = next(
+            group for group in embodiment["groups"] if group["name"] == "arm"
+        )
+        assert arm_group["group_id"] == 12
+        assert arm_group["action_semantics"][-1] == "absolute_gripper_close01"
+        observed_scales.add(tuple(translation + rotation))
+    assert len(observed_scales) == len(ROBOCASA)
 
 
 def test_existing_robot_mix_reads_episode_video_segments(tmp_path: Path) -> None:

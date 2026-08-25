@@ -163,7 +163,10 @@ class NativeWorldModelConfig:
                 )
         if len(set(self.bridge_layers_state)) != len(self.bridge_layers_state):
             raise ValueError("bridge_layers_state contains duplicates")
-        if any(index < 0 or index >= self.state_layers for index in self.bridge_layers_state):
+        if any(
+            index < 0 or index >= self.state_layers
+            for index in self.bridge_layers_state
+        ):
             raise ValueError("bridge layer index is outside state trunk")
         if self.dynamics_layers <= 0:
             raise ValueError("dynamics_layers must be positive")
@@ -178,7 +181,9 @@ class NativeWorldModelConfig:
             not isfinite(self.factual_action_residual_scale)
             or self.factual_action_residual_scale < 0.0
         ):
-            raise ValueError("factual_action_residual_scale must be finite and non-negative")
+            raise ValueError(
+                "factual_action_residual_scale must be finite and non-negative"
+            )
         if self.render_factual_action_residual_scale is not None and (
             not isfinite(self.render_factual_action_residual_scale)
             or self.render_factual_action_residual_scale < 0.0
@@ -206,7 +211,9 @@ class NativeWorldModelConfig:
         if tuple(sorted(set(self.rgb_decode_indices))) != self.rgb_decode_indices:
             raise ValueError("rgb_decode_indices must be unique and increasing")
         if any(index < 0 or index >= self.K for index in self.rgb_decode_indices):
-            raise ValueError("rgb_decode_indices must refer to future world-state steps")
+            raise ValueError(
+                "rgb_decode_indices must refer to future world-state steps"
+            )
         if not isinstance(self.rgb_context_enabled, bool):
             raise ValueError("rgb_context_enabled must be boolean")
         if (
@@ -225,13 +232,9 @@ class NativeWorldModelConfig:
             not isfinite(self.rgb_context_action_scale)
             or self.rgb_context_action_scale < 0.0
         ):
-            raise ValueError(
-                "rgb_context_action_scale must be finite and non-negative"
-            )
+            raise ValueError("rgb_context_action_scale must be finite and non-negative")
         if self.rgb_context_action_scale > 0.0 and not self.rgb_context_enabled:
-            raise ValueError(
-                "rgb_context_action_scale requires rgb_context_enabled"
-            )
+            raise ValueError("rgb_context_action_scale requires rgb_context_enabled")
         if not isinstance(self.appearance_enabled, bool):
             raise ValueError("appearance_enabled must be boolean")
         if self.appearance_enabled:
@@ -362,12 +365,16 @@ class CrossAttention(nn.Module):
     ) -> torch.Tensor:
         batch, query_length, _ = query_value.shape
         context_length = context.shape[1]
-        query = self.query(query_value).view(
-            batch, query_length, self.heads, self.head_dim
-        ).transpose(1, 2)
+        query = (
+            self.query(query_value)
+            .view(batch, query_length, self.heads, self.head_dim)
+            .transpose(1, 2)
+        )
         key, value = self.key_value(context).chunk(2, dim=-1)
         key = key.view(batch, context_length, self.heads, self.head_dim).transpose(1, 2)
-        value = value.view(batch, context_length, self.heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch, context_length, self.heads, self.head_dim).transpose(
+            1, 2
+        )
         result = F.scaled_dot_product_attention(
             query,
             key,
@@ -391,7 +398,9 @@ class ContinuousTimeEmbedding(nn.Module):
         self._log_min_frequency = log_min_frequency
         self._log_max_frequency = log_max_frequency
         self._half = half
-        frequencies = torch.exp(torch.linspace(log_min_frequency, log_max_frequency, half))
+        frequencies = torch.exp(
+            torch.linspace(log_min_frequency, log_max_frequency, half)
+        )
         self.register_buffer("frequencies", frequencies, persistent=True)
         self.proj = nn.Sequential(
             nn.Linear(cfg.time_fourier_dim + 1, output_dim, bias=False),
@@ -487,7 +496,9 @@ class FactorizedStateBlock(nn.Module):
         spatial = spatial + self.spatial(self.spatial_norm(spatial))
         value = spatial.view(batch, frames, patches, dim)
         temporal = value.transpose(1, 2).reshape(batch * patches, frames, dim)
-        temporal = temporal + self.temporal(self.temporal_norm(temporal), is_causal=True)
+        temporal = temporal + self.temporal(
+            self.temporal_norm(temporal), is_causal=True
+        )
         value = temporal.view(batch, patches, frames, dim).transpose(1, 2)
         return value + self.ff(self.ff_norm(value))
 
@@ -596,9 +607,9 @@ class GroupedSignalEncoder(nn.Module):
 
         semantic = self.action_semantic(action_semantic_ids)
         semantic_valid = action_semantic_ids.ne(0)
-        semantic = (
-            semantic * semantic_valid[..., None].to(dtype=semantic.dtype)
-        ).sum(dim=2) / semantic_valid.sum(dim=2).clamp_min(1)[..., None]
+        semantic = (semantic * semantic_valid[..., None].to(dtype=semantic.dtype)).sum(
+            dim=2
+        ) / semantic_valid.sum(dim=2).clamp_min(1)[..., None]
         signal = signal + semantic[:, None]
         signal = signal + self.group(group_ids)[:, None]
         signal = signal + self.embodiment(embodiment_ids)[:, None, None]
@@ -634,9 +645,13 @@ class CurrentStateEncoder(nn.Module):
             raise ValueError("state semantic ids must align to current state")
         group_declares_state = semantic_ids.ne(0).any(dim=-1)
         if not bool((dim_mask.any(dim=-1) | ~group_declares_state | ~group_mask).all()):
-            raise ValueError("every group with state semantics requires measured current state")
+            raise ValueError(
+                "every group with state semantics requires measured current state"
+            )
         if not bool((dim_mask & group_mask[..., None]).any(dim=(1, 2)).all()):
-            raise ValueError("every sample requires at least one measured current-state value")
+            raise ValueError(
+                "every sample requires at least one measured current-state value"
+            )
         pair = torch.cat(
             (values * dim_mask.to(dtype=values.dtype), dim_mask.to(dtype=values.dtype)),
             dim=-1,
@@ -644,10 +659,15 @@ class CurrentStateEncoder(nn.Module):
         token = self.value(pair)
         semantic = self.semantic(semantic_ids)
         semantic_valid = semantic_ids.ne(0)
-        semantic = (
-            semantic * semantic_valid[..., None].to(dtype=semantic.dtype)
-        ).sum(dim=2) / semantic_valid.sum(dim=2).clamp_min(1)[..., None]
-        token = token + semantic + self.group(group_ids) + self.embodiment(embodiment_ids)[:, None]
+        semantic = (semantic * semantic_valid[..., None].to(dtype=semantic.dtype)).sum(
+            dim=2
+        ) / semantic_valid.sum(dim=2).clamp_min(1)[..., None]
+        token = (
+            token
+            + semantic
+            + self.group(group_ids)
+            + self.embodiment(embodiment_ids)[:, None]
+        )
         return self.norm(token) * group_mask[..., None].to(dtype=token.dtype)
 
 
@@ -685,8 +705,7 @@ class ActionBlock(nn.Module):
         temporal_times = action_times.transpose(1, 2).reshape(batch * groups, steps)
         temporal_valid = token_mask.transpose(1, 2).reshape(batch * groups, steps)
         temporal_allowed = (
-            temporal_times[:, :, None] + 1.0e-7
-            >= temporal_times[:, None, :]
+            temporal_times[:, :, None] + 1.0e-7 >= temporal_times[:, None, :]
         ) & temporal_valid[:, None, :]
         temporal = temporal + self.attn(
             self.attn_norm(temporal),
@@ -791,7 +810,9 @@ class DynamicsConditionBlock(nn.Module):
         context = torch.cat((null, factual_action), dim=2)
         valid = torch.cat(
             (
-                torch.ones(batch, horizon, 1, dtype=torch.bool, device=factual_mask.device),
+                torch.ones(
+                    batch, horizon, 1, dtype=torch.bool, device=factual_mask.device
+                ),
                 factual_mask,
             ),
             dim=2,
@@ -889,7 +910,9 @@ class PerViewAppearanceDynamics(nn.Module):
     def _upsample_geometry(self, future_state: torch.Tensor) -> torch.Tensor:
         batch, horizon, patches, _ = future_state.shape
         if (horizon, patches) != (self.cfg.K, self.cfg.P):
-            raise ValueError("future geometry shape is incompatible with appearance lane")
+            raise ValueError(
+                "future geometry shape is incompatible with appearance lane"
+            )
         value = self.geometry(future_state)
         value = value.reshape(
             batch * horizon,
@@ -932,9 +955,9 @@ class PerViewAppearanceDynamics(nn.Module):
         if tuple(world_times_s.shape) != (batch, cfg.T + cfg.K):
             raise ValueError("appearance world times are incompatible with T/K")
         if future_mask is None:
-            future_mask = context_mask.any(dim=1)[:, None].expand(
-                -1, cfg.K, -1, -1
-            ).clone()
+            future_mask = (
+                context_mask.any(dim=1)[:, None].expand(-1, cfg.K, -1, -1).clone()
+            )
         elif tuple(future_mask.shape) != (
             batch,
             cfg.K,
@@ -1037,7 +1060,9 @@ class UnifiedActionHead(nn.Module):
             raise ValueError(
                 "gripper/binary/discrete action normalization must be identity"
             )
-        physical = raw * normalization_scale[:, :, None] + normalization_offset[:, :, None]
+        physical = (
+            raw * normalization_scale[:, :, None] + normalization_offset[:, :, None]
+        )
         decoded = torch.where(binary, torch.sigmoid(raw), physical)
         output_mask = query_mask[..., None] & action_semantic_ids[:, :, None, :].ne(0)
         return {
@@ -1159,8 +1184,7 @@ class NativeRGBImageDecoder(nn.Module):
                 nn.GELU(),
             ]
             stage.extend(
-                ResidualConvBlock(output_channels)
-                for _ in range(cfg.rgb_res_blocks)
+                ResidualConvBlock(output_channels) for _ in range(cfg.rgb_res_blocks)
             )
             ups.append(nn.Sequential(*stage))
         self.ups = nn.ModuleList(ups)
@@ -1181,7 +1205,9 @@ class NativeRGBImageDecoder(nn.Module):
                 self.cfg.P,
                 self.cfg.state_hidden,
             ):
-                raise ValueError("dual-path RGB decoder requires native geometry tokens")
+                raise ValueError(
+                    "dual-path RGB decoder requires native geometry tokens"
+                )
             geometry = geometry_tokens.transpose(1, 2).reshape(
                 geometry_tokens.shape[0],
                 self.cfg.state_hidden,
@@ -1191,7 +1217,9 @@ class NativeRGBImageDecoder(nn.Module):
             geometry = self.geometry_stem(geometry)
             if self.geometry_grid != self.grid:
                 geometry = F.interpolate(
-                    geometry.float(), size=(self.grid, self.grid), mode="bilinear",
+                    geometry.float(),
+                    size=(self.grid, self.grid),
+                    mode="bilinear",
                     align_corners=False,
                 ).to(dtype=value.dtype)
             value = value + geometry
@@ -1242,9 +1270,7 @@ class _RGBDownBlock(nn.Module):
     def __init__(self, input_channels: int, output_channels: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(
-                input_channels, output_channels, 3, stride=2, padding=1
-            ),
+            nn.Conv2d(input_channels, output_channels, 3, stride=2, padding=1),
             nn.GroupNorm(_rgb_norm_groups(output_channels), output_channels),
             nn.SiLU(inplace=True),
             _RGBConvBlock(output_channels, output_channels),
@@ -1321,6 +1347,16 @@ class NativeContextRGBImageDecoder(nn.Module):
             if cfg.rgb_context_action_scale > 0.0
             else None
         )
+        # V7 conditions the renderer bottleneck on the task directly.  The
+        # world/token path also sees the task, but asking that lower-resolution
+        # path to preserve all task information was the V8 RGB regression we
+        # are explicitly avoiding here.
+        self.task_proj = nn.Sequential(
+            nn.LayerNorm(cfg.task_dim),
+            nn.Linear(cfg.task_dim, channels[0]),
+            nn.SiLU(inplace=True),
+            nn.Linear(channels[0], channels[0]),
+        )
         context_channels = tuple(reversed(channels))
         self.context_stem = _RGBConvBlock(3, context_channels[0])
         self.context_downs = nn.ModuleList(
@@ -1351,6 +1387,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         view_embedding: torch.Tensor,
         geometry_tokens: Optional[torch.Tensor],
         factual_action_summary: Optional[torch.Tensor],
+        task_embedding: torch.Tensor,
         context_rgb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if tuple(context_rgb.shape[1:]) != (
@@ -1363,6 +1400,10 @@ class NativeContextRGBImageDecoder(nn.Module):
             tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
         )
         value = self.token_stem(value) + view_embedding
+        if tuple(task_embedding.shape) != (tokens.shape[0], self.cfg.task_dim):
+            raise ValueError("context RGB task embedding must be [N,task_dim]")
+        task = self.task_proj(task_embedding).to(dtype=value.dtype)
+        value = value + task[:, :, None, None]
         if self.action_proj is not None:
             if factual_action_summary is None or tuple(
                 factual_action_summary.shape
@@ -1372,8 +1413,7 @@ class NativeContextRGBImageDecoder(nn.Module):
                 )
             action = self.action_proj(factual_action_summary).to(dtype=value.dtype)
             value = value + (
-                float(self.cfg.rgb_context_action_scale)
-                * action[:, :, None, None]
+                float(self.cfg.rgb_context_action_scale) * action[:, :, None, None]
             )
         elif factual_action_summary is not None:
             raise ValueError(
@@ -1384,7 +1424,9 @@ class NativeContextRGBImageDecoder(nn.Module):
                 self.cfg.P,
                 self.cfg.state_hidden,
             ):
-                raise ValueError("dual-path RGB decoder requires native geometry tokens")
+                raise ValueError(
+                    "dual-path RGB decoder requires native geometry tokens"
+                )
             geometry = geometry_tokens.transpose(1, 2).reshape(
                 geometry_tokens.shape[0],
                 self.cfg.state_hidden,
@@ -1423,10 +1465,7 @@ class NativeContextRGBImageDecoder(nn.Module):
 
         raw = self.head(value)
         direct = torch.sigmoid(raw[:, :3])
-        residual = (
-            torch.tanh(raw[:, 3:6])
-            * float(self.cfg.rgb_context_residual_scale)
-        )
+        residual = torch.tanh(raw[:, 3:6]) * float(self.cfg.rgb_context_residual_scale)
         motion_logit = self.motion_head(value)
         motion_hint = torch.sigmoid(motion_logit)
         blend = torch.sigmoid(raw[:, 6:7])
@@ -1449,9 +1488,7 @@ class NativeRGBDecoder(nn.Module):
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.view_embed = nn.Parameter(
-            torch.empty(cfg.num_views, cfg.rgb_hidden, 1, 1)
-        )
+        self.view_embed = nn.Parameter(torch.empty(cfg.num_views, cfg.rgb_hidden, 1, 1))
         nn.init.normal_(self.view_embed, std=0.02)
         image_decoder: nn.Module
         if cfg.rgb_context_enabled:
@@ -1473,6 +1510,7 @@ class NativeRGBDecoder(nn.Module):
         appearance_tokens: Optional[torch.Tensor] = None,
         geometry_state: Optional[torch.Tensor] = None,
         factual_action_summary: Optional[torch.Tensor] = None,
+        task_embedding: Optional[torch.Tensor] = None,
         context_rgb: Optional[torch.Tensor] = None,
         context_rgb_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1483,7 +1521,9 @@ class NativeRGBDecoder(nn.Module):
             raise ValueError("RGB decode index is outside the future horizon")
         if tuple(future_tokens.shape[2:]) != (self.cfg.P, self.cfg.token_dim):
             raise ValueError("future RGB tokens must end in [P,token_dim]")
-        index_tensor = torch.tensor(indices, dtype=torch.long, device=future_tokens.device)
+        index_tensor = torch.tensor(
+            indices, dtype=torch.long, device=future_tokens.device
+        )
         if not indices:
             empty = future_tokens.new_empty(
                 future_tokens.shape[0],
@@ -1542,20 +1582,35 @@ class NativeRGBDecoder(nn.Module):
                 self.cfg.K,
                 self.cfg.state_hidden,
             )
-            if factual_action_summary is None or tuple(
-                factual_action_summary.shape
-            ) != expected_action:
-                raise ValueError(
-                    f"factual_action_summary must be {expected_action}"
-                )
+            if (
+                factual_action_summary is None
+                or tuple(factual_action_summary.shape) != expected_action
+            ):
+                raise ValueError(f"factual_action_summary must be {expected_action}")
             selected_action = factual_action_summary.index_select(1, index_tensor)
-            expanded_action = selected_action[:, :, None].expand(
-                -1, -1, views, -1
-            ).reshape(batch * frames * views, self.cfg.state_hidden)
+            expanded_action = (
+                selected_action[:, :, None]
+                .expand(-1, -1, views, -1)
+                .reshape(batch * frames * views, self.cfg.state_hidden)
+            )
         elif factual_action_summary is not None:
             raise ValueError(
                 "factual action summary was supplied while RGB action conditioning is disabled"
             )
+        expanded_task: Optional[torch.Tensor] = None
+        if self.cfg.rgb_context_enabled:
+            if task_embedding is None or tuple(task_embedding.shape) != (
+                batch,
+                self.cfg.task_dim,
+            ):
+                raise ValueError(f"task_embedding must be {(batch, self.cfg.task_dim)}")
+            expanded_task = (
+                task_embedding[:, None, None]
+                .expand(-1, frames, views, -1)
+                .reshape(batch * frames * views, self.cfg.task_dim)
+            )
+        elif task_embedding is not None:
+            raise ValueError("task embedding was supplied to a non-context renderer")
         expanded_context: Optional[torch.Tensor] = None
         context_valid: Optional[torch.Tensor] = None
         if self.cfg.rgb_context_enabled:
@@ -1573,17 +1628,19 @@ class NativeRGBDecoder(nn.Module):
                 views,
             ):
                 raise ValueError("context_rgb_mask must be [B,V]")
-            expanded_context = context_rgb[:, None].expand(
-                -1, frames, -1, -1, -1, -1
-            ).reshape(
-                batch * frames * views,
-                3,
-                self.cfg.rgb_size,
-                self.cfg.rgb_size,
+            expanded_context = (
+                context_rgb[:, None]
+                .expand(-1, frames, -1, -1, -1, -1)
+                .reshape(
+                    batch * frames * views,
+                    3,
+                    self.cfg.rgb_size,
+                    self.cfg.rgb_size,
+                )
             )
-            context_valid = context_rgb_mask[:, None].expand(
-                -1, frames, -1
-            ).reshape(-1).bool()
+            context_valid = (
+                context_rgb_mask[:, None].expand(-1, frames, -1).reshape(-1).bool()
+            )
         elif context_rgb is not None or context_rgb_mask is not None:
             raise ValueError("context RGB was supplied to a non-context renderer")
         if target_view_mask is None:
@@ -1624,12 +1681,14 @@ class NativeRGBDecoder(nn.Module):
                     0, view_ids.index_select(0, chunk_indices)
                 ),
                 (
-                    None if expanded_geometry is None else
-                    expanded_geometry.index_select(0, chunk_indices)
+                    None
+                    if expanded_geometry is None
+                    else expanded_geometry.index_select(0, chunk_indices)
                 ),
             )
             if self.cfg.rgb_context_enabled:
                 assert expanded_context is not None
+                assert expanded_task is not None
                 decoded, motion_logit, blend = self.image_decoder(
                     *decoder_inputs,
                     (
@@ -1637,6 +1696,7 @@ class NativeRGBDecoder(nn.Module):
                         if expanded_action is None
                         else expanded_action.index_select(0, chunk_indices)
                     ),
+                    expanded_task.index_select(0, chunk_indices),
                     expanded_context.index_select(0, chunk_indices),
                 )
             else:
@@ -1645,9 +1705,7 @@ class NativeRGBDecoder(nn.Module):
                     decoded.shape[0], 1, decoded.shape[-2], decoded.shape[-1]
                 )
                 blend = torch.zeros_like(motion_logit)
-            chunk_valid = valid.index_select(0, chunk_indices)[
-                :, None, None, None
-            ]
+            chunk_valid = valid.index_select(0, chunk_indices)[:, None, None, None]
             decoded_chunks.append(decoded * chunk_valid.to(dtype=decoded.dtype))
             motion_chunks.append(
                 motion_logit * chunk_valid.to(dtype=motion_logit.dtype)
@@ -1657,9 +1715,7 @@ class NativeRGBDecoder(nn.Module):
         dense_motion = torch.cat(motion_chunks, dim=0)
         dense_blend = torch.cat(blend_chunks, dim=0)
         return (
-            dense.view(
-                batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
-            ),
+            dense.view(batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size),
             index_tensor,
             dense_motion.view(
                 batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
@@ -1681,14 +1737,18 @@ class NativeWorldModel(nn.Module):
         self.state_time = ContinuousTimeEmbedding(cfg.state_hidden, cfg)
         self.action_time = ContinuousTimeEmbedding(cfg.action_hidden, cfg)
         self.state_space = nn.Parameter(torch.empty(1, 1, cfg.P, cfg.state_hidden))
-        self.future_queries = nn.Parameter(torch.empty(1, cfg.K, cfg.P, cfg.state_hidden))
+        self.future_queries = nn.Parameter(
+            torch.empty(1, cfg.K, cfg.P, cfg.state_hidden)
+        )
         # Query identity comes from physical time, group/embodiment and current
         # state.  A shared seed avoids learning discrete 20Hz-style position
         # slots and makes the capacity ceiling parameter-count independent.
-        self.policy_query_seed = nn.Parameter(
-            torch.empty(1, 1, 1, cfg.action_hidden)
-        )
-        for parameter in (self.state_space, self.future_queries, self.policy_query_seed):
+        self.policy_query_seed = nn.Parameter(torch.empty(1, 1, 1, cfg.action_hidden))
+        for parameter in (
+            self.state_space,
+            self.future_queries,
+            self.policy_query_seed,
+        ):
             nn.init.normal_(parameter, std=0.02)
         self.task_state = nn.Linear(cfg.task_dim, cfg.state_hidden, bias=False)
         self.task_action = nn.Linear(cfg.task_dim, cfg.action_hidden, bias=False)
@@ -1724,9 +1784,7 @@ class NativeWorldModel(nn.Module):
         self.action_norm = RMSNorm(cfg.action_hidden)
         self.token_output = nn.Linear(cfg.state_hidden, cfg.token_dim, bias=False)
         self.appearance_dynamics: Optional[PerViewAppearanceDynamics] = (
-            PerViewAppearanceDynamics(cfg)
-            if cfg.appearance_enabled
-            else None
+            PerViewAppearanceDynamics(cfg) if cfg.appearance_enabled else None
         )
         self.action_head = UnifiedActionHead(cfg)
         self.geometry_head = NativeGeometryHead(cfg)
@@ -1790,7 +1848,9 @@ class NativeWorldModel(nn.Module):
         del enabled
         return module(*args)
 
-    def _validate_world_times(self, world_times_s: torch.Tensor, batch: int) -> torch.Tensor:
+    def _validate_world_times(
+        self, world_times_s: torch.Tensor, batch: int
+    ) -> torch.Tensor:
         expected = (batch, self.cfg.T + self.cfg.K)
         if tuple(world_times_s.shape) != expected:
             raise ValueError(f"world_times_s must be {expected}")
@@ -1910,7 +1970,9 @@ class NativeWorldModel(nn.Module):
         future = self.future_queries.expand(batch, -1, -1, -1)
         state = torch.cat((context, future), dim=1)
         state = self.state_input_norm(state)
-        state = state + self.state_space + self.state_time(relative_world_time)[:, :, None]
+        state = (
+            state + self.state_space + self.state_time(relative_world_time)[:, :, None]
+        )
         state = state + self.task_state(task_embedding)[:, None, None]
         state = self._encode_aux(state, aux_values, aux_mask, aux_type_ids)
 
@@ -1939,16 +2001,24 @@ class NativeWorldModel(nn.Module):
         )
         query_time = policy_query_dt.transpose(1, 2)
         query = query + self.action_time(query_time)
-        query = query + current[:, None] + self.task_action(task_embedding)[:, None, None]
-        history = history + self.action_time(relative_world_time[:, : cfg.T])[:, :, None]
+        query = (
+            query + current[:, None] + self.task_action(task_embedding)[:, None, None]
+        )
+        history = (
+            history + self.action_time(relative_world_time[:, : cfg.T])[:, :, None]
+        )
         history = history + self.task_action(task_embedding)[:, None, None]
         action = torch.cat((history, query), dim=1)
         history_mask = history_valid & action_group_mask[:, None, :]
-        query_token_mask = policy_query_mask.transpose(1, 2) & action_group_mask[:, None]
+        query_token_mask = (
+            policy_query_mask.transpose(1, 2) & action_group_mask[:, None]
+        )
         action_mask = torch.cat((history_mask, query_token_mask), dim=1)
         action_times = torch.cat(
             (
-                relative_world_time[:, : cfg.T, None].expand(-1, -1, cfg.max_action_groups),
+                relative_world_time[:, : cfg.T, None].expand(
+                    -1, -1, cfg.max_action_groups
+                ),
                 query_time,
             ),
             dim=1,
@@ -2042,9 +2112,7 @@ class NativeWorldModel(nn.Module):
             refined = action_free_future
             if residual_scale > 0.0:
                 assert summary is not None
-                refined = refined + (
-                    residual_scale * summary[:, :, None, :]
-                )
+                refined = refined + (residual_scale * summary[:, :, None, :])
             for _ in range(repeats):
                 for dynamics_block in self.dynamics_blocks:
                     refined = self._run(
@@ -2122,7 +2190,9 @@ class NativeWorldModel(nn.Module):
                 or appearance_context_tokens is None
                 or appearance_context_mask is None
             ):
-                raise ValueError("dual-path model requires appearance context tokens and mask")
+                raise ValueError(
+                    "dual-path model requires appearance context tokens and mask"
+                )
             appearance_pred, appearance_pred_mask = self.appearance_dynamics(
                 appearance_context_tokens,
                 appearance_context_mask,
@@ -2142,11 +2212,15 @@ class NativeWorldModel(nn.Module):
                 raise ValueError("appearance teacher ratio must be a scalar in [0,1]")
             if target_appearance_tokens is None:
                 if bool(appearance_ratio > 0):
-                    raise ValueError("teacher forcing requires target appearance tokens")
+                    raise ValueError(
+                        "teacher forcing requires target appearance tokens"
+                    )
                 appearance_for_rgb = appearance_pred
             else:
                 if target_appearance_tokens.shape != appearance_pred.shape:
-                    raise ValueError("target appearance tokens must align to predictions")
+                    raise ValueError(
+                        "target appearance tokens must align to predictions"
+                    )
                 if (
                     target_appearance_mask is None
                     or target_appearance_mask.shape != appearance_pred.shape[:-1]
@@ -2203,6 +2277,7 @@ class NativeWorldModel(nn.Module):
             appearance_for_rgb,
             render_future if cfg.appearance_enabled else None,
             factual_summary if cfg.rgb_context_action_scale > 0.0 else None,
+            task_embedding if cfg.rgb_context_enabled else None,
             context_rgb,
             context_rgb_mask,
             enabled=cfg.activation_checkpointing,
@@ -2257,14 +2332,18 @@ class NativeWorldModel(nn.Module):
             name: sum(parameter.numel() for parameter in module.parameters())
             for name, module in groups.items()
         }
-        counts["other"] = sum(parameter.numel() for parameter in self.parameters()) - sum(
-            counts.values()
-        )
+        counts["other"] = sum(
+            parameter.numel() for parameter in self.parameters()
+        ) - sum(counts.values())
         counts["total"] = sum(parameter.numel() for parameter in self.parameters())
         return counts
 
     def num_trainable_params(self) -> int:
-        return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+        return sum(
+            parameter.numel()
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
 
 
 def native_config_from_mapping(mapping: Mapping[str, object]) -> NativeWorldModelConfig:

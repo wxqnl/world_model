@@ -90,51 +90,55 @@ def _batch(cfg: NativeWorldModelConfig) -> dict[str, torch.Tensor]:
     future_mask[1, :, 1] = False
     sample_mask[1, :, 1] = False
     future_sample_mask[1, :, 1] = False
-    action_semantic_ids = torch.tensor(
-        [
-            ACTION_SEMANTIC_IDS["delta_position_m"],
-            ACTION_SEMANTIC_IDS["delta_position_m"],
-            ACTION_SEMANTIC_IDS["delta_position_m"],
-            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
-            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
-            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
-            ACTION_SEMANTIC_IDS["absolute_gripper_open01"],
-        ]
-    ).view(1, 1, action_dim).expand(batch, groups, -1).clone()
-    state_semantic_ids = torch.tensor(
-        [
-            STATE_SEMANTIC_IDS["eef_position_m"],
-            STATE_SEMANTIC_IDS["eef_position_m"],
-            STATE_SEMANTIC_IDS["eef_position_m"],
-            STATE_SEMANTIC_IDS["eef_rotation_6d"],
-            STATE_SEMANTIC_IDS["eef_rotation_6d"],
-            STATE_SEMANTIC_IDS["eef_rotation_6d"],
-            STATE_SEMANTIC_IDS["eef_rotation_6d"],
-            STATE_SEMANTIC_IDS["eef_rotation_6d"],
-            STATE_SEMANTIC_IDS["eef_rotation_6d"],
-            STATE_SEMANTIC_IDS["gripper_close01"],
-        ]
-    ).view(1, 1, state_dim).expand(batch, groups, -1).clone()
+    action_semantic_ids = (
+        torch.tensor(
+            [
+                ACTION_SEMANTIC_IDS["delta_position_m"],
+                ACTION_SEMANTIC_IDS["delta_position_m"],
+                ACTION_SEMANTIC_IDS["delta_position_m"],
+                ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+                ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+                ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+                ACTION_SEMANTIC_IDS["absolute_gripper_open01"],
+            ]
+        )
+        .view(1, 1, action_dim)
+        .expand(batch, groups, -1)
+        .clone()
+    )
+    state_semantic_ids = (
+        torch.tensor(
+            [
+                STATE_SEMANTIC_IDS["eef_position_m"],
+                STATE_SEMANTIC_IDS["eef_position_m"],
+                STATE_SEMANTIC_IDS["eef_position_m"],
+                STATE_SEMANTIC_IDS["eef_rotation_6d"],
+                STATE_SEMANTIC_IDS["eef_rotation_6d"],
+                STATE_SEMANTIC_IDS["eef_rotation_6d"],
+                STATE_SEMANTIC_IDS["eef_rotation_6d"],
+                STATE_SEMANTIC_IDS["eef_rotation_6d"],
+                STATE_SEMANTIC_IDS["eef_rotation_6d"],
+                STATE_SEMANTIC_IDS["gripper_close01"],
+            ]
+        )
+        .view(1, 1, state_dim)
+        .expand(batch, groups, -1)
+        .clone()
+    )
     query_dt = torch.tensor([0.01, 0.073, 0.231]).view(1, 1, -1)
     query_dt = query_dt.expand(batch, groups, -1).clone()
     query_mask = group_mask[..., None].expand(-1, -1, cfg.max_policy_queries).clone()
     current_mask = group_mask[..., None].expand(-1, -1, state_dim).clone()
     return {
-        "world_tokens": torch.randn(
-            batch, cfg.T, cfg.num_views, cfg.P, cfg.token_dim
-        ),
+        "world_tokens": torch.randn(batch, cfg.T, cfg.num_views, cfg.P, cfg.token_dim),
         "view_mask": torch.ones(batch, cfg.T, cfg.num_views, dtype=torch.bool),
-        "world_times_s": torch.tensor(
-            [[0.0, 0.13, 0.37, 0.82], [1.0, 1.08, 1.4, 2.1]]
-        ),
+        "world_times_s": torch.tensor([[0.0, 0.13, 0.37, 0.82], [1.0, 1.08, 1.4, 2.1]]),
         "task_embedding": torch.randn(batch, cfg.task_dim),
         "history_fine_action_values": context_fine,
         "history_fine_action_mask": context_mask,
         "history_fine_action_dt": context_dt,
         "history_fine_sample_mask": sample_mask,
-        "history_coarse_action_values": torch.zeros(
-            batch, cfg.T, groups, action_dim
-        ),
+        "history_coarse_action_values": torch.zeros(batch, cfg.T, groups, action_dim),
         "history_coarse_action_mask": torch.zeros(
             batch, cfg.T, groups, action_dim, dtype=torch.bool
         ),
@@ -171,7 +175,12 @@ def test_one_core_handles_bimanual_nonuniform_state_and_action_times() -> None:
     assert output["depth"].shape == (2, cfg.K, cfg.num_views, cfg.P)
     assert output["point"].shape == (2, cfg.K, cfg.num_views, cfg.P, 3)
     assert output["rgb"].shape == (
-        2, cfg.K, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+        2,
+        cfg.K,
+        cfg.num_views,
+        3,
+        cfg.rgb_size,
+        cfg.rgb_size,
     )
     assert output["policy_action"].shape == (
         2,
@@ -372,7 +381,9 @@ def test_current_state_changes_policy_but_not_action_free_world_prior() -> None:
     )
 
 
-def test_policy_and_world_losses_reach_current_state_action_and_native_modules() -> None:
+def test_policy_and_world_losses_reach_current_state_action_and_native_modules() -> (
+    None
+):
     cfg = _tiny_config()
     model = NativeWorldModel(cfg).train()
     output = model(**_batch(cfg))
@@ -459,7 +470,9 @@ def test_activation_checkpoint_recompute_preserves_bf16_autocast_metadata() -> N
     )
 
 
-def test_activation_checkpoint_units_are_structural_and_state_dict_transparent() -> None:
+def test_activation_checkpoint_units_are_structural_and_state_dict_transparent() -> (
+    None
+):
     enabled = NativeWorldModel(replace(_tiny_config(), activation_checkpointing=True))
     disabled = NativeWorldModel(replace(_tiny_config(), activation_checkpointing=False))
 
@@ -542,8 +555,11 @@ def test_policy_query_length_over_capacity_fails_closed() -> None:
     model = NativeWorldModel(cfg).eval()
     batch = _batch(cfg)
     too_many = cfg.max_policy_queries + 1
-    batch["policy_query_dt"] = torch.arange(too_many).float().view(1, 1, -1).expand(
-        2, cfg.max_action_groups, -1
+    batch["policy_query_dt"] = (
+        torch.arange(too_many)
+        .float()
+        .view(1, 1, -1)
+        .expand(2, cfg.max_action_groups, -1)
     )
     batch["policy_query_mask"] = torch.ones_like(
         batch["policy_query_dt"], dtype=torch.bool
@@ -623,7 +639,12 @@ def test_model_data_gate_rejects_bimanual_capacity_truncation() -> None:
                 "dual": EmbodimentSpec(
                     name="dual",
                     embodiment_id=1,
-                    groups=(group, ActionGroupSpec(**{**group.__dict__, "name": "right", "group_id": 2})),
+                    groups=(
+                        group,
+                        ActionGroupSpec(
+                            **{**group.__dict__, "name": "right", "group_id": 2}
+                        ),
+                    ),
                 )
             },
         },
@@ -638,6 +659,8 @@ def test_model_profile_validation_reaches_native_architecture_fields() -> None:
     profile["model"]["state_heads"] = 7
     with pytest.raises(ValueError, match="divisible"):
         build_world_model(profile)
+
+
 def _tiny_dual_path_config() -> NativeWorldModelConfig:
     return replace(
         _tiny_config(),
@@ -794,6 +817,7 @@ def test_context_renderer_directly_uses_factual_action_summary() -> None:
     geometry = torch.randn(batch, cfg.K, cfg.P, cfg.state_hidden)
     context = torch.rand(batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     context_mask = torch.ones(batch, cfg.num_views, dtype=torch.bool)
+    task = torch.randn(batch, cfg.task_dim)
     zero = torch.zeros(batch, cfg.K, cfg.state_hidden)
     factual = torch.randn_like(zero)
 
@@ -803,6 +827,7 @@ def test_context_renderer_directly_uses_factual_action_summary() -> None:
         appearance_tokens=appearance,
         geometry_state=geometry,
         factual_action_summary=zero,
+        task_embedding=task,
         context_rgb=context,
         context_rgb_mask=context_mask,
     )[0]
@@ -812,6 +837,7 @@ def test_context_renderer_directly_uses_factual_action_summary() -> None:
         appearance_tokens=appearance,
         geometry_state=geometry,
         factual_action_summary=factual,
+        task_embedding=task,
         context_rgb=context,
         context_rgb_mask=context_mask,
     )[0]
@@ -828,6 +854,51 @@ def test_context_renderer_directly_uses_factual_action_summary() -> None:
     assert any(gradient.abs().sum() > 0 for gradient in action_gradients)
 
 
+def test_context_renderer_directly_uses_task_embedding() -> None:
+    cfg = replace(_tiny_dual_path_config(), rgb_context_enabled=True)
+    torch.manual_seed(131)
+    decoder = NativeWorldModel(cfg).rgb_head.train()
+    batch = 2
+    future_tokens = torch.randn(batch, cfg.K, cfg.P, cfg.token_dim)
+    appearance = torch.randn(
+        batch, cfg.K, cfg.num_views, cfg.appearance_P, cfg.token_dim
+    )
+    geometry = torch.randn(batch, cfg.K, cfg.P, cfg.state_hidden)
+    context = torch.rand(batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    context_mask = torch.ones(batch, cfg.num_views, dtype=torch.bool)
+    task = torch.randn(batch, cfg.task_dim)
+
+    baseline = decoder(
+        future_tokens,
+        None,
+        appearance_tokens=appearance,
+        geometry_state=geometry,
+        task_embedding=task,
+        context_rgb=context,
+        context_rgb_mask=context_mask,
+    )[0]
+    changed = decoder(
+        future_tokens,
+        None,
+        appearance_tokens=appearance,
+        geometry_state=geometry,
+        task_embedding=task.roll(1, dims=0),
+        context_rgb=context,
+        context_rgb_mask=context_mask,
+    )[0]
+
+    assert not torch.allclose(baseline, changed)
+    baseline.square().mean().backward()
+    task_gradients = [
+        parameter.grad
+        for name, parameter in decoder.named_parameters()
+        if "task_proj" in name
+    ]
+    assert task_gradients
+    assert all(gradient is not None for gradient in task_gradients)
+    assert any(gradient.abs().sum() > 0 for gradient in task_gradients)
+
+
 def test_renderer_action_route_stays_out_of_action_free_policy_trunk() -> None:
     cfg = replace(
         _tiny_dual_path_config(),
@@ -837,12 +908,8 @@ def test_renderer_action_route_stays_out_of_action_free_policy_trunk() -> None:
     torch.manual_seed(129)
     model = NativeWorldModel(cfg).eval()
     batch = _dual_path_batch(cfg)
-    batch["context_rgb"] = torch.rand(
-        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
-    )
-    batch["context_rgb_mask"] = torch.ones(
-        2, cfg.num_views, dtype=torch.bool
-    )
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     zero_action = dict(batch)
     zero_action["future_factual_fine_action_values"] = torch.zeros_like(
         batch["future_factual_fine_action_values"]
@@ -930,6 +997,7 @@ def test_dual_path_1b_and_5b_profiles_are_materializable() -> None:
     assert 1_000_000_000 < counts["native_1b_dual_path.yaml"] < 2_000_000_000
     assert counts["native_5b_dual_path.yaml"] > 5_000_000_000
 
+
 def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
     cfg = replace(_tiny_config(), factual_dynamics_repeats=3)
     torch.manual_seed(41)
@@ -960,6 +1028,7 @@ def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
         atol=0,
     )
     assert not torch.allclose(baseline["pred_tokens"], counterfactual["pred_tokens"])
+
 
 def test_zero_action_control_reuses_the_exact_factual_path() -> None:
     cfg = replace(_tiny_config(), factual_dynamics_repeats=2, dropout=0.0)

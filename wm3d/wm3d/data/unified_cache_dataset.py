@@ -646,10 +646,10 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             zip(embodiment.groups, prepared_robot.action_series)
         ):
             fine_available = bool(
-                normalization.fine_action_available[slot, : group.action_dim].all()
+                normalization.fine_action_available[slot, : group.action_dim].any()
             )
             coarse_available = bool(
-                normalization.coarse_action_available[slot, : group.action_dim].all()
+                normalization.coarse_action_available[slot, : group.action_dim].any()
             )
             if (series.supervision == "fine_command") != fine_available or (
                 series.supervision == "coarse_effect"

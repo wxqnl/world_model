@@ -104,9 +104,20 @@ def main() -> None:
         raise RuntimeError("adapter groups differ from the selected embodiment")
     for name, spec in specs.items():
         mapping = mappings[name]
-        if sum(len(term.columns) for term in mapping.action) != spec.action_dim:
+        raw_action_width = sum(len(term.columns) for term in mapping.action)
+        action_width = (
+            raw_action_width if mapping.action_transform == "identity" else 7
+        )
+        if action_width != spec.action_dim:
             raise RuntimeError(f"{name}: adapter action width differs from embodiment")
-        if sum(len(term.columns) for term in mapping.state) != spec.state_dim:
+        raw_state_width = sum(len(term.columns) for term in mapping.state)
+        if mapping.state_transform == "identity":
+            state_width = raw_state_width
+        elif mapping.state_transform == "zero":
+            state_width = 0
+        else:
+            state_width = 10
+        if state_width != spec.state_dim:
             raise RuntimeError(f"{name}: adapter state width differs from embodiment")
 
     template = yaml.safe_load(_regular(args.data_template, "data template").read_text())
@@ -136,7 +147,21 @@ def main() -> None:
                         observed_widths = shape.get("observed_list_widths")
                         observed_rows = int(shape.get("observed_list_rows", 0))
                         observed_nulls = int(shape.get("observed_list_null_rows", 0))
-                        if (
+                        if shape.get("arrow_type") in {
+                            "bool",
+                            "double",
+                            "float",
+                            "int8",
+                            "int16",
+                            "int32",
+                            "int64",
+                            "uint8",
+                            "uint16",
+                            "uint32",
+                            "uint64",
+                        }:
+                            width = 1
+                        elif (
                             not isinstance(observed_widths, list)
                             or len(observed_widths) != 1
                             or observed_rows <= 0
@@ -146,7 +171,8 @@ def main() -> None:
                                 f"{root.get('relative_root')}: {term.key} has no "
                                 "single non-null observed payload width"
                             )
-                        width = int(observed_widths[0])
+                        else:
+                            width = int(observed_widths[0])
                     if max(term.columns) >= int(width):
                         raise RuntimeError(
                             f"{root.get('relative_root')}: {term.key} does not expose "

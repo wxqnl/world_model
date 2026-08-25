@@ -446,10 +446,25 @@ def build_grouped_normalization_artifact(
                     key = (kind, lane, source_name, group.group_id, dimension)
                     statistic = moments.get(key)
                     if statistic is None or statistic.count <= 0:
-                        raise GroupedNormalizationError(
-                            f"no masked train values for {key}; dimensions cannot be dropped"
+                        count = 0
+                        observed_mean = 0.0
+                        observed_std = 0.0
+                        observed_minimum = 0.0
+                        observed_maximum = 0.0
+                        offset = 0.0
+                        scale = 1.0
+                    else:
+                        count = statistic.count
+                        observed_mean = statistic.mean
+                        observed_std = statistic.std
+                        observed_minimum = statistic.minimum
+                        observed_maximum = statistic.maximum
+                        offset = 0.0 if semantic in identities else statistic.mean
+                        scale = (
+                            1.0
+                            if semantic in identities
+                            else _scale_floor(statistic, minimum_scale)
                         )
-                    observed_std = statistic.std
                     identity = semantic in identities
                     rows.append(
                         {
@@ -465,15 +480,13 @@ def build_grouped_normalization_artifact(
                             "semantic_id": semantic_ids[semantic],
                             "lane": lane,
                             "transform": "identity" if identity else "zscore",
-                            "count": statistic.count,
-                            "observed_mean": statistic.mean,
+                            "count": count,
+                            "observed_mean": observed_mean,
                             "observed_std": observed_std,
-                            "observed_min": statistic.minimum,
-                            "observed_max": statistic.maximum,
-                            "offset": 0.0 if identity else statistic.mean,
-                            "scale": 1.0
-                            if identity
-                            else _scale_floor(statistic, minimum_scale),
+                            "observed_min": observed_minimum,
+                            "observed_max": observed_maximum,
+                            "offset": offset,
+                            "scale": scale,
                         }
                     )
     return {
@@ -586,24 +599,35 @@ class GroupedRobotNormalizer:
                     "observed_max",
                 )
             ]
-            if count <= 0 or not np.isfinite([offset, scale, *numeric]).all() or scale <= 0:
+            if count < 0 or not np.isfinite([offset, scale, *numeric]).all() or scale <= 0:
                 raise GroupedNormalizationError("normalization row statistics are invalid")
             observed_mean, observed_std, observed_minimum, observed_maximum = numeric
-            if (
+            if count == 0:
+                if (
+                    offset != 0.0
+                    or scale != 1.0
+                    or any(value != 0.0 for value in numeric)
+                ):
+                    raise GroupedNormalizationError(
+                        "unsupervised normalization coordinates must use the zero/identity placeholder"
+                    )
+            elif (
                 observed_std < 0
                 or observed_minimum > observed_mean
                 or observed_mean > observed_maximum
             ):
                 raise GroupedNormalizationError("normalization observed moments are inconsistent")
-            if identity and (offset != 0.0 or scale != 1.0):
+            if count > 0 and identity and (offset != 0.0 or scale != 1.0):
                 raise GroupedNormalizationError(
                     "gripper/binary/discrete normalization must be identity"
                 )
-            if identity and (observed_minimum < 0.0 or observed_maximum > 1.0):
+            if count > 0 and identity and (
+                observed_minimum < 0.0 or observed_maximum > 1.0
+            ):
                 raise GroupedNormalizationError(
                     "gripper/binary/discrete values must remain in [0,1]"
                 )
-            if not identity:
+            if count > 0 and not identity:
                 expected_scale = max(
                     observed_std,
                     minimum_scale
@@ -757,7 +781,7 @@ class GroupedRobotNormalizer:
                     row = self._rows[(kind, lane, source, group.group_id, dimension)]
                     offset_tensor[slot, dimension] = float(row["offset"])
                     scale_tensor[slot, dimension] = float(row["scale"])
-                    available_tensor[slot, dimension] = True
+                    available_tensor[slot, dimension] = int(row["count"]) > 0
                 if bool(semantic_tensor[slot, len(semantics) :].ne(0).any()):
                     raise GroupedNormalizationError(
                         "normalization sample has nonzero padded semantic ids"

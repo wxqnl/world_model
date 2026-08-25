@@ -7,9 +7,15 @@ import numpy as np
 import pytest
 import yaml
 
-from wm3d.data.grouped_robot import bimanual_arm_spec
+from wm3d.data.grouped_robot import (
+    ActionGroupSpec,
+    EmbodimentSpec,
+    bimanual_arm_spec,
+)
 from wm3d.data.source_adapters import (
     AdapterContractError,
+    _canonical_action,
+    _canonical_state7,
     adapt_action_series,
     adapt_current_state,
     adapt_robot_signals,
@@ -54,13 +60,14 @@ def _write_contract(path: Path) -> str:
         "views:\n"
         "  - name: overhead\n"
         "    key: observation.rgb.overhead\n"
-        "groups:\n"
-        + "".join(groups)
+        "groups:\n" + "".join(groups)
     )
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_one_config_driven_adapter_preserves_both_arms_and_native_times(tmp_path: Path) -> None:
+def test_one_config_driven_adapter_preserves_both_arms_and_native_times(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "adapter.yaml"
     contract = load_adapter_contract(path, expected_sha256=_write_contract(path))
     assert [(view.name, view.key) for view in contract.views] == [
@@ -167,3 +174,217 @@ def test_color_order_v4_accepts_bgr_and_rejects_unknown_order(tmp_path: Path) ->
             path,
             expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         )
+
+
+def _canonical_arm(*, state: bool = True) -> EmbodimentSpec:
+    return EmbodimentSpec(
+        "canonical_arm",
+        200,
+        (
+            ActionGroupSpec(
+                "arm",
+                1,
+                (
+                    "delta_position_m",
+                    "delta_position_m",
+                    "delta_position_m",
+                    "delta_rotation_axis_angle_rad",
+                    "delta_rotation_axis_angle_rad",
+                    "delta_rotation_axis_angle_rad",
+                    "absolute_gripper_close01",
+                ),
+                (
+                    (
+                        "eef_position_m",
+                        "eef_position_m",
+                        "eef_position_m",
+                        "eef_rotation_6d",
+                        "eef_rotation_6d",
+                        "eef_rotation_6d",
+                        "eef_rotation_6d",
+                        "eef_rotation_6d",
+                        "eef_rotation_6d",
+                        "controller_state",
+                    )
+                    if state
+                    else ()
+                ),
+                "robot_base",
+                "robot_base" if state else "not_applicable",
+                (
+                    "sum",
+                    "sum",
+                    "sum",
+                    "so3_axis_angle_base_left",
+                    "so3_axis_angle_base_left",
+                    "so3_axis_angle_base_left",
+                    "logical_last",
+                ),
+            ),
+        ),
+    )
+
+
+def _write_canonical_contract(path: Path, *, droid: bool) -> str:
+    action = (
+        [
+            {
+                "key": "action.pose",
+                "columns": list(range(6)),
+                "scale": [1] * 6,
+                "offset": [0] * 6,
+            },
+            {"key": "action.grip", "columns": [0], "scale": [1], "offset": [0]},
+        ]
+        if droid
+        else [
+            {
+                "key": "action",
+                "columns": list(range(7)),
+                "scale": [1] * 7,
+                "offset": [0] * 7,
+            }
+        ]
+    )
+    state_mapping = (
+        [
+            {
+                "key": "state.pose",
+                "columns": list(range(6)),
+                "scale": [1] * 6,
+                "offset": [0] * 6,
+            },
+            {"key": "state.grip", "columns": [0], "scale": [1], "offset": [0]},
+        ]
+        if droid
+        else [
+            {
+                "key": "state",
+                "columns": list(range(8)),
+                "scale": [1] * 8,
+                "offset": [0] * 8,
+            }
+        ]
+    )
+    value = {
+        "schema": "wm3d_source_adapter_v5",
+        "name": "canonical_fixture",
+        "raw_format": "npz",
+        "observation_time_key": "time",
+        "views": [{"name": "head", "key": "rgb", "color_order": "rgb"}],
+        "groups": [
+            {
+                "group": "arm",
+                "supervision": "fine_command",
+                "action": action,
+                "state": state_mapping,
+                "action_time_key": "time",
+                "state_time_key": "time",
+                "world_interval_index_key": None,
+                "action_transform": "droid_target" if droid else "state_euler_residual",
+                "state_transform": "droid_state" if droid else "pos_euler_8d",
+                "action_value_mask": [True, True, True, True, True, False, True],
+                "state_value_mask": [True] * 10,
+            }
+        ],
+    }
+    path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_v5_bridge_canonicalizes_rotation_gripper_and_masks(tmp_path: Path) -> None:
+    path = tmp_path / "bridge.yaml"
+    contract = load_adapter_contract(
+        path,
+        expected_sha256=_write_canonical_contract(path, droid=False),
+    )
+    time = np.asarray([0.0, 0.1], dtype=np.float64)
+    state = np.zeros((2, 8), dtype=np.float32)
+    state[:, 7] = 0.4
+    action = np.zeros((2, 7), dtype=np.float32)
+    action[:, :3] = (0.1, -0.2, 0.3)
+    action[:, 5] = np.pi / 2.0
+    action[:, 6] = 0.25
+    accessor = Accessor({"action": action, "state": state, "time": time})
+
+    actions = adapt_action_series(
+        accessor=accessor, contract=contract, embodiment=_canonical_arm()
+    )
+    np.testing.assert_allclose(actions[0].values[:, :3], action[:, :3])
+    np.testing.assert_allclose(
+        actions[0].values[:, 3:6],
+        np.asarray([[0.0, 0.0, np.pi / 2.0]] * 2),
+        atol=1.0e-5,
+    )
+    np.testing.assert_allclose(actions[0].values[:, 6], 0.75)
+    np.testing.assert_array_equal(
+        actions[0].value_mask,
+        np.asarray([[True, True, True, True, True, False, True]] * 2),
+    )
+    current = adapt_current_state(
+        accessor=accessor,
+        contract=contract,
+        embodiment=_canonical_arm(),
+        policy_chunk_start_s=0.0,
+    )[0]
+    np.testing.assert_allclose(current.values[3:9], [1, 0, 0, 0, 1, 0])
+    np.testing.assert_allclose(current.values[9], 0.4)
+
+
+def test_v5_droid_uses_target_minus_current_pose(tmp_path: Path) -> None:
+    path = tmp_path / "droid.yaml"
+    contract = load_adapter_contract(
+        path,
+        expected_sha256=_write_canonical_contract(path, droid=True),
+    )
+    time = np.asarray([0.0], dtype=np.float64)
+    state_pose = np.asarray([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0]], np.float32)
+    target_pose = np.asarray([[1.1, 2.2, 2.5, 0.0, 0.0, np.pi / 2.0]], np.float32)
+    accessor = Accessor(
+        {
+            "action.pose": target_pose,
+            "action.grip": np.asarray([[0.8]], np.float32),
+            "state.pose": state_pose,
+            "state.grip": np.asarray([[0.3]], np.float32),
+            "time": time,
+        }
+    )
+    action = adapt_action_series(
+        accessor=accessor, contract=contract, embodiment=_canonical_arm()
+    )[0].values[0]
+    np.testing.assert_allclose(action[:3], [0.1, 0.2, -0.5], atol=1.0e-6)
+    np.testing.assert_allclose(action[3:6], [0.0, 0.0, np.pi / 2.0], atol=1.0e-5)
+    np.testing.assert_allclose(action[6], 0.2)
+
+
+def test_nyu_signed_gripper_is_clipped_before_open_to_close() -> None:
+    raw = np.zeros((2, 14), dtype=np.float32)
+    raw[:, -2] = (-1.0, 1.0)
+    action = _canonical_action(raw, "nyu_franka", state7=None)
+    np.testing.assert_allclose(action[:, 6], [1.0, 0.0])
+
+
+def test_robocasa_panda_uses_close_positive_action_and_state() -> None:
+    state = np.zeros((2, 16), dtype=np.float32)
+    state[:, 10:14] = (0.0, 0.0, 0.0, 1.0)
+    state[0, 14:16] = (0.04, -0.04)
+    state[1, 14:16] = (0.0, 0.0)
+    canonical_state = _canonical_state7(state, "robocasa")
+    np.testing.assert_allclose(canonical_state[:, 6], [0.0, 1.0])
+
+    action = np.zeros((2, 7), dtype=np.float32)
+    action[:, 6] = (-1.0, 1.0)
+    canonical_action = _canonical_action(
+        action,
+        "robocasa",
+        state7=canonical_state,
+    )
+    np.testing.assert_allclose(canonical_action[:, 6], [0.0, 1.0])
+
+
+def test_robocasa_panda_rejects_impossible_gripper_aperture() -> None:
+    state = np.zeros((1, 16), dtype=np.float32)
+    state[:, 10:14] = (0.0, 0.0, 0.0, 1.0)
+    state[0, 14:16] = (0.07, -0.07)
+    with pytest.raises(AdapterContractError, match="0.12 m envelope"):
+        _canonical_state7(state, "robocasa")

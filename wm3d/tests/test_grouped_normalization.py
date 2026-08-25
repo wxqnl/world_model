@@ -201,6 +201,58 @@ def test_valid_mask_cannot_cross_action_lane() -> None:
         )
 
 
+def test_explicitly_unsupervised_coordinate_has_no_stats_or_availability(
+    tmp_path: Path,
+) -> None:
+    profile = _profile(tmp_path)
+    artifact = _artifact(profile)
+    row = next(
+        item
+        for item in artifact["rows"]
+        if item["kind"] == "action" and item["dimension"] == 0
+    )
+    row.update(
+        count=0,
+        observed_mean=0.0,
+        observed_std=0.0,
+        observed_min=0.0,
+        observed_max=0.0,
+        offset=0.0,
+        scale=1.0,
+    )
+    artifact["rows_sha256"] = canonical_sha256(artifact["rows"])
+    normalizer = GroupedRobotNormalizer(artifact, data_profile=profile)
+    embodiment = profile.embodiments["bimanual_arm"]
+    tensors = normalizer.tensors_for(
+        source="source_a",
+        embodiment_id=embodiment.embodiment_id,
+        group_ids=torch.tensor([group.group_id for group in embodiment.groups]),
+        action_semantic_ids=torch.tensor(
+            [
+                [ACTION_SEMANTIC_IDS[name] for name in group.action_semantics]
+                for group in embodiment.groups
+            ]
+        ),
+        state_semantic_ids=torch.tensor(
+            [
+                [STATE_SEMANTIC_IDS[name] for name in group.state_semantics]
+                for group in embodiment.groups
+            ]
+        ),
+    )
+    assert not tensors.fine_action_available[0, 0]
+    assert tensors.fine_action_available[0, 1:].all()
+    mask = torch.zeros(1, 2, 1, 7, dtype=torch.bool)
+    mask[0, 0, 0, 0] = True
+    with pytest.raises(GroupedNormalizationError, match="outside declared"):
+        validate_grouped_lane_mask(
+            mask,
+            available=tensors.fine_action_available,
+            group_axis=1,
+            lane="fine_command",
+        )
+
+
 def test_coarse_lane_has_distinct_statistics_and_no_fine_availability(
     tmp_path: Path,
 ) -> None:
