@@ -422,21 +422,30 @@ def _episode_video_coverage(
     values = _path_values(row, episode_index)
     for view_key in view_keys:
         direct = row.get(f"videos/{view_key}/path")
-        video_values = {**values, "video_key": view_key}
+        video_chunk_index = int(
+            row.get(f"videos/{view_key}/chunk_index", values["chunk_index"])
+        )
+        video_file_index = int(
+            row.get(f"videos/{view_key}/file_index", values["file_index"])
+        )
+        video_values = {
+            **values,
+            "video_key": view_key,
+            "chunk_index": video_chunk_index,
+            "file_index": video_file_index,
+        }
         candidates = [str(direct)] if direct else []
         candidates.extend(
             [
                 _format(video_template, video_values),
                 (
                     "videos/chunk-"
-                    f"{int(row.get(f'videos/{view_key}/chunk_index', values['chunk_index'])):03d}/"
+                    f"{video_chunk_index:03d}/"
                     f"{view_key}/episode_{episode_index:06d}.mp4"
                 ),
                 (
                     f"videos/{view_key}/chunk-"
-                    f"{int(row.get(f'videos/{view_key}/chunk_index', values['chunk_index'])):03d}/"
-                    "file-"
-                    f"{int(row.get(f'videos/{view_key}/file_index', values['file_index'])):03d}.mp4"
+                    f"{video_chunk_index:03d}/file-{video_file_index:03d}.mp4"
                 ),
             ]
         )

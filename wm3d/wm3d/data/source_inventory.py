@@ -403,13 +403,26 @@ def _episode_rows(
         views: list[dict[str, Any]] = []
         for view in adapter.views:
             direct = metadata.get(f"videos/{view.key}/path")
-            video_values = {**values, "video_key": view.key}
+            video_chunk_index = int(
+                metadata.get(
+                    f"videos/{view.key}/chunk_index", values["chunk_index"]
+                )
+            )
+            video_file_index = int(
+                metadata.get(f"videos/{view.key}/file_index", values["file_index"])
+            )
+            video_values = {
+                **values,
+                "video_key": view.key,
+                "chunk_index": video_chunk_index,
+                "file_index": video_file_index,
+            }
             video_candidates = [str(direct)] if direct else []
             video_candidates.extend(
                 [
                     _format(video_template, video_values),
-                    f"videos/chunk-{int(metadata.get(f'videos/{view.key}/chunk_index', values['chunk_index'])):03d}/{view.key}/episode_{episode_index:06d}.mp4",
-                    f"videos/{view.key}/chunk-{int(metadata.get(f'videos/{view.key}/chunk_index', values['chunk_index'])):03d}/file-{int(metadata.get(f'videos/{view.key}/file_index', values['file_index'])):03d}.mp4",
+                    f"videos/chunk-{video_chunk_index:03d}/{view.key}/episode_{episode_index:06d}.mp4",
+                    f"videos/{view.key}/chunk-{video_chunk_index:03d}/file-{video_file_index:03d}.mp4",
                 ]
             )
             video = _existing_relative(root, video_candidates)

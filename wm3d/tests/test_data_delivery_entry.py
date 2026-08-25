@@ -15,6 +15,7 @@ import pytest
 import torch
 import yaml
 
+from scripts.data import materialize_existing_robot_mix
 from scripts.data.materialize_existing_robot_mix import (
     _episode_candidates,
     _segment_has_video_coverage,
@@ -158,6 +159,43 @@ def test_existing_robot_mix_rejects_episode_segment_beyond_video() -> None:
         available_start_s=0.0,
         available_stop_s=20.0,
         frame_count=1,
+    )
+
+
+def test_existing_robot_mix_binds_video_template_to_camera_file_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed_candidates: list[str] = []
+
+    def choose(_root: Path, candidates: object) -> str:
+        observed_candidates.extend(str(candidate) for candidate in candidates)
+        return observed_candidates[0]
+
+    monkeypatch.setattr(materialize_existing_robot_mix, "_existing_relative", choose)
+    monkeypatch.setattr(
+        materialize_existing_robot_mix,
+        "_video_bounds",
+        lambda _path, _cache: (0.0, 20.0, 200),
+    )
+    assert materialize_existing_robot_mix._episode_video_coverage(
+        root=tmp_path,
+        row={
+            "data/chunk_index": 0,
+            "data/file_index": 0,
+            "videos/observation.images.head/chunk_index": 0,
+            "videos/observation.images.head/file_index": 3,
+            "videos/observation.images.head/from_timestamp": 10.0,
+            "videos/observation.images.head/to_timestamp": 11.0,
+        },
+        episode_index=7,
+        view_keys=("observation.images.head",),
+        video_template=(
+            "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+        ),
+        cache={},
+    )
+    assert observed_candidates[0] == (
+        "videos/observation.images.head/chunk-000/file-003.mp4"
     )
 
 

@@ -190,6 +190,9 @@ def test_explicit_shared_file_selection_uses_global_file_origin(
     (tmp_path / "videos/observation.images.top/chunk-000/file-000.mp4").write_bytes(
         b"shared-video-container"
     )
+    (tmp_path / "videos/observation.images.top/chunk-000/file-003.mp4").write_bytes(
+        b"camera-metadata-bound-video-container"
+    )
     (tmp_path / "meta/info.json").write_text(
         json.dumps(
             {
@@ -212,7 +215,7 @@ def test_explicit_shared_file_selection_uses_global_file_origin(
                     type=pa.list_(pa.string()),
                 ),
                 "videos/observation.images.top/chunk_index": [0, 0],
-                "videos/observation.images.top/file_index": [0, 0],
+                "videos/observation.images.top/file_index": [0, 3],
                 "videos/observation.images.top/from_timestamp": [0.0, 10.0],
                 "videos/observation.images.top/to_timestamp": [0.4, 10.4],
             }
@@ -262,3 +265,6 @@ def test_explicit_shared_file_selection_uses_global_file_origin(
     assert rows[0]["payload_row_stop"] == 8
     assert rows[0]["observation_clock"]["start_s"] == pytest.approx(10.0)
     assert payload_reads == 1
+    assert next(
+        asset["path"] for asset in rows[0]["assets"] if asset["role"] == "rgb/overhead"
+    ) == "videos/observation.images.top/chunk-000/file-003.mp4"
