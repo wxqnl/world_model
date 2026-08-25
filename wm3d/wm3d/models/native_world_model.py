@@ -118,6 +118,11 @@ class NativeWorldModelConfig:
     rgb_context_enabled: bool = False
     rgb_context_residual_scale: float = 0.75
     rgb_context_motion_blend_gain: float = 0.5
+    # V7 conditions the context-residual renderer directly on the future
+    # command. Keep that route renderer-only: the canonical grouped factual
+    # action summary reaches the RGB bottleneck but never the action-free
+    # state or policy trunks.
+    rgb_context_action_scale: float = 0.0
     geom_hidden: int = 768
 
     # Optional high-resolution, per-view appearance lane.  The geometry/action
@@ -215,6 +220,17 @@ class NativeWorldModelConfig:
         ):
             raise ValueError(
                 "rgb_context_motion_blend_gain must be finite and non-negative"
+            )
+        if (
+            not isfinite(self.rgb_context_action_scale)
+            or self.rgb_context_action_scale < 0.0
+        ):
+            raise ValueError(
+                "rgb_context_action_scale must be finite and non-negative"
+            )
+        if self.rgb_context_action_scale > 0.0 and not self.rgb_context_enabled:
+            raise ValueError(
+                "rgb_context_action_scale requires rgb_context_enabled"
             )
         if not isinstance(self.appearance_enabled, bool):
             raise ValueError("appearance_enabled must be boolean")
@@ -1296,6 +1312,15 @@ class NativeContextRGBImageDecoder(nn.Module):
             if cfg.appearance_enabled
             else None
         )
+        self.action_proj = (
+            nn.Sequential(
+                nn.Linear(cfg.state_hidden, channels[0]),
+                nn.SiLU(inplace=True),
+                nn.Linear(channels[0], channels[0]),
+            )
+            if cfg.rgb_context_action_scale > 0.0
+            else None
+        )
         context_channels = tuple(reversed(channels))
         self.context_stem = _RGBConvBlock(3, context_channels[0])
         self.context_downs = nn.ModuleList(
@@ -1325,6 +1350,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         tokens: torch.Tensor,
         view_embedding: torch.Tensor,
         geometry_tokens: Optional[torch.Tensor],
+        factual_action_summary: Optional[torch.Tensor],
         context_rgb: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if tuple(context_rgb.shape[1:]) != (
@@ -1337,6 +1363,22 @@ class NativeContextRGBImageDecoder(nn.Module):
             tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
         )
         value = self.token_stem(value) + view_embedding
+        if self.action_proj is not None:
+            if factual_action_summary is None or tuple(
+                factual_action_summary.shape
+            ) != (tokens.shape[0], self.cfg.state_hidden):
+                raise ValueError(
+                    "context RGB factual action summary must be [N,state_hidden]"
+                )
+            action = self.action_proj(factual_action_summary).to(dtype=value.dtype)
+            value = value + (
+                float(self.cfg.rgb_context_action_scale)
+                * action[:, :, None, None]
+            )
+        elif factual_action_summary is not None:
+            raise ValueError(
+                "factual action summary was supplied while RGB action conditioning is disabled"
+            )
         if self.geometry_stem is not None:
             if geometry_tokens is None or tuple(geometry_tokens.shape[1:]) != (
                 self.cfg.P,
@@ -1430,6 +1472,7 @@ class NativeRGBDecoder(nn.Module):
         target_view_mask: Optional[torch.Tensor] = None,
         appearance_tokens: Optional[torch.Tensor] = None,
         geometry_state: Optional[torch.Tensor] = None,
+        factual_action_summary: Optional[torch.Tensor] = None,
         context_rgb: Optional[torch.Tensor] = None,
         context_rgb_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1492,6 +1535,27 @@ class NativeRGBDecoder(nn.Module):
             expanded = expanded.reshape(batch * frames * views, patches, token_dim)
         view_ids = torch.arange(views, device=future_tokens.device)
         view_ids = view_ids.view(1, 1, views).expand(batch, frames, -1).reshape(-1)
+        expanded_action: Optional[torch.Tensor] = None
+        if self.cfg.rgb_context_action_scale > 0.0:
+            expected_action = (
+                batch,
+                self.cfg.K,
+                self.cfg.state_hidden,
+            )
+            if factual_action_summary is None or tuple(
+                factual_action_summary.shape
+            ) != expected_action:
+                raise ValueError(
+                    f"factual_action_summary must be {expected_action}"
+                )
+            selected_action = factual_action_summary.index_select(1, index_tensor)
+            expanded_action = selected_action[:, :, None].expand(
+                -1, -1, views, -1
+            ).reshape(batch * frames * views, self.cfg.state_hidden)
+        elif factual_action_summary is not None:
+            raise ValueError(
+                "factual action summary was supplied while RGB action conditioning is disabled"
+            )
         expanded_context: Optional[torch.Tensor] = None
         context_valid: Optional[torch.Tensor] = None
         if self.cfg.rgb_context_enabled:
@@ -1568,6 +1632,11 @@ class NativeRGBDecoder(nn.Module):
                 assert expanded_context is not None
                 decoded, motion_logit, blend = self.image_decoder(
                     *decoder_inputs,
+                    (
+                        None
+                        if expanded_action is None
+                        else expanded_action.index_select(0, chunk_indices)
+                    ),
                     expanded_context.index_select(0, chunk_indices),
                 )
             else:
@@ -1955,6 +2024,7 @@ class NativeWorldModel(nn.Module):
                 cfg.factual_action_residual_scale > 0.0
                 or cfg.render_factual_action_residual_scale is not None
                 or cfg.appearance_action_residual_scale > 0.0
+                or cfg.rgb_context_action_scale > 0.0
             ):
                 weight = encoded_mask[..., None].to(dtype=encoded.dtype)
                 summary = (encoded * weight).sum(dim=2)
@@ -2132,6 +2202,7 @@ class NativeWorldModel(nn.Module):
             rgb_view_mask,
             appearance_for_rgb,
             render_future if cfg.appearance_enabled else None,
+            factual_summary if cfg.rgb_context_action_scale > 0.0 else None,
             context_rgb,
             context_rgb_mask,
             enabled=cfg.activation_checkpointing,

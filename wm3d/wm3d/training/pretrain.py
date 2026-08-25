@@ -489,6 +489,25 @@ def _appearance_teacher_ratio(step: int, runtime: Mapping[str, Any]) -> float:
     return start + (end - start) * progress
 
 
+def _training_appearance_teacher_ratio(
+    step: int, runtime: Mapping[str, Any]
+) -> float:
+    """Keep the stable teacher schedule while training the inference endpoint.
+
+    A full teacher decay over a short canary damaged RGB quality, while the
+    original 10k schedule gave the teacher-free renderer almost no early
+    gradient. A deterministic, globally shared teacher-free step trains the
+    exact inference path without adding a second decoder forward or changing
+    the scheduled batches.
+    """
+
+    ratio = _appearance_teacher_ratio(step, runtime)
+    every = runtime["train"].get("appearance_teacher0_every_steps")
+    if every is not None and (int(step) + 1) % int(every) == 0:
+        return 0.0
+    return ratio
+
+
 def _forward(
     model: torch.nn.Module,
     batch: Mapping[str, torch.Tensor],
@@ -1429,7 +1448,7 @@ def main() -> None:
                             output=_forward_with_action_counterfactual(
                                 model,
                                 batch,
-                                appearance_teacher_ratio=_appearance_teacher_ratio(
+                                appearance_teacher_ratio=_training_appearance_teacher_ratio(
                                     step, runtime
                                 ),
                                 objective=objective,

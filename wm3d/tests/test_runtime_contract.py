@@ -260,7 +260,10 @@ def test_batch_collate_trims_storage_padding_without_dropping_real_queries() -> 
     assert result["policy_query_dt"].shape[-1] == 4
     assert result["target_fine_action"].shape[-2] == 4
 def test_dual_path_teacher_schedule_is_explicit_and_fail_closed() -> None:
-    from wm3d.training.pretrain import _appearance_teacher_ratio
+    from wm3d.training.pretrain import (
+        _appearance_teacher_ratio,
+        _training_appearance_teacher_ratio,
+    )
 
     value = _load("h100_3_fsdp2_dual_path_pilot.yaml")
     validate_runtime_profile(value)
@@ -269,6 +272,22 @@ def test_dual_path_teacher_schedule_is_explicit_and_fail_closed() -> None:
     assert _appearance_teacher_ratio(150, value) == pytest.approx(0.0)
     assert _appearance_teacher_ratio(200, value) == pytest.approx(0.0)
     assert value["train"]["appearance_validation_three_way"] is True
+
+    periodic = copy.deepcopy(value)
+    periodic["train"]["appearance_teacher0_every_steps"] = 4
+    validate_runtime_profile(periodic)
+    assert _training_appearance_teacher_ratio(2, periodic) == pytest.approx(
+        _appearance_teacher_ratio(2, periodic)
+    )
+    assert _training_appearance_teacher_ratio(3, periodic) == 0.0
+    assert _training_appearance_teacher_ratio(4, periodic) == pytest.approx(
+        _appearance_teacher_ratio(4, periodic)
+    )
+
+    invalid_periodic = copy.deepcopy(value)
+    invalid_periodic["train"]["appearance_teacher0_every_steps"] = 1
+    with pytest.raises(RuntimeContractError, match="integer >= 2"):
+        validate_runtime_profile(invalid_periodic)
 
     partial = copy.deepcopy(value)
     partial["train"].pop("appearance_teacher_end_ratio")
@@ -359,6 +378,7 @@ def test_streaming_data_contract_ignores_action_conditioning_residual_scales() -
             "render_factual_dynamics_repeats": 1,
             "render_factual_action_residual_scale": 0.0,
             "appearance_action_residual_scale": 0.5,
+            "rgb_context_action_scale": 1.0,
         }
     )
 

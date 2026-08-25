@@ -57,6 +57,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "rgb_context_enabled",
     "rgb_context_residual_scale",
     "rgb_context_motion_blend_gain",
+    "rgb_context_action_scale",
 }
 
 
@@ -215,6 +216,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "appearance_teacher_start_ratio",
         "appearance_teacher_end_ratio",
         "appearance_teacher_decay_steps",
+        "appearance_teacher0_every_steps",
         "appearance_validation_three_way",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
@@ -308,6 +310,20 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         ):
             raise RuntimeContractError(
                 "train.appearance_teacher_decay_steps must lie within total_steps"
+            )
+    teacher0_every = train.get("appearance_teacher0_every_steps")
+    if teacher0_every is not None:
+        if (
+            isinstance(teacher0_every, bool)
+            or not isinstance(teacher0_every, int)
+            or teacher0_every < 2
+        ):
+            raise RuntimeContractError(
+                "train.appearance_teacher0_every_steps must be an integer >= 2"
+            )
+        if not present_appearance_schedule:
+            raise RuntimeContractError(
+                "periodic teacher0 training requires an appearance teacher schedule"
             )
     appearance_validation_three_way = train.get(
         "appearance_validation_three_way", False

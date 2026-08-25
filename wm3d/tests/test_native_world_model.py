@@ -309,6 +309,23 @@ def test_appearance_action_residual_scale_fails_closed(value: float) -> None:
         )
 
 
+@pytest.mark.parametrize("value", (-0.1, float("nan"), float("inf")))
+def test_rgb_context_action_scale_fails_closed(value: float) -> None:
+    with pytest.raises(
+        ValueError,
+        match="rgb_context_action_scale must be finite and non-negative",
+    ):
+        NativeWorldModel(replace(_tiny_config(), rgb_context_action_scale=value))
+
+
+def test_rgb_context_action_requires_context_renderer() -> None:
+    with pytest.raises(
+        ValueError,
+        match="rgb_context_action_scale requires rgb_context_enabled",
+    ):
+        NativeWorldModel(replace(_tiny_config(), rgb_context_action_scale=1.0))
+
+
 def test_swapping_commands_between_real_substep_times_changes_dynamics() -> None:
     """The encoder must retain command/timestamp pairing inside an interval."""
 
@@ -759,6 +776,93 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
         cfg.rgb_size,
     )
     assert output["rgb_blend"][0, :, 1].count_nonzero() == 0
+
+
+def test_context_renderer_directly_uses_factual_action_summary() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_action_scale=1.0,
+    )
+    torch.manual_seed(127)
+    decoder = NativeWorldModel(cfg).rgb_head.train()
+    batch = 2
+    future_tokens = torch.randn(batch, cfg.K, cfg.P, cfg.token_dim)
+    appearance = torch.randn(
+        batch, cfg.K, cfg.num_views, cfg.appearance_P, cfg.token_dim
+    )
+    geometry = torch.randn(batch, cfg.K, cfg.P, cfg.state_hidden)
+    context = torch.rand(batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    context_mask = torch.ones(batch, cfg.num_views, dtype=torch.bool)
+    zero = torch.zeros(batch, cfg.K, cfg.state_hidden)
+    factual = torch.randn_like(zero)
+
+    zero_rgb = decoder(
+        future_tokens,
+        None,
+        appearance_tokens=appearance,
+        geometry_state=geometry,
+        factual_action_summary=zero,
+        context_rgb=context,
+        context_rgb_mask=context_mask,
+    )[0]
+    factual_rgb = decoder(
+        future_tokens,
+        None,
+        appearance_tokens=appearance,
+        geometry_state=geometry,
+        factual_action_summary=factual,
+        context_rgb=context,
+        context_rgb_mask=context_mask,
+    )[0]
+
+    assert not torch.allclose(factual_rgb, zero_rgb)
+    factual_rgb.square().mean().backward()
+    action_gradients = [
+        parameter.grad
+        for name, parameter in decoder.named_parameters()
+        if "action_proj" in name
+    ]
+    assert action_gradients
+    assert all(gradient is not None for gradient in action_gradients)
+    assert any(gradient.abs().sum() > 0 for gradient in action_gradients)
+
+
+def test_renderer_action_route_stays_out_of_action_free_policy_trunk() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_action_scale=1.0,
+    )
+    torch.manual_seed(129)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    zero_action = dict(batch)
+    zero_action["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    zero_action["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+
+    factual = model(**batch, appearance_teacher_ratio=1.0)
+    zero = model(**zero_action, appearance_teacher_ratio=1.0)
+    torch.testing.assert_close(
+        factual["action_free_pred_tokens"],
+        zero["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        factual["policy_action_raw"], zero["policy_action_raw"], rtol=0, atol=0
+    )
+    assert not torch.allclose(factual["rgb"], zero["rgb"])
 
 
 def test_appearance_action_residual_changes_rgb_without_policy_leakage() -> None:

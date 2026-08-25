@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_5b_dual_path
 architecture: native_world_model
-expected_parameter_count: 5536215416
+expected_parameter_count: 5542509944
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -61,6 +61,7 @@ model:
   rgb_context_enabled: true
   rgb_context_residual_scale: 0.75
   rgb_context_motion_blend_gain: 0.5
+  rgb_context_action_scale: 1.0
   geom_hidden: 768
   appearance_enabled: true
   appearance_P: 256

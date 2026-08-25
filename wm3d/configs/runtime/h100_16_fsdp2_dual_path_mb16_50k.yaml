@@ -34,6 +34,9 @@ train:
   appearance_teacher_start_ratio: 1.0
   appearance_teacher_end_ratio: 0.0
   appearance_teacher_decay_steps: 10000
+  # One globally synchronized inference-path batch out of four. The other
+  # batches retain the validated 10k teacher decay.
+  appearance_teacher0_every_steps: 4
   appearance_validation_three_way: true
 optimizer:
   name: adamw
