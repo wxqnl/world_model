@@ -20,7 +20,6 @@ offline_eval = importlib.import_module(f"{_PACKAGE}.training.offline_eval")
 _ORIGINAL_FORWARD = offline_eval._forward_with_action_counterfactual
 _ORIGINAL_OBJECTIVE = offline_eval.compute_native_objective
 _PREFIX = "_policy_conditioning_audit_"
-_previous_task: torch.Tensor | None = None
 _previous_inputs: dict[str, torch.Tensor] = {}
 
 
@@ -76,20 +75,16 @@ def _audited_forward(
     *args: Any,
     **kwargs: Any,
 ) -> Mapping[str, torch.Tensor]:
-    global _previous_task
     baseline = dict(_ORIGINAL_FORWARD(model, batch, *args, **kwargs))
     current_task = batch.get("task_embedding")
-    previous = None
-    if (
-        current_task is not None
-        and _previous_task is not None
-        and _previous_task.shape == current_task.shape
-    ):
-        previous = _previous_task.to(device=current_task.device)
 
     variants = {
         "task": _variant(
-            batch, ("task_embedding",), first_replacement=previous
+            batch,
+            ("task_embedding",),
+            first_replacement=(
+                None if current_task is None else torch.zeros_like(current_task)
+            ),
         ),
         "observation": _variant(batch, ("world_tokens", "view_mask")),
         "current_state": _variant(
@@ -122,8 +117,23 @@ def _audited_forward(
         for field in fields:
             if field in changed_output:
                 baseline[f"{_PREFIX}{name}_{field}"] = changed_output[field]
-    if current_task is not None:
-        _previous_task = current_task.detach().clone()
+
+    zero_future_batch = dict(batch)
+    for name in (
+        "future_factual_fine_action_values",
+        "future_factual_coarse_action_values",
+    ):
+        zero_future_batch[name] = torch.zeros_like(batch[name])
+    zero_future_output = _ORIGINAL_FORWARD(
+        model, zero_future_batch, *args, **kwargs
+    )
+    for field in (
+        "rgb",
+        "policy_action_normalized",
+        "action_free_pred_tokens",
+    ):
+        baseline[f"{_PREFIX}zero_future_{field}"] = zero_future_output[field]
+
     for key in (
         "world_tokens",
         "view_mask",
@@ -256,6 +266,33 @@ def _audited_objective(
     losses["policy_audit_baseline_consistency"] = (
         losses["action_fine"] - recomputed
     ).abs()
+
+    zero_future_rgb = output[f"{_PREFIX}zero_future_rgb"]
+    rgb_mask = batch.get(
+        "target_rgb_mask",
+        torch.ones_like(batch["target_rgb"][:, :, :, :1, :1, :1], dtype=torch.bool),
+    )
+    factual_rgb_l1 = _masked_mean(
+        (output["rgb"] - batch["target_rgb"]).abs(), rgb_mask
+    )
+    zero_future_rgb_l1 = _masked_mean(
+        (zero_future_rgb - batch["target_rgb"]).abs(), rgb_mask
+    )
+    losses["policy_audit_rgb_zero_future_l1"] = zero_future_rgb_l1
+    losses["policy_audit_rgb_action_gain"] = (
+        zero_future_rgb_l1 - factual_rgb_l1
+    )
+    losses["policy_audit_rgb_action_response_rms"] = torch.sqrt(
+        _masked_mean((output["rgb"] - zero_future_rgb).square(), rgb_mask)
+    )
+    losses["policy_audit_future_action_policy_max_abs"] = (
+        output["policy_action_normalized"]
+        - output[f"{_PREFIX}zero_future_policy_action_normalized"]
+    ).abs().max()
+    losses["policy_audit_future_action_action_free_max_abs"] = (
+        output["action_free_pred_tokens"]
+        - output[f"{_PREFIX}zero_future_action_free_pred_tokens"]
+    ).abs().max()
     return losses
 
 
