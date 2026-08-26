@@ -801,6 +801,39 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
     assert output["rgb_blend"][0, :, 1].count_nonzero() == 0
 
 
+def test_context_renderer_rgb_loss_reaches_per_view_p256_appearance_lane() -> None:
+    cfg = replace(_tiny_dual_path_config(), rgb_context_enabled=True)
+    torch.manual_seed(101)
+    model = NativeWorldModel(cfg).train()
+    batch = _dual_path_batch(cfg)
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
+
+    teacher = model(**batch, appearance_teacher_ratio=1.0)
+    changed = dict(batch)
+    changed_target = batch["target_appearance_tokens"].clone()
+    changed_target[:, :, 1] = changed_target[:, :, 1].roll(1, dims=0)
+    changed["target_appearance_tokens"] = changed_target
+    changed_teacher = model(**changed, appearance_teacher_ratio=1.0)
+    torch.testing.assert_close(
+        teacher["rgb"][:, :, 0], changed_teacher["rgb"][:, :, 0], rtol=0, atol=0
+    )
+    assert not torch.allclose(teacher["rgb"][:, :, 1], changed_teacher["rgb"][:, :, 1])
+
+    model.zero_grad(set_to_none=True)
+    predicted = model(**batch, appearance_teacher_ratio=0.0)
+    predicted["appearance_pred_tokens"].retain_grad()
+    predicted["rgb"].square().mean().backward()
+    appearance_gradient = predicted["appearance_pred_tokens"].grad
+    assert appearance_gradient is not None
+    assert torch.isfinite(appearance_gradient).all()
+    assert appearance_gradient.abs().sum() > 0
+    token_stem = model.rgb_head.image_decoder.token_stem[0]
+    assert token_stem.weight.grad is not None
+    assert torch.isfinite(token_stem.weight.grad).all()
+    assert token_stem.weight.grad.abs().sum() > 0
+
+
 def test_context_renderer_directly_uses_factual_action_summary() -> None:
     cfg = replace(
         _tiny_dual_path_config(),
