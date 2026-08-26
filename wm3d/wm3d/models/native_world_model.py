@@ -2159,11 +2159,26 @@ class NativeWorldModel(nn.Module):
                 residual_scale=render_residual_scale,
             )
         zero_action_pred_tokens: Optional[torch.Tensor] = None
-        if compute_zero_action_control:
+        zero_encoded: Optional[torch.Tensor] = None
+        zero_encoded_mask: Optional[torch.Tensor] = None
+        zero_summary: Optional[torch.Tensor] = None
+        if compute_zero_action_control or cfg.rgb_context_action_scale > 0.0:
             zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
                 torch.zeros_like(future_factual_fine_action_values),
                 torch.zeros_like(future_factual_coarse_action_values),
             )
+        rgb_action_summary: Optional[torch.Tensor] = None
+        if cfg.rgb_context_action_scale > 0.0:
+            assert factual_summary is not None and zero_summary is not None
+            # The renderer needs the action value itself, as in V7, rather
+            # than the action encoder's large action-independent mixture of
+            # mask/time/semantic/group/embodiment context.  Centering against
+            # the same-mask zero command preserves those semantics in the
+            # world lane while making the direct RGB route exactly zero for a
+            # neutral future action.
+            rgb_action_summary = factual_summary - zero_summary
+        if compute_zero_action_control:
+            assert zero_encoded is not None and zero_encoded_mask is not None
             zero_action_future = refine_factual(
                 zero_encoded,
                 zero_encoded_mask,
@@ -2276,7 +2291,7 @@ class NativeWorldModel(nn.Module):
             rgb_view_mask,
             appearance_for_rgb,
             render_future if cfg.appearance_enabled else None,
-            factual_summary if cfg.rgb_context_action_scale > 0.0 else None,
+            rgb_action_summary,
             task_embedding if cfg.rgb_context_enabled else None,
             context_rgb,
             context_rgb_mask,

@@ -932,6 +932,43 @@ def test_renderer_action_route_stays_out_of_action_free_policy_trunk() -> None:
     assert not torch.allclose(factual["rgb"], zero["rgb"])
 
 
+def test_renderer_direct_action_is_centered_on_same_mask_zero_command() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_action_scale=1.0,
+    )
+    torch.manual_seed(130)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
+    zero_action = dict(batch)
+    zero_action["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    zero_action["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+    observed: list[torch.Tensor] = []
+
+    def record(_module, inputs) -> None:
+        observed.append(inputs[0].detach())
+
+    handle = model.rgb_head.image_decoder.action_proj.register_forward_pre_hook(record)
+    try:
+        model(**zero_action, appearance_teacher_ratio=1.0)
+        zero_count = len(observed)
+        assert zero_count > 0
+        assert torch.cat(observed).count_nonzero() == 0
+        model(**batch, appearance_teacher_ratio=1.0)
+    finally:
+        handle.remove()
+
+    assert len(observed) > zero_count
+    assert torch.cat(observed[zero_count:]).count_nonzero() > 0
+
+
 def test_appearance_action_residual_changes_rgb_without_policy_leakage() -> None:
     cfg = replace(
         _tiny_dual_path_config(),
