@@ -34,8 +34,8 @@ model:
   dynamics_layers: 1
   factual_dynamics_repeats: 2
   factual_action_residual_scale: 0.3
-  # Give future P256 dynamics the same centered physical-action residual used
-  # by the factual state lane. The same-mask zero command is exactly zero.
+  # Condition future P256 patches on the same centered grouped physical action
+  # before appearance space/time reasoning. The same-mask zero command is exact 0.
   appearance_action_residual_scale: 0.3
   view_hidden: 768
   view_heads: 12
