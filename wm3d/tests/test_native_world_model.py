@@ -1217,7 +1217,7 @@ def test_appearance_action_residual_changes_rgb_without_policy_leakage() -> None
     assert not torch.allclose(factual["rgb"], zero["rgb"])
 
 
-def test_appearance_action_residual_is_centered_on_same_mask_zero_command() -> None:
+def test_appearance_action_conditioning_is_centered_and_spatially_resolved() -> None:
     cfg = replace(
         _tiny_dual_path_config(),
         appearance_action_residual_scale=0.3,
@@ -1233,30 +1233,76 @@ def test_appearance_action_residual_is_centered_on_same_mask_zero_command() -> N
         batch["future_factual_coarse_action_values"]
     )
     observed: list[torch.Tensor] = []
+    updates: list[torch.Tensor] = []
 
-    def record(_module, inputs) -> None:
-        value = inputs[0]
-        value.retain_grad()
-        observed.append(value)
+    def record_input(_module, inputs) -> None:
+        centered = inputs[1]
+        centered.retain_grad()
+        observed.append(centered)
+
+    def record_update(_module, inputs, output) -> None:
+        updates.append((output - inputs[0]).detach())
 
     assert model.appearance_dynamics is not None
-    handle = model.appearance_dynamics.geometry.register_forward_pre_hook(record)
+    conditioner = model.appearance_dynamics.action_conditioner
+    assert conditioner is not None
+    input_handle = conditioner.register_forward_pre_hook(record_input)
+    output_handle = conditioner.register_forward_hook(record_update)
     try:
         model(**zero_action, appearance_teacher_ratio=0.0)
         zero_call_count = len(observed)
-        assert zero_call_count >= 2
+        assert zero_call_count == 1
         assert observed[0].count_nonzero() == 0
+        assert updates[0].count_nonzero() == 0
         factual = model(**batch, appearance_teacher_ratio=0.0)
     finally:
-        handle.remove()
+        input_handle.remove()
+        output_handle.remove()
 
-    assert len(observed) >= zero_call_count + 2
+    assert len(observed) == zero_call_count + 1
     centered = observed[zero_call_count]
     assert centered.count_nonzero() > 0
+    spatial_update = updates[zero_call_count]
+    assert spatial_update.count_nonzero() > 0
+    flattened = spatial_update.flatten(2, 3)
+    assert bool(flattened.var(dim=2).gt(0).any())
     factual["appearance_pred_tokens"].float().square().mean().backward()
     assert centered.grad is not None
     assert torch.isfinite(centered.grad).all()
     assert centered.grad.count_nonzero() > 0
+    assert conditioner.cross.key_value.weight.grad is not None
+    assert torch.isfinite(conditioner.cross.key_value.weight.grad).all()
+    assert conditioner.cross.key_value.weight.grad.count_nonzero() > 0
+    for parameter in conditioner.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.count_nonzero() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast is required")
+def test_appearance_action_conditioner_checkpoint_preserves_bf16_gradients() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        appearance_action_residual_scale=0.3,
+        activation_checkpointing=True,
+    )
+    model = NativeWorldModel(cfg).cuda().train()
+    batch = {
+        name: value.cuda() if isinstance(value, torch.Tensor) else value
+        for name, value in _dual_path_batch(cfg).items()
+    }
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = model(**batch, appearance_teacher_ratio=0.0)
+        loss = output["appearance_pred_tokens"].float().square().mean()
+    loss.backward()
+
+    assert model.appearance_dynamics is not None
+    conditioner = model.appearance_dynamics.action_conditioner
+    assert conditioner is not None
+    for parameter in conditioner.parameters():
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.count_nonzero() > 0
 
 
 def test_dual_path_inference_uses_predicted_appearance_without_future_targets() -> None:

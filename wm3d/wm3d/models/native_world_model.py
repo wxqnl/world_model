@@ -968,6 +968,76 @@ class FactorizedAppearanceBlock(nn.Module):
         return value * mask[..., None].to(dtype=value.dtype)
 
 
+class AppearanceActionConditioner(nn.Module):
+    """Condition future appearance patches on centered physical actions.
+
+    Grouped action tokens are read before spatial/temporal appearance
+    reasoning. Cross-attention preserves group semantics when an embodiment
+    has multiple action owners; bounded feature modulation keeps the update
+    patch-dependent even for the common single-arm/single-group case. Every
+    projection is bias-free, so a same-mask zero command produces an exactly
+    zero update without introducing a second objective.
+    """
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.scale = cfg.appearance_action_residual_scale
+        self.query_norm = RMSNorm(cfg.appearance_hidden)
+        self.action_input = nn.Linear(
+            cfg.state_hidden, cfg.appearance_hidden, bias=False
+        )
+        self.action_norm = RMSNorm(cfg.appearance_hidden)
+        self.cross = CrossAttention(
+            cfg.appearance_hidden,
+            cfg.appearance_hidden,
+            cfg.appearance_heads,
+            cfg.dropout,
+        )
+
+    def forward(
+        self,
+        future: torch.Tensor,
+        centered_action: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, horizon, views, patches, dim = future.shape
+        if centered_action.ndim != 4:
+            raise ValueError("centered appearance action must be [B,K,G,D]")
+        if centered_action.shape[:2] != (batch, horizon):
+            raise ValueError("centered appearance action must align to B/K")
+        if tuple(action_mask.shape) != tuple(centered_action.shape[:-1]):
+            raise ValueError("centered appearance action mask must be [B,K,G]")
+
+        groups = centered_action.shape[2]
+        valid = action_mask.bool().reshape(batch * horizon, groups)
+        action = centered_action * action_mask[..., None].to(
+            dtype=centered_action.dtype
+        )
+        action = self.action_input(action).reshape(batch * horizon, groups, dim)
+
+        # SDPA requires at least one allowed key. A row without a valid group
+        # receives a visible all-zero token, which remains an exact zero update
+        # because every conditioner projection is bias-free.
+        safe_valid = valid.clone()
+        safe_valid[:, 0] |= ~safe_valid.any(dim=-1)
+
+        query = future.reshape(batch * horizon, views * patches, dim)
+        normalized_query = self.query_norm(query)
+        condition = self.cross(
+            normalized_query,
+            self.action_norm(action),
+            allowed_mask=safe_valid[:, None, None, :],
+        )
+        # With one action group, plain cross-attention returns the same value
+        # for every patch. Feature modulation makes that physical command act
+        # through each patch/view representation while remaining continuous
+        # and exactly neutral at zero action.
+        update = condition * (1.0 + torch.tanh(normalized_query))
+        return (query + self.scale * update).view(
+            batch, horizon, views, patches, dim
+        )
+
+
 class PerViewAppearanceDynamics(nn.Module):
     """Predict unfused future view latents from view history and 3D dynamics."""
 
@@ -978,6 +1048,12 @@ class PerViewAppearanceDynamics(nn.Module):
         self.appearance_grid = isqrt(cfg.appearance_P)
         self.input = nn.Linear(cfg.token_dim, cfg.appearance_hidden, bias=False)
         self.geometry = nn.Linear(cfg.state_hidden, cfg.appearance_hidden, bias=False)
+        action_conditioner: Optional[nn.Module] = None
+        if cfg.appearance_action_residual_scale > 0.0:
+            action_conditioner = AppearanceActionConditioner(cfg)
+            if cfg.activation_checkpointing:
+                action_conditioner = checkpoint_wrapper(action_conditioner)
+        self.action_conditioner = action_conditioner
         self.time = ContinuousTimeEmbedding(cfg.appearance_hidden, cfg)
         self.view_embed = nn.Parameter(
             torch.empty(1, 1, cfg.num_views, 1, cfg.appearance_hidden)
@@ -1033,7 +1109,8 @@ class PerViewAppearanceDynamics(nn.Module):
         future_state: torch.Tensor,
         world_times_s: torch.Tensor,
         future_mask: Optional[torch.Tensor] = None,
-        centered_action_summary: Optional[torch.Tensor] = None,
+        centered_action_tokens: Optional[torch.Tensor] = None,
+        centered_action_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         expected = (
@@ -1064,15 +1141,6 @@ class PerViewAppearanceDynamics(nn.Module):
 
         context_time = world_times_s[:, cfg.T - cfg.appearance_context_frames : cfg.T]
         future_time = world_times_s[:, cfg.T :]
-        action_skip: Optional[torch.Tensor] = None
-        if cfg.appearance_action_residual_scale > 0.0:
-            if centered_action_summary is None or tuple(
-                centered_action_summary.shape
-            ) != (batch, cfg.K, cfg.state_hidden):
-                raise ValueError(
-                    "appearance action residual requires centered [B,K,state_hidden]"
-                )
-            action_skip = self.geometry(centered_action_summary)[:, :, None, None]
         context = self.input(context_tokens)
         context = context + self.time(context_time)[:, :, None, None]
         context = context + self.view_embed + self.patch_embed
@@ -1081,6 +1149,21 @@ class PerViewAppearanceDynamics(nn.Module):
         future = self.future_seed.expand(batch, -1, cfg.num_views, -1, -1)
         future = future + geometry + self.time(future_time)[:, :, None, None]
         future = future + self.view_embed + self.patch_embed
+        if self.action_conditioner is not None:
+            if centered_action_tokens is None or centered_action_mask is None:
+                raise ValueError(
+                    "appearance action conditioning requires centered grouped tokens"
+                )
+            if tuple(centered_action_tokens.shape) != (
+                batch,
+                cfg.K,
+                cfg.max_action_groups,
+                cfg.state_hidden,
+            ):
+                raise ValueError("centered appearance action has incompatible shape")
+            future = self.action_conditioner(
+                future, centered_action_tokens, centered_action_mask
+            )
         value = torch.cat((context, future), dim=1)
         mask = torch.cat((context_mask.bool(), future_mask.bool()), dim=1)
         value = value * mask[..., None].to(dtype=value.dtype)
@@ -1092,10 +1175,6 @@ class PerViewAppearanceDynamics(nn.Module):
             valid = context_mask[:, index, ..., None]
             last_context = torch.where(valid, context_tokens[:, index], last_context)
         future_value = value[:, -cfg.K :]
-        if action_skip is not None:
-            future_value = future_value + (
-                cfg.appearance_action_residual_scale * action_skip
-            )
         predicted = self.output(self.norm(future_value)) + last_context[:, None]
         predicted = predicted * future_mask[..., None].to(dtype=predicted.dtype)
         return predicted, future_mask.bool()
@@ -2303,7 +2382,6 @@ class NativeWorldModel(nn.Module):
             if (
                 cfg.factual_action_residual_scale > 0.0
                 or cfg.render_factual_action_residual_scale is not None
-                or cfg.appearance_action_residual_scale > 0.0
                 or cfg.rgb_context_action_scale > 0.0
             ):
                 weight = encoded_mask[..., None].to(dtype=encoded.dtype)
@@ -2382,25 +2460,25 @@ class NativeWorldModel(nn.Module):
                 torch.zeros_like(future_factual_coarse_action_values),
             )
         centered_action_summary: Optional[torch.Tensor] = None
-        if (
-            cfg.rgb_context_action_scale > 0.0
-            or cfg.appearance_action_residual_scale > 0.0
-        ):
+        if cfg.rgb_context_action_scale > 0.0:
             assert factual_summary is not None and zero_summary is not None
-            # Both the RGB renderer and the future appearance predictor need
-            # the physical command itself, not the action encoder's large
-            # action-independent mixture of mask/time/semantic/group context.
-            # Centering against the same-mask zero command makes a neutral
-            # future action exactly zero without changing the world lane.
+            # The RGB renderer needs the physical command itself, not the
+            # encoder's action-independent mask/time/semantic/group mixture.
             centered_action_summary = factual_summary - zero_summary
         rgb_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
             assert centered_action_summary is not None
             rgb_action_summary = centered_action_summary
-        appearance_action_summary: Optional[torch.Tensor] = None
+        appearance_action_tokens: Optional[torch.Tensor] = None
+        appearance_action_mask: Optional[torch.Tensor] = None
         if cfg.appearance_action_residual_scale > 0.0:
-            assert centered_action_summary is not None
-            appearance_action_summary = centered_action_summary
+            assert zero_encoded is not None and zero_encoded_mask is not None
+            # Keep every grouped action token and remove only the same-mask
+            # action-independent encoder component. The appearance lane can
+            # then resolve physical direction per patch before its own
+            # spatial/temporal reasoning, while a zero command stays exact 0.
+            appearance_action_tokens = factual_encoded - zero_encoded
+            appearance_action_mask = factual_encoded_mask
         if compute_zero_action_control:
             assert zero_encoded is not None and zero_encoded_mask is not None
             zero_action_future = refine_factual(
@@ -2448,7 +2526,8 @@ class NativeWorldModel(nn.Module):
                 render_future,
                 relative_world_time,
                 target_appearance_mask,
-                appearance_action_summary,
+                appearance_action_tokens,
+                appearance_action_mask,
             )
             appearance_ratio = torch.as_tensor(
                 appearance_teacher_ratio,
