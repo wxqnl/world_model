@@ -58,6 +58,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "rgb_context_residual_scale",
     "rgb_context_motion_blend_gain",
     "rgb_context_action_scale",
+    "rgb_context_appearance_delta_scale",
 }
 
 

@@ -361,7 +361,7 @@ def test_direct_raw_closure_translates_to_the_sealed_metadata_contract(
     assert "direct_prefetch_windows" not in observed
 
 
-def test_streaming_data_contract_ignores_action_conditioning_residual_scales() -> None:
+def test_streaming_data_contract_ignores_model_only_conditioning_scales() -> None:
     sealed = {
         "model": {
             "T": 16,
@@ -379,6 +379,7 @@ def test_streaming_data_contract_ignores_action_conditioning_residual_scales() -
             "render_factual_action_residual_scale": 0.0,
             "appearance_action_residual_scale": 0.5,
             "rgb_context_action_scale": 1.0,
+            "rgb_context_appearance_delta_scale": 1.0,
         }
     )
 
