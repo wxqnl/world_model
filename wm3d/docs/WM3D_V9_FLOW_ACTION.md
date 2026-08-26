@@ -1,5 +1,19 @@
 # WM3D V9 flow-action contract
 
+## 工程状态
+
+- GitHub branch: `v9`
+- development branch: `codex/v9-flow-action-20260826`
+- isolated worktree: `/data/Minko/wm3d_v9_flow_action_20260826`
+- model profiles: `native_1b_v9_flow.yaml`、`native_5b_v9_flow.yaml`
+- objective profile: `stage0_native_v9_flow.yaml`
+- implementation: `wm3d/models/flow_action.py`
+- contract tests: `tests/test_flow_action_policy.py`
+
+当前交付是代码和 ABI 合同，不包含 V9 已训练 checkpoint，也没有启动 V9/5B 实验。V9 从
+当前 V8 RGB/P256 修正之后独立分支，禁止把 V8/旧 canary checkpoint 作为初始化或 resume。
+未来实验必须重新 materialize V9 model/data/runtime seal。
+
 ## Scope
 
 V9 is an isolated alternative to V8. It replaces only the executable policy's
@@ -79,6 +93,21 @@ Absolute gripper and other binary controller fields retain BCE logits and are
 excluded from Gaussian diffusion. Their normalization must remain identity.
 This preserves exact discrete semantics across heterogeneous action schemas.
 
+### 不与 WSA 生搬硬套的部分
+
+WSA 的公开 action 包装主要面向单个 padded action vector；WM3D 同时服务不同 embodiment、
+多个 physical group、不同 semantic dimensions 和 source-native timestamps。V9 因此不复制
+WSA 的 task-specific adapter，而只复用已经被其代码验证的 flow 核心：continuous interpolation、
+velocity target、ActionDiT 式 persistent conditioning、shifted weighting 和 Euler sampling。
+
+以下 WM3D 合同不能为了复刻 WSA 跑分而改变：
+
+- group-major `[B,G,C,A]`、semantic/group mask 和真实 query time；
+- adapter 审计后的米/弧度/absolute gripper 物理定义；
+- 每个 source 的 normalization/calibration 与 serving 对称性；
+- future factual candidate 与 executable policy 的严格隔离；
+- RGB/P256/world/geometry 的独立 gradient ownership。
+
 ## Inference and serving
 
 Inference starts from masked Gaussian noise and applies the sealed 10-step
@@ -90,6 +119,22 @@ V9-only robot adapter is required.
 Validation batches may carry labels through the shared data adapter, but the
 flow sampler never reads them. Supplying a fixed initial noise tensor makes
 sampling deterministic for tests and A/B evaluation.
+
+## 未来实验顺序
+
+V9 不应因为代码已合并就直接扩大到 5B。资源可用时按以下顺序独立验证：
+
+1. fresh 1B 小步 canary，检查所有 loss/gradient 有限、flow block 与 policy context 都有梯度、
+   fixed-noise future-candidate isolation 严格成立；
+2. 固定 validation seed 比较 V8 regression 与 V9 flow 的 normalized/physical trajectory error、
+   gripper accuracy、task/vision/state/history conditioning sensitivity 和跨 source 表现；
+3. 用相同 observation/task 和多组初始 noise 检查轨迹分布不是单点坍缩或随机噪声；
+4. 多种机器人/模拟器闭环任务验证真实执行成功率，LIBERO 只能是其中一项，不能反向定义
+   grouped action ABI；
+5. 只有 1B 证据同时通过代码、离线 action、serving 和闭环门槛，才考虑单独启动 V9 5B。
+
+RGB/P256 指标沿用 V8 门槛，但它不是 V9 action 路线的替代证据。任何 V9 action 改动都不得
+以牺牲 static/motion RGB、world dynamics 或 policy/action-free 不变量换取单一 benchmark 分数。
 
 ## Profiles and verification
 

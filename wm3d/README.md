@@ -11,7 +11,7 @@ flowchart LR
   O --> V["逐视角 P256 appearance"]
   G --> C["Native 3D core"]
   A["source-native 已执行动作"] --> C
-  S["current state + embodiment"] --> H["统一 action policy"]
+  S["task + current state + action history"] --> H["V8 regression / V9 flow policy"]
   C --> W["未来 depth / point / pose"]
   C --> R["原生 RGB decoder"]
   V --> R
@@ -32,6 +32,25 @@ flowchart LR
   candidates 和 native 3D future evidence 学习候选排序。
 - DDP/FSDP2 共用训练入口；DCP 支持完整编号 checkpoint、独立进程 exact resume 和受控
   topology reshard。
+
+## V8 与 V9 路径
+
+| 合同 | V8 | V9 |
+|---|---|---|
+| 连续 executable action owner | 单次 regression | 条件 flow matching + 迭代采样 |
+| binary/gripper | BCE logits | BCE logits，不进入高斯 flow |
+| policy condition | observation/native3D、task、state、history | 相同条件在每个 flow block 持续 cross-attend |
+| grouped action、物理单位、normalization | 保持 | 完全保持 |
+| future candidate 与 policy 隔离 | 必须 | 必须，固定 noise 下逐元素不变 |
+| world、RGB/P256、geometry | V8 主线 | 复用同一合同 |
+| checkpoint/runtime | V8 专属 | 必须 fresh，禁止复用 V8 |
+
+V9 的连续 action loss 是 shifted-schedule weighted velocity MSE，它**替代** V8 continuous
+SmoothL1；不是附加在 regression 旁边的新 loss。旧 coarse trajectory error 只作为 V9 评测
+指标，不参与优化，因此不存在两套连续 action objective 抢梯度。详细数学、WSA 对应关系、
+配置入口和验收边界见
+[V9 flow-action contract](docs/WM3D_V9_FLOW_ACTION.md)。V9 的代码/ABI 回归通过只表示
+实现可运行，不表示真实 VLA 或闭环能力已经成立。
 
 ## 目录
 
@@ -62,7 +81,7 @@ Python 包、脚本和文档统一使用 `WM3D` / `wm3d`。
 访问配置的数据和输出路径，并具备节点内 NVLink、节点间 InfiniBand 和足够的磁盘空间。
 
 ```bash
-git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
+git clone --branch v9 --single-branch https://github.com/wxqnl/world_model.git
 cd world_model/wm3d
 ./run_wm3d.sh env
 source .venv/bin/activate
@@ -127,6 +146,10 @@ cache、Stage0 训练、独立进程恢复和离线评测：
 
 模型、数据和运行拓扑是相互独立的 profile。先物化 sealed runtime，再在每台节点运行
 preflight，之后使用相同 rendezvous 参数启动训练：
+
+V9 必须选择 `configs/model/native_{1b,5b}_v9_flow.yaml` 与
+`configs/objective/stage0_native_v9_flow.yaml`，并重新生成数据 metadata seal 与 runtime；
+V8 model profile 会拒绝 flow mode，V9 profile 也会拒绝 regression mode。
 
 ```bash
 ./run_wm3d.sh preflight \

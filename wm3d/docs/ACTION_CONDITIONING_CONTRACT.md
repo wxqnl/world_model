@@ -6,8 +6,10 @@ Stage0 的 action policy 必须从 observation/native 3D、task、当前物理�
 history 预测可执行 grouped action。future candidate action 只属于 world/planning 分支，不能进入
 action-free state 或 policy trunk。
 
-本实现补强 task 在 policy 深层主链中的持续作用，但不增加新的 task loss，也不改已有 action
-loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，避免多目标权重竞争。
+V8 通过每层零初始化有界 FiLM 补强 task 在 regression policy 主链中的持续作用，不增加新的
+task loss。V9 是另一条 fail-closed 路径：连续动作改用条件 flow matching，velocity MSE 直接
+替代 continuous SmoothL1，不能与 regression/coarse action loss 叠加；binary/gripper 仍由
+BCE 监督。两条路径都只从 action supervision 学习，不另造 task-consistency loss。
 
 同一 embodiment 可以来自多个数据源，而每个来源的 action/state z-score 坐标可能不同。
 `embodiment/group/semantic` 不能唯一说明这套数值坐标。policy query 因此还接收与训练、
@@ -15,6 +17,8 @@ loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，�
 显式知道自己正在预测哪套控制坐标；descriptor 不含 source id 或未来 action，也没有新增 loss。
 
 ## 实现
+
+### V8 regression owner
 
 - task bank 的 pooled embedding 仍只经过一次共享 `task_action` 投影。
 - 每个 `ActionBlock` 的 attention 与 feed-forward 输入，以及最终 visual spatial read 的
@@ -28,10 +32,25 @@ loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，�
 - 该路径属于 `policy_action_trunk` 的 gradient owner，不参与 world、geometry、appearance 或
   RGB 的参数所有权。
 
+### V9 flow owner
+
+- action-free policy query 保留 observation/native3D、task、current state、真实 history、
+  embodiment、timestamps 和 calibration；noisy action trajectory 是独立输入。
+- 每个 flow block 都执行 time-modulated grouped trajectory self-attention、回到 policy query 的
+  persistent cross-attention 和 time-modulated SwiGLU，避免 condition 只在入口出现一次后被主链
+  忽略。
+- 连续维训练 `x_sigma=(1-sigma)*action+sigma*noise`，预测 `noise-action`；推理从高斯噪声
+  经过封存的 shifted 10-step Euler schedule 得到 normalized trajectory，再使用训练同源
+  offset/scale 解码为物理动作。
+- absolute gripper、contact、controller mode 等 binary semantic 使用独立 BCE logits，不进入
+  高斯 flow，normalization 必须保持 identity。
+- V9 不复用 V8 policy checkpoint。固定初始 noise 时，只改变 future factual candidate 不能改变
+  policy output；验证 batch 即使携带 label，inference sampler 也不能读取 label。
+
 ## 保持不变的合同
 
 - 统一模型按真实 timestamp/mask 接受动态 history 与 query 数，不声明全机器人统一频率或
-  horizon；当前 Panda V8 policy profile 使用 H16 的真实 20 Hz history、K8 candidate、H1
+  horizon；当前 Panda controller profile 使用 H16 的真实 20 Hz history、K8 candidate、H1
   执行，这只是经审计的 Panda controller profile，不是由 LIBERO 定义的全局结构。
 - 每个 adapter 保持自身经审计的物理 action ABI；Panda 仍为 delta position（米）、
   base-frame SO(3) rotvec（弧度）和 absolute close01。训练与 serving 必须选择同一封存
@@ -49,8 +68,11 @@ loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，�
 1. 启用 modulation 且 gate 为零时，policy、world 和 RGB 与旧前向逐元素一致。
 2. gate 学习后，只能改变 policy query/policy 输出，不能改变 history、world 或 RGB。
 3. 每层 attention/FF gate 和最终 spatial gate 都能从现有 action loss 获得有限非零梯度。
-4. 1B/5B profile 可 materialize，参数合同与 gradient ownership 一致。
-5. serving 的 H16/K8/H1、物理单位和 normalization 与训练一致。
+4. V9 scheduler、velocity target、迭代采样、binary mask 和物理解码与封存合同一致。
+5. V9 flow block、policy context/trunk 能获得有限非零梯度，continuous regression/coarse loss
+   不得同时优化。
+6. V8/V9 profile 必须 fail-closed，1B/5B 都能 meta/FSDP materialize，gradient ownership 一致。
+7. serving 的 H16/K8/H1、物理单位和 normalization 与训练一致。
 
 ## 实证门槛
 
