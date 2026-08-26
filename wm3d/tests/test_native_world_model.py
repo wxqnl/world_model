@@ -435,8 +435,10 @@ def test_policy_task_modulation_changes_queries_without_relabeling_history() -> 
     block = ActionBlock(cfg).eval()
     batch, steps, groups, dim = 2, 4, cfg.max_action_groups, cfg.action_hidden
     value = torch.randn(batch, steps, groups, dim)
-    times = torch.arange(steps, dtype=torch.float32).view(1, -1, 1).expand(
-        batch, -1, groups
+    times = (
+        torch.arange(steps, dtype=torch.float32)
+        .view(1, -1, 1)
+        .expand(batch, -1, groups)
     )
     valid = torch.ones(batch, steps, groups, dtype=torch.bool)
     query_mask = torch.zeros_like(valid)
@@ -457,9 +459,7 @@ def test_policy_task_modulation_changes_queries_without_relabeling_history() -> 
         block.attn_task_modulation.shift.fill_(0.1)
         block.ff_task_modulation.shift.fill_(0.1)
     changed = block(value, times, valid, second_task, query_mask)
-    torch.testing.assert_close(
-        baseline[:, :-2], changed[:, :-2], rtol=0, atol=0
-    )
+    torch.testing.assert_close(baseline[:, :-2], changed[:, :-2], rtol=0, atol=0)
     assert not torch.allclose(baseline[:, -2:], changed[:, -2:])
 
 
@@ -477,7 +477,9 @@ def test_learned_policy_task_modulation_stays_out_of_world_and_rgb() -> None:
     changed = model(**batch)
     for name in ("action_free_pred_tokens", "pred_tokens", "rgb"):
         torch.testing.assert_close(baseline[name], changed[name], rtol=0, atol=0)
-    assert not torch.allclose(baseline["policy_action_raw"], changed["policy_action_raw"])
+    assert not torch.allclose(
+        baseline["policy_action_raw"], changed["policy_action_raw"]
+    )
 
 
 def test_policy_task_modulation_gates_receive_action_supervision() -> None:
@@ -1213,6 +1215,48 @@ def test_appearance_action_residual_changes_rgb_without_policy_leakage() -> None
         factual["appearance_pred_tokens"], zero["appearance_pred_tokens"]
     )
     assert not torch.allclose(factual["rgb"], zero["rgb"])
+
+
+def test_appearance_action_residual_is_centered_on_same_mask_zero_command() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        appearance_action_residual_scale=0.3,
+    )
+    torch.manual_seed(132)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    zero_action = dict(batch)
+    zero_action["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    zero_action["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+    observed: list[torch.Tensor] = []
+
+    def record(_module, inputs) -> None:
+        value = inputs[0]
+        value.retain_grad()
+        observed.append(value)
+
+    assert model.appearance_dynamics is not None
+    handle = model.appearance_dynamics.geometry.register_forward_pre_hook(record)
+    try:
+        model(**zero_action, appearance_teacher_ratio=0.0)
+        zero_call_count = len(observed)
+        assert zero_call_count >= 2
+        assert observed[0].count_nonzero() == 0
+        factual = model(**batch, appearance_teacher_ratio=0.0)
+    finally:
+        handle.remove()
+
+    assert len(observed) >= zero_call_count + 2
+    centered = observed[zero_call_count]
+    assert centered.count_nonzero() > 0
+    factual["appearance_pred_tokens"].float().square().mean().backward()
+    assert centered.grad is not None
+    assert torch.isfinite(centered.grad).all()
+    assert centered.grad.count_nonzero() > 0
 
 
 def test_dual_path_inference_uses_predicted_appearance_without_future_targets() -> None:

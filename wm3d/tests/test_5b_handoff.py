@@ -58,7 +58,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert model["model"]["factual_action_residual_scale"] == 0.3
     assert "render_factual_dynamics_repeats" not in model["model"]
     assert "render_factual_action_residual_scale" not in model["model"]
-    assert model["model"]["appearance_action_residual_scale"] == 0.0
+    assert model["model"]["appearance_action_residual_scale"] == 0.3
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75
     assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
@@ -94,10 +94,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert runtime["train"]["appearance_teacher_start_ratio"] == 1.0
     assert runtime["train"]["appearance_teacher_end_ratio"] == 0.0
     assert runtime["train"]["appearance_validation_three_way"] is True
-    assert (
-        runtime["train"]["appearance_teacher_decay_steps"]
-        == teacher_decay_steps
-    )
+    assert runtime["train"]["appearance_teacher_decay_steps"] == teacher_decay_steps
 
 
 def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
@@ -109,13 +106,17 @@ def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
         "canary1k",
         str(destination),
     ]
-    first = subprocess.run(command, cwd=ROOT, check=False, text=True, capture_output=True)
+    first = subprocess.run(
+        command, cwd=ROOT, check=False, text=True, capture_output=True
+    )
     assert first.returncode == 0, first.stderr
     assert destination.is_file()
     assert destination.stat().st_mode & 0o777 == 0o600
     assert "WM3D_5B_PRESET=canary1k" in destination.read_text()
     payload = destination.read_bytes()
-    second = subprocess.run(command, cwd=ROOT, check=False, text=True, capture_output=True)
+    second = subprocess.run(
+        command, cwd=ROOT, check=False, text=True, capture_output=True
+    )
     assert second.returncode == 2
     assert destination.read_bytes() == payload
 
@@ -128,9 +129,7 @@ def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
         ("episode_cache", "episode cache"),
     ],
 )
-def test_5b_init_selects_data_mode(
-    tmp_path: Path, data_mode: str, detail: str
-) -> None:
+def test_5b_init_selects_data_mode(tmp_path: Path, data_mode: str, detail: str) -> None:
     site = tmp_path / f"{data_mode}.env"
     result = subprocess.run(
         [
@@ -149,7 +148,9 @@ def test_5b_init_selects_data_mode(
     assert result.returncode == 0, result.stderr
     payload = site.read_text()
     assert f"WM3D_DATA_MODE={data_mode}" in payload
-    payload = payload.replace("PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}")
+    payload = payload.replace(
+        "PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}"
+    )
     site.write_text(payload)
     plan = subprocess.run(
         ["bash", str(ROOT / "scripts/cluster/wm3d_5b.sh"), "plan", str(site)],
@@ -278,8 +279,7 @@ def test_5b_site_defaults_to_oxe_and_direct_p144_p256() -> None:
     assert "STREAMING_LRU_GIB_PER_RANK=" not in site
     assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
     assert (
-        "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml"
-        in site
+        "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
     )
     assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in site
     assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
@@ -292,7 +292,9 @@ def test_5b_direct_template_has_optimized_runtime_defaults() -> None:
     assert "DIRECT_DECODE_WORKERS=1" in site
     assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
     assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
-    assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
+    assert (
+        "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
+    )
 
 
 def _oxe_info(action_dim: int, state_dim: int, views: int = 1) -> dict:
@@ -337,9 +339,7 @@ def test_5b_oxe_generator_adds_sources_without_a_fixed_pool_share() -> None:
         if not name.startswith("oxe_")
     }
     assert main == {
-        name: value
-        for name, value in default_weights.items()
-        if name != "agibot_beta"
+        name: value for name, value in default_weights.items() if name != "agibot_beta"
     }
     oxe = {
         name: value
@@ -442,7 +442,11 @@ def test_5b_report_accepts_complete_synthetic_run(tmp_path: Path) -> None:
         },
     }
     (run / "gradient_ownership.json").write_text(json.dumps(ownership))
-    metadata = {"schema": "wm3d_v8_distributed_checkpoint_v2", "step": 10, "world_size": 1}
+    metadata = {
+        "schema": "wm3d_v8_distributed_checkpoint_v2",
+        "step": 10,
+        "world_size": 1,
+    }
     payload = checkpoint / "payload.bin"
     payload.write_bytes(b"sealed")
     (checkpoint / "metadata.json").write_text(json.dumps(metadata, sort_keys=True))

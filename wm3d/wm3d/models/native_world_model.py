@@ -1033,7 +1033,7 @@ class PerViewAppearanceDynamics(nn.Module):
         future_state: torch.Tensor,
         world_times_s: torch.Tensor,
         future_mask: Optional[torch.Tensor] = None,
-        factual_action_summary: Optional[torch.Tensor] = None,
+        centered_action_summary: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         expected = (
@@ -1066,13 +1066,13 @@ class PerViewAppearanceDynamics(nn.Module):
         future_time = world_times_s[:, cfg.T :]
         action_skip: Optional[torch.Tensor] = None
         if cfg.appearance_action_residual_scale > 0.0:
-            if factual_action_summary is None or tuple(
-                factual_action_summary.shape
+            if centered_action_summary is None or tuple(
+                centered_action_summary.shape
             ) != (batch, cfg.K, cfg.state_hidden):
                 raise ValueError(
-                    "appearance action residual requires factual [B,K,state_hidden]"
+                    "appearance action residual requires centered [B,K,state_hidden]"
                 )
-            action_skip = self.geometry(factual_action_summary)[:, :, None, None]
+            action_skip = self.geometry(centered_action_summary)[:, :, None, None]
         context = self.input(context_tokens)
         context = context + self.time(context_time)[:, :, None, None]
         context = context + self.view_embed + self.patch_embed
@@ -2269,9 +2269,7 @@ class NativeWorldModel(nn.Module):
             spatial_query = self.policy_spatial_task_modulation(
                 spatial_query,
                 action_task,
-                query_token_mask.reshape(
-                    batch, query_count * cfg.max_action_groups
-                ),
+                query_token_mask.reshape(batch, query_count * cfg.max_action_groups),
             )
         spatial_update = self.policy_spatial_cross(
             spatial_query,
@@ -2374,21 +2372,35 @@ class NativeWorldModel(nn.Module):
         zero_encoded: Optional[torch.Tensor] = None
         zero_encoded_mask: Optional[torch.Tensor] = None
         zero_summary: Optional[torch.Tensor] = None
-        if compute_zero_action_control or cfg.rgb_context_action_scale > 0.0:
+        if (
+            compute_zero_action_control
+            or cfg.rgb_context_action_scale > 0.0
+            or cfg.appearance_action_residual_scale > 0.0
+        ):
             zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
                 torch.zeros_like(future_factual_fine_action_values),
                 torch.zeros_like(future_factual_coarse_action_values),
             )
+        centered_action_summary: Optional[torch.Tensor] = None
+        if (
+            cfg.rgb_context_action_scale > 0.0
+            or cfg.appearance_action_residual_scale > 0.0
+        ):
+            assert factual_summary is not None and zero_summary is not None
+            # Both the RGB renderer and the future appearance predictor need
+            # the physical command itself, not the action encoder's large
+            # action-independent mixture of mask/time/semantic/group context.
+            # Centering against the same-mask zero command makes a neutral
+            # future action exactly zero without changing the world lane.
+            centered_action_summary = factual_summary - zero_summary
         rgb_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
-            assert factual_summary is not None and zero_summary is not None
-            # The renderer needs the action value itself, as in V7, rather
-            # than the action encoder's large action-independent mixture of
-            # mask/time/semantic/group/embodiment context.  Centering against
-            # the same-mask zero command preserves those semantics in the
-            # world lane while making the direct RGB route exactly zero for a
-            # neutral future action.
-            rgb_action_summary = factual_summary - zero_summary
+            assert centered_action_summary is not None
+            rgb_action_summary = centered_action_summary
+        appearance_action_summary: Optional[torch.Tensor] = None
+        if cfg.appearance_action_residual_scale > 0.0:
+            assert centered_action_summary is not None
+            appearance_action_summary = centered_action_summary
         if compute_zero_action_control:
             assert zero_encoded is not None and zero_encoded_mask is not None
             zero_action_future = refine_factual(
@@ -2436,7 +2448,7 @@ class NativeWorldModel(nn.Module):
                 render_future,
                 relative_world_time,
                 target_appearance_mask,
-                factual_summary,
+                appearance_action_summary,
             )
             appearance_ratio = torch.as_tensor(
                 appearance_teacher_ratio,
