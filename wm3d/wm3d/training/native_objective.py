@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isqrt
 from typing import Mapping
 
 import torch
@@ -23,6 +24,8 @@ class NativeObjectiveConfig:
     token_cosine: float = 0.1
     appearance_mse: float = 0.0
     appearance_cosine: float = 0.0
+    appearance_motion_mse: float = 0.0
+    appearance_delta_cosine: float = 0.0
     rgb_l1: float = 0.0
     rgb_charbonnier: float = 2.0
     rgb_gradient: float = 0.5
@@ -602,14 +605,24 @@ def compute_native_objective(
         )
     appearance_mse = zero
     appearance_cosine = zero
+    appearance_motion_mse = zero
+    appearance_delta_cosine = zero
+    appearance_motion_fraction = zero
     appearance_supervised = zero
     has_appearance = (
         "appearance_pred_tokens" in output
         or "target_appearance_tokens" in batch
     )
-    if (
-        config.appearance_mse > 0.0 or config.appearance_cosine > 0.0
-    ) and not has_appearance:
+    appearance_loss_enabled = any(
+        weight > 0.0
+        for weight in (
+            config.appearance_mse,
+            config.appearance_cosine,
+            config.appearance_motion_mse,
+            config.appearance_delta_cosine,
+        )
+    )
+    if appearance_loss_enabled and not has_appearance:
         raise NativeObjectiveError(
             "appearance loss is enabled but the model/data provide no appearance lane"
         )
@@ -643,6 +656,132 @@ def compute_native_objective(
         appearance_supervised = torch.broadcast_to(
             appearance_mask[..., None], appearance_target.shape
         ).sum().to(dtype=token_mse.dtype)
+        if (
+            config.appearance_motion_mse > 0.0
+            or config.appearance_delta_cosine > 0.0
+        ):
+            required = (
+                "appearance_context_tokens",
+                "appearance_context_mask",
+                "target_rgb",
+                "context_rgb",
+            )
+            missing = [name for name in required if name not in batch]
+            if missing:
+                raise NativeObjectiveError(
+                    "motion-aware appearance loss requires " + ", ".join(missing)
+                )
+            context_tokens = batch["appearance_context_tokens"]
+            context_mask = batch["appearance_context_mask"].bool()
+            if (
+                context_tokens.ndim != 5
+                or context_tokens.shape[0] != appearance_target.shape[0]
+            ):
+                raise NativeObjectiveError(
+                    "appearance context tokens must be [B,C,V,P,D]"
+                )
+            if context_mask.shape != context_tokens.shape[:-1]:
+                raise NativeObjectiveError(
+                    "appearance context mask must align to context tokens"
+                )
+            if context_tokens.shape[2:] != appearance_target.shape[2:]:
+                raise NativeObjectiveError(
+                    "appearance context and target view/patch/token shapes differ"
+                )
+            latest_context = torch.zeros_like(context_tokens[:, 0])
+            for index in range(int(context_tokens.shape[1])):
+                latest_context = torch.where(
+                    context_mask[:, index, ..., None],
+                    context_tokens[:, index],
+                    latest_context,
+                )
+            context_token_valid = context_mask.any(dim=1)
+            predicted_delta = appearance_prediction - latest_context[:, None]
+            target_delta = appearance_target - latest_context[:, None]
+
+            target_rgb = batch["target_rgb"].float()
+            context_rgb = batch["context_rgb"].float()
+            expected_rgb_prefix = appearance_target.shape[:3]
+            if (
+                target_rgb.ndim != 6
+                or target_rgb.shape[:3] != expected_rgb_prefix
+                or target_rgb.shape[3] != 3
+            ):
+                raise NativeObjectiveError(
+                    "target RGB must align to appearance [B,K,V]"
+                )
+            if context_rgb.shape != (
+                appearance_target.shape[0],
+                appearance_target.shape[2],
+                3,
+                target_rgb.shape[-2],
+                target_rgb.shape[-1],
+            ):
+                raise NativeObjectiveError(
+                    "context RGB must align to appearance views and target resolution"
+                )
+            target_rgb_mask = batch.get(
+                "target_rgb_mask",
+                torch.ones_like(target_rgb[:, :, :, :1, :1, :1], dtype=torch.bool),
+            ).bool()
+            context_rgb_mask = batch.get(
+                "context_rgb_mask",
+                torch.ones(
+                    appearance_target.shape[0],
+                    appearance_target.shape[2],
+                    dtype=torch.bool,
+                    device=appearance_target.device,
+                ),
+            ).bool()
+            if target_rgb_mask.shape != target_rgb.shape[:3] + (1, 1, 1):
+                raise NativeObjectiveError("target RGB mask must be [B,K,V,1,1,1]")
+            if context_rgb_mask.shape != (
+                appearance_target.shape[:1] + appearance_target.shape[2:3]
+            ):
+                raise NativeObjectiveError("context RGB mask must be [B,V]")
+            rgb_valid = (
+                target_rgb_mask
+                & context_rgb_mask[:, None, :, None, None, None]
+            )
+            pixel_motion = (
+                (target_rgb - context_rgb[:, None]).abs().mean(dim=3, keepdim=True)
+                > config.rgb_motion_threshold
+            ) & rgb_valid
+            appearance_patches = int(appearance_target.shape[3])
+            appearance_grid = isqrt(appearance_patches)
+            if appearance_grid * appearance_grid != appearance_patches:
+                raise NativeObjectiveError(
+                    "motion-aware appearance loss requires a square patch grid"
+                )
+            motion_weight = F.adaptive_avg_pool2d(
+                pixel_motion.float().reshape(
+                    -1, 1, target_rgb.shape[-2], target_rgb.shape[-1]
+                ),
+                output_size=(appearance_grid, appearance_grid),
+            ).reshape(*appearance_target.shape[:3], appearance_patches)
+            motion_valid = appearance_mask & context_token_valid[:, None]
+            motion_weight = motion_weight * motion_valid.to(dtype=motion_weight.dtype)
+            appearance_motion_fraction = _masked_mean(
+                motion_weight,
+                motion_valid,
+                epsilon=epsilon,
+            )
+            appearance_motion_mse = _masked_mean(
+                appearance_error.square(),
+                motion_weight[..., None],
+                epsilon=epsilon,
+            )
+            delta_direction_weight = motion_weight * (
+                target_delta.float().square().sum(dim=-1).sqrt() > epsilon
+            ).to(dtype=motion_weight.dtype)
+            appearance_delta_cosine = _masked_mean(
+                1.0
+                - F.cosine_similarity(
+                    predicted_delta.float(), target_delta.float(), dim=-1
+                ),
+                delta_direction_weight,
+                epsilon=epsilon,
+            )
     rgb_l1 = zero
     rgb_charbonnier = zero
     rgb_gradient = zero
@@ -968,6 +1107,9 @@ def compute_native_objective(
         ),
         "appearance_mse": appearance_mse,
         "appearance_cosine": appearance_cosine,
+        "appearance_motion_mse": appearance_motion_mse,
+        "appearance_delta_cosine": appearance_delta_cosine,
+        "appearance_motion_fraction": appearance_motion_fraction,
         "appearance_teacher_ratio": output.get("appearance_teacher_ratio", zero),
         "rgb_l1": rgb_l1,
         "rgb_charbonnier": rgb_charbonnier,
@@ -1044,6 +1186,8 @@ def compute_native_objective(
         + config.token_cosine * token_cosine
         + config.appearance_mse * appearance_mse
         + config.appearance_cosine * appearance_cosine
+        + config.appearance_motion_mse * appearance_motion_mse
+        + config.appearance_delta_cosine * appearance_delta_cosine
         + config.rgb_l1 * rgb_l1
         + config.rgb_charbonnier * rgb_charbonnier
         + config.rgb_gradient * rgb_gradient

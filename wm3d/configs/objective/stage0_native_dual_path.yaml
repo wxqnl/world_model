@@ -11,6 +11,12 @@ objective:
   token_cosine: 0.1
   appearance_mse: 1.0
   appearance_cosine: 0.1
+  # Preserve P256 as the high-frequency appearance path, but prevent the
+  # last-context residual predictor from winning by copying static texture.
+  # Motion-patch MSE learns change magnitude; residual cosine learns the
+  # direction of future appearance change relative to the last observation.
+  appearance_motion_mse: 1.0
+  appearance_delta_cosine: 0.1
   rgb_charbonnier: 1.0
   rgb_charbonnier_epsilon: 0.000001
   rgb_gradient: 0.25

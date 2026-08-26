@@ -61,7 +61,12 @@ from wm3d.training.runtime_contract import load_materialized_runtime
 EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_offline_eval_v2"
 _COVERAGE_WEIGHTS = {
     "native_token_supervised_elements": ("token_mse", "token_cosine"),
-    "appearance_supervised_elements": ("appearance_mse", "appearance_cosine"),
+    "appearance_supervised_elements": (
+        "appearance_mse",
+        "appearance_cosine",
+        "appearance_motion_mse",
+        "appearance_delta_cosine",
+    ),
     "rgb_supervised_elements": (
         "rgb_l1",
         "rgb_charbonnier",
@@ -121,6 +126,8 @@ def declared_eval_coverage_lanes(
     if (
         getattr(objective, "appearance_mse", 0.0) > 0.0
         or getattr(objective, "appearance_cosine", 0.0) > 0.0
+        or getattr(objective, "appearance_motion_mse", 0.0) > 0.0
+        or getattr(objective, "appearance_delta_cosine", 0.0) > 0.0
     ):
         lanes.add("appearance_supervised_elements")
     for key, lane in (

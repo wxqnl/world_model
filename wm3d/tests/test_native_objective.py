@@ -102,6 +102,83 @@ def test_rgb_motion_objective_separates_static_and_changed_pixels() -> None:
     assert motion_logit.grad is not None and motion_logit.grad.abs().sum() > 0
 
 
+def test_appearance_motion_objective_supervises_future_p256_residual() -> None:
+    appearance_prediction = torch.zeros(1, 1, 1, 4, 2, requires_grad=True)
+    with torch.no_grad():
+        appearance_prediction[0, 0, 0, 0] = torch.tensor([0.0, 1.0])
+        # A large static-patch error must not leak into the motion-only metric.
+        appearance_prediction[0, 0, 0, 1] = torch.tensor([10.0, 10.0])
+    appearance_target = torch.zeros_like(appearance_prediction)
+    appearance_target[0, 0, 0, 0] = torch.tensor([1.0, 0.0])
+    target_rgb = torch.zeros(1, 1, 1, 3, 2, 2)
+    target_rgb[..., 0, 0] = 1.0
+    policy = torch.zeros(1, 1, 1, 1)
+    output = {
+        "pred_tokens": torch.zeros(1, 1, 1, 2),
+        "appearance_pred_tokens": appearance_prediction,
+        "appearance_pred_mask": torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        "rgb": torch.zeros_like(target_rgb),
+        "depth": torch.ones(1, 1, 1, 1),
+        "point": torch.zeros(1, 1, 1, 1, 3),
+        "camera_pose": torch.zeros(1, 1, 1, 9),
+        "policy_action_raw": policy,
+        "policy_action_normalized": policy,
+        "policy_action": policy,
+        "policy_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "policy_gripper_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_binary_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_query_dt": torch.tensor([[[0.5]]]),
+    }
+    batch = {
+        "target_tokens": torch.zeros(1, 1, 1, 2),
+        "target_appearance_tokens": appearance_target,
+        "target_appearance_mask": torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        "appearance_context_tokens": torch.zeros(1, 1, 1, 4, 2),
+        "appearance_context_mask": torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        "target_rgb": target_rgb,
+        "target_rgb_mask": torch.ones(1, 1, 1, 1, 1, 1, dtype=torch.bool),
+        "context_rgb": torch.zeros(1, 1, 3, 2, 2),
+        "context_rgb_mask": torch.ones(1, 1, dtype=torch.bool),
+        "target_fine_action": torch.zeros_like(policy),
+        "target_fine_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "future_world_boundaries_dt": torch.tensor([[0.0, 1.0]]),
+        "composition_operator_ids": torch.tensor(
+            [[[COMPOSITION_OPERATOR_IDS["last"]]]]
+        ),
+        "target_coarse_action_normalized": torch.zeros(1, 1, 1, 1),
+        "target_coarse_action_mask": torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        "action_normalization_offset": torch.zeros(1, 1, 1),
+        "action_normalization_scale": torch.ones(1, 1, 1),
+    }
+    losses = compute_native_objective(
+        output=output,
+        batch=batch,
+        config=NativeObjectiveConfig(
+            token_mse=0.0,
+            token_cosine=0.0,
+            appearance_motion_mse=1.0,
+            appearance_delta_cosine=1.0,
+            rgb_l1=0.0,
+            rgb_charbonnier=0.0,
+            rgb_gradient=0.0,
+            depth_log=0.0,
+            point=0.0,
+            camera_pose=0.0,
+            action_fine=0.0,
+            action_coarse=0.0,
+        ),
+    )
+
+    assert losses["appearance_motion_fraction"].item() == pytest.approx(0.25)
+    assert losses["appearance_motion_mse"].item() == pytest.approx(1.0)
+    assert losses["appearance_delta_cosine"].item() == pytest.approx(1.0)
+    assert losses["total"].item() == pytest.approx(2.0)
+    losses["total"].backward()
+    assert appearance_prediction.grad is not None
+    assert appearance_prediction.grad[0, 0, 0, 0].abs().sum() > 0
+    assert appearance_prediction.grad[0, 0, 0, 1].abs().sum() == 0
+
+
 def test_factual_zero_advantage_updates_both_sides_of_the_ranking() -> None:
     factual = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)
     zero_action = torch.full((2, 1, 1, 2), 0.2, requires_grad=True)
