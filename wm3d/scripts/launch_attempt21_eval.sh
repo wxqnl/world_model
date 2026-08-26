@@ -40,6 +40,7 @@ exec "$VENV/bin/torchrun" \
   --master-port=29823 \
   --max-restarts=0 \
   "$CODE/scripts/eval_action_conditioning.py" \
+  --diagnostic-skip-launch-qualification \
   --runtime "$ROOT/runtime.yaml" \
   --checkpoint "$CHECKPOINT" \
   --output "$OUTPUT" \

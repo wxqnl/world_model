@@ -20,7 +20,8 @@ PANDA_ROBOCASA_LIBERO_ARM_GROUP_ID = 12
 PANDA_LIBERO_CONTROLLER_HZ = 20
 PANDA_LIBERO_POLICY_HORIZON = 8
 PANDA_LIBERO_EXECUTION_HORIZON = 1
-PANDA_LIBERO_NATIVE_HISTORY = 4
+PANDA_LIBERO_POLICY_HISTORY = 16
+PANDA_LIBERO_HISTORY_WORLD_INTERVALS = 4
 
 
 class PandaLiberoContractError(ValueError):
@@ -142,11 +143,12 @@ def panda_libero_policy_inputs(
 ) -> PandaLiberoPolicyInputs:
     """Pack the documented V8 direct-policy ABI for the unified model.
 
-    ``native_action_history_close01`` is the causal H4 sequence of completed
-    5 Hz physical effects used by the V8 LIBERO contract.  It is deliberately
-    represented as coarse history; the future K8 queries remain direct 20 Hz
-    controller commands.  No future action is inserted into the action-free
-    world/policy trunk.
+    ``native_action_history_close01`` is the causal H16 sequence of completed
+    20 Hz controller commands required by the V8 action contract.  The commands
+    occupy the final four 5 Hz world intervals as four real fine substeps per
+    interval; they are never composed into coarse effects.  The future K8
+    queries remain direct 20 Hz controller commands.  No future action is
+    inserted into the action-free world/policy trunk.
     """
 
     state = np.asarray(current_state, dtype=np.float32)
@@ -155,11 +157,11 @@ def panda_libero_policy_inputs(
     scale = np.asarray(action_normalization_scale, dtype=np.float32)
     if state.shape != (10,) or not np.isfinite(state).all():
         raise PandaLiberoContractError("current_state must be finite canonical [10]")
-    if history.shape != (PANDA_LIBERO_NATIVE_HISTORY, 7) or not np.isfinite(
+    if history.shape != (PANDA_LIBERO_POLICY_HISTORY, 7) or not np.isfinite(
         history
     ).all():
         raise PandaLiberoContractError(
-            "native action history must be finite canonical H4x7"
+            "native action history must be finite canonical H16x7"
         )
     if np.any((history[:, 6] < 0.0) | (history[:, 6] > 1.0)):
         raise PandaLiberoContractError("history gripper must be close01")
@@ -174,12 +176,12 @@ def panda_libero_policy_inputs(
             "absolute gripper close01 must use identity normalization"
         )
     if (
-        context_steps < PANDA_LIBERO_NATIVE_HISTORY
+        context_steps < PANDA_LIBERO_HISTORY_WORLD_INTERVALS
         or world_horizon != 8
         or max_groups < 1
         or max_action_dim < 7
         or max_state_dim < 10
-        or max_substeps < 1
+        or max_substeps < 4
         or max_policy_queries < PANDA_LIBERO_POLICY_HORIZON
     ):
         raise PandaLiberoContractError("model capacities cannot represent the LIBERO ABI")
@@ -237,16 +239,48 @@ def panda_libero_policy_inputs(
         device=device,
     )
 
+    normalized_history = (history - offset[None]) / scale[None]
+    history_fine = torch.zeros(
+        (
+            1,
+            context_steps,
+            max_groups,
+            max_substeps,
+            max_action_dim,
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+    history_fine_mask = torch.zeros_like(history_fine, dtype=torch.bool)
+    history_fine_dt = torch.zeros(
+        history_fine.shape[:-1], dtype=torch.float32, device=device
+    )
+    history_fine_sample_mask = torch.zeros_like(history_fine_dt, dtype=torch.bool)
+    grouped_history = torch.as_tensor(
+        normalized_history.reshape(PANDA_LIBERO_HISTORY_WORLD_INTERVALS, 4, 7),
+        dtype=torch.float32,
+        device=device,
+    )
+    history_fine[
+        0, -PANDA_LIBERO_HISTORY_WORLD_INTERVALS :, 0, :4, :7
+    ] = grouped_history
+    history_fine_mask[
+        0, -PANDA_LIBERO_HISTORY_WORLD_INTERVALS :, 0, :4, :7
+    ] = True
+    history_fine_dt[
+        0, -PANDA_LIBERO_HISTORY_WORLD_INTERVALS :, 0, :4
+    ] = torch.arange(4, dtype=torch.float32, device=device) / float(
+        PANDA_LIBERO_CONTROLLER_HZ
+    )
+    history_fine_sample_mask[
+        0, -PANDA_LIBERO_HISTORY_WORLD_INTERVALS :, 0, :4
+    ] = True
     history_coarse = torch.zeros(
         (1, context_steps, max_groups, max_action_dim),
         dtype=torch.float32,
         device=device,
     )
     history_coarse_mask = torch.zeros_like(history_coarse, dtype=torch.bool)
-    history_coarse[0, -PANDA_LIBERO_NATIVE_HISTORY :, 0, :7] = torch.as_tensor(
-        history, dtype=torch.float32, device=device
-    )
-    history_coarse_mask[0, -PANDA_LIBERO_NATIVE_HISTORY :, 0, :7] = True
 
     query_dt = torch.zeros(
         (1, max_groups, max_policy_queries), dtype=torch.float32, device=device
@@ -271,13 +305,6 @@ def panda_libero_policy_inputs(
     norm_offset[0, 0, :7] = torch.as_tensor(offset, device=device)
     norm_scale[0, 0, :7] = torch.as_tensor(scale, device=device)
 
-    fine_shape = (
-        1,
-        context_steps,
-        max_groups,
-        max_substeps,
-        max_action_dim,
-    )
     future_fine_shape = (
         1,
         world_horizon,
@@ -286,18 +313,10 @@ def panda_libero_policy_inputs(
         max_action_dim,
     )
     tensors = {
-        "history_fine_action_values": torch.zeros(
-            fine_shape, dtype=torch.float32, device=device
-        ),
-        "history_fine_action_mask": torch.zeros(
-            fine_shape, dtype=torch.bool, device=device
-        ),
-        "history_fine_action_dt": torch.zeros(
-            fine_shape[:-1], dtype=torch.float32, device=device
-        ),
-        "history_fine_sample_mask": torch.zeros(
-            fine_shape[:-1], dtype=torch.bool, device=device
-        ),
+        "history_fine_action_values": history_fine,
+        "history_fine_action_mask": history_fine_mask,
+        "history_fine_action_dt": history_fine_dt,
+        "history_fine_sample_mask": history_fine_sample_mask,
         "history_coarse_action_values": history_coarse,
         "history_coarse_action_mask": history_coarse_mask,
         "future_factual_fine_action_values": torch.zeros(

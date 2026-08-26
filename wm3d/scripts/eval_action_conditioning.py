@@ -33,7 +33,11 @@ def _capture_renderer_action(
 
     action_proj = None
     for name, module in model.named_modules():
-        if "image_decoder.action_proj" in name and name.endswith("action_proj"):
+        if (
+            "rgb_head" in name
+            and "image_decoder" in name
+            and name.endswith("action_proj")
+        ):
             action_proj = module
             break
     if action_proj is None:

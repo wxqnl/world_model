@@ -6,6 +6,8 @@ import torch
 
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS
 from wm3d.serving.panda_libero import (
+    PANDA_LIBERO_HISTORY_WORLD_INTERVALS,
+    PANDA_LIBERO_POLICY_HISTORY,
     PANDA_LIBERO_POLICY_HORIZON,
     PANDA_ROBOCASA_LIBERO_ARM_GROUP_ID,
     PANDA_ROBOCASA_LIBERO_EMBODIMENT_ID,
@@ -105,14 +107,16 @@ def test_model_action_chunk_rejects_wrong_panda_identity() -> None:
 
 
 def test_libero_policy_inputs_are_exact_k8_h1_panda_contract() -> None:
-    history = np.zeros((4, 7), dtype=np.float32)
-    history[:, 0] = (0.01, 0.02, 0.03, 0.04)
-    history[:, 6] = (0.0, 0.0, 1.0, 1.0)
+    history = np.zeros((PANDA_LIBERO_POLICY_HISTORY, 7), dtype=np.float32)
+    history[:, 0] = np.arange(1, PANDA_LIBERO_POLICY_HISTORY + 1) * 0.01
+    history[:, 6] = np.arange(PANDA_LIBERO_POLICY_HISTORY) >= 8
+    offset = np.asarray((0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), np.float32)
+    scale = np.asarray((0.02, 0.02, 0.02, 0.1, 0.1, 0.1, 1.0), np.float32)
     packed = panda_libero_policy_inputs(
         np.asarray((0.1, -0.2, 0.3, 1, 0, 0, 0, 1, 0, 0.25), np.float32),
         history,
-        np.asarray((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), np.float32),
-        np.asarray((0.02, 0.02, 0.02, 0.1, 0.1, 0.1, 1.0), np.float32),
+        offset,
+        scale,
     ).model_kwargs()
 
     assert packed["embodiment_ids"].item() == PANDA_ROBOCASA_LIBERO_EMBODIMENT_ID
@@ -125,10 +129,18 @@ def test_libero_policy_inputs_are_exact_k8_h1_panda_contract() -> None:
         torch.arange(PANDA_LIBERO_POLICY_HORIZON) / 20.0,
     )
     torch.testing.assert_close(
-        packed["history_coarse_action_values"][0, -4:, 0, :7],
-        torch.from_numpy(history),
+        packed["history_fine_action_values"][
+            0, -PANDA_LIBERO_HISTORY_WORLD_INTERVALS :, 0, :4, :7
+        ],
+        torch.from_numpy(((history - offset[None]) / scale[None]).reshape(4, 4, 7)),
     )
-    assert packed["history_fine_action_mask"].sum().item() == 0
+    assert packed["history_fine_action_mask"].sum().item() == 16 * 7
+    torch.testing.assert_close(
+        packed["history_fine_action_dt"][0, -4:, 0, :4],
+        (torch.arange(4) / 20.0).repeat(4, 1),
+    )
+    assert packed["history_fine_sample_mask"].sum().item() == 16
+    assert packed["history_coarse_action_mask"].sum().item() == 0
     assert packed["future_factual_fine_action_mask"].sum().item() == 0
     assert packed["future_factual_coarse_action_mask"].sum().item() == 0
 
@@ -137,7 +149,17 @@ def test_libero_policy_inputs_reject_nonidentity_gripper_normalization() -> None
     with pytest.raises(PandaLiberoContractError, match="identity normalization"):
         panda_libero_policy_inputs(
             np.zeros(10, dtype=np.float32),
-            np.zeros((4, 7), dtype=np.float32),
+            np.zeros((PANDA_LIBERO_POLICY_HISTORY, 7), dtype=np.float32),
             np.zeros(7, dtype=np.float32),
             np.ones(7, dtype=np.float32) * 2.0,
+        )
+
+
+def test_libero_policy_inputs_reject_old_h4_coarse_history_abi() -> None:
+    with pytest.raises(PandaLiberoContractError, match="H16x7"):
+        panda_libero_policy_inputs(
+            np.zeros(10, dtype=np.float32),
+            np.zeros((4, 7), dtype=np.float32),
+            np.zeros(7, dtype=np.float32),
+            np.ones(7, dtype=np.float32),
         )
