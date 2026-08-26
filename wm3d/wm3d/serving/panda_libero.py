@@ -131,6 +131,8 @@ def panda_libero_policy_inputs(
     native_action_history_close01: object,
     action_normalization_offset: object,
     action_normalization_scale: object,
+    state_normalization_offset: object,
+    state_normalization_scale: object,
     *,
     context_steps: int = 16,
     world_horizon: int = 8,
@@ -155,6 +157,8 @@ def panda_libero_policy_inputs(
     history = np.asarray(native_action_history_close01, dtype=np.float32)
     offset = np.asarray(action_normalization_offset, dtype=np.float32)
     scale = np.asarray(action_normalization_scale, dtype=np.float32)
+    state_offset = np.asarray(state_normalization_offset, dtype=np.float32)
+    state_scale = np.asarray(state_normalization_scale, dtype=np.float32)
     if state.shape != (10,) or not np.isfinite(state).all():
         raise PandaLiberoContractError("current_state must be finite canonical [10]")
     if history.shape != (PANDA_LIBERO_POLICY_HISTORY, 7) or not np.isfinite(
@@ -174,6 +178,20 @@ def panda_libero_policy_inputs(
     if offset[6] != 0.0 or scale[6] != 1.0:
         raise PandaLiberoContractError(
             "absolute gripper close01 must use identity normalization"
+        )
+    if state_offset.shape != (10,) or state_scale.shape != (10,):
+        raise PandaLiberoContractError("state normalization must be canonical [10]")
+    if (
+        not np.isfinite(state_offset).all()
+        or not np.isfinite(state_scale).all()
+        or np.any(state_scale <= 0.0)
+    ):
+        raise PandaLiberoContractError(
+            "state normalization must be finite and positive"
+        )
+    if state_offset[9] != 0.0 or state_scale[9] != 1.0:
+        raise PandaLiberoContractError(
+            "gripper state close01 must use identity normalization"
         )
     if (
         context_steps < PANDA_LIBERO_HISTORY_WORLD_INTERVALS
@@ -296,7 +314,9 @@ def panda_libero_policy_inputs(
     )
     current_mask = torch.zeros_like(current_values, dtype=torch.bool)
     current_values[0, 0, :10] = torch.as_tensor(
-        state, dtype=torch.float32, device=device
+        (state - state_offset) / state_scale,
+        dtype=torch.float32,
+        device=device,
     )
     current_mask[0, 0, :10] = True
 
@@ -304,6 +324,12 @@ def panda_libero_policy_inputs(
     norm_scale = torch.ones(action_shape, dtype=torch.float32, device=device)
     norm_offset[0, 0, :7] = torch.as_tensor(offset, device=device)
     norm_scale[0, 0, :7] = torch.as_tensor(scale, device=device)
+    state_norm_offset = torch.zeros(
+        (1, max_groups, max_state_dim), dtype=torch.float32, device=device
+    )
+    state_norm_scale = torch.ones_like(state_norm_offset)
+    state_norm_offset[0, 0, :10] = torch.as_tensor(state_offset, device=device)
+    state_norm_scale[0, 0, :10] = torch.as_tensor(state_scale, device=device)
 
     future_fine_shape = (
         1,
@@ -355,6 +381,8 @@ def panda_libero_policy_inputs(
         "policy_query_mask": query_mask,
         "action_normalization_offset": norm_offset,
         "action_normalization_scale": norm_scale,
+        "state_normalization_offset": state_norm_offset,
+        "state_normalization_scale": state_norm_scale,
     }
     return PandaLiberoPolicyInputs(tensors)
 

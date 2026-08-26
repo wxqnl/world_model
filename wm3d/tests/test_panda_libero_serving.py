@@ -112,11 +112,15 @@ def test_libero_policy_inputs_are_exact_k8_h1_panda_contract() -> None:
     history[:, 6] = np.arange(PANDA_LIBERO_POLICY_HISTORY) >= 8
     offset = np.asarray((0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), np.float32)
     scale = np.asarray((0.02, 0.02, 0.02, 0.1, 0.1, 0.1, 1.0), np.float32)
+    state_offset = np.asarray((0.05, 0, 0, 0, 0, 0, 0, 0, 0, 0), np.float32)
+    state_scale = np.asarray((0.05, 1, 1, 1, 1, 1, 1, 1, 1, 1), np.float32)
     packed = panda_libero_policy_inputs(
         np.asarray((0.1, -0.2, 0.3, 1, 0, 0, 0, 1, 0, 0.25), np.float32),
         history,
         offset,
         scale,
+        state_offset,
+        state_scale,
     ).model_kwargs()
 
     assert packed["embodiment_ids"].item() == PANDA_ROBOCASA_LIBERO_EMBODIMENT_ID
@@ -143,6 +147,15 @@ def test_libero_policy_inputs_are_exact_k8_h1_panda_contract() -> None:
     assert packed["history_coarse_action_mask"].sum().item() == 0
     assert packed["future_factual_fine_action_mask"].sum().item() == 0
     assert packed["future_factual_coarse_action_mask"].sum().item() == 0
+    assert packed["current_state_values"][0, 0, 0].item() == pytest.approx(1.0)
+    torch.testing.assert_close(
+        packed["state_normalization_offset"][0, 0, :10],
+        torch.from_numpy(state_offset),
+    )
+    torch.testing.assert_close(
+        packed["state_normalization_scale"][0, 0, :10],
+        torch.from_numpy(state_scale),
+    )
 
 
 def test_libero_policy_inputs_reject_nonidentity_gripper_normalization() -> None:
@@ -152,6 +165,8 @@ def test_libero_policy_inputs_reject_nonidentity_gripper_normalization() -> None
             np.zeros((PANDA_LIBERO_POLICY_HISTORY, 7), dtype=np.float32),
             np.zeros(7, dtype=np.float32),
             np.ones(7, dtype=np.float32) * 2.0,
+            np.zeros(10, dtype=np.float32),
+            np.ones(10, dtype=np.float32),
         )
 
 
@@ -162,4 +177,20 @@ def test_libero_policy_inputs_reject_old_h4_coarse_history_abi() -> None:
             np.zeros((4, 7), dtype=np.float32),
             np.zeros(7, dtype=np.float32),
             np.ones(7, dtype=np.float32),
+            np.zeros(10, dtype=np.float32),
+            np.ones(10, dtype=np.float32),
+        )
+
+
+def test_libero_policy_inputs_reject_missing_state_calibration() -> None:
+    state_scale = np.ones(10, dtype=np.float32)
+    state_scale[0] = 0.0
+    with pytest.raises(PandaLiberoContractError, match="state normalization"):
+        panda_libero_policy_inputs(
+            np.zeros(10, dtype=np.float32),
+            np.zeros((PANDA_LIBERO_POLICY_HISTORY, 7), dtype=np.float32),
+            np.zeros(7, dtype=np.float32),
+            np.ones(7, dtype=np.float32),
+            np.zeros(10, dtype=np.float32),
+            state_scale,
         )

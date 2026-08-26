@@ -9,6 +9,11 @@ action-free state 或 policy trunk。
 本实现补强 task 在 policy 深层主链中的持续作用，但不增加新的 task loss，也不改已有 action
 loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，避免多目标权重竞争。
 
+同一 embodiment 可以来自多个数据源，而每个来源的 action/state z-score 坐标可能不同。
+`embodiment/group/semantic` 不能唯一说明这套数值坐标。policy query 因此还接收与训练、
+反归一化完全同源的 calibration descriptor（action/state offset、log-scale 和有效维），让模型
+显式知道自己正在预测哪套控制坐标；descriptor 不含 source id 或未来 action，也没有新增 loss。
+
 ## 实现
 
 - task bank 的 pooled embedding 仍只经过一次共享 `task_action` 投影。
@@ -18,14 +23,19 @@ loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，�
   task 重新标注。
 - scale/shift gate 全零初始化，并经 `tanh` 有界化。初始化时前向逐元素等同于未启用该路径的
   模型；训练只会从已有 action objective 学习需要多少 task 调制。
+- calibration 使用 query-only 的零初始化线性投影。初始化时逐元素保持旧 policy；第一步即可
+  从已有 action objective 获得梯度。它不写回 history/world/RGB，不引入数据集专用 head。
 - 该路径属于 `policy_action_trunk` 的 gradient owner，不参与 world、geometry、appearance 或
   RGB 的参数所有权。
 
 ## 保持不变的合同
 
-- history 为 H16 的真实 20 Hz 物理 action，candidate 为 K8，执行为 H1。
-- Panda action 保持 delta position（米）、base-frame SO(3) rotvec（弧度）和 absolute
-  close01；训练与 serving 使用同一 offset/scale normalization。
+- 统一模型按真实 timestamp/mask 接受动态 history 与 query 数，不声明全机器人统一频率或
+  horizon；当前 Panda V8 policy profile 使用 H16 的真实 20 Hz history、K8 candidate、H1
+  执行，这只是经审计的 Panda controller profile，不是由 LIBERO 定义的全局结构。
+- 每个 adapter 保持自身经审计的物理 action ABI；Panda 仍为 delta position（米）、
+  base-frame SO(3) rotvec（弧度）和 absolute close01。训练与 serving 必须选择同一封存
+  calibration profile，并同时应用 action 与 current-state normalization。
 - grouped action owner、mask、time、semantic/group id 均不改变。
 - future factual/zero candidate 对 policy 和 action-free state 的输出差异必须逐元素为零。
 - RGB/P256、world dynamics、数据闭包、batch、teacher schedule 和所有 objective 权重不改变。
@@ -52,4 +62,5 @@ loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，�
 - baseline action 优于 neutral，token/action gain 正向；
 - policy/action-free 不变量逐元素成立，RGB/P256 指标不退化。
 
-最终能力仍以独立 action regression 和 LIBERO 闭环任务成功率为准。
+最终能力仍以独立 action regression 和多种闭环机器人/模拟器任务成功率为准；LIBERO 只是
+其中一个可选下游验收器，不能反向定义统一 action head、group 布局或训练目标。

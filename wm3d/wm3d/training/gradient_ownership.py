@@ -40,6 +40,8 @@ def _required_owner_modules(model: NativeWorldModel) -> Mapping[str, tuple[nn.Mo
     ]
     if model.policy_spatial_task_modulation is not None:
         policy_modules.append(model.policy_spatial_task_modulation)
+    if model.policy_calibration is not None:
+        policy_modules.append(model.policy_calibration)
     owners: dict[str, tuple[nn.Module, ...]] = {
         "native_state_trunk": (
             model.view_fuser,

@@ -61,6 +61,12 @@ class NativeWorldModelConfig:
     # zero-initialized FiLM route keeps the task observable at every action
     # layer and at the final visual read without introducing a competing loss.
     policy_task_modulation: bool = False
+    # Normalization is a training coordinate system, not dataset identity.  A
+    # shared policy that mixes several sources for one embodiment must know
+    # which action/state coordinate transform its normalized inputs and target
+    # use.  This query-only route makes that calibration explicit without
+    # exposing a source id, adding an auxiliary loss, or changing world/RGB.
+    policy_calibration_conditioning: bool = False
     bridge_layers_state: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29)
     bridge_heads: int = 16
     dynamics_layers: int = 4
@@ -174,6 +180,8 @@ class NativeWorldModelConfig:
             raise ValueError("bridge_layers_state contains duplicates")
         if not isinstance(self.policy_task_modulation, bool):
             raise ValueError("policy_task_modulation must be boolean")
+        if not isinstance(self.policy_calibration_conditioning, bool):
+            raise ValueError("policy_calibration_conditioning must be boolean")
         if any(
             index < 0 or index >= self.state_layers
             for index in self.bridge_layers_state
@@ -693,6 +701,107 @@ class CurrentStateEncoder(nn.Module):
             + self.embodiment(embodiment_ids)[:, None]
         )
         return self.norm(token) * group_mask[..., None].to(dtype=token.dtype)
+
+
+class PolicyCalibrationEncoder(nn.Module):
+    """Encode the exact control coordinate transform for each policy group.
+
+    The data pipeline z-scores action history, current state and continuous
+    action targets with source-specific statistics.  Embodiment/group/semantic
+    ids alone cannot identify that numerical coordinate system when several
+    sources share the same robot.  This encoder therefore exposes only the
+    transform itself: offset, log-scale and real-dimension mask for action and
+    state.  It never receives a source id or a future action value.
+
+    A single zero-initialized linear map is sufficient and intentional.  The
+    old forward is exactly preserved at initialization, while the existing
+    action objective gives the map a non-zero gradient on the first step.  No
+    competing calibration loss or tunable loss weight is introduced.
+    """
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        feature_dim = 3 * (cfg.max_action_dim + cfg.max_state_dim)
+        self.weight = nn.Parameter(torch.zeros(cfg.action_hidden, feature_dim))
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+
+    @staticmethod
+    def _features(
+        offset: torch.Tensor,
+        scale: torch.Tensor,
+        valid: torch.Tensor,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        if offset.shape != scale.shape or valid.shape != offset.shape:
+            raise ValueError(f"{name} calibration tensors must have identical shapes")
+        if (
+            not bool(torch.isfinite(offset).all())
+            or not bool(torch.isfinite(scale).all())
+            or bool((scale <= 0).any())
+        ):
+            raise ValueError(f"{name} calibration statistics are invalid")
+        mask = valid.to(dtype=torch.float32)
+        # asinh is linear near zero and only logarithmic for large offsets;
+        # log-scale represents multiplicative unit changes directly.
+        offset_feature = torch.asinh(offset.float()) * mask
+        scale_feature = torch.log(scale.float()) * mask
+        return torch.cat((offset_feature, scale_feature, mask), dim=-1)
+
+    def forward(
+        self,
+        action_offset: torch.Tensor,
+        action_scale: torch.Tensor,
+        action_semantic_ids: torch.Tensor,
+        state_offset: torch.Tensor,
+        state_scale: torch.Tensor,
+        state_semantic_ids: torch.Tensor,
+        group_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+        batch = action_offset.shape[0]
+        if tuple(action_offset.shape) != (
+            batch,
+            cfg.max_action_groups,
+            cfg.max_action_dim,
+        ):
+            raise ValueError("action calibration must be [B,G,A]")
+        if tuple(state_offset.shape) != (
+            batch,
+            cfg.max_action_groups,
+            cfg.max_state_dim,
+        ):
+            raise ValueError("state calibration must be [B,G,D]")
+        if action_semantic_ids.shape != action_offset.shape:
+            raise ValueError("action semantics must align with action calibration")
+        if state_semantic_ids.shape != state_offset.shape:
+            raise ValueError("state semantics must align with state calibration")
+        if tuple(group_mask.shape) != (batch, cfg.max_action_groups):
+            raise ValueError("group mask must align with policy calibration")
+        action_valid = action_semantic_ids.ne(0) & group_mask[..., None]
+        state_valid = state_semantic_ids.ne(0) & group_mask[..., None]
+        features = torch.cat(
+            (
+                self._features(
+                    action_offset,
+                    action_scale,
+                    action_valid,
+                    name="action",
+                ),
+                self._features(
+                    state_offset,
+                    state_scale,
+                    state_valid,
+                    name="state",
+                ),
+            ),
+            dim=-1,
+        )
+        encoded = F.linear(features.to(dtype=self.weight.dtype), self.weight)
+        return encoded * group_mask[..., None].to(dtype=encoded.dtype)
 
 
 class TaskFeatureModulation(nn.Module):
@@ -1949,6 +2058,11 @@ class NativeWorldModel(nn.Module):
         self.history_action = GroupedSignalEncoder(cfg.action_hidden, cfg)
         self.factual_action = GroupedSignalEncoder(cfg.state_hidden, cfg)
         self.current_state = CurrentStateEncoder(cfg)
+        self.policy_calibration: Optional[PolicyCalibrationEncoder] = (
+            PolicyCalibrationEncoder(cfg)
+            if cfg.policy_calibration_conditioning
+            else None
+        )
         self.aux_value = nn.Linear(cfg.aux_dim, cfg.state_hidden, bias=False)
         self.aux_type = nn.Embedding(cfg.max_aux_type_id, cfg.state_hidden)
 
@@ -2113,6 +2227,8 @@ class NativeWorldModel(nn.Module):
         policy_query_mask: torch.Tensor,
         action_normalization_offset: torch.Tensor,
         action_normalization_scale: torch.Tensor,
+        state_normalization_offset: Optional[torch.Tensor] = None,
+        state_normalization_scale: Optional[torch.Tensor] = None,
         aux_values: Optional[torch.Tensor] = None,
         aux_mask: Optional[torch.Tensor] = None,
         aux_type_ids: Optional[torch.Tensor] = None,
@@ -2193,6 +2309,24 @@ class NativeWorldModel(nn.Module):
             action_group_mask,
             embodiment_ids,
         )
+        calibration: Optional[torch.Tensor] = None
+        if self.policy_calibration is not None:
+            if (
+                state_normalization_offset is None
+                or state_normalization_scale is None
+            ):
+                raise ValueError(
+                    "policy calibration requires state normalization statistics"
+                )
+            calibration = self.policy_calibration(
+                action_normalization_offset,
+                action_normalization_scale,
+                action_semantic_ids,
+                state_normalization_offset,
+                state_normalization_scale,
+                state_semantic_ids,
+                action_group_mask,
+            )
         query = self.policy_query_seed.expand(
             batch, query_count, cfg.max_action_groups, -1
         )
@@ -2200,6 +2334,8 @@ class NativeWorldModel(nn.Module):
         query = query + self.action_time(query_time)
         action_task = self.task_action(task_embedding)
         query = query + current[:, None] + action_task[:, None, None]
+        if calibration is not None:
+            query = query + calibration[:, None]
         history = (
             history + self.action_time(relative_world_time[:, : cfg.T])[:, :, None]
         )
