@@ -1039,16 +1039,52 @@ def compute_native_objective(
     binary_mask = output.get("policy_binary_mask", output["policy_gripper_mask"])
     continuous_mask = fine_mask & ~binary_mask
     gripper_mask = fine_mask & binary_mask
-    fine_continuous = _masked_mean(
-        F.smooth_l1_loss(
-            output["policy_action_normalized"],
-            fine_target,
-            reduction="none",
-            beta=config.huber_delta,
-        ),
-        continuous_mask,
-        epsilon=epsilon,
-    )
+    flow_training = "policy_flow_velocity" in output
+    if flow_training:
+        required_flow = {
+            "policy_flow_target_velocity",
+            "policy_flow_continuous_mask",
+            "policy_flow_weight",
+        }
+        missing_flow = sorted(required_flow - set(output))
+        if missing_flow:
+            raise NativeObjectiveError(
+                f"flow policy outputs are incomplete: {missing_flow}"
+            )
+        velocity = output["policy_flow_velocity"]
+        target_velocity = output["policy_flow_target_velocity"]
+        flow_mask = output["policy_flow_continuous_mask"] & continuous_mask
+        if (
+            velocity.shape != fine_target.shape
+            or target_velocity.shape != fine_target.shape
+            or flow_mask.shape != fine_target.shape
+        ):
+            raise NativeObjectiveError("flow policy tensors must align to fine action")
+        flow_weight = output["policy_flow_weight"]
+        if (
+            tuple(flow_weight.shape) != (fine_target.shape[0],)
+            or not bool(torch.isfinite(flow_weight).all())
+            or bool((flow_weight < 0).any())
+        ):
+            raise NativeObjectiveError("flow policy weights are invalid")
+        fine_continuous = _masked_mean(
+            (velocity - target_velocity).square()
+            * flow_weight[:, None, None, None].to(dtype=velocity.dtype),
+            flow_mask,
+            epsilon=epsilon,
+        )
+        continuous_mask = flow_mask
+    else:
+        fine_continuous = _masked_mean(
+            F.smooth_l1_loss(
+                output["policy_action_normalized"],
+                fine_target,
+                reduction="none",
+                beta=config.huber_delta,
+            ),
+            continuous_mask,
+            epsilon=epsilon,
+        )
     fine_gripper = _masked_mean(
         F.binary_cross_entropy_with_logits(
             output["policy_action_raw"], fine_target.clamp(0, 1), reduction="none"
@@ -1081,7 +1117,7 @@ def compute_native_objective(
     coarse_normalized = (
         composed - normalization_offset[:, None]
     ) / normalization_scale[:, None]
-    action_coarse = _masked_mean(
+    action_coarse_metric = _masked_mean(
         F.smooth_l1_loss(
             coarse_normalized,
             batch["target_coarse_action_normalized"],
@@ -1091,6 +1127,10 @@ def compute_native_objective(
         coarse_mask,
         epsilon=epsilon,
     )
+    # Do not stack direct trajectory regression on WSA's velocity objective.
+    # The composed error remains observable as an evaluation metric; V8 keeps
+    # its historical optimized coarse objective unchanged.
+    action_coarse = zero if flow_training else action_coarse_metric
 
     action_velocity = zero
 
@@ -1136,6 +1176,7 @@ def compute_native_objective(
         "action_fine_continuous": fine_continuous,
         "action_fine_gripper": fine_gripper,
         "action_coarse": action_coarse,
+        "action_coarse_metric": action_coarse_metric,
         "action_velocity": action_velocity,
         "fine_supervised_dimensions": fine_mask.sum().to(dtype=token_mse.dtype),
         "fine_continuous_supervised_dimensions": continuous_mask.sum().to(

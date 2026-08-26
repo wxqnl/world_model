@@ -24,8 +24,13 @@ def validate_model_profile(profile: Mapping[str, Any]) -> None:
     unknown = sorted(set(profile) - allowed)
     if unknown:
         raise ValueError(f"unknown model profile fields: {unknown}")
-    if profile.get("schema") != "wm3d_v8_model_profile_v1":
-        raise ValueError("model profile schema must be wm3d_v8_model_profile_v1")
+    profile_schema = profile.get("schema")
+    supported_schemas = {
+        "wm3d_v8_model_profile_v1",
+        "wm3d_v9_flow_model_profile_v1",
+    }
+    if profile_schema not in supported_schemas:
+        raise ValueError(f"unsupported model profile schema: {profile_schema!r}")
     if not str(profile.get("name", "")):
         raise ValueError("model profile name must be non-empty")
     sampling = profile.get("sampling")
@@ -78,6 +83,14 @@ def validate_model_profile(profile: Mapping[str, Any]) -> None:
     if not isinstance(model_mapping, dict):
         raise ValueError("native_world_model profile requires a model mapping")
     config = native_config_from_mapping(model_mapping)
+    if profile_schema == "wm3d_v9_flow_model_profile_v1":
+        if config.policy_action_mode != "flow_matching":
+            raise ValueError("V9 profile requires policy_action_mode=flow_matching")
+    elif config.policy_action_mode != "regression":
+        raise ValueError(
+            "V8 profile is frozen to policy_action_mode=regression; "
+            "use the isolated V9 schema for flow matching"
+        )
     if "future_offsets_seconds" in sampling:
         offsets = sampling["future_offsets_seconds"]
         if not isinstance(offsets, list) or len(offsets) != int(config.K):

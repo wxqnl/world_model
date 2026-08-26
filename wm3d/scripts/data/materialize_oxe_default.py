@@ -23,7 +23,10 @@ COLLECTION_API = (
 )
 SOURCE_SCHEMA = "wm3d_v8_raw_source_lock_v1"
 DATA_SCHEMA = "wm3d_v8_data_profile_v4"
-MODEL_SCHEMA = "wm3d_v8_model_profile_v1"
+MODEL_SCHEMAS = {
+    "wm3d_v8_model_profile_v1",
+    "wm3d_v9_flow_model_profile_v1",
+}
 ENCODER_SCHEMA = "wm3d_native_vggt_encoder_v1"
 MAX_ACTION_DIM = 16
 MAX_STATE_DIM = 32
@@ -48,12 +51,15 @@ def _publish(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _load_yaml(path: Path, *, schema: str) -> dict:
+def _load_yaml(path: Path, *, schema: str | set[str]) -> dict:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"expected regular YAML file: {path}")
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or value.get("schema") != schema:
-        raise ValueError(f"{path}: expected schema {schema}")
+    expected = {schema} if isinstance(schema, str) else set(schema)
+    if not isinstance(value, dict) or value.get("schema") not in expected:
+        raise ValueError(
+            f"{path}: expected one of schemas {sorted(expected)}"
+        )
     return value
 
 
@@ -230,7 +236,7 @@ def _representation_from_profiles(
     model_path: Path,
     encoder_path: Path,
 ) -> dict:
-    model_profile = _load_yaml(model_path, schema=MODEL_SCHEMA)
+    model_profile = _load_yaml(model_path, schema=MODEL_SCHEMAS)
     encoder = _load_yaml(encoder_path, schema=ENCODER_SCHEMA)
     model = model_profile.get("model")
     sampling = model_profile.get("sampling")

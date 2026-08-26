@@ -57,6 +57,16 @@ class NativeWorldModelConfig:
     action_layers: int = 24
     action_heads: int = 16
     action_ff_mult: float = 8.0 / 3.0
+    # V8 keeps the deterministic regression owner. V9 selects an independent
+    # WSA-style continuous flow policy while preserving the same grouped
+    # physical-action ABI and semantic decoding.
+    policy_action_mode: str = "regression"
+    policy_flow_layers: int = 4
+    policy_flow_ff_mult: float = 8.0 / 3.0
+    policy_flow_train_timesteps: int = 1000
+    policy_flow_train_shift: float = 5.0
+    policy_flow_infer_shift: float = 5.0
+    policy_flow_inference_steps: int = 10
     # A pooled task embedding already enters the policy input. This bounded,
     # zero-initialized FiLM route keeps the task observable at every action
     # layer and at the final visual read without introducing a competing loss.
@@ -182,6 +192,25 @@ class NativeWorldModelConfig:
             raise ValueError("policy_task_modulation must be boolean")
         if not isinstance(self.policy_calibration_conditioning, bool):
             raise ValueError("policy_calibration_conditioning must be boolean")
+        if self.policy_action_mode not in {"regression", "flow_matching"}:
+            raise ValueError(
+                "policy_action_mode must be regression or flow_matching"
+            )
+        if self.policy_flow_layers <= 0:
+            raise ValueError("policy_flow_layers must be positive")
+        if not isfinite(self.policy_flow_ff_mult) or self.policy_flow_ff_mult <= 0:
+            raise ValueError("policy_flow_ff_mult must be finite and positive")
+        if self.policy_flow_train_timesteps <= 0:
+            raise ValueError("policy_flow_train_timesteps must be positive")
+        if (
+            not isfinite(self.policy_flow_train_shift)
+            or self.policy_flow_train_shift <= 0
+            or not isfinite(self.policy_flow_infer_shift)
+            or self.policy_flow_infer_shift <= 0
+        ):
+            raise ValueError("policy flow shifts must be finite and positive")
+        if self.policy_flow_inference_steps <= 0:
+            raise ValueError("policy_flow_inference_steps must be positive")
         if any(
             index < 0 or index >= self.state_layers
             for index in self.bridge_layers_state
@@ -2097,7 +2126,14 @@ class NativeWorldModel(nn.Module):
         self.appearance_dynamics: Optional[PerViewAppearanceDynamics] = (
             PerViewAppearanceDynamics(cfg) if cfg.appearance_enabled else None
         )
-        self.action_head = UnifiedActionHead(cfg)
+        if cfg.policy_action_mode == "flow_matching":
+            # Local import avoids coupling the frozen V8 regression owner to
+            # the V9 module while keeping one world-model construction path.
+            from .flow_action import GroupedFlowActionHead
+
+            self.action_head = GroupedFlowActionHead(cfg)
+        else:
+            self.action_head = UnifiedActionHead(cfg)
         self.geometry_head = NativeGeometryHead(cfg)
         self.rgb_head = NativeRGBDecoder(cfg)
 
@@ -2227,6 +2263,10 @@ class NativeWorldModel(nn.Module):
         policy_query_mask: torch.Tensor,
         action_normalization_offset: torch.Tensor,
         action_normalization_scale: torch.Tensor,
+        target_fine_action: Optional[torch.Tensor] = None,
+        target_fine_action_mask: Optional[torch.Tensor] = None,
+        policy_flow_noise: Optional[torch.Tensor] = None,
+        policy_flow_timestep: Optional[torch.Tensor] = None,
         state_normalization_offset: Optional[torch.Tensor] = None,
         state_normalization_scale: Optional[torch.Tensor] = None,
         aux_values: Optional[torch.Tensor] = None,
@@ -2632,6 +2672,19 @@ class NativeWorldModel(nn.Module):
         if appearance_pred is not None and appearance_pred_mask is not None:
             output["appearance_pred_tokens"] = appearance_pred
             output["appearance_pred_mask"] = appearance_pred_mask
+        action_head_kwargs: dict[str, torch.Tensor | None] = {}
+        if cfg.policy_action_mode == "flow_matching":
+            action_head_kwargs = {
+                "target_action": target_fine_action,
+                "target_action_mask": target_fine_action_mask,
+                "flow_noise": policy_flow_noise,
+                "flow_timestep": policy_flow_timestep,
+            }
+        elif any(
+            value is not None
+            for value in (policy_flow_noise, policy_flow_timestep)
+        ):
+            raise ValueError("flow inputs require policy_action_mode=flow_matching")
         output.update(
             self.action_head(
                 policy_query,
@@ -2639,6 +2692,7 @@ class NativeWorldModel(nn.Module):
                 policy_query_mask,
                 action_normalization_offset,
                 action_normalization_scale,
+                **action_head_kwargs,
             )
         )
         output.update(self.geometry_head(render_future))
@@ -2675,6 +2729,8 @@ class NativeWorldModel(nn.Module):
         yield from self.action_blocks
         yield from self.bridges
         yield from self.dynamics_blocks
+        if self.cfg.policy_action_mode == "flow_matching":
+            yield from self.action_head.blocks
         if self.appearance_dynamics is not None:
             yield from self.appearance_dynamics.blocks
         yield self.rgb_head.image_decoder
@@ -2689,6 +2745,8 @@ class NativeWorldModel(nn.Module):
         yield from self.action_blocks
         yield from self.bridges
         yield from self.dynamics_blocks
+        if self.cfg.policy_action_mode == "flow_matching":
+            yield from self.action_head.blocks
         if self.appearance_dynamics is not None:
             yield from self.appearance_dynamics.blocks
         yield self.rgb_head.image_decoder

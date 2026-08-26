@@ -449,6 +449,12 @@ _APPEARANCE_MODEL_INPUTS = (
 )
 
 
+_POLICY_TARGET_MODEL_INPUTS = (
+    "target_fine_action",
+    "target_fine_action_mask",
+)
+
+
 def _relative_world_times_for_model(
     world_times_s: torch.Tensor, *, context_length: int
 ) -> torch.Tensor:
@@ -532,6 +538,9 @@ def _forward(
             raise PretrainError("target_rgb_mask must be [B,F,V,1,1,1]")
         kwargs["rgb_view_mask"] = rgb_mask[..., 0, 0, 0]
     for name in _APPEARANCE_MODEL_INPUTS:
+        if name in batch:
+            kwargs[name] = batch[name]
+    for name in _POLICY_TARGET_MODEL_INPUTS:
         if name in batch:
             kwargs[name] = batch[name]
     if "appearance_context_tokens" in batch:

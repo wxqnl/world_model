@@ -1,0 +1,56 @@
+schema: wm3d_v8_objective_profile_v1
+name: stage0_native_v9_flow
+objective:
+  # Retain the validated direct pixel anchor. A from-scratch step500 canary
+  # did not justify changing this jointly with the conditioning intervention.
+  rgb_l1: 0.5
+  # LPIPS restores perceptual supervision; pixel and gradient terms remain
+  # explicit anchors instead of being silently replaced.
+  rgb_perceptual: 0.1
+  token_mse: 1.0
+  token_cosine: 0.1
+  appearance_mse: 1.0
+  appearance_cosine: 0.1
+  # Preserve P256 as the high-frequency appearance path, but prevent the
+  # last-context residual predictor from winning by copying static texture.
+  # Motion-patch MSE is exactly the future-minus-last residual error because
+  # the same last-context latent cancels on both sides.  It preserves both
+  # magnitude and direction on the same squared-error scale as global MSE.
+  appearance_motion_mse: 1.0
+  # A separate angular term dominated the early appearance gradient while the
+  # predicted residual was still noisy, causing the renderer to abandon P256
+  # for the context shortcut.  Keep one coherent residual objective.
+  appearance_delta_cosine: 0.0
+  rgb_charbonnier: 1.0
+  rgb_charbonnier_epsilon: 0.000001
+  rgb_gradient: 0.25
+  # V7-proven motion-region emphasis and learned change mask.
+  rgb_motion_l1: 1.0
+  rgb_motion_bce: 0.03
+  rgb_motion_dice: 0.03
+  rgb_motion_pos_weight: 2.0
+  rgb_motion_threshold: 0.03
+  rgb_motion_gain: 3.0
+  depth_log: 1.5
+  point: 0.5
+  camera_pose: 0.1
+  # In a V9 flow model this is the shifted-schedule weighted velocity MSE,
+  # not an additional loss beside direct action regression. Binary semantics
+  # remain BCE inside the same fine-action owner.
+  action_fine: 2.0
+  # Composed coarse action error is reported but does not compete with flow.
+  action_coarse: 0.0
+  # Compare the factual world with the same model/dynamics under zero future
+  # action values.  Both token branches stay in the graph, so the hinge learns
+  # their relative action-conditioned difference while sharing the action-free
+  # trunk.  The policy prior is not a valid control for this ranking.
+  action_counterfactual_token_advantage: 1.0
+  action_counterfactual_token_margin: 0.005
+  # Scheduled teacher appearance can reveal the true future to RGB.  Keep RGB
+  # quality training unchanged and measure RGB action causality at teacher=0.
+  action_counterfactual_rgb_advantage: 0.0
+  action_counterfactual_rgb_margin: 0.002
+  # 不同 source-native cadence 及 delta/absolute semantic 没有统一速度正则定义。
+  action_velocity: 0.0
+  epsilon: 0.000001
+  huber_delta: 0.05
