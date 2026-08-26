@@ -21,6 +21,9 @@ WM3D 的正式 RGB 路径不依赖 Wan 或其他外部视频生成器。模型�
 appearance tokens 不在相机之间提前融合；appearance dynamics 分别预测每个视角的未来
 P256 latent，并接受 3D future state 作为条件。RGB decoder 同时读取对应视角的 appearance
 latent 和 3D 条件，因此纹理不会被迫先穿过 P64/P144 的融合瓶颈，几何一致性也没有被绕开。
+最后观测 RGB 只负责静态高频载体；`future P256 - last-context P256` 通过轻量残差
+金字塔在 decoder 的每个分辨率持续注入。这样保留 context U-Net 的清晰纹理，同时不允许
+full-resolution skip 完全绕过未来 appearance dynamics。
 
 1B 在原有主干上只增加约 850 万参数；总参数量约 13.28 亿。5B 仍保持原有 P144
 几何容量，appearance 通路固定为 P256，避免为了 RGB 纹理把整个 3D 主干扩大四倍。
@@ -52,10 +55,12 @@ appearance-to-RGB 重建；随后按照 runtime 中的
 `appearance_teacher_start_ratio`、`appearance_teacher_end_ratio` 和
 `appearance_teacher_decay_steps` 线性切换到模型预测 latent。无论 teacher ratio 是多少，
 appearance dynamics 都持续接受 MSE 与 cosine 监督，不会因为 teacher forcing 而没有梯度。
-此外，正式目标在由真值 RGB 变化得到的运动 patch 上监督 P256 的未来残差：既约束
-`predicted - last_context` 的幅值，也约束其与
-`target - last_context` 的方向一致。全局 MSE/cosine 继续保存静态纹理与绝对外观，
-新增项只补上原先缺失的时序变化约束，不删除 P256，也不改变 RGB decoder 结构。
+此外，正式目标在由真值 RGB 变化得到的运动 patch 上监督 P256 的未来残差。由于
+`prediction - target` 等于
+`(prediction - last_context) - (target - last_context)`，运动区 residual MSE 已在同一
+平方误差尺度上同时约束幅值和方向。单独的 delta cosine 在残差尚未成形的早期产生了远大于
+其余 appearance 项的角度梯度，并诱导 decoder 转向 context shortcut，因此正式目标不再
+叠加该角度项。全局 MSE/cosine 继续保存静态纹理与绝对外观。
 验证在同一批固定样本上同时记录 teacher0、当前线性 schedule 和 teacher1，直接量化
 appearance inference gap。step5000 的同样本探针没有支持“latent lerp 导致模糊”的假设：
 ratio=0.5 的结果优于按样本随机选两个 endpoint 的期望，因此正式 schedule 保留 lerp。

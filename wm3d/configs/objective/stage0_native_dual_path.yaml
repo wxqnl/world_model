@@ -13,10 +13,14 @@ objective:
   appearance_cosine: 0.1
   # Preserve P256 as the high-frequency appearance path, but prevent the
   # last-context residual predictor from winning by copying static texture.
-  # Motion-patch MSE learns change magnitude; residual cosine learns the
-  # direction of future appearance change relative to the last observation.
+  # Motion-patch MSE is exactly the future-minus-last residual error because
+  # the same last-context latent cancels on both sides.  It preserves both
+  # magnitude and direction on the same squared-error scale as global MSE.
   appearance_motion_mse: 1.0
-  appearance_delta_cosine: 0.1
+  # A separate angular term dominated the early appearance gradient while the
+  # predicted residual was still noisy, causing the renderer to abandon P256
+  # for the context shortcut.  Keep one coherent residual objective.
+  appearance_delta_cosine: 0.0
   rgb_charbonnier: 1.0
   rgb_charbonnier_epsilon: 0.000001
   rgb_gradient: 0.25

@@ -336,6 +336,29 @@ def test_rgb_context_action_requires_context_renderer() -> None:
         NativeWorldModel(replace(_tiny_config(), rgb_context_action_scale=1.0))
 
 
+@pytest.mark.parametrize("value", (-0.1, float("nan"), float("inf")))
+def test_rgb_context_appearance_delta_scale_fails_closed(value: float) -> None:
+    with pytest.raises(
+        ValueError,
+        match=("rgb_context_appearance_delta_scale must be finite and non-negative"),
+    ):
+        NativeWorldModel(
+            replace(_tiny_config(), rgb_context_appearance_delta_scale=value)
+        )
+
+
+def test_rgb_context_appearance_delta_requires_context_and_appearance() -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            "rgb_context_appearance_delta_scale requires context RGB and appearance"
+        ),
+    ):
+        NativeWorldModel(
+            replace(_tiny_config(), rgb_context_appearance_delta_scale=1.0)
+        )
+
+
 def test_swapping_commands_between_real_substep_times_changes_dynamics() -> None:
     """The encoder must retain command/timestamp pairing inside an interval."""
 
@@ -928,6 +951,64 @@ def test_context_renderer_rgb_loss_reaches_per_view_p256_appearance_lane() -> No
     assert token_stem.weight.grad is not None
     assert torch.isfinite(token_stem.weight.grad).all()
     assert token_stem.weight.grad.abs().sum() > 0
+
+
+def test_context_renderer_p256_delta_has_persistent_multiscale_ownership() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_appearance_delta_scale=1.0,
+    )
+    torch.manual_seed(103)
+    decoder = NativeWorldModel(cfg).rgb_head.train()
+    batch = 2
+    future_tokens = torch.randn(batch, cfg.K, cfg.P, cfg.token_dim)
+    appearance_context = torch.randn(
+        batch, cfg.num_views, cfg.appearance_P, cfg.token_dim
+    )
+    appearance = appearance_context[:, None].expand(-1, cfg.K, -1, -1, -1)
+    appearance = appearance.clone()
+    appearance[:, 1].add_(0.25)
+    geometry = torch.randn(batch, cfg.K, cfg.P, cfg.state_hidden)
+    context = torch.rand(batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    context_mask = torch.ones(batch, cfg.num_views, dtype=torch.bool)
+    task = torch.randn(batch, cfg.task_dim)
+    observed_delta: list[torch.Tensor] = []
+
+    delta_stem = decoder.image_decoder.appearance_delta_stem
+    assert delta_stem is not None
+
+    def record_delta(_module, inputs) -> None:
+        observed_delta.append(inputs[0].detach())
+
+    handle = delta_stem.register_forward_pre_hook(record_delta)
+    try:
+        rgb = decoder(
+            future_tokens,
+            None,
+            appearance_tokens=appearance,
+            appearance_context_tokens=appearance_context,
+            geometry_state=geometry,
+            task_embedding=task,
+            context_rgb=context,
+            context_rgb_mask=context_mask,
+        )[0]
+    finally:
+        handle.remove()
+
+    assert observed_delta
+    assert any(value.count_nonzero() == 0 for value in observed_delta)
+    assert any(value.count_nonzero() > 0 for value in observed_delta)
+    rgb.square().mean().backward()
+    delta_gradients = [
+        parameter.grad
+        for name, parameter in decoder.named_parameters()
+        if "appearance_delta" in name
+    ]
+    assert delta_gradients
+    assert all(gradient is not None for gradient in delta_gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in delta_gradients)
+    assert all(gradient.abs().sum() > 0 for gradient in delta_gradients)
 
 
 def test_context_renderer_directly_uses_factual_action_summary() -> None:

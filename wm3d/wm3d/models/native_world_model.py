@@ -127,6 +127,11 @@ class NativeWorldModelConfig:
     # action summary reaches the RGB bottleneck but never the action-free
     # state or policy trunks.
     rgb_context_action_scale: float = 0.0
+    # Preserve the last observed RGB as the static carrier, while giving the
+    # future-minus-last P256 appearance residual an explicit spatial path at
+    # every decoder scale.  This prevents the full-resolution context skips
+    # from becoming a complete shortcut around future appearance dynamics.
+    rgb_context_appearance_delta_scale: float = 0.0
     geom_hidden: int = 768
 
     # Optional high-resolution, per-view appearance lane.  The geometry/action
@@ -241,6 +246,19 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_context_action_scale must be finite and non-negative")
         if self.rgb_context_action_scale > 0.0 and not self.rgb_context_enabled:
             raise ValueError("rgb_context_action_scale requires rgb_context_enabled")
+        if (
+            not isfinite(self.rgb_context_appearance_delta_scale)
+            or self.rgb_context_appearance_delta_scale < 0.0
+        ):
+            raise ValueError(
+                "rgb_context_appearance_delta_scale must be finite and non-negative"
+            )
+        if self.rgb_context_appearance_delta_scale > 0.0 and (
+            not self.rgb_context_enabled or not self.appearance_enabled
+        ):
+            raise ValueError(
+                "rgb_context_appearance_delta_scale requires context RGB and appearance"
+            )
         if not isinstance(self.appearance_enabled, bool):
             raise ValueError("appearance_enabled must be boolean")
         if self.appearance_enabled:
@@ -1411,6 +1429,27 @@ class NativeContextRGBImageDecoder(nn.Module):
             nn.SiLU(inplace=True),
             _RGBConvBlock(channels[0], channels[0]),
         )
+        self.appearance_delta_stem = (
+            nn.Sequential(
+                nn.Conv2d(cfg.token_dim, channels[0], 1, bias=False),
+                nn.GroupNorm(_rgb_norm_groups(channels[0]), channels[0], affine=False),
+                nn.SiLU(inplace=True),
+            )
+            if cfg.rgb_context_appearance_delta_scale > 0.0
+            else None
+        )
+        self.appearance_delta_projections = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(channels[0], output_channels, 1, bias=False),
+                nn.GroupNorm(
+                    _rgb_norm_groups(output_channels), output_channels, affine=False
+                ),
+                nn.SiLU(inplace=True),
+            )
+            for output_channels in (
+                channels[1:] if cfg.rgb_context_appearance_delta_scale > 0.0 else ()
+            )
+        )
         self.geometry_stem = (
             nn.Conv2d(cfg.state_hidden, channels[0], 1, bias=False)
             if cfg.appearance_enabled
@@ -1464,6 +1503,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         tokens: torch.Tensor,
         view_embedding: torch.Tensor,
         geometry_tokens: Optional[torch.Tensor],
+        appearance_context_tokens: Optional[torch.Tensor],
         factual_action_summary: Optional[torch.Tensor],
         task_embedding: torch.Tensor,
         context_rgb: torch.Tensor,
@@ -1478,6 +1518,23 @@ class NativeContextRGBImageDecoder(nn.Module):
             tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
         )
         value = self.token_stem(value) + view_embedding
+        appearance_delta: Optional[torch.Tensor] = None
+        if self.appearance_delta_stem is not None:
+            if appearance_context_tokens is None or tuple(
+                appearance_context_tokens.shape
+            ) != tuple(tokens.shape):
+                raise ValueError(
+                    "context RGB appearance tokens must align to future tokens"
+                )
+            delta = tokens - appearance_context_tokens.to(dtype=tokens.dtype)
+            delta = delta.transpose(1, 2).reshape(
+                tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
+            )
+            appearance_delta = self.appearance_delta_stem(delta).to(dtype=value.dtype)
+        elif appearance_context_tokens is not None:
+            raise ValueError(
+                "appearance context was supplied while RGB delta conditioning is disabled"
+            )
         if tuple(task_embedding.shape) != (tokens.shape[0], self.cfg.task_dim):
             raise ValueError("context RGB task embedding must be [N,task_dim]")
         task = self.task_proj(task_embedding).to(dtype=value.dtype)
@@ -1527,6 +1584,13 @@ class NativeContextRGBImageDecoder(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             ).to(dtype=tokens.dtype)
+            if appearance_delta is not None:
+                appearance_delta = F.interpolate(
+                    appearance_delta.float(),
+                    size=(self.decode_grid, self.decode_grid),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=tokens.dtype)
 
         context = context_rgb.to(dtype=value.dtype)
         skips = [self.context_stem(context)]
@@ -1535,11 +1599,25 @@ class NativeContextRGBImageDecoder(nn.Module):
         if skips[-1].shape[-2:] != value.shape[-2:]:
             raise ValueError("context pyramid does not align with RGB token grid")
         value = self.bottleneck_fuse(torch.cat((value, skips[-1]), dim=1))
-        for upsample, fuse, skip in zip(
-            self.ups, self.skip_fuses, reversed(skips[:-1])
+        delta_scale = float(self.cfg.rgb_context_appearance_delta_scale)
+        if appearance_delta is not None:
+            value = value + delta_scale * torch.tanh(appearance_delta)
+        for stage_index, (upsample, fuse, skip) in enumerate(
+            zip(self.ups, self.skip_fuses, reversed(skips[:-1]))
         ):
             value = upsample(value)
             value = fuse(torch.cat((value, skip), dim=1))
+            if appearance_delta is not None:
+                delta_at_scale = F.interpolate(
+                    appearance_delta.float(),
+                    size=value.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=value.dtype)
+                delta_at_scale = self.appearance_delta_projections[stage_index](
+                    delta_at_scale
+                )
+                value = value + delta_scale * torch.tanh(delta_at_scale)
 
         raw = self.head(value)
         direct = torch.sigmoid(raw[:, :3])
@@ -1586,6 +1664,7 @@ class NativeRGBDecoder(nn.Module):
         frame_indices: Optional[Sequence[int]],
         target_view_mask: Optional[torch.Tensor] = None,
         appearance_tokens: Optional[torch.Tensor] = None,
+        appearance_context_tokens: Optional[torch.Tensor] = None,
         geometry_state: Optional[torch.Tensor] = None,
         factual_action_summary: Optional[torch.Tensor] = None,
         task_embedding: Optional[torch.Tensor] = None,
@@ -1622,6 +1701,7 @@ class NativeRGBDecoder(nn.Module):
             return empty, index_tensor, empty_aux, empty_aux
         views = self.cfg.num_views
         expanded_geometry: Optional[torch.Tensor] = None
+        expanded_appearance_context: Optional[torch.Tensor] = None
         if self.cfg.appearance_enabled:
             expected = (
                 future_tokens.shape[0],
@@ -1646,7 +1726,36 @@ class NativeRGBDecoder(nn.Module):
             expanded_geometry = geometry.reshape(
                 batch * frames * views, self.cfg.P, self.cfg.state_hidden
             )
+            if self.cfg.rgb_context_appearance_delta_scale > 0.0:
+                expected_context_appearance = (
+                    batch,
+                    views,
+                    self.cfg.appearance_P,
+                    self.cfg.token_dim,
+                )
+                if (
+                    appearance_context_tokens is None
+                    or tuple(appearance_context_tokens.shape)
+                    != expected_context_appearance
+                ):
+                    raise ValueError(
+                        "appearance_context_tokens must be "
+                        f"{expected_context_appearance}"
+                    )
+                expanded_appearance_context = (
+                    appearance_context_tokens[:, None]
+                    .expand(-1, frames, -1, -1, -1)
+                    .reshape(batch * frames * views, patches, token_dim)
+                )
+            elif appearance_context_tokens is not None:
+                raise ValueError(
+                    "appearance context was supplied while RGB delta conditioning is disabled"
+                )
         else:
+            if appearance_context_tokens is not None:
+                raise ValueError(
+                    "appearance context was supplied to a fused-only RGB decoder"
+                )
             selected = future_tokens.index_select(1, index_tensor)
             batch, frames, patches, token_dim = selected.shape
             expanded = selected[:, :, None].expand(-1, -1, views, -1, -1)
@@ -1769,6 +1878,11 @@ class NativeRGBDecoder(nn.Module):
                 assert expanded_task is not None
                 decoded, motion_logit, blend = self.image_decoder(
                     *decoder_inputs,
+                    (
+                        None
+                        if expanded_appearance_context is None
+                        else expanded_appearance_context.index_select(0, chunk_indices)
+                    ),
                     (
                         None
                         if expanded_action is None
@@ -2294,6 +2408,7 @@ class NativeWorldModel(nn.Module):
             else self.token_output(render_future)
         )
         appearance_for_rgb: Optional[torch.Tensor] = None
+        appearance_context_for_rgb: Optional[torch.Tensor] = None
         appearance_ratio = pred_tokens.new_zeros(())
         appearance_pred: Optional[torch.Tensor] = None
         appearance_pred_mask: Optional[torch.Tensor] = None
@@ -2305,6 +2420,15 @@ class NativeWorldModel(nn.Module):
             ):
                 raise ValueError(
                     "dual-path model requires appearance context tokens and mask"
+                )
+            appearance_context_for_rgb = torch.zeros_like(
+                appearance_context_tokens[:, 0]
+            )
+            for context_index in range(int(appearance_context_tokens.shape[1])):
+                appearance_context_for_rgb = torch.where(
+                    appearance_context_mask[:, context_index, ..., None].bool(),
+                    appearance_context_tokens[:, context_index],
+                    appearance_context_for_rgb,
                 )
             appearance_pred, appearance_pred_mask = self.appearance_dynamics(
                 appearance_context_tokens,
@@ -2388,6 +2512,11 @@ class NativeWorldModel(nn.Module):
             rgb_frame_indices,
             rgb_view_mask,
             appearance_for_rgb,
+            (
+                appearance_context_for_rgb
+                if cfg.rgb_context_appearance_delta_scale > 0.0
+                else None
+            ),
             render_future if cfg.appearance_enabled else None,
             rgb_action_summary,
             task_embedding if cfg.rgb_context_enabled else None,

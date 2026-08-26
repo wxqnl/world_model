@@ -46,7 +46,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_548_323_192
+    assert model["expected_parameter_count"] == 5_555_892_600
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_P"] == 256
@@ -62,6 +62,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75
     assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
+    assert model["model"]["rgb_context_appearance_delta_scale"] == 1.0
     assert objective["objective"]["rgb_l1"] == 0.5
     assert objective["objective"]["rgb_charbonnier"] == 1.0
     assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
@@ -75,6 +76,8 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert objective["objective"]["rgb_motion_dice"] == 0.03
     assert objective["objective"]["appearance_mse"] == 1.0
     assert objective["objective"]["appearance_cosine"] == 0.1
+    assert objective["objective"]["appearance_motion_mse"] == 1.0
+    assert objective["objective"]["appearance_delta_cosine"] == 0.0
     assert runtime["expected_world_size"] == 64
     assert runtime["distributed"]["shard_degree"] == 8
     assert runtime["resources"]["gpu_name_substring"] == "H200"
@@ -146,9 +149,7 @@ def test_5b_init_selects_data_mode(
     assert result.returncode == 0, result.stderr
     payload = site.read_text()
     assert f"WM3D_DATA_MODE={data_mode}" in payload
-    payload = payload.replace(
-        "PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}"
-    )
+    payload = payload.replace("PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}")
     site.write_text(payload)
     plan = subprocess.run(
         ["bash", str(ROOT / "scripts/cluster/wm3d_5b.sh"), "plan", str(site)],
@@ -189,7 +190,9 @@ def test_5b_init_selects_a_complete_preset(
     )
     assert init.returncode == 0, init.stderr
     payload = site.read_text()
-    payload = payload.replace("PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}")
+    payload = payload.replace(
+        "PYTHON_BIN=${ENV_DIR}/bin/python", f"PYTHON_BIN={sys.executable}"
+    )
     payload = payload.replace(
         "HF_TOKEN_FILE=/data/secrets/huggingface_token",
         f"HF_TOKEN_FILE={tmp_path / 'token'}",

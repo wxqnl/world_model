@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_dual_path
 architecture: native_world_model
-expected_parameter_count: 1483398168
+expected_parameter_count: 1489091608
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -66,6 +66,9 @@ model:
   rgb_context_motion_blend_gain: 0.5
   # Restore V7's direct renderer-only future-action condition.
   rgb_context_action_scale: 1.0
+  # Carry future-minus-last P256 motion through every decoder scale so the
+  # full-resolution context skips cannot bypass future appearance dynamics.
+  rgb_context_appearance_delta_scale: 1.0
   geom_hidden: 512
   appearance_enabled: true
   appearance_P: 256
