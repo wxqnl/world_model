@@ -33,6 +33,13 @@ class GradientOwnershipError(RuntimeError):
 def _required_owner_modules(model: NativeWorldModel) -> Mapping[str, tuple[nn.Module, ...]]:
     """Return disjoint, capability-level module owners required by Stage0."""
 
+    policy_modules: list[nn.Module] = [
+        model.history_action,
+        model.action_blocks,
+        model.policy_spatial_cross,
+    ]
+    if model.policy_spatial_task_modulation is not None:
+        policy_modules.append(model.policy_spatial_task_modulation)
     owners: dict[str, tuple[nn.Module, ...]] = {
         "native_state_trunk": (
             model.view_fuser,
@@ -40,11 +47,7 @@ def _required_owner_modules(model: NativeWorldModel) -> Mapping[str, tuple[nn.Mo
             model.token_output,
         ),
         "factual_dynamics": (model.factual_action, model.dynamics_blocks),
-        "policy_action_trunk": (
-            model.history_action,
-            model.action_blocks,
-            model.policy_spatial_cross,
-        ),
+        "policy_action_trunk": tuple(policy_modules),
         "state_action_bridges": (model.bridges,),
         "current_state_proprio": (model.current_state,),
         "unified_action_head": (model.action_head,),

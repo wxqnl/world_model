@@ -57,6 +57,10 @@ class NativeWorldModelConfig:
     action_layers: int = 24
     action_heads: int = 16
     action_ff_mult: float = 8.0 / 3.0
+    # A pooled task embedding already enters the policy input. This bounded,
+    # zero-initialized FiLM route keeps the task observable at every action
+    # layer and at the final visual read without introducing a competing loss.
+    policy_task_modulation: bool = False
     bridge_layers_state: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29)
     bridge_heads: int = 16
     dynamics_layers: int = 4
@@ -163,6 +167,8 @@ class NativeWorldModelConfig:
                 )
         if len(set(self.bridge_layers_state)) != len(self.bridge_layers_state):
             raise ValueError("bridge_layers_state contains duplicates")
+        if not isinstance(self.policy_task_modulation, bool):
+            raise ValueError("policy_task_modulation must be boolean")
         if any(
             index < 0 or index >= self.state_layers
             for index in self.bridge_layers_state
@@ -671,6 +677,46 @@ class CurrentStateEncoder(nn.Module):
         return self.norm(token) * group_mask[..., None].to(dtype=token.dtype)
 
 
+class TaskFeatureModulation(nn.Module):
+    """Bounded FiLM whose exact initialization is the identity function.
+
+    The shared task projection establishes the semantic basis once. Each
+    policy layer learns only bounded feature-wise scale/shift gates, avoiding
+    both a large per-layer projection and an extra objective weight. A token
+    mask restricts the route to policy queries; history remains physical
+    evidence selected by a task-conditioned query rather than being relabeled
+    with the task at every layer.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.task_norm = RMSNorm(dim)
+        self.scale = nn.Parameter(torch.zeros(dim))
+        self.shift = nn.Parameter(torch.zeros(dim))
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.scale)
+        nn.init.zeros_(self.shift)
+
+    def forward(
+        self,
+        value: torch.Tensor,
+        task_condition: torch.Tensor,
+        token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, dim = task_condition.shape
+        if value.shape[0] != batch or value.shape[-1] != dim:
+            raise ValueError("task condition must align with feature batch/dimension")
+        if token_mask.shape != value.shape[:-1]:
+            raise ValueError("task modulation mask must align with feature tokens")
+        task = torch.tanh(self.task_norm(task_condition))
+        task = task.view(batch, *((1,) * (value.ndim - 2)), dim)
+        scale = torch.tanh(self.scale).view(*((1,) * (value.ndim - 1)), dim)
+        shift = torch.tanh(self.shift).view(*((1,) * (value.ndim - 1)), dim)
+        conditioned = value * (1.0 + task * scale) + task * shift
+        return torch.where(token_mask[..., None], conditioned, value)
+
+
 class ActionBlock(nn.Module):
     """Factorized temporal/group attention for variable-rate embodiments.
 
@@ -687,28 +733,50 @@ class ActionBlock(nn.Module):
         self.attn = SelfAttention(dim, cfg.action_heads, cfg.dropout)
         self.ff_norm = RMSNorm(dim)
         self.ff = SwiGLU(dim, cfg.action_ff_mult, cfg.dropout)
+        self.attn_task_modulation: Optional[TaskFeatureModulation] = (
+            TaskFeatureModulation(dim) if cfg.policy_task_modulation else None
+        )
+        self.ff_task_modulation: Optional[TaskFeatureModulation] = (
+            TaskFeatureModulation(dim) if cfg.policy_task_modulation else None
+        )
 
     def forward(
         self,
         value: torch.Tensor,
         action_times: torch.Tensor,
         token_mask: torch.Tensor,
+        task_condition: torch.Tensor,
+        task_token_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch, steps, groups, dim = value.shape
         if tuple(action_times.shape) != (batch, steps, groups):
             raise ValueError("action_times must align with [B,S,G] action tokens")
         if token_mask.shape != action_times.shape:
             raise ValueError("action token mask must align with action times")
+        if tuple(task_condition.shape) != (batch, dim):
+            raise ValueError("task_condition must be [B,D] for action tokens")
+        if task_token_mask.shape != token_mask.shape:
+            raise ValueError("task token mask must align with action token mask")
+        if bool((task_token_mask & ~token_mask).any()):
+            raise ValueError("task modulation cannot enable an invalid action token")
 
         # Each group first follows its own physical timeline.
         temporal = value.transpose(1, 2).reshape(batch * groups, steps, dim)
+        temporal_input = self.attn_norm(value)
+        if self.attn_task_modulation is not None:
+            temporal_input = self.attn_task_modulation(
+                temporal_input, task_condition, task_token_mask
+            )
+        temporal_input = temporal_input.transpose(1, 2).reshape(
+            batch * groups, steps, dim
+        )
         temporal_times = action_times.transpose(1, 2).reshape(batch * groups, steps)
         temporal_valid = token_mask.transpose(1, 2).reshape(batch * groups, steps)
         temporal_allowed = (
             temporal_times[:, :, None] + 1.0e-7 >= temporal_times[:, None, :]
         ) & temporal_valid[:, None, :]
         temporal = temporal + self.attn(
-            self.attn_norm(temporal),
+            temporal_input,
             allowed_mask=temporal_allowed[:, None],
         )
         value = temporal.view(batch, groups, steps, dim).transpose(1, 2)
@@ -721,12 +789,22 @@ class ActionBlock(nn.Module):
         group_allowed = (
             group_times[:, :, None] + 1.0e-7 >= group_times[:, None, :]
         ) & group_valid[:, None, :]
+        group_input = self.attn_norm(value)
+        if self.attn_task_modulation is not None:
+            group_input = self.attn_task_modulation(
+                group_input, task_condition, task_token_mask
+            )
         grouped = grouped + self.attn(
-            self.attn_norm(grouped),
+            group_input.reshape(batch * steps, groups, dim),
             allowed_mask=group_allowed[:, None],
         )
-        grouped = grouped + self.ff(self.ff_norm(grouped))
         value = grouped.view(batch, steps, groups, dim)
+        ff_input = self.ff_norm(value)
+        if self.ff_task_modulation is not None:
+            ff_input = self.ff_task_modulation(
+                ff_input, task_condition, task_token_mask
+            )
+        value = value + self.ff(ff_input)
         return value * token_mask[..., None].to(dtype=value.dtype)
 
 
@@ -1776,6 +1854,11 @@ class NativeWorldModel(nn.Module):
         self.policy_spatial_cross = CrossAttention(
             cfg.action_hidden, cfg.state_hidden, cfg.action_heads, cfg.dropout
         )
+        self.policy_spatial_task_modulation: Optional[TaskFeatureModulation] = (
+            TaskFeatureModulation(cfg.action_hidden)
+            if cfg.policy_task_modulation
+            else None
+        )
         self.dynamics_blocks = self._checkpoint_module_list(
             (DynamicsConditionBlock(cfg) for _ in range(cfg.dynamics_layers)),
             enabled=cfg.activation_checkpointing,
@@ -2001,19 +2084,21 @@ class NativeWorldModel(nn.Module):
         )
         query_time = policy_query_dt.transpose(1, 2)
         query = query + self.action_time(query_time)
-        query = (
-            query + current[:, None] + self.task_action(task_embedding)[:, None, None]
-        )
+        action_task = self.task_action(task_embedding)
+        query = query + current[:, None] + action_task[:, None, None]
         history = (
             history + self.action_time(relative_world_time[:, : cfg.T])[:, :, None]
         )
-        history = history + self.task_action(task_embedding)[:, None, None]
+        history = history + action_task[:, None, None]
         action = torch.cat((history, query), dim=1)
         history_mask = history_valid & action_group_mask[:, None, :]
         query_token_mask = (
             policy_query_mask.transpose(1, 2) & action_group_mask[:, None]
         )
         action_mask = torch.cat((history_mask, query_token_mask), dim=1)
+        task_token_mask = torch.cat(
+            (torch.zeros_like(history_mask), query_token_mask), dim=1
+        )
         action_times = torch.cat(
             (
                 relative_world_time[:, : cfg.T, None].expand(
@@ -2032,6 +2117,8 @@ class NativeWorldModel(nn.Module):
                     action,
                     action_times,
                     action_mask,
+                    action_task,
+                    task_token_mask,
                     enabled=cfg.activation_checkpointing,
                 )
                 action_index += 1
@@ -2050,6 +2137,8 @@ class NativeWorldModel(nn.Module):
                 action,
                 action_times,
                 action_mask,
+                action_task,
+                task_token_mask,
                 enabled=cfg.activation_checkpointing,
             )
             action_index += 1
@@ -2061,8 +2150,17 @@ class NativeWorldModel(nn.Module):
         query_flat = policy_query.reshape(
             batch, query_count * cfg.max_action_groups, cfg.action_hidden
         )
+        spatial_query = self.policy_spatial_norm(query_flat)
+        if self.policy_spatial_task_modulation is not None:
+            spatial_query = self.policy_spatial_task_modulation(
+                spatial_query,
+                action_task,
+                query_token_mask.reshape(
+                    batch, query_count * cfg.max_action_groups
+                ),
+            )
         spatial_update = self.policy_spatial_cross(
-            self.policy_spatial_norm(query_flat),
+            spatial_query,
             prior_state.reshape(batch, (cfg.T + cfg.K) * cfg.P, cfg.state_hidden),
         )
         policy_query = (query_flat + spatial_update).view(

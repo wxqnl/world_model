@@ -12,6 +12,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS, STATE_SEMANTIC_IDS
 from wm3d.models.native_world_model import (
+    ActionBlock,
     NativeWorldModel,
     NativeWorldModelConfig,
 )
@@ -378,6 +379,101 @@ def test_current_state_changes_policy_but_not_action_free_world_prior() -> None:
     )
     assert not torch.allclose(
         baseline["policy_action_raw"], counterfactual["policy_action_raw"]
+    )
+
+
+def test_policy_task_modulation_is_exact_identity_at_initialization() -> None:
+    old_cfg = _tiny_config()
+    new_cfg = replace(old_cfg, policy_task_modulation=True)
+    torch.manual_seed(1301)
+    old = NativeWorldModel(old_cfg).eval()
+    torch.manual_seed(1302)
+    new = NativeWorldModel(new_cfg).eval()
+    incompatible = new.load_state_dict(old.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert incompatible.missing_keys
+    assert all("task_modulation" in name for name in incompatible.missing_keys)
+
+    batch = _batch(old_cfg)
+    baseline = old(**batch)
+    conditioned = new(**batch)
+    for name in (
+        "policy_action_raw",
+        "policy_latent",
+        "action_free_pred_tokens",
+        "pred_tokens",
+        "rgb",
+    ):
+        torch.testing.assert_close(baseline[name], conditioned[name], rtol=0, atol=0)
+
+
+def test_policy_task_modulation_changes_queries_without_relabeling_history() -> None:
+    cfg = replace(_tiny_config(), policy_task_modulation=True)
+    block = ActionBlock(cfg).eval()
+    batch, steps, groups, dim = 2, 4, cfg.max_action_groups, cfg.action_hidden
+    value = torch.randn(batch, steps, groups, dim)
+    times = torch.arange(steps, dtype=torch.float32).view(1, -1, 1).expand(
+        batch, -1, groups
+    )
+    valid = torch.ones(batch, steps, groups, dtype=torch.bool)
+    query_mask = torch.zeros_like(valid)
+    query_mask[:, -2:] = True
+    first_task = torch.randn(batch, dim)
+    second_task = torch.randn(batch, dim)
+
+    baseline = block(value, times, valid, first_task, query_mask)
+    torch.testing.assert_close(
+        baseline,
+        block(value, times, valid, second_task, query_mask),
+        rtol=0,
+        atol=0,
+    )
+    assert block.attn_task_modulation is not None
+    assert block.ff_task_modulation is not None
+    with torch.no_grad():
+        block.attn_task_modulation.shift.fill_(0.1)
+        block.ff_task_modulation.shift.fill_(0.1)
+    changed = block(value, times, valid, second_task, query_mask)
+    torch.testing.assert_close(
+        baseline[:, :-2], changed[:, :-2], rtol=0, atol=0
+    )
+    assert not torch.allclose(baseline[:, -2:], changed[:, -2:])
+
+
+def test_learned_policy_task_modulation_stays_out_of_world_and_rgb() -> None:
+    cfg = replace(_tiny_config(), policy_task_modulation=True)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    baseline = model(**batch)
+
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "task_modulation" in name and name.endswith(("scale", "shift")):
+                parameter.fill_(0.1)
+
+    changed = model(**batch)
+    for name in ("action_free_pred_tokens", "pred_tokens", "rgb"):
+        torch.testing.assert_close(baseline[name], changed[name], rtol=0, atol=0)
+    assert not torch.allclose(baseline["policy_action_raw"], changed["policy_action_raw"])
+
+
+def test_policy_task_modulation_gates_receive_action_supervision() -> None:
+    cfg = replace(_tiny_config(), policy_task_modulation=True)
+    model = NativeWorldModel(cfg).train()
+    output = model(**_batch(cfg))
+    output["policy_action_raw"].square().mean().backward()
+    gates = [
+        parameter.grad
+        for name, parameter in model.named_parameters()
+        if "task_modulation" in name
+        and (name.endswith("scale") or name.endswith("shift"))
+    ]
+    assert gates
+    assert all(
+        gradient is not None
+        and torch.isfinite(gradient).all()
+        and gradient.abs().sum() > 0
+        for gradient in gates
     )
 
 
