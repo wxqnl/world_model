@@ -87,6 +87,7 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
     assert "WM3D_DATA_MODE=direct_raw" in payload
     assert "MINIMUM_RAW_FILESYSTEM_BYTES=0" in payload
     assert "DIRECT_PREFETCH_WINDOWS=16" in payload
+    assert "DIRECT_PREFETCH_WORKERS=1" in payload
     assert "DIRECT_DECODE_WORKERS=1" in payload
     assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in payload
     assert "STREAMING_LRU_ROOT=" not in payload
@@ -112,6 +113,8 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
     assert "h100_8_fsdp2_streaming_formal100k.yaml" in plan.stdout
     assert "final step: 100000" in plan.stdout
     assert "runs/1b_formal100k" in plan.stdout
+    assert "batch-coalesced decode" in plan.stdout
+    assert "prefetch workers=1" in plan.stdout
 
 
 def test_1b_rejects_5b_only_preset(tmp_path: Path) -> None:

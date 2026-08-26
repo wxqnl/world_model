@@ -84,6 +84,9 @@ Canary 通过后，用新的 site 文件执行 `formal100k`。不要复用 canar
   减半，最低到 `DIRECT_MINIMUM_CHUNK_ROWS`。
 - `DIRECT_PREFETCH_WINDOWS`：CPU 上有界的 uint8 RGB window 队列；官方 1B 默认 16、
   5B 默认 8，分别覆盖两个 micro-batch。它不是 latent cache，内存上限不随训练步数增长。
+- `DIRECT_PREFETCH_WORKERS=1`：每 rank 用一个 worker 批量准备 lookahead。多个 worker
+  会对重叠 window 形成并发重复解码和随机视频读取竞争；单 worker 配合 batch coalescing
+  是 1B/5B 的正式默认。
 - `DIRECT_VIDEO_INDEX_CACHE_ASSETS=128`：只缓存小型 PTS 数组，不缓存 RGB 或
   latent。
 - `DIRECT_DECODE_WORKERS=1`：每个 rank 顺序解码相机；多 rank 已经提供节点级并行，
@@ -95,10 +98,12 @@ Canary 通过后，用新的 site 文件执行 `formal100k`。不要复用 canar
 ## 稳定性边界
 
 Direct 路径先按稳定的 episode/observation identity 合并同一 batch 的重叠行，
-VGGT 输出再恢复为原来的固定 `B×(T+K)` 形状；RGB 解码和 resize 结果也仅在 rank
-本地做有界 LRU 重用。两项复用都不改变采样、监督或模型输入形状。内存由显式字节上限
-约束，不随训练步数或 episode 长度增长。encoder OOM 只降低 frozen VGGT chunk，不改变 micro batch、global
-batch、模型、数据或 loss。Checkpoint 仍由既有分布式 checkpoint 合同管理；
+按有序唯一 observation 行只执行一次视频解码和 resize，再严格重建每个原始 window；
+VGGT 输出随后恢复为原来的固定 `B×(T+K)` 形状。lookahead 先消费当前 batch 再补
+future，避免旧 future 占满容量。RGB 解码和 resize 结果仅在 rank 本地做有界 LRU
+重用。这些复用都不改变采样、监督或模型输入形状。内存由显式字节上限约束，不随训练
+步数或 episode 长度增长。encoder OOM 只降低 frozen VGGT chunk，不改变 micro batch、
+global batch、模型、数据或 loss。Checkpoint 仍由既有分布式 checkpoint 合同管理；
 direct adapter 没有可训练参数，不进入 optimizer 或 checkpoint。VGGT 的各 chunk
 直接写入一份预分配输出，避免先保留全部 chunk 再 `cat` 所产生的双份峰值显存。
 
