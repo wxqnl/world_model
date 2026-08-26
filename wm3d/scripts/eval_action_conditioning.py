@@ -17,7 +17,7 @@ _PACKAGE = os.environ.get("WM3D_ACTION_AUDIT_PACKAGE", "wm3d")
 offline_eval = importlib.import_module(f"{_PACKAGE}.training.offline_eval")
 
 
-_ORIGINAL_FORWARD = offline_eval._forward
+_ORIGINAL_FORWARD = offline_eval._forward_with_action_counterfactual
 _ORIGINAL_OBJECTIVE = offline_eval.compute_native_objective
 _PREFIX = "_policy_conditioning_audit_"
 _previous_task: torch.Tensor | None = None
@@ -277,7 +277,7 @@ def main() -> None:
         offline_eval._publish_and_validate_launch = (
             lambda *args, **kwargs: (None, None)
         )
-    offline_eval._forward = _audited_forward
+    offline_eval._forward_with_action_counterfactual = _audited_forward
     offline_eval.compute_native_objective = _audited_objective
     if compat_shim is None:
         offline_eval.main()
