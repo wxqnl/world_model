@@ -583,10 +583,15 @@ def main() -> None:
             raise OfflineEvalError(f"checkpoint inspection failed: {inspection[0]}")
         run_contract = _run_contract(config, parameter_counts, raw_model)
         run_contract_path = Path(config["run"]["output_root"]) / "run_contract.json"
-        if (
-            not run_contract_path.is_file()
-            or json.loads(run_contract_path.read_text(encoding="utf-8")) != run_contract
-        ):
+        stable_run_contract: list[Any] = [None]
+        if context.is_rank0:
+            stable_run_contract[0] = (
+                run_contract_path.is_file()
+                and json.loads(run_contract_path.read_text(encoding="utf-8"))
+                == run_contract
+            )
+        dist.broadcast_object_list(stable_run_contract, src=0)
+        if stable_run_contract[0] is not True:
             raise OfflineEvalError("stable run contract is missing or differs")
         launch_qualification_path, launch_qualification_sha256 = (
             _publish_and_validate_launch(
