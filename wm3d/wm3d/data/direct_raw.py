@@ -1065,6 +1065,8 @@ class DirectRawDataset(UnifiedCacheDataset):
             normalization.fine_action_scale,
             normalization.coarse_action_scale,
         )
+        action["state_normalization_offset"] = normalization.state_offset
+        action["state_normalization_scale"] = normalization.state_scale
         return action, prepared_robot.task_embedding
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:

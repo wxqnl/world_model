@@ -16,6 +16,9 @@ policy loss，大尺度通道会压制小尺度通道。
   runtime 视图中归一化；
 - policy head 的连续输出在 normalized coordinate 中受监督，随后立即反变换为
   物理量；serving 和 coarse composition 只读取物理量 `policy_action`；
+- policy query 显式接收同一 action/state transform 的 calibration descriptor。这样同一
+  embodiment 的多个 source 不需要靠视觉去猜归一化键，serving 也不能只给 action stats
+  而漏掉 current-state stats；
 - gripper、`binary_contact` 与已审计为 `[0,1]` 的离散 `controller_mode`
   只使用 identity transform，不做 z-score；它们由统一 head 的 binary logit
   路径训练和解码。
@@ -85,6 +88,11 @@ episode 数量线性占用内存。
 
 训练和离线 eval 都由同一 materialized runtime 加载同一个 SHA-bound artifact；
 没有 zero/fallback、插值或按数据集硬编码。
+
+部署 adapter 必须显式选择与目标数据/控制器对应的封存 normalization profile，并把同一组
+action offset/scale 用于 history 归一化、policy query calibration 与输出反归一化，同时把
+state offset/scale 用于 current state 归一化与同一 calibration。未知 profile 必须 fail-closed，
+不能用单位矩阵或靠模型猜 source。这个约束对所有下游成立，不是 LIBERO 专用分支。
 
 ## action velocity 决策
 

@@ -743,6 +743,8 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             normalization.fine_action_scale,
             normalization.coarse_action_scale,
         )
+        action["state_normalization_offset"] = normalization.state_offset
+        action["state_normalization_scale"] = normalization.state_scale
         task_embedding = prepared_robot.task_embedding
         if task_embedding.numel() != int(self.model["task_dim"]):
             raise CacheDataError(

@@ -36,7 +36,11 @@ def test_1b_streaming_presets_use_dual_path_1b_and_saturating_batch() -> None:
         (ROOT / "configs/model/native_1b_dual_path.yaml").read_text()
     )
     validate_model_profile(model)
+<<<<<<< HEAD
     assert model["expected_parameter_count"] == 1_484_820_752
+=======
+    assert model["expected_parameter_count"] == 1_489_275_928
+>>>>>>> cc51418 (Align action calibration across training and serving)
     assert model["model"]["P"] == 64
     assert model["model"]["appearance_P"] == 256
     assert model["model"]["appearance_autoregressive_steps"] == 2

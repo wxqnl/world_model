@@ -480,6 +480,8 @@ class FormalCacheDataset(Dataset[dict[str, torch.Tensor]]):
             "future_world_boundaries_dt": torch.arange(K + 1).float() * 0.2,
             "action_normalization_offset": norm_offset,
             "action_normalization_scale": norm_scale,
+            "state_normalization_offset": torch.zeros(G, 32),
+            "state_normalization_scale": torch.ones(G, 32),
             "aux_values": torch.zeros(T, 16, 256),
             "aux_mask": torch.zeros(T, 16, dtype=torch.bool),
             "aux_type_ids": torch.zeros(T, 16, dtype=torch.long),

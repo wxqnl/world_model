@@ -166,6 +166,8 @@ def _batch(cfg: NativeWorldModelConfig) -> dict[str, torch.Tensor]:
         "policy_query_mask": query_mask,
         "action_normalization_offset": torch.zeros(batch, groups, action_dim),
         "action_normalization_scale": torch.ones(batch, groups, action_dim),
+        "state_normalization_offset": torch.zeros(batch, groups, state_dim),
+        "state_normalization_scale": torch.ones(batch, groups, state_dim),
     }
 
 
@@ -502,6 +504,82 @@ def test_policy_task_modulation_gates_receive_action_supervision() -> None:
         and gradient.abs().sum() > 0
         for gradient in gates
     )
+
+
+def test_policy_calibration_is_exact_identity_at_initialization() -> None:
+    old_cfg = _tiny_config()
+    new_cfg = replace(old_cfg, policy_calibration_conditioning=True)
+    torch.manual_seed(1311)
+    old = NativeWorldModel(old_cfg).eval()
+    torch.manual_seed(1312)
+    new = NativeWorldModel(new_cfg).eval()
+    incompatible = new.load_state_dict(old.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert incompatible.missing_keys == ["policy_calibration.weight"]
+
+    batch = _batch(old_cfg)
+    baseline = old(**batch)
+    conditioned = new(**batch)
+    for name in (
+        "policy_action_raw",
+        "policy_latent",
+        "action_free_pred_tokens",
+        "pred_tokens",
+        "rgb",
+    ):
+        torch.testing.assert_close(baseline[name], conditioned[name], rtol=0, atol=0)
+
+
+def test_learned_policy_calibration_changes_only_policy_coordinates() -> None:
+    cfg = replace(_tiny_config(), policy_calibration_conditioning=True)
+    model = NativeWorldModel(cfg).eval()
+    assert model.policy_calibration is not None
+    with torch.no_grad():
+        model.policy_calibration.weight.fill_(0.01)
+
+    batch = _batch(cfg)
+    baseline = model(**batch)
+    changed = dict(batch)
+    action_offset = batch["action_normalization_offset"].clone()
+    action_scale = batch["action_normalization_scale"].clone()
+    action_offset[..., :6] += 0.25
+    action_scale[..., :6] *= 3.0
+    changed["action_normalization_offset"] = action_offset
+    changed["action_normalization_scale"] = action_scale
+    state_offset = batch["state_normalization_offset"].clone()
+    state_scale = batch["state_normalization_scale"].clone()
+    state_offset[..., :9] -= 0.5
+    state_scale[..., :9] *= 2.0
+    changed["state_normalization_offset"] = state_offset
+    changed["state_normalization_scale"] = state_scale
+    calibrated = model(**changed)
+
+    for name in ("action_free_pred_tokens", "pred_tokens", "rgb"):
+        torch.testing.assert_close(baseline[name], calibrated[name], rtol=0, atol=0)
+    assert not torch.allclose(
+        baseline["policy_action_raw"], calibrated["policy_action_raw"]
+    )
+
+
+def test_policy_calibration_receives_existing_action_supervision() -> None:
+    cfg = replace(_tiny_config(), policy_calibration_conditioning=True)
+    model = NativeWorldModel(cfg).train()
+    output = model(**_batch(cfg))
+    output["policy_action_raw"].square().mean().backward()
+    assert model.policy_calibration is not None
+    gradient = model.policy_calibration.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
+
+
+def test_policy_calibration_rejects_invalid_state_statistics() -> None:
+    cfg = replace(_tiny_config(), policy_calibration_conditioning=True)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    batch["state_normalization_scale"][0, 0, 0] = 0.0
+    with pytest.raises(ValueError, match="state calibration statistics are invalid"):
+        model(**batch)
 
 
 def test_policy_and_world_losses_reach_current_state_action_and_native_modules() -> (

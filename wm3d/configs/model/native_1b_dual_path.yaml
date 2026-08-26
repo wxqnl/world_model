@@ -1,7 +1,11 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_dual_path
 architecture: native_world_model
+<<<<<<< HEAD
 expected_parameter_count: 1484820752
+=======
+expected_parameter_count: 1489275928
+>>>>>>> cc51418 (Align action calibration across training and serving)
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -29,6 +33,7 @@ model:
   action_heads: 16
   action_ff_mult: 2.6666666666666665
   policy_task_modulation: true
+  policy_calibration_conditioning: true
   bridge_layers_state: [2, 5, 8, 11, 14, 17]
   bridge_heads: 16
   dynamics_layers: 1

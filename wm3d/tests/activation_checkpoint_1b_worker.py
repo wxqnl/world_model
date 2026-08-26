@@ -135,6 +135,12 @@ def _batch(model: NativeWorldModel, device: torch.device) -> dict[str, torch.Ten
         "action_normalization_scale": torch.ones(
             batch, groups, action_dim, device=device
         ),
+        "state_normalization_offset": torch.zeros(
+            batch, groups, state_dim, device=device
+        ),
+        "state_normalization_scale": torch.ones(
+            batch, groups, state_dim, device=device
+        ),
     }
 
 

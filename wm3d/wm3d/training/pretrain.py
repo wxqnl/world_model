@@ -453,6 +453,8 @@ _MODEL_INPUTS = {
     "policy_query_mask",
     "action_normalization_offset",
     "action_normalization_scale",
+    "state_normalization_offset",
+    "state_normalization_scale",
     "aux_values",
     "aux_mask",
     "aux_type_ids",
