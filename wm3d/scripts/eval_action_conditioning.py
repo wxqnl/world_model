@@ -23,6 +23,46 @@ _PREFIX = "_policy_conditioning_audit_"
 _previous_inputs: dict[str, torch.Tensor] = {}
 
 
+def _capture_renderer_action(
+    model: torch.nn.Module,
+    batch: Mapping[str, torch.Tensor],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[Mapping[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Run one forward and retain the direct renderer action MLP boundary."""
+
+    action_proj = None
+    for name, module in model.named_modules():
+        if "image_decoder.action_proj" in name and name.endswith("action_proj"):
+            action_proj = module
+            break
+    if action_proj is None:
+        raise RuntimeError("RGB conditioning audit could not find renderer action_proj")
+    captured_inputs: list[torch.Tensor] = []
+    captured_outputs: list[torch.Tensor] = []
+
+    def record(
+        _module: torch.nn.Module,
+        module_args: tuple[torch.Tensor, ...],
+        module_output: torch.Tensor,
+    ) -> None:
+        captured_inputs.append(module_args[0].detach())
+        captured_outputs.append(module_output.detach())
+
+    handle = action_proj.register_forward_hook(record)
+    try:
+        output = _ORIGINAL_FORWARD(model, batch, *args, **kwargs)
+    finally:
+        handle.remove()
+    if not captured_inputs or len(captured_inputs) != len(captured_outputs):
+        raise RuntimeError("renderer action_proj was not exercised during RGB audit")
+    return (
+        output,
+        torch.cat(captured_inputs, dim=0),
+        torch.cat(captured_outputs, dim=0),
+    )
+
+
 def _changed_fraction(before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
     if before.shape != after.shape or before.ndim == 0:
         raise RuntimeError("conditioning audit replacement shape differs")
@@ -75,7 +115,10 @@ def _audited_forward(
     *args: Any,
     **kwargs: Any,
 ) -> Mapping[str, torch.Tensor]:
-    baseline = dict(_ORIGINAL_FORWARD(model, batch, *args, **kwargs))
+    factual_output, factual_action_input, factual_action_output = (
+        _capture_renderer_action(model, batch, *args, **kwargs)
+    )
+    baseline = dict(factual_output)
     current_task = batch.get("task_embedding")
 
     variants = {
@@ -124,7 +167,7 @@ def _audited_forward(
         "future_factual_coarse_action_values",
     ):
         zero_future_batch[name] = torch.zeros_like(batch[name])
-    zero_future_output = _ORIGINAL_FORWARD(
+    zero_future_output, zero_action_input, zero_action_output = _capture_renderer_action(
         model, zero_future_batch, *args, **kwargs
     )
     for field in (
@@ -133,6 +176,18 @@ def _audited_forward(
         "action_free_pred_tokens",
     ):
         baseline[f"{_PREFIX}zero_future_{field}"] = zero_future_output[field]
+    baseline[f"{_PREFIX}renderer_action_input_delta_rms"] = torch.sqrt(
+        (factual_action_input - zero_action_input).float().square().mean()
+    )
+    baseline[f"{_PREFIX}renderer_action_output_delta_rms"] = torch.sqrt(
+        (factual_action_output - zero_action_output).float().square().mean()
+    )
+    baseline[f"{_PREFIX}renderer_action_input_factual_rms"] = torch.sqrt(
+        factual_action_input.float().square().mean()
+    )
+    baseline[f"{_PREFIX}renderer_action_input_zero_rms"] = torch.sqrt(
+        zero_action_input.float().square().mean()
+    )
 
     for key in (
         "world_tokens",
@@ -293,6 +348,13 @@ def _audited_objective(
         output["action_free_pred_tokens"]
         - output[f"{_PREFIX}zero_future_action_free_pred_tokens"]
     ).abs().max()
+    for name in (
+        "renderer_action_input_delta_rms",
+        "renderer_action_output_delta_rms",
+        "renderer_action_input_factual_rms",
+        "renderer_action_input_zero_rms",
+    ):
+        losses[f"policy_audit_{name}"] = output[f"{_PREFIX}{name}"]
     return losses
 
 
