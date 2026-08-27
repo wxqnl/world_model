@@ -207,6 +207,73 @@ def _audited_objective(
         > float(config.rgb_motion_threshold)
     ) & valid
     static = (~motion) & valid
+    appearance_target = batch["target_appearance_tokens"].float()
+    appearance_mask = batch["target_appearance_mask"].bool()
+    context_tokens = batch["appearance_context_tokens"].float()
+    context_token_mask = batch["appearance_context_mask"].bool()
+    batch_size, horizon, views, patches, _ = appearance_target.shape
+    appearance_grid = int(patches**0.5)
+    if appearance_grid * appearance_grid != patches:
+        raise RuntimeError("P256 temporal baseline requires a square patch grid")
+    motion_weight = torch.nn.functional.adaptive_avg_pool2d(
+        motion.float().reshape(
+            batch_size * horizon * views,
+            1,
+            target.shape[-2],
+            target.shape[-1],
+        ),
+        output_size=(appearance_grid, appearance_grid),
+    ).reshape(batch_size, horizon, views, patches)
+
+    world_times = batch["world_times_s"].float()
+    context_steps = int(context_tokens.shape[1])
+    context_times = world_times[:, -horizon - context_steps : -horizon]
+    future_times = world_times[:, -horizon:]
+    latest = torch.zeros_like(context_tokens[:, 0])
+    previous = torch.zeros_like(latest)
+    latest_time = torch.zeros_like(context_token_mask[:, 0], dtype=torch.float32)
+    previous_time = torch.zeros_like(latest_time)
+    latest_valid = torch.zeros_like(context_token_mask[:, 0])
+    previous_valid = torch.zeros_like(latest_valid)
+    for index in range(context_steps):
+        observed = context_token_mask[:, index]
+        previous = torch.where(observed[..., None], latest, previous)
+        previous_time = torch.where(observed, latest_time, previous_time)
+        previous_valid = torch.where(observed, latest_valid, previous_valid)
+        latest = torch.where(observed[..., None], context_tokens[:, index], latest)
+        observed_time = context_times[:, index, None, None].expand_as(latest_time)
+        latest_time = torch.where(observed, observed_time, latest_time)
+        latest_valid = latest_valid | observed
+
+    observed_dt = latest_time - previous_time
+    temporal_valid = previous_valid & latest_valid & observed_dt.gt(1.0e-6)
+    velocity = (latest - previous) / observed_dt.clamp_min(1.0e-6)[..., None]
+    future_dt = future_times[:, :, None, None] - latest_time[:, None]
+    linear_delta = velocity[:, None] * future_dt[..., None]
+    target_delta = appearance_target - latest[:, None]
+    linear_valid = appearance_mask & temporal_valid[:, None]
+    linear_weight = motion_weight * linear_valid.to(dtype=motion_weight.dtype)
+    direction_weight = linear_weight * target_delta.square().sum(dim=-1).sqrt().gt(
+        1.0e-6
+    ).to(dtype=linear_weight.dtype)
+    linear_cosine = torch.nn.functional.cosine_similarity(
+        linear_delta, target_delta, dim=-1
+    )
+    linear_error = _masked_rms(
+        linear_delta - target_delta, linear_weight[..., None]
+    )
+    copy_last_error = _masked_rms(target_delta, linear_weight[..., None])
+    losses["p256_last_velocity_delta_cosine"] = _masked_mean(
+        linear_cosine, direction_weight
+    )
+    losses["p256_last_velocity_delta_error_rms"] = linear_error
+    losses["p256_last_velocity_vs_copy_last_error_ratio"] = linear_error / (
+        copy_last_error + 1.0e-6
+    )
+    for index in range(horizon):
+        losses[f"p256_last_velocity_delta_cosine_h{index + 1}"] = _masked_mean(
+            linear_cosine[:, index], direction_weight[:, index]
+        )
     target_temporal = _temporal_change_rms(target, context, rgb_mask, context_mask)
     losses["p256_target_rgb_temporal_change_rms"] = target_temporal
 
