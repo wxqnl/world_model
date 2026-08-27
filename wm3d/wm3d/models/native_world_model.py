@@ -323,6 +323,20 @@ class RMSNorm(nn.Module):
         return normalized.to(dtype=value.dtype) * self.weight
 
 
+class ZeroInitializedLinear(nn.Linear):
+    """Linear residual projection whose exact prior is the identity path.
+
+    FSDP2 materializes child modules independently and calls their
+    reset_parameters methods, so the initialization must live on the
+    projection itself rather than only in its parent module.
+    """
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
 class SwiGLU(nn.Module):
     def __init__(self, dim: int, mult: float, dropout: float):
         super().__init__()
@@ -1073,7 +1087,12 @@ class PerViewAppearanceDynamics(nn.Module):
             blocks = tuple(checkpoint_wrapper(block) for block in blocks)
         self.blocks = nn.ModuleList(blocks)
         self.norm = RMSNorm(cfg.appearance_hidden)
-        self.output = nn.Linear(cfg.appearance_hidden, cfg.token_dim, bias=False)
+        # The prediction is added to the last observed P256 token. Starting
+        # this residual at zero preserves copy-last until evidence learns
+        # motion.
+        self.output = ZeroInitializedLinear(
+            cfg.appearance_hidden, cfg.token_dim, bias=False
+        )
 
     def reset_parameters(self) -> None:
         for parameter in (self.view_embed, self.patch_embed, self.future_seed):

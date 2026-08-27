@@ -15,6 +15,7 @@ from wm3d.models.native_world_model import (
     ActionBlock,
     NativeWorldModel,
     NativeWorldModelConfig,
+    ZeroInitializedLinear,
 )
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.model_factory import validate_model_data_compatibility
@@ -830,6 +831,54 @@ def _dual_path_batch(cfg: NativeWorldModelConfig) -> dict[str, torch.Tensor]:
     return batch
 
 
+def _take_appearance_output_step(
+    model: NativeWorldModel, batch: dict[str, torch.Tensor]
+) -> None:
+    assert model.appearance_dynamics is not None
+    projection = model.appearance_dynamics.output
+    was_training = model.training
+    model.train()
+    optimizer = torch.optim.SGD((projection.weight,), lr=0.05)
+    output = model(**batch, appearance_teacher_ratio=0.0)
+    loss = (
+        output["appearance_pred_tokens"] - batch["target_appearance_tokens"]
+    ).float().square().mean()
+    loss.backward()
+    assert projection.weight.grad is not None
+    assert torch.isfinite(projection.weight.grad).all()
+    assert projection.weight.grad.count_nonzero() > 0
+    optimizer.step()
+    model.zero_grad(set_to_none=True)
+    model.train(was_training)
+
+
+def test_appearance_residual_projection_starts_at_exact_copy_last() -> None:
+    cfg = _tiny_dual_path_config()
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+
+    output = model(**batch, appearance_teacher_ratio=0.0)
+    latest = batch["appearance_context_tokens"][:, -1]
+    expected = latest[:, None].expand_as(output["appearance_pred_tokens"])
+    torch.testing.assert_close(
+        output["appearance_pred_tokens"], expected, rtol=0, atol=0
+    )
+
+    assert model.appearance_dynamics is not None
+    projection = model.appearance_dynamics.output
+    assert projection.weight.count_nonzero() == 0
+    torch.nn.init.normal_(projection.weight)
+    projection.reset_parameters()
+    assert projection.weight.count_nonzero() == 0
+    with torch.device("meta"):
+        meta_projection = ZeroInitializedLinear(
+            cfg.appearance_hidden, cfg.token_dim, bias=False
+        )
+    meta_projection.to_empty(device=torch.device("cpu"))
+    meta_projection.reset_parameters()
+    assert meta_projection.weight.count_nonzero() == 0
+
+
 def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> None:
     cfg = _tiny_dual_path_config()
     torch.manual_seed(31)
@@ -1189,6 +1238,7 @@ def test_appearance_action_residual_changes_rgb_without_policy_leakage() -> None
     torch.manual_seed(131)
     model = NativeWorldModel(cfg).eval()
     batch = _dual_path_batch(cfg)
+    _take_appearance_output_step(model, batch)
     zero_action = dict(batch)
     zero_action["future_factual_fine_action_values"] = torch.zeros_like(
         batch["future_factual_fine_action_values"]
@@ -1225,6 +1275,7 @@ def test_appearance_action_conditioning_is_centered_and_spatially_resolved() -> 
     torch.manual_seed(132)
     model = NativeWorldModel(cfg).eval()
     batch = _dual_path_batch(cfg)
+    _take_appearance_output_step(model, batch)
     zero_action = dict(batch)
     zero_action["future_factual_fine_action_values"] = torch.zeros_like(
         batch["future_factual_fine_action_values"]
@@ -1291,6 +1342,7 @@ def test_appearance_action_conditioner_checkpoint_preserves_bf16_gradients() -> 
         name: value.cuda() if isinstance(value, torch.Tensor) else value
         for name, value in _dual_path_batch(cfg).items()
     }
+    _take_appearance_output_step(model, batch)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output = model(**batch, appearance_teacher_ratio=0.0)
         loss = output["appearance_pred_tokens"].float().square().mean()
