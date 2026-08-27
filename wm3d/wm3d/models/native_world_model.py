@@ -1206,13 +1206,42 @@ class PerViewAppearanceDynamics(nn.Module):
         centered_action_mask: Optional[torch.Tensor],
         *,
         steps: int,
+        first_prediction: Optional[torch.Tensor] = None,
+        first_prediction_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         history_tokens = context_tokens
         history_mask = context_mask
         history_time = context_time
         predictions: list[torch.Tensor] = []
         prediction_masks: list[torch.Tensor] = []
-        for index in range(steps):
+        start_index = 0
+        if first_prediction is not None:
+            expected_prediction = (
+                context_tokens.shape[0],
+                self.cfg.num_views,
+                self.cfg.appearance_P,
+                self.cfg.token_dim,
+            )
+            if tuple(first_prediction.shape) != expected_prediction:
+                raise ValueError("reused appearance prediction has incompatible shape")
+            if first_prediction_mask is None or tuple(
+                first_prediction_mask.shape
+            ) != expected_prediction[:-1]:
+                raise ValueError("reused appearance mask has incompatible shape")
+            predictions.append(first_prediction)
+            prediction_masks.append(first_prediction_mask)
+            history_tokens = torch.cat(
+                (history_tokens, first_prediction[:, None]), dim=1
+            )
+            history_mask = torch.cat(
+                (history_mask, first_prediction_mask[:, None]), dim=1
+            )
+            history_time = torch.cat((history_time, future_time[:, :1]), dim=1)
+            start_index = 1
+        elif first_prediction_mask is not None:
+            raise ValueError("reused appearance mask requires a prediction")
+
+        for index in range(start_index, steps):
             value = self._conditioned_sequence(
                 history_tokens,
                 history_mask,
@@ -1356,6 +1385,14 @@ class PerViewAppearanceDynamics(nn.Module):
                 centered_action_mask,
             )
 
+        # Teacher position zero and AR position zero have exactly the same
+        # causal inputs.  Reuse that result instead of running the full
+        # appearance stack a second time.  Training dropout would make the two
+        # old passes intentionally stochastic, so preserve that behavior for
+        # nonzero-dropout profiles.
+        reuse_teacher_first = target_tokens is not None and (
+            not self.training or float(cfg.dropout) == 0.0
+        )
         autoregressive_prediction, autoregressive_mask = self._autoregressive(
             context_tokens,
             context_mask.bool(),
@@ -1366,6 +1403,12 @@ class PerViewAppearanceDynamics(nn.Module):
             centered_action_tokens,
             centered_action_mask,
             steps=steps,
+            first_prediction=(
+                teacher_prediction[:, 0] if reuse_teacher_first else None
+            ),
+            first_prediction_mask=(
+                teacher_mask[:, 0] if reuse_teacher_first else None
+            ),
         )
         if steps == cfg.K:
             predicted = autoregressive_prediction
@@ -1797,6 +1840,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         factual_action_summary: Optional[torch.Tensor],
         task_embedding: torch.Tensor,
         context_rgb: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if tuple(context_rgb.shape[1:]) != (
             3,
@@ -1804,6 +1848,16 @@ class NativeContextRGBImageDecoder(nn.Module):
             self.cfg.rgb_size,
         ):
             raise ValueError("context RGB must be [N,3,rgb_size,rgb_size]")
+        if context_indices is None:
+            if context_rgb.shape[0] != tokens.shape[0]:
+                raise ValueError("context RGB must align to decoder tokens")
+        else:
+            if tuple(context_indices.shape) != (tokens.shape[0],):
+                raise ValueError("context RGB indices must be [N]")
+            if context_indices.dtype != torch.long:
+                raise ValueError("context RGB indices must use torch.long")
+            if context_indices.device != context_rgb.device:
+                raise ValueError("context RGB indices must share the RGB device")
         value = tokens.transpose(1, 2).reshape(
             tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
         )
@@ -1899,15 +1953,30 @@ class NativeContextRGBImageDecoder(nn.Module):
             skips.append(downsample(skips[-1]))
         if skips[-1].shape[-2:] != value.shape[-2:]:
             raise ValueError("context pyramid does not align with RGB token grid")
-        value = self.bottleneck_fuse(torch.cat((value, skips[-1]), dim=1))
+
+        # One observed image conditions every decoded future for the same
+        # batch/view pair.  Build its convolutional pyramid once per chunk and
+        # expand only the already-computed feature maps.  Convolutions and
+        # GroupNorm are sample-local, so this is mathematically identical to
+        # repeating the RGB image before the pyramid.
+        def expand_context(value_to_expand: torch.Tensor) -> torch.Tensor:
+            if context_indices is None:
+                return value_to_expand
+            return value_to_expand.index_select(0, context_indices)
+
+        value = self.bottleneck_fuse(
+            torch.cat((value, expand_context(skips[-1])), dim=1)
+        )
         delta_scale = float(self.cfg.rgb_context_appearance_delta_scale)
         if appearance_delta is not None:
             value = value + delta_scale * torch.tanh(appearance_delta)
-        for stage_index, (upsample, fuse, skip) in enumerate(
+        for stage_index, (upsample, fuse, context_skip) in enumerate(
             zip(self.ups, self.skip_fuses, reversed(skips[:-1]))
         ):
             value = upsample(value)
-            value = fuse(torch.cat((value, skip), dim=1))
+            value = fuse(
+                torch.cat((value, expand_context(context_skip)), dim=1)
+            )
             if appearance_delta is not None:
                 delta_at_scale = F.interpolate(
                     projected_appearance_deltas[stage_index].float(),
@@ -1934,7 +2003,9 @@ class NativeContextRGBImageDecoder(nn.Module):
                 0.0,
                 1.0,
             )
-        residual_rgb = torch.clamp(context + residual, 0.0, 1.0)
+        residual_rgb = torch.clamp(
+            expand_context(context) + residual, 0.0, 1.0
+        )
         rgb = blend * direct + (1.0 - blend) * residual_rgb
         return rgb, motion_logit, blend
 
@@ -2099,7 +2170,8 @@ class NativeRGBDecoder(nn.Module):
             )
         elif task_embedding is not None:
             raise ValueError("task embedding was supplied to a non-context renderer")
-        expanded_context: Optional[torch.Tensor] = None
+        context_bank: Optional[torch.Tensor] = None
+        context_slot_ids: Optional[torch.Tensor] = None
         context_valid: Optional[torch.Tensor] = None
         if self.cfg.rgb_context_enabled:
             expected_context = (
@@ -2116,15 +2188,17 @@ class NativeRGBDecoder(nn.Module):
                 views,
             ):
                 raise ValueError("context_rgb_mask must be [B,V]")
-            expanded_context = (
-                context_rgb[:, None]
-                .expand(-1, frames, -1, -1, -1, -1)
-                .reshape(
-                    batch * frames * views,
-                    3,
-                    self.cfg.rgb_size,
-                    self.cfg.rgb_size,
-                )
+            context_bank = context_rgb.reshape(
+                batch * views,
+                3,
+                self.cfg.rgb_size,
+                self.cfg.rgb_size,
+            )
+            context_slot_ids = (
+                torch.arange(batch * views, device=future_tokens.device)
+                .view(batch, 1, views)
+                .expand(-1, frames, -1)
+                .reshape(-1)
             )
             context_valid = (
                 context_rgb_mask[:, None].expand(-1, frames, -1).reshape(-1).bool()
@@ -2151,9 +2225,18 @@ class NativeRGBDecoder(nn.Module):
         # The layout depends only on the sealed batch/model shape, so collective
         # ordering is identical across ranks while invalid RGB outputs and their
         # gradients remain exactly zero.
-        dense_indices = torch.arange(
+        source_indices = torch.arange(
             batch * frames * views, device=future_tokens.device
         )
+        if self.cfg.rgb_context_enabled:
+            # Group all horizons for one batch/view so a decoder chunk can
+            # reuse the observed context pyramid across K instead of rebuilding
+            # it once per image slot.  Outputs are transposed back below.
+            dense_indices = source_indices.view(batch, frames, views).permute(
+                0, 2, 1
+            ).reshape(-1)
+        else:
+            dense_indices = source_indices
         decoded_chunks: list[torch.Tensor] = []
         motion_chunks: list[torch.Tensor] = []
         blend_chunks: list[torch.Tensor] = []
@@ -2175,8 +2258,17 @@ class NativeRGBDecoder(nn.Module):
                 ),
             )
             if self.cfg.rgb_context_enabled:
-                assert expanded_context is not None
+                assert context_bank is not None
+                assert context_slot_ids is not None
                 assert expanded_task is not None
+                chunk_context_ids = context_slot_ids.index_select(
+                    0, chunk_indices
+                )
+                unique_context_ids, local_context_indices = (
+                    torch.unique_consecutive(
+                        chunk_context_ids, return_inverse=True
+                    )
+                )
                 decoded, motion_logit, blend = self.image_decoder(
                     *decoder_inputs,
                     (
@@ -2190,7 +2282,8 @@ class NativeRGBDecoder(nn.Module):
                         else expanded_action.index_select(0, chunk_indices)
                     ),
                     expanded_task.index_select(0, chunk_indices),
-                    expanded_context.index_select(0, chunk_indices),
+                    context_bank.index_select(0, unique_context_ids),
+                    local_context_indices,
                 )
             else:
                 decoded = self.image_decoder(*decoder_inputs)
@@ -2207,15 +2300,31 @@ class NativeRGBDecoder(nn.Module):
         dense = torch.cat(decoded_chunks, dim=0)
         dense_motion = torch.cat(motion_chunks, dim=0)
         dense_blend = torch.cat(blend_chunks, dim=0)
+        if self.cfg.rgb_context_enabled:
+            rgb = dense.view(
+                batch, views, frames, 3, self.cfg.rgb_size, self.cfg.rgb_size
+            ).permute(0, 2, 1, 3, 4, 5)
+            motion = dense_motion.view(
+                batch, views, frames, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            ).permute(0, 2, 1, 3, 4, 5)
+            blend = dense_blend.view(
+                batch, views, frames, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            ).permute(0, 2, 1, 3, 4, 5)
+        else:
+            rgb = dense.view(
+                batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size
+            )
+            motion = dense_motion.view(
+                batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            )
+            blend = dense_blend.view(
+                batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            )
         return (
-            dense.view(batch, frames, views, 3, self.cfg.rgb_size, self.cfg.rgb_size),
+            rgb,
             index_tensor,
-            dense_motion.view(
-                batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
-            ),
-            dense_blend.view(
-                batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
-            ),
+            motion,
+            blend,
         )
 
 

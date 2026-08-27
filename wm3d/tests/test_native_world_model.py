@@ -13,6 +13,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS, STATE_SEMANTIC_IDS
 from wm3d.models.native_world_model import (
     ActionBlock,
+    NativeContextRGBImageDecoder,
     NativeWorldModel,
     NativeWorldModelConfig,
 )
@@ -898,6 +899,32 @@ def test_appearance_predictor_starts_normalized_without_copy_last_prior() -> Non
     assert projection.weight.count_nonzero() > 0
 
 
+def test_appearance_ar_reuses_causally_identical_teacher_first_step() -> None:
+    cfg = _tiny_dual_path_config()
+    torch.manual_seed(133)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    assert model.appearance_dynamics is not None
+    calls: list[int] = []
+    handle = model.appearance_dynamics.blocks[0].register_forward_pre_hook(
+        lambda _module, inputs: calls.append(int(inputs[0].shape[1]))
+    )
+    try:
+        output = model(**batch, appearance_teacher_ratio=0.0)
+    finally:
+        handle.remove()
+
+    torch.testing.assert_close(
+        output["appearance_teacher_pred_tokens"][:, 0],
+        output["appearance_autoregressive_pred_tokens"][:, 0],
+        rtol=0,
+        atol=0,
+    )
+    # One teacher pass plus K-1 remaining AR passes; the duplicate AR-zero
+    # pass is gone.
+    assert len(calls) == cfg.K
+
+
 def test_teacher_forced_appearance_is_one_step_causal() -> None:
     cfg = _tiny_dual_path_config()
     torch.manual_seed(30)
@@ -1024,6 +1051,143 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
         cfg.rgb_size,
     )
     assert output["rgb_blend"][0, :, 1].count_nonzero() == 0
+
+
+def test_context_renderer_builds_one_pyramid_per_batch_view_and_chunk() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_decode_chunk_size=4,
+    )
+    torch.manual_seed(134)
+    decoder = NativeWorldModel(cfg).rgb_head.eval()
+    batch = 2
+    future_tokens = torch.randn(batch, cfg.K, cfg.P, cfg.token_dim)
+    appearance = torch.randn(
+        batch, cfg.K, cfg.num_views, cfg.appearance_P, cfg.token_dim
+    )
+    geometry = torch.randn(batch, cfg.K, cfg.P, cfg.state_hidden)
+    context = torch.rand(
+        batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    context_mask = torch.ones(batch, cfg.num_views, dtype=torch.bool)
+    task = torch.randn(batch, cfg.task_dim)
+    pyramid_batches: list[int] = []
+
+    stem = decoder.image_decoder.context_stem
+    handle = stem.register_forward_pre_hook(
+        lambda _module, inputs: pyramid_batches.append(int(inputs[0].shape[0]))
+    )
+    try:
+        rgb = decoder(
+            future_tokens,
+            None,
+            appearance_tokens=appearance,
+            geometry_state=geometry,
+            task_embedding=task,
+            context_rgb=context,
+            context_rgb_mask=context_mask,
+        )[0]
+    finally:
+        handle.remove()
+
+    assert rgb.shape == (
+        batch,
+        cfg.K,
+        cfg.num_views,
+        3,
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+    # Each four-slot chunk is two views times two future frames, but the
+    # context pyramid sees only its two unique observed images.
+    assert pyramid_batches == [2, 2]
+
+
+def test_context_pyramid_reuse_preserves_outputs_and_gradients() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_action_scale=1.0,
+        rgb_context_appearance_delta_scale=1.0,
+    )
+    torch.manual_seed(135)
+    reference = NativeContextRGBImageDecoder(cfg).train()
+    reused = NativeContextRGBImageDecoder(cfg).train()
+    reused.load_state_dict(reference.state_dict())
+    slots = 4
+    context_indices = torch.tensor([0, 0, 1, 1], dtype=torch.long)
+
+    common_values = (
+        torch.randn(slots, cfg.appearance_P, cfg.token_dim),
+        torch.randn(slots, cfg.rgb_hidden, 1, 1),
+        torch.randn(slots, cfg.P, cfg.state_hidden),
+        torch.randn(slots, cfg.appearance_P, cfg.token_dim),
+        torch.randn(slots, cfg.state_hidden),
+        torch.randn(slots, cfg.task_dim),
+    )
+    reference_inputs = tuple(
+        value.clone().requires_grad_() for value in common_values
+    )
+    reused_inputs = tuple(value.clone().requires_grad_() for value in common_values)
+    reference_context = torch.rand(
+        2, 3, cfg.rgb_size, cfg.rgb_size, requires_grad=True
+    )
+    reused_context = reference_context.detach().clone().requires_grad_()
+
+    reference_output = reference(
+        *reference_inputs,
+        reference_context.index_select(0, context_indices),
+    )
+    reused_output = reused(
+        *reused_inputs,
+        reused_context,
+        context_indices,
+    )
+    for expected, actual in zip(reference_output, reused_output):
+        torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=2.0e-6)
+
+    reference_loss = sum(
+        (index + 1) * value.float().square().mean()
+        for index, value in enumerate(reference_output)
+    )
+    reused_loss = sum(
+        (index + 1) * value.float().square().mean()
+        for index, value in enumerate(reused_output)
+    )
+    reference_loss.backward()
+    reused_loss.backward()
+
+    for expected, actual in zip(reference_inputs, reused_inputs):
+        assert expected.grad is not None
+        assert actual.grad is not None
+        torch.testing.assert_close(
+            actual.grad, expected.grad, rtol=2.0e-4, atol=2.0e-6
+        )
+    assert reference_context.grad is not None
+    assert reused_context.grad is not None
+    torch.testing.assert_close(
+        reused_context.grad,
+        reference_context.grad,
+        rtol=2.0e-4,
+        atol=2.0e-6,
+    )
+    reference_parameters = dict(reference.named_parameters())
+    reused_parameters = dict(reused.named_parameters())
+    assert reference_parameters.keys() == reused_parameters.keys()
+    for name, expected in reference_parameters.items():
+        actual = reused_parameters[name]
+        assert expected.grad is not None, name
+        assert actual.grad is not None, name
+        torch.testing.assert_close(
+            actual.grad,
+            expected.grad,
+            rtol=2.0e-4,
+            atol=2.0e-6,
+            msg=lambda message, parameter_name=name: (
+                f"{parameter_name}: {message}"
+            ),
+        )
 
 
 def test_context_renderer_rgb_loss_reaches_per_view_p256_appearance_lane() -> None:
@@ -1357,7 +1521,7 @@ def test_appearance_action_conditioning_is_centered_and_spatially_resolved() -> 
     try:
         model(**zero_action, appearance_teacher_ratio=0.0)
         zero_call_count = len(observed)
-        assert zero_call_count == cfg.K + 1
+        assert zero_call_count == cfg.K
         assert all(value.count_nonzero() == 0 for value in observed)
         assert all(value.count_nonzero() == 0 for value in updates)
         factual = model(**batch, appearance_teacher_ratio=0.0)
