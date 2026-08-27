@@ -1724,6 +1724,13 @@ class NativeContextRGBImageDecoder(nn.Module):
         self.appearance_delta_projections = nn.ModuleList(
             nn.Sequential(
                 nn.Conv2d(channels[0], output_channels, 1, bias=False),
+            )
+            for output_channels in (
+                channels[1:] if cfg.rgb_context_appearance_delta_scale > 0.0 else ()
+            )
+        )
+        self.appearance_delta_activations = nn.ModuleList(
+            nn.Sequential(
                 nn.GroupNorm(
                     _rgb_norm_groups(output_channels), output_channels, affine=False
                 ),
@@ -1875,6 +1882,17 @@ class NativeContextRGBImageDecoder(nn.Module):
                     align_corners=False,
                 ).to(dtype=tokens.dtype)
 
+        # A bias-free pointwise projection commutes with bilinear resize.
+        # Project once on the token grid so high-resolution stages resize only
+        # their required channel width.  GroupNorm and SiLU remain after each
+        # resize because their spatial semantics must not move.
+        projected_appearance_deltas: tuple[torch.Tensor, ...] = ()
+        if appearance_delta is not None:
+            projected_appearance_deltas = tuple(
+                projection(appearance_delta)
+                for projection in self.appearance_delta_projections
+            )
+
         context = context_rgb.to(dtype=value.dtype)
         skips = [self.context_stem(context)]
         for downsample in self.context_downs:
@@ -1892,12 +1910,12 @@ class NativeContextRGBImageDecoder(nn.Module):
             value = fuse(torch.cat((value, skip), dim=1))
             if appearance_delta is not None:
                 delta_at_scale = F.interpolate(
-                    appearance_delta.float(),
+                    projected_appearance_deltas[stage_index].float(),
                     size=value.shape[-2:],
                     mode="bilinear",
                     align_corners=False,
                 ).to(dtype=value.dtype)
-                delta_at_scale = self.appearance_delta_projections[stage_index](
+                delta_at_scale = self.appearance_delta_activations[stage_index](
                     delta_at_scale
                 )
                 value = value + delta_scale * torch.tanh(delta_at_scale)
