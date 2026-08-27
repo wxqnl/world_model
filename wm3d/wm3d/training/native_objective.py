@@ -22,6 +22,10 @@ class NativeObjectiveError(ValueError):
 class NativeObjectiveConfig:
     token_mse: float = 1.0
     token_cosine: float = 0.1
+    appearance_l1: float = 0.0
+    appearance_teacher_l1: float = 0.0
+    appearance_autoregressive_l1: float = 0.0
+    appearance_motion_l1: float = 0.0
     appearance_mse: float = 0.0
     appearance_cosine: float = 0.0
     appearance_motion_mse: float = 0.0
@@ -603,6 +607,10 @@ def compute_native_objective(
             epsilon=epsilon,
             absolute_error=False,
         )
+    appearance_l1 = zero
+    appearance_teacher_l1 = zero
+    appearance_autoregressive_l1 = zero
+    appearance_motion_l1 = zero
     appearance_mse = zero
     appearance_cosine = zero
     appearance_motion_mse = zero
@@ -616,6 +624,10 @@ def compute_native_objective(
     appearance_loss_enabled = any(
         weight > 0.0
         for weight in (
+            config.appearance_l1,
+            config.appearance_teacher_l1,
+            config.appearance_autoregressive_l1,
+            config.appearance_motion_l1,
             config.appearance_mse,
             config.appearance_cosine,
             config.appearance_motion_mse,
@@ -636,13 +648,19 @@ def compute_native_objective(
                 "appearance prediction, target and mask must be provided together"
             )
         appearance_prediction = output["appearance_pred_tokens"]
-        appearance_target = batch["target_appearance_tokens"]
-        if appearance_prediction.shape != appearance_target.shape:
+        raw_appearance_target = batch["target_appearance_tokens"]
+        if appearance_prediction.shape != raw_appearance_target.shape:
             raise NativeObjectiveError("appearance prediction/target shapes differ")
+        appearance_target = F.layer_norm(
+            raw_appearance_target.float(), (raw_appearance_target.shape[-1],)
+        ).to(dtype=appearance_prediction.dtype)
         appearance_mask = batch["target_appearance_mask"].bool()
         if "appearance_pred_mask" in output:
             appearance_mask = appearance_mask & output["appearance_pred_mask"].bool()
         appearance_error = appearance_prediction - appearance_target
+        appearance_l1 = _masked_mean(
+            appearance_error.abs(), appearance_mask[..., None], epsilon=epsilon
+        )
         appearance_mse = _masked_mean(
             appearance_error.square(), appearance_mask[..., None], epsilon=epsilon
         )
@@ -656,8 +674,73 @@ def compute_native_objective(
         appearance_supervised = torch.broadcast_to(
             appearance_mask[..., None], appearance_target.shape
         ).sum().to(dtype=token_mse.dtype)
+
+        teacher_keys = (
+            "appearance_teacher_pred_tokens",
+            "appearance_teacher_pred_mask",
+        )
+        if any(name in output for name in teacher_keys):
+            if not all(name in output for name in teacher_keys):
+                raise NativeObjectiveError(
+                    "teacher-forced appearance prediction and mask must be paired"
+                )
+            teacher_prediction = output[teacher_keys[0]]
+            if teacher_prediction.shape != appearance_target.shape:
+                raise NativeObjectiveError(
+                    "teacher-forced appearance prediction/target shapes differ"
+                )
+            teacher_mask = appearance_mask & output[teacher_keys[1]].bool()
+            appearance_teacher_l1 = _masked_mean(
+                (teacher_prediction - appearance_target).abs(),
+                teacher_mask[..., None],
+                epsilon=epsilon,
+            )
+        elif config.appearance_teacher_l1 > 0.0:
+            raise NativeObjectiveError(
+                "teacher-forced appearance L1 requires its prediction path"
+            )
+
+        autoregressive_keys = (
+            "appearance_autoregressive_pred_tokens",
+            "appearance_autoregressive_pred_mask",
+        )
+        if any(name in output for name in autoregressive_keys):
+            if not all(name in output for name in autoregressive_keys):
+                raise NativeObjectiveError(
+                    "autoregressive appearance prediction and mask must be paired"
+                )
+            autoregressive_prediction = output[autoregressive_keys[0]]
+            rollout = int(autoregressive_prediction.shape[1])
+            if (
+                autoregressive_prediction.ndim != appearance_target.ndim
+                or rollout <= 0
+                or rollout > appearance_target.shape[1]
+                or autoregressive_prediction.shape[:1]
+                + autoregressive_prediction.shape[2:]
+                != appearance_target.shape[:1] + appearance_target.shape[2:]
+            ):
+                raise NativeObjectiveError(
+                    "autoregressive appearance prediction/target shapes differ"
+                )
+            autoregressive_mask = (
+                appearance_mask[:, :rollout]
+                & output[autoregressive_keys[1]].bool()
+            )
+            appearance_autoregressive_l1 = _masked_mean(
+                (
+                    autoregressive_prediction
+                    - appearance_target[:, :rollout]
+                ).abs(),
+                autoregressive_mask[..., None],
+                epsilon=epsilon,
+            )
+        elif config.appearance_autoregressive_l1 > 0.0:
+            raise NativeObjectiveError(
+                "autoregressive appearance L1 requires its prediction path"
+            )
         if (
-            config.appearance_motion_mse > 0.0
+            config.appearance_motion_l1 > 0.0
+            or config.appearance_motion_mse > 0.0
             or config.appearance_delta_cosine > 0.0
         ):
             required = (
@@ -688,11 +771,14 @@ def compute_native_objective(
                 raise NativeObjectiveError(
                     "appearance context and target view/patch/token shapes differ"
                 )
-            latest_context = torch.zeros_like(context_tokens[:, 0])
-            for index in range(int(context_tokens.shape[1])):
+            normalized_context = F.layer_norm(
+                context_tokens.float(), (context_tokens.shape[-1],)
+            ).to(dtype=appearance_prediction.dtype)
+            latest_context = torch.zeros_like(normalized_context[:, 0])
+            for index in range(int(normalized_context.shape[1])):
                 latest_context = torch.where(
                     context_mask[:, index, ..., None],
-                    context_tokens[:, index],
+                    normalized_context[:, index],
                     latest_context,
                 )
             context_token_valid = context_mask.any(dim=1)
@@ -764,6 +850,11 @@ def compute_native_objective(
             appearance_motion_fraction = _masked_mean(
                 motion_weight,
                 motion_valid,
+                epsilon=epsilon,
+            )
+            appearance_motion_l1 = _masked_mean(
+                appearance_error.abs(),
+                motion_weight[..., None],
                 epsilon=epsilon,
             )
             appearance_motion_mse = _masked_mean(
@@ -1105,6 +1196,10 @@ def compute_native_objective(
         "action_counterfactual_token_response_rms": (
             action_counterfactual_token_response_rms
         ),
+        "appearance_l1": appearance_l1,
+        "appearance_teacher_l1": appearance_teacher_l1,
+        "appearance_autoregressive_l1": appearance_autoregressive_l1,
+        "appearance_motion_l1": appearance_motion_l1,
         "appearance_mse": appearance_mse,
         "appearance_cosine": appearance_cosine,
         "appearance_motion_mse": appearance_motion_mse,
@@ -1184,6 +1279,10 @@ def compute_native_objective(
     total = (
         config.token_mse * token_mse
         + config.token_cosine * token_cosine
+        + config.appearance_l1 * appearance_l1
+        + config.appearance_teacher_l1 * appearance_teacher_l1
+        + config.appearance_autoregressive_l1 * appearance_autoregressive_l1
+        + config.appearance_motion_l1 * appearance_motion_l1
         + config.appearance_mse * appearance_mse
         + config.appearance_cosine * appearance_cosine
         + config.appearance_motion_mse * appearance_motion_mse

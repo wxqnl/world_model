@@ -62,6 +62,10 @@ EVAL_RECEIPT_SCHEMA = "wm3d_v8_unified_offline_eval_v2"
 _COVERAGE_WEIGHTS = {
     "native_token_supervised_elements": ("token_mse", "token_cosine"),
     "appearance_supervised_elements": (
+        "appearance_l1",
+        "appearance_teacher_l1",
+        "appearance_autoregressive_l1",
+        "appearance_motion_l1",
         "appearance_mse",
         "appearance_cosine",
         "appearance_motion_mse",
@@ -123,11 +127,18 @@ def declared_eval_coverage_lanes(
         "native_token_supervised_elements",
         "current_state_supervised_dimensions",
     }
-    if (
-        getattr(objective, "appearance_mse", 0.0) > 0.0
-        or getattr(objective, "appearance_cosine", 0.0) > 0.0
-        or getattr(objective, "appearance_motion_mse", 0.0) > 0.0
-        or getattr(objective, "appearance_delta_cosine", 0.0) > 0.0
+    if any(
+        getattr(objective, name, 0.0) > 0.0
+        for name in (
+            "appearance_l1",
+            "appearance_teacher_l1",
+            "appearance_autoregressive_l1",
+            "appearance_motion_l1",
+            "appearance_mse",
+            "appearance_cosine",
+            "appearance_motion_mse",
+            "appearance_delta_cosine",
+        )
     ):
         lanes.add("appearance_supervised_elements")
     for key, lane in (

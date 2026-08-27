@@ -49,6 +49,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "appearance_layers",
     "appearance_heads",
     "appearance_ff_mult",
+    "appearance_autoregressive_steps",
     "appearance_action_residual_scale",
     "policy_task_modulation",
     "factual_dynamics_repeats",
@@ -340,6 +341,13 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         )
     if optimizer.get("name") != "adamw":
         raise RuntimeContractError("optimizer.name must be adamw")
+    start_lr = float(optimizer.get("start_lr", 0.0))
+    peak_lr = float(optimizer["peak_lr"])
+    min_lr = float(optimizer["min_lr"])
+    if not 0.0 <= start_lr <= peak_lr or not 0.0 < min_lr <= peak_lr:
+        raise RuntimeContractError(
+            "optimizer learning rates must satisfy 0 <= start <= peak and 0 < min <= peak"
+        )
     if schedule.get("name") != "warmup_stable_cosine":
         raise RuntimeContractError("schedule.name must be warmup_stable_cosine")
     total_steps = int(train["total_steps"])

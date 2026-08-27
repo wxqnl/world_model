@@ -15,7 +15,6 @@ from wm3d.models.native_world_model import (
     ActionBlock,
     NativeWorldModel,
     NativeWorldModelConfig,
-    ZeroInitializedLinear,
 )
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.model_factory import validate_model_data_compatibility
@@ -840,9 +839,13 @@ def _take_appearance_output_step(
     model.train()
     optimizer = torch.optim.SGD((projection.weight,), lr=0.05)
     output = model(**batch, appearance_teacher_ratio=0.0)
+    normalized_target = torch.nn.functional.layer_norm(
+        batch["target_appearance_tokens"].float(),
+        (batch["target_appearance_tokens"].shape[-1],),
+    )
     loss = (
-        output["appearance_pred_tokens"] - batch["target_appearance_tokens"]
-    ).float().square().mean()
+        output["appearance_pred_tokens"].float() - normalized_target
+    ).square().mean()
     loss.backward()
     assert projection.weight.grad is not None
     assert torch.isfinite(projection.weight.grad).all()
@@ -852,31 +855,83 @@ def _take_appearance_output_step(
     model.train(was_training)
 
 
-def test_appearance_residual_projection_starts_at_exact_copy_last() -> None:
+def test_appearance_predictor_starts_normalized_without_copy_last_prior() -> None:
     cfg = _tiny_dual_path_config()
     model = NativeWorldModel(cfg).eval()
     batch = _dual_path_batch(cfg)
 
     output = model(**batch, appearance_teacher_ratio=0.0)
-    latest = batch["appearance_context_tokens"][:, -1]
-    expected = latest[:, None].expand_as(output["appearance_pred_tokens"])
-    torch.testing.assert_close(
-        output["appearance_pred_tokens"], expected, rtol=0, atol=0
+    latest = torch.nn.functional.layer_norm(
+        batch["appearance_context_tokens"][:, -1].float(),
+        (cfg.token_dim,),
     )
+    latest = latest[:, None].expand_as(output["appearance_pred_tokens"])
+    assert not torch.allclose(output["appearance_pred_tokens"], latest)
+
+    valid_prediction = output["appearance_pred_tokens"][
+        output["appearance_pred_mask"]
+    ].float()
+    torch.testing.assert_close(
+        valid_prediction.mean(dim=-1),
+        torch.zeros_like(valid_prediction[:, 0]),
+        atol=2.0e-5,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        valid_prediction.var(dim=-1, unbiased=False),
+        torch.ones_like(valid_prediction[:, 0]),
+        atol=2.0e-4,
+        rtol=0,
+    )
+    assert output["appearance_teacher_pred_tokens"].shape == output[
+        "appearance_pred_tokens"
+    ].shape
+    assert output["appearance_autoregressive_pred_tokens"].shape == output[
+        "appearance_pred_tokens"
+    ].shape
 
     assert model.appearance_dynamics is not None
     projection = model.appearance_dynamics.output
-    assert projection.weight.count_nonzero() == 0
-    torch.nn.init.normal_(projection.weight)
+    assert projection.weight.count_nonzero() > 0
+    projection.weight.data.zero_()
     projection.reset_parameters()
-    assert projection.weight.count_nonzero() == 0
-    with torch.device("meta"):
-        meta_projection = ZeroInitializedLinear(
-            cfg.appearance_hidden, cfg.token_dim, bias=False
-        )
-    meta_projection.to_empty(device=torch.device("cpu"))
-    meta_projection.reset_parameters()
-    assert meta_projection.weight.count_nonzero() == 0
+    assert projection.weight.count_nonzero() > 0
+
+
+def test_teacher_forced_appearance_is_one_step_causal() -> None:
+    cfg = _tiny_dual_path_config()
+    torch.manual_seed(30)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    baseline = model(**batch, appearance_teacher_ratio=1.0)
+
+    changed_last = dict(batch)
+    changed_last_target = batch["target_appearance_tokens"].clone()
+    changed_last_target[:, -1] = changed_last_target[:, -1].roll(1, dims=-1)
+    changed_last["target_appearance_tokens"] = changed_last_target
+    last_output = model(**changed_last, appearance_teacher_ratio=1.0)
+    torch.testing.assert_close(
+        baseline["appearance_teacher_pred_tokens"],
+        last_output["appearance_teacher_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+
+    changed_first = dict(batch)
+    changed_first_target = batch["target_appearance_tokens"].clone()
+    changed_first_target[:, 0] = changed_first_target[:, 0].roll(1, dims=-1)
+    changed_first["target_appearance_tokens"] = changed_first_target
+    first_output = model(**changed_first, appearance_teacher_ratio=1.0)
+    torch.testing.assert_close(
+        baseline["appearance_teacher_pred_tokens"][:, 0],
+        first_output["appearance_teacher_pred_tokens"][:, 0],
+        rtol=0,
+        atol=0,
+    )
+    assert not torch.allclose(
+        baseline["appearance_teacher_pred_tokens"][:, 1],
+        first_output["appearance_teacher_pred_tokens"][:, 1],
+    )
 
 
 def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> None:
@@ -901,7 +956,7 @@ def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> No
 
     changed = dict(batch)
     changed_target = batch["target_appearance_tokens"].clone()
-    changed_target[:, :, 1].add_(3.0)
+    changed_target[:, :, 1, :, 0].add_(3.0)
     changed["target_appearance_tokens"] = changed_target
     changed_teacher = model(**changed, appearance_teacher_ratio=1.0)
     torch.testing.assert_close(
@@ -1302,18 +1357,20 @@ def test_appearance_action_conditioning_is_centered_and_spatially_resolved() -> 
     try:
         model(**zero_action, appearance_teacher_ratio=0.0)
         zero_call_count = len(observed)
-        assert zero_call_count == 1
-        assert observed[0].count_nonzero() == 0
-        assert updates[0].count_nonzero() == 0
+        assert zero_call_count == cfg.K + 1
+        assert all(value.count_nonzero() == 0 for value in observed)
+        assert all(value.count_nonzero() == 0 for value in updates)
         factual = model(**batch, appearance_teacher_ratio=0.0)
     finally:
         input_handle.remove()
         output_handle.remove()
 
-    assert len(observed) == zero_call_count + 1
-    centered = observed[zero_call_count]
-    assert centered.count_nonzero() > 0
-    spatial_update = updates[zero_call_count]
+    assert len(observed) == 2 * zero_call_count
+    factual_observed = observed[zero_call_count:]
+    factual_updates = updates[zero_call_count:]
+    assert any(value.count_nonzero() > 0 for value in factual_observed)
+    centered = factual_observed[-1]
+    spatial_update = factual_updates[-1]
     assert spatial_update.count_nonzero() > 0
     flattened = spatial_update.flatten(2, 3)
     assert bool(flattened.var(dim=2).gt(0).any())

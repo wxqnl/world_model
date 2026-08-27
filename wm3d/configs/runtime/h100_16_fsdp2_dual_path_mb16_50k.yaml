@@ -40,6 +40,9 @@ train:
   appearance_validation_three_way: true
 optimizer:
   name: adamw
+  # Start at the stable floor instead of spending the whole 500-step canary
+  # near zero while retaining the formal-run warmup to peak.
+  start_lr: 0.000012
   peak_lr: 0.00012
   min_lr: 0.000012
   betas: [0.9, 0.95]

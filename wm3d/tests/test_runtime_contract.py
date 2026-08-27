@@ -14,7 +14,7 @@ from wm3d.training.runtime_contract import (
     validate_direct_raw_data_closure,
     validate_runtime_profile,
 )
-from wm3d.training.pretrain import _collate_and_trim
+from wm3d.training.pretrain import _collate_and_trim, _learning_rate
 from wm3d.data.step_sampler import ExactSourceSchedule
 
 
@@ -96,6 +96,23 @@ def test_cudnn_benchmark_is_an_optional_boolean_execution_tuning() -> None:
         invalid_value["train"]["cudnn_benchmark"] = invalid
         with pytest.raises(RuntimeContractError, match="cudnn_benchmark"):
             validate_runtime_profile(invalid_value)
+
+
+def test_nonzero_start_lr_survives_formal_warmup() -> None:
+    value = _load("h100_16_fsdp2_dual_path_mb16_50k.yaml")
+    validate_runtime_profile(value)
+    start = value["optimizer"]["start_lr"]
+    peak = value["optimizer"]["peak_lr"]
+    warmup = value["schedule"]["warmup_steps"]
+    assert _learning_rate(0, value) == pytest.approx(
+        start + (peak - start) / warmup
+    )
+    assert _learning_rate(warmup - 1, value) == pytest.approx(peak)
+
+    invalid = copy.deepcopy(value)
+    invalid["optimizer"]["start_lr"] = peak * 2
+    with pytest.raises(RuntimeContractError, match="learning rates"):
+        validate_runtime_profile(invalid)
 
 
 def test_runtime_does_not_contain_model_or_dataset_branch() -> None:
@@ -378,6 +395,7 @@ def test_streaming_data_contract_ignores_model_only_conditioning_scales() -> Non
             "render_factual_dynamics_repeats": 1,
             "render_factual_action_residual_scale": 0.0,
             "appearance_action_residual_scale": 0.5,
+            "appearance_autoregressive_steps": 2,
             "policy_task_modulation": True,
             "rgb_context_action_scale": 1.0,
             "rgb_context_appearance_delta_scale": 1.0,

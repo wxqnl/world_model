@@ -36,9 +36,10 @@ def test_1b_streaming_presets_use_dual_path_1b_and_saturating_batch() -> None:
         (ROOT / "configs/model/native_1b_dual_path.yaml").read_text()
     )
     validate_model_profile(model)
-    assert model["expected_parameter_count"] == 1_490_960_408
+    assert model["expected_parameter_count"] == 1_489_911_832
     assert model["model"]["P"] == 64
     assert model["model"]["appearance_P"] == 256
+    assert model["model"]["appearance_autoregressive_steps"] == 2
     assert model["model"]["rgb_decode_indices"] == list(range(8))
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75

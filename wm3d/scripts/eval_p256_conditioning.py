@@ -47,6 +47,9 @@ def _last_context(
             context_tokens[:, index],
             latest,
         )
+    latest = torch.nn.functional.layer_norm(
+        latest.float(), (latest.shape[-1],)
+    ).to(dtype=context_tokens.dtype)
     return latest[:, None].expand(-1, horizon, -1, -1, -1)
 
 
@@ -63,10 +66,10 @@ def _forward_with_variant(
     def replace(
         _module: torch.nn.Module,
         module_args: tuple[torch.Tensor, ...],
-        module_output: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        module_output: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
         nonlocal effective
-        predicted, predicted_mask = module_output
+        predicted, predicted_mask, *auxiliary = module_output
         context_tokens, context_mask = module_args[:2]
         if variant == "last_context":
             replacement = _last_context(
@@ -84,9 +87,12 @@ def _forward_with_variant(
                     device=predicted.device, dtype=predicted.dtype
                 )
         elif variant == "teacher":
-            replacement = batch["target_appearance_tokens"].to(
-                device=predicted.device, dtype=predicted.dtype
+            target = batch["target_appearance_tokens"].to(
+                device=predicted.device
             )
+            replacement = torch.nn.functional.layer_norm(
+                target.float(), (target.shape[-1],)
+            ).to(dtype=predicted.dtype)
         else:
             raise RuntimeError(f"unknown P256 audit variant: {variant}")
         if replacement.shape != predicted.shape:
@@ -100,7 +106,7 @@ def _forward_with_variant(
         replacement = replacement * replacement_mask[..., None].to(
             dtype=replacement.dtype
         )
-        return replacement, replacement_mask
+        return replacement, replacement_mask, *auxiliary
 
     handle = module.register_forward_hook(replace)
     try:
@@ -137,7 +143,10 @@ def _audited_forward(
         batch["appearance_context_mask"],
         int(prediction.shape[1]),
     )
-    target = batch["target_appearance_tokens"].to(dtype=prediction.dtype)
+    raw_target = batch["target_appearance_tokens"]
+    target = torch.nn.functional.layer_norm(
+        raw_target.float(), (raw_target.shape[-1],)
+    ).to(dtype=prediction.dtype)
     mask = prediction_mask & batch["target_appearance_mask"].bool()
     target_delta = target - last_context
     prediction_delta = prediction - last_context

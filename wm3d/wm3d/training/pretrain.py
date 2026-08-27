@@ -386,8 +386,10 @@ def _learning_rate(step: int, runtime: Mapping[str, Any]) -> float:
     warmup = int(schedule["warmup_steps"])
     peak = float(optimizer["peak_lr"])
     minimum = float(optimizer["min_lr"])
+    start = float(optimizer.get("start_lr", 0.0))
     if step < warmup:
-        return peak * float(step + 1) / float(max(1, warmup))
+        progress = float(step + 1) / float(max(1, warmup))
+        return start + (peak - start) * progress
     remaining = total - warmup
     stable = int(round(remaining * float(schedule["stable_fraction"])))
     decay_start = warmup + stable

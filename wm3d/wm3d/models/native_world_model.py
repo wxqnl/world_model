@@ -144,6 +144,7 @@ class NativeWorldModelConfig:
     appearance_layers: int = 2
     appearance_heads: int = 8
     appearance_ff_mult: float = 2.0
+    appearance_autoregressive_steps: int = 2
 
     dropout: float = 0.0
     activation_checkpointing: bool = True
@@ -275,6 +276,10 @@ class NativeWorldModelConfig:
                 or self.appearance_ff_mult <= 0
             ):
                 raise ValueError("appearance capacity/head fields are invalid")
+            if not 0 < self.appearance_autoregressive_steps <= self.K:
+                raise ValueError(
+                    "appearance_autoregressive_steps must lie within K"
+                )
             if self.appearance_P < self.P:
                 raise ValueError("appearance_P cannot be smaller than geometry P")
             if appearance_grid > self.rgb_size:
@@ -321,20 +326,6 @@ class RMSNorm(nn.Module):
             value_fp32.square().mean(-1, keepdim=True) + self.eps
         )
         return normalized.to(dtype=value.dtype) * self.weight
-
-
-class ZeroInitializedLinear(nn.Linear):
-    """Linear residual projection whose exact prior is the identity path.
-
-    FSDP2 materializes child modules independently and calls their
-    reset_parameters methods, so the initialization must live on the
-    projection itself rather than only in its parent module.
-    """
-
-    def reset_parameters(self) -> None:
-        nn.init.zeros_(self.weight)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
 
 
 class SwiGLU(nn.Module):
@@ -1053,7 +1044,7 @@ class AppearanceActionConditioner(nn.Module):
 
 
 class PerViewAppearanceDynamics(nn.Module):
-    """Predict unfused future view latents from view history and 3D dynamics."""
+    """Causal one-step appearance predictor with teacher-forced and AR paths."""
 
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
@@ -1075,10 +1066,7 @@ class PerViewAppearanceDynamics(nn.Module):
         self.patch_embed = nn.Parameter(
             torch.empty(1, 1, 1, cfg.appearance_P, cfg.appearance_hidden)
         )
-        self.future_seed = nn.Parameter(
-            torch.empty(1, cfg.K, 1, cfg.appearance_P, cfg.appearance_hidden)
-        )
-        for parameter in (self.view_embed, self.patch_embed, self.future_seed):
+        for parameter in (self.view_embed, self.patch_embed):
             nn.init.normal_(parameter, std=0.02)
         blocks: tuple[nn.Module, ...] = tuple(
             FactorizedAppearanceBlock(cfg) for _ in range(cfg.appearance_layers)
@@ -1087,20 +1075,21 @@ class PerViewAppearanceDynamics(nn.Module):
             blocks = tuple(checkpoint_wrapper(block) for block in blocks)
         self.blocks = nn.ModuleList(blocks)
         self.norm = RMSNorm(cfg.appearance_hidden)
-        # The prediction is added to the last observed P256 token. Starting
-        # this residual at zero preserves copy-last until evidence learns
-        # motion.
-        self.output = ZeroInitializedLinear(
-            cfg.appearance_hidden, cfg.token_dim, bias=False
-        )
+        self.output = nn.Linear(cfg.appearance_hidden, cfg.token_dim, bias=False)
 
     def reset_parameters(self) -> None:
-        for parameter in (self.view_embed, self.patch_embed, self.future_seed):
+        for parameter in (self.view_embed, self.patch_embed):
             nn.init.normal_(parameter, std=0.02)
+
+    @staticmethod
+    def _normalize_tokens(value: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(value.float(), (value.shape[-1],)).to(
+            dtype=value.dtype
+        )
 
     def _upsample_geometry(self, future_state: torch.Tensor) -> torch.Tensor:
         batch, horizon, patches, _ = future_state.shape
-        if (horizon, patches) != (self.cfg.K, self.cfg.P):
+        if patches != self.cfg.P:
             raise ValueError(
                 "future geometry shape is incompatible with appearance lane"
             )
@@ -1121,6 +1110,145 @@ class PerViewAppearanceDynamics(nn.Module):
             batch, horizon, self.cfg.appearance_P, self.cfg.appearance_hidden
         )
 
+    def _conditioned_sequence(
+        self,
+        tokens: torch.Tensor,
+        mask: torch.Tensor,
+        times: torch.Tensor,
+        *,
+        transition_start: int,
+        future_state: torch.Tensor,
+        future_time: torch.Tensor,
+        centered_action_tokens: Optional[torch.Tensor],
+        centered_action_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        batch, steps, _views, _patches, _token_dim = tokens.shape
+        transitions = steps - transition_start
+        if transitions <= 0 or tuple(future_state.shape[:2]) != (
+            batch,
+            transitions,
+        ):
+            raise ValueError("appearance transition sequence is misaligned")
+        if tuple(future_time.shape) != (batch, transitions):
+            raise ValueError("appearance transition times are misaligned")
+
+        value = self.input(tokens) + self.view_embed + self.patch_embed
+        prefix = value[:, :transition_start]
+        if transition_start:
+            prefix = prefix + self.time(times[:, :transition_start])[
+                :, :, None, None
+            ]
+        transition = value[:, transition_start:]
+        transition = transition + self.time(future_time)[:, :, None, None]
+        transition = transition + self._upsample_geometry(future_state)[:, :, None]
+        if self.action_conditioner is not None:
+            if centered_action_tokens is None or centered_action_mask is None:
+                raise ValueError(
+                    "appearance action conditioning requires centered grouped tokens"
+                )
+            transition = self.action_conditioner(
+                transition, centered_action_tokens, centered_action_mask
+            )
+        value = torch.cat((prefix, transition), dim=1)
+        value = value * mask[..., None].to(dtype=value.dtype)
+        for block in self.blocks:
+            value = block(value, mask)
+        return value
+
+    def _project(self, value: torch.Tensor) -> torch.Tensor:
+        return self._normalize_tokens(self.output(self.norm(value)))
+
+    def _teacher_forced(
+        self,
+        context_tokens: torch.Tensor,
+        context_mask: torch.Tensor,
+        context_time: torch.Tensor,
+        target_tokens: torch.Tensor,
+        target_mask: torch.Tensor,
+        future_state: torch.Tensor,
+        future_time: torch.Tensor,
+        centered_action_tokens: Optional[torch.Tensor],
+        centered_action_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        source_tokens = torch.cat(
+            (context_tokens, target_tokens[:, :-1]), dim=1
+        )
+        source_mask = torch.cat((context_mask, target_mask[:, :-1]), dim=1)
+        source_time = torch.cat((context_time, future_time[:, :-1]), dim=1)
+        transition_start = cfg.appearance_context_frames - 1
+        value = self._conditioned_sequence(
+            source_tokens,
+            source_mask,
+            source_time,
+            transition_start=transition_start,
+            future_state=future_state,
+            future_time=future_time,
+            centered_action_tokens=centered_action_tokens,
+            centered_action_mask=centered_action_mask,
+        )
+        prediction_mask = target_mask & source_mask[:, transition_start:]
+        prediction = self._project(value[:, transition_start:])
+        prediction = prediction * prediction_mask[..., None].to(
+            dtype=prediction.dtype
+        )
+        return prediction, prediction_mask
+
+    def _autoregressive(
+        self,
+        context_tokens: torch.Tensor,
+        context_mask: torch.Tensor,
+        context_time: torch.Tensor,
+        future_state: torch.Tensor,
+        future_time: torch.Tensor,
+        future_mask: torch.Tensor,
+        centered_action_tokens: Optional[torch.Tensor],
+        centered_action_mask: Optional[torch.Tensor],
+        *,
+        steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        history_tokens = context_tokens
+        history_mask = context_mask
+        history_time = context_time
+        predictions: list[torch.Tensor] = []
+        prediction_masks: list[torch.Tensor] = []
+        for index in range(steps):
+            value = self._conditioned_sequence(
+                history_tokens,
+                history_mask,
+                history_time,
+                transition_start=int(history_tokens.shape[1]) - 1,
+                future_state=future_state[:, index : index + 1],
+                future_time=future_time[:, index : index + 1],
+                centered_action_tokens=(
+                    None
+                    if centered_action_tokens is None
+                    else centered_action_tokens[:, index : index + 1]
+                ),
+                centered_action_mask=(
+                    None
+                    if centered_action_mask is None
+                    else centered_action_mask[:, index : index + 1]
+                ),
+            )
+            prediction_mask = future_mask[:, index] & history_mask[:, -1]
+            prediction = self._project(value[:, -1])
+            prediction = prediction * prediction_mask[..., None].to(
+                dtype=prediction.dtype
+            )
+            predictions.append(prediction)
+            prediction_masks.append(prediction_mask)
+            history_tokens = torch.cat((history_tokens, prediction[:, None]), dim=1)
+            history_mask = torch.cat(
+                (history_mask, prediction_mask[:, None]), dim=1
+            )
+            history_time = torch.cat(
+                (history_time, future_time[:, index : index + 1]), dim=1
+            )
+        return torch.stack(predictions, dim=1), torch.stack(
+            prediction_masks, dim=1
+        )
+
     def forward(
         self,
         context_tokens: torch.Tensor,
@@ -1130,7 +1258,16 @@ class PerViewAppearanceDynamics(nn.Module):
         future_mask: Optional[torch.Tensor] = None,
         centered_action_tokens: Optional[torch.Tensor] = None,
         centered_action_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        target_tokens: Optional[torch.Tensor] = None,
+        rollout_steps: Optional[int] = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         cfg = self.cfg
         expected = (
             context_tokens.shape[0],
@@ -1148,7 +1285,9 @@ class PerViewAppearanceDynamics(nn.Module):
             raise ValueError("appearance world times are incompatible with T/K")
         if future_mask is None:
             future_mask = (
-                context_mask.any(dim=1)[:, None].expand(-1, cfg.K, -1, -1).clone()
+                context_mask.any(dim=1)[:, None]
+                .expand(-1, cfg.K, -1, -1)
+                .clone()
             )
         elif tuple(future_mask.shape) != (
             batch,
@@ -1158,46 +1297,92 @@ class PerViewAppearanceDynamics(nn.Module):
         ):
             raise ValueError("appearance future mask must be [B,K,V,P]")
 
-        context_time = world_times_s[:, cfg.T - cfg.appearance_context_frames : cfg.T]
+        context_time = world_times_s[
+            :, cfg.T - cfg.appearance_context_frames : cfg.T
+        ]
         future_time = world_times_s[:, cfg.T :]
-        context = self.input(context_tokens)
-        context = context + self.time(context_time)[:, :, None, None]
-        context = context + self.view_embed + self.patch_embed
+        context_tokens = self._normalize_tokens(context_tokens)
+        context_tokens = context_tokens * context_mask[..., None].to(
+            dtype=context_tokens.dtype
+        )
+        if centered_action_tokens is not None and tuple(
+            centered_action_tokens.shape
+        ) != (
+            batch,
+            cfg.K,
+            cfg.max_action_groups,
+            cfg.state_hidden,
+        ):
+            raise ValueError("centered appearance action has incompatible shape")
+        steps = (
+            cfg.appearance_autoregressive_steps
+            if rollout_steps is None
+            else int(rollout_steps)
+        )
+        if target_tokens is None:
+            steps = cfg.K
+        if not 0 < steps <= cfg.K:
+            raise ValueError("appearance rollout steps must lie within K")
 
-        geometry = self._upsample_geometry(future_state)[:, :, None]
-        future = self.future_seed.expand(batch, -1, cfg.num_views, -1, -1)
-        future = future + geometry + self.time(future_time)[:, :, None, None]
-        future = future + self.view_embed + self.patch_embed
-        if self.action_conditioner is not None:
-            if centered_action_tokens is None or centered_action_mask is None:
-                raise ValueError(
-                    "appearance action conditioning requires centered grouped tokens"
-                )
-            if tuple(centered_action_tokens.shape) != (
+        teacher_prediction = context_tokens.new_empty(
+            batch, 0, cfg.num_views, cfg.appearance_P, cfg.token_dim
+        )
+        teacher_mask = context_mask.new_empty(
+            batch, 0, cfg.num_views, cfg.appearance_P
+        )
+        if target_tokens is not None:
+            expected_target = (
                 batch,
                 cfg.K,
-                cfg.max_action_groups,
-                cfg.state_hidden,
-            ):
-                raise ValueError("centered appearance action has incompatible shape")
-            future = self.action_conditioner(
-                future, centered_action_tokens, centered_action_mask
+                cfg.num_views,
+                cfg.appearance_P,
+                cfg.token_dim,
             )
-        value = torch.cat((context, future), dim=1)
-        mask = torch.cat((context_mask.bool(), future_mask.bool()), dim=1)
-        value = value * mask[..., None].to(dtype=value.dtype)
-        for block in self.blocks:
-            value = block(value, mask)
+            if tuple(target_tokens.shape) != expected_target:
+                raise ValueError(f"appearance target must be {expected_target}")
+            target_tokens = self._normalize_tokens(target_tokens)
+            target_tokens = target_tokens * future_mask[..., None].to(
+                dtype=target_tokens.dtype
+            )
+            teacher_prediction, teacher_mask = self._teacher_forced(
+                context_tokens,
+                context_mask.bool(),
+                context_time,
+                target_tokens,
+                future_mask.bool(),
+                future_state,
+                future_time,
+                centered_action_tokens,
+                centered_action_mask,
+            )
 
-        last_context = torch.zeros_like(context_tokens[:, 0])
-        for index in range(cfg.appearance_context_frames):
-            valid = context_mask[:, index, ..., None]
-            last_context = torch.where(valid, context_tokens[:, index], last_context)
-        future_value = value[:, -cfg.K :]
-        predicted = self.output(self.norm(future_value)) + last_context[:, None]
-        predicted = predicted * future_mask[..., None].to(dtype=predicted.dtype)
-        return predicted, future_mask.bool()
-
+        autoregressive_prediction, autoregressive_mask = self._autoregressive(
+            context_tokens,
+            context_mask.bool(),
+            context_time,
+            future_state,
+            future_time,
+            future_mask.bool(),
+            centered_action_tokens,
+            centered_action_mask,
+            steps=steps,
+        )
+        if steps == cfg.K:
+            predicted = autoregressive_prediction
+            predicted_mask = autoregressive_mask
+        elif target_tokens is not None:
+            predicted = teacher_prediction
+            predicted_mask = teacher_mask
+        else:
+            raise RuntimeError("partial target-free appearance rollout is invalid")
+        return (
+            predicted,
+            predicted_mask,
+            teacher_prediction,
+            teacher_mask,
+            autoregressive_prediction,
+            autoregressive_mask,
+        )
 
 class UnifiedActionHead(nn.Module):
     """The sole policy owner; semantic decoding is a deterministic transform."""
@@ -2521,6 +2706,10 @@ class NativeWorldModel(nn.Module):
         appearance_ratio = pred_tokens.new_zeros(())
         appearance_pred: Optional[torch.Tensor] = None
         appearance_pred_mask: Optional[torch.Tensor] = None
+        appearance_teacher_pred: Optional[torch.Tensor] = None
+        appearance_teacher_mask: Optional[torch.Tensor] = None
+        appearance_autoregressive_pred: Optional[torch.Tensor] = None
+        appearance_autoregressive_mask: Optional[torch.Tensor] = None
         if cfg.appearance_enabled:
             if (
                 self.appearance_dynamics is None
@@ -2530,28 +2719,10 @@ class NativeWorldModel(nn.Module):
                 raise ValueError(
                     "dual-path model requires appearance context tokens and mask"
                 )
-            appearance_context_for_rgb = torch.zeros_like(
-                appearance_context_tokens[:, 0]
-            )
-            for context_index in range(int(appearance_context_tokens.shape[1])):
-                appearance_context_for_rgb = torch.where(
-                    appearance_context_mask[:, context_index, ..., None].bool(),
-                    appearance_context_tokens[:, context_index],
-                    appearance_context_for_rgb,
-                )
-            appearance_pred, appearance_pred_mask = self.appearance_dynamics(
-                appearance_context_tokens,
-                appearance_context_mask,
-                render_future,
-                relative_world_time,
-                target_appearance_mask,
-                appearance_action_tokens,
-                appearance_action_mask,
-            )
             appearance_ratio = torch.as_tensor(
                 appearance_teacher_ratio,
-                dtype=appearance_pred.dtype,
-                device=appearance_pred.device,
+                dtype=pred_tokens.dtype,
+                device=pred_tokens.device,
             )
             if appearance_ratio.numel() != 1 or not bool(
                 ((appearance_ratio >= 0) & (appearance_ratio <= 1)).all()
@@ -2562,21 +2733,66 @@ class NativeWorldModel(nn.Module):
                     raise ValueError(
                         "teacher forcing requires target appearance tokens"
                     )
+            elif (
+                target_appearance_mask is None
+                or target_appearance_mask.shape
+                != target_appearance_tokens.shape[:-1]
+            ):
+                raise ValueError("target appearance mask must align to targets")
+
+            appearance_context_for_rgb = torch.zeros_like(
+                appearance_context_tokens[:, 0]
+            )
+            for context_index in range(int(appearance_context_tokens.shape[1])):
+                appearance_context_for_rgb = torch.where(
+                    appearance_context_mask[:, context_index, ..., None].bool(),
+                    appearance_context_tokens[:, context_index],
+                    appearance_context_for_rgb,
+                )
+            appearance_context_for_rgb = F.layer_norm(
+                appearance_context_for_rgb.float(),
+                (appearance_context_for_rgb.shape[-1],),
+            ).to(dtype=appearance_context_tokens.dtype)
+
+            rollout_steps = (
+                cfg.K
+                if target_appearance_tokens is None
+                or bool(appearance_ratio == 0)
+                else cfg.appearance_autoregressive_steps
+            )
+            (
+                appearance_pred,
+                appearance_pred_mask,
+                appearance_teacher_pred,
+                appearance_teacher_mask,
+                appearance_autoregressive_pred,
+                appearance_autoregressive_mask,
+            ) = self.appearance_dynamics(
+                appearance_context_tokens,
+                appearance_context_mask,
+                render_future,
+                relative_world_time,
+                target_appearance_mask,
+                appearance_action_tokens,
+                appearance_action_mask,
+                target_appearance_tokens,
+                rollout_steps,
+            )
+            if target_appearance_tokens is None:
                 appearance_for_rgb = appearance_pred
             else:
                 if target_appearance_tokens.shape != appearance_pred.shape:
                     raise ValueError(
                         "target appearance tokens must align to predictions"
                     )
-                if (
-                    target_appearance_mask is None
-                    or target_appearance_mask.shape != appearance_pred.shape[:-1]
-                ):
-                    raise ValueError("target appearance mask must align to predictions")
+                normalized_target = F.layer_norm(
+                    target_appearance_tokens.detach().float(),
+                    (target_appearance_tokens.shape[-1],),
+                ).to(dtype=appearance_pred.dtype)
                 appearance_for_rgb = torch.lerp(
                     appearance_pred,
-                    target_appearance_tokens.detach().to(dtype=appearance_pred.dtype),
-                    appearance_ratio,
+                    normalized_target,
+                    appearance_ratio.to(dtype=appearance_pred.dtype),
                 )
                 appearance_for_rgb = appearance_for_rgb * target_appearance_mask[
                     ..., None
@@ -2606,6 +2822,23 @@ class NativeWorldModel(nn.Module):
         if appearance_pred is not None and appearance_pred_mask is not None:
             output["appearance_pred_tokens"] = appearance_pred
             output["appearance_pred_mask"] = appearance_pred_mask
+        if (
+            appearance_teacher_pred is not None
+            and appearance_teacher_mask is not None
+            and appearance_teacher_pred.shape[1]
+        ):
+            output["appearance_teacher_pred_tokens"] = appearance_teacher_pred
+            output["appearance_teacher_pred_mask"] = appearance_teacher_mask
+        if (
+            appearance_autoregressive_pred is not None
+            and appearance_autoregressive_mask is not None
+        ):
+            output["appearance_autoregressive_pred_tokens"] = (
+                appearance_autoregressive_pred
+            )
+            output["appearance_autoregressive_pred_mask"] = (
+                appearance_autoregressive_mask
+            )
         output.update(
             self.action_head(
                 policy_query,

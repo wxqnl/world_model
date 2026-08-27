@@ -46,10 +46,11 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_560_219_512
+    assert model["expected_parameter_count"] == 5_557_073_784
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_P"] == 256
+    assert model["model"]["appearance_autoregressive_steps"] == 2
     assert model["model"]["rgb_hidden"] == 1536
     assert model["model"]["rgb_res_blocks"] == 2
     assert model["model"]["rgb_decode_chunk_size"] == 2
@@ -74,9 +75,13 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert objective["objective"]["rgb_motion_l1"] == 1.0
     assert objective["objective"]["rgb_motion_bce"] == 0.03
     assert objective["objective"]["rgb_motion_dice"] == 0.03
-    assert objective["objective"]["appearance_mse"] == 1.0
-    assert objective["objective"]["appearance_cosine"] == 0.1
-    assert objective["objective"]["appearance_motion_mse"] == 1.0
+    assert objective["objective"]["appearance_l1"] == 0.0
+    assert objective["objective"]["appearance_teacher_l1"] == 1.0
+    assert objective["objective"]["appearance_autoregressive_l1"] == 1.0
+    assert objective["objective"]["appearance_motion_l1"] == 0.5
+    assert objective["objective"]["appearance_mse"] == 0.0
+    assert objective["objective"]["appearance_cosine"] == 0.0
+    assert objective["objective"]["appearance_motion_mse"] == 0.0
     assert objective["objective"]["appearance_delta_cosine"] == 0.0
     assert runtime["expected_world_size"] == 64
     assert runtime["distributed"]["shard_degree"] == 8

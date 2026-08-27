@@ -102,14 +102,14 @@ def test_rgb_motion_objective_separates_static_and_changed_pixels() -> None:
     assert motion_logit.grad is not None and motion_logit.grad.abs().sum() > 0
 
 
-def test_appearance_motion_objective_supervises_future_p256_residual() -> None:
+def test_normalized_appearance_motion_l1_supervises_changed_patches() -> None:
     appearance_prediction = torch.zeros(1, 1, 1, 4, 2, requires_grad=True)
     with torch.no_grad():
-        appearance_prediction[0, 0, 0, 0] = torch.tensor([0.0, 1.0])
+        appearance_prediction[0, 0, 0, 0] = torch.tensor([-1.0, 1.0])
         # A large static-patch error must not leak into the motion-only metric.
         appearance_prediction[0, 0, 0, 1] = torch.tensor([10.0, 10.0])
     appearance_target = torch.zeros_like(appearance_prediction)
-    appearance_target[0, 0, 0, 0] = torch.tensor([1.0, 0.0])
+    appearance_target[0, 0, 0, 0] = torch.tensor([1.0, -1.0])
     target_rgb = torch.zeros(1, 1, 1, 3, 2, 2)
     target_rgb[..., 0, 0] = 1.0
     policy = torch.zeros(1, 1, 1, 1)
@@ -156,8 +156,7 @@ def test_appearance_motion_objective_supervises_future_p256_residual() -> None:
         config=NativeObjectiveConfig(
             token_mse=0.0,
             token_cosine=0.0,
-            appearance_motion_mse=1.0,
-            appearance_delta_cosine=1.0,
+            appearance_motion_l1=1.0,
             rgb_l1=0.0,
             rgb_charbonnier=0.0,
             rgb_gradient=0.0,
@@ -169,10 +168,16 @@ def test_appearance_motion_objective_supervises_future_p256_residual() -> None:
         ),
     )
 
+    expected = (
+        appearance_prediction[0, 0, 0, 0]
+        - torch.nn.functional.layer_norm(
+            appearance_target[0, 0, 0, 0],
+            (appearance_target.shape[-1],),
+        )
+    ).abs().mean()
     assert losses["appearance_motion_fraction"].item() == pytest.approx(0.25)
-    assert losses["appearance_motion_mse"].item() == pytest.approx(1.0)
-    assert losses["appearance_delta_cosine"].item() == pytest.approx(1.0)
-    assert losses["total"].item() == pytest.approx(2.0)
+    assert losses["appearance_motion_l1"].item() == pytest.approx(expected.item())
+    assert losses["total"].item() == pytest.approx(expected.item())
     losses["total"].backward()
     assert appearance_prediction.grad is not None
     assert appearance_prediction.grad[0, 0, 0, 0].abs().sum() > 0
@@ -594,7 +599,9 @@ def test_coarse_only_batch_has_zero_fine_count_but_nonzero_policy_gradient() -> 
         ),
         "action_normalization_offset": torch.zeros(batch_size, groups, action_dim),
         "action_normalization_scale": torch.ones(batch_size, groups, action_dim),
-        "target_appearance_tokens": torch.ones_like(appearance_pred),
+        "target_appearance_tokens": torch.tensor(
+            [1.0, -1.0, 1.0, -1.0]
+        ).view(1, 1, 1, 1, token_dim).expand_as(appearance_pred).clone(),
         "target_appearance_mask": torch.ones_like(appearance_pred[..., 0], dtype=torch.bool),
     }
     losses = compute_native_objective(
