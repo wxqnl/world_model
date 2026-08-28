@@ -25,6 +25,9 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS
+from wm3d.models.latent_motion_renderer import (
+    NativeLatentFlowRGBDecoder,
+)
 
 
 NATIVE_WORLD_MODEL_SCHEMA = "wm3d_native_world_model_v2"
@@ -132,6 +135,14 @@ class NativeWorldModelConfig:
     # every decoder scale.  This prevents the full-resolution context skips
     # from becoming a complete shortcut around future appearance dynamics.
     rgb_context_appearance_delta_scale: float = 0.0
+    # The latent-flow renderer replaces raw, unaligned RGB skips with a frozen
+    # reconstructable codec and an explicitly warped latent feature pyramid.
+    rgb_renderer_mode: str = "native"
+    rgb_latent_channels: int = 16
+    rgb_latent_grid: int = 32
+    rgb_latent_hidden: int = 384
+    rgb_flow_max_pixels: float = 128.0
+    rgb_tokenizer_spatial_compression: int = 8
     geom_hidden: int = 768
 
     # Optional high-resolution, per-view appearance lane.  The geometry/action
@@ -260,6 +271,29 @@ class NativeWorldModelConfig:
             raise ValueError(
                 "rgb_context_appearance_delta_scale requires context RGB and appearance"
             )
+        if self.rgb_renderer_mode not in {"native", "latent_flow"}:
+            raise ValueError("rgb_renderer_mode must be native or latent_flow")
+        if self.rgb_renderer_mode == "latent_flow":
+            if not self.appearance_enabled or not self.rgb_context_enabled:
+                raise ValueError(
+                    "latent-flow RGB requires appearance tokens and context RGB"
+                )
+            if self.rgb_latent_channels <= 0 or self.rgb_latent_grid <= 0:
+                raise ValueError("RGB latent channels/grid must be positive")
+            if self.rgb_latent_hidden <= 0 or self.rgb_latent_hidden % 6:
+                raise ValueError("rgb_latent_hidden must be positive and divisible by 6")
+            if (
+                not isfinite(self.rgb_flow_max_pixels)
+                or self.rgb_flow_max_pixels <= 0.0
+            ):
+                raise ValueError("rgb_flow_max_pixels must be finite and positive")
+            if self.rgb_tokenizer_spatial_compression <= 0 or (
+                self.rgb_size // self.rgb_tokenizer_spatial_compression
+                != self.rgb_latent_grid
+            ):
+                raise ValueError(
+                    "RGB tokenizer compression/grid must exactly cover rgb_size"
+                )
         if not isinstance(self.appearance_enabled, bool):
             raise ValueError("appearance_enabled must be boolean")
         if self.appearance_enabled:
@@ -2395,7 +2429,13 @@ class NativeWorldModel(nn.Module):
         )
         self.action_head = UnifiedActionHead(cfg)
         self.geometry_head = NativeGeometryHead(cfg)
-        self.rgb_head = NativeRGBDecoder(cfg)
+        if cfg.rgb_renderer_mode == "latent_flow":
+            latent_renderer: nn.Module = NativeLatentFlowRGBDecoder(cfg)
+            if cfg.activation_checkpointing:
+                latent_renderer = checkpoint_wrapper(latent_renderer)
+            self.rgb_head = latent_renderer
+        else:
+            self.rgb_head = NativeRGBDecoder(cfg)
 
         self._action_steps = [
             (cfg.action_layers * (index + 1) // cfg.state_layers)
@@ -2493,6 +2533,135 @@ class NativeWorldModel(nn.Module):
             (state[:, : cfg.T] + summary[:, :, None], state[:, cfg.T :]), dim=1
         )
 
+    def _forward_teacher_rgb_renderer(
+        self,
+        *,
+        world_times_s: torch.Tensor,
+        task_embedding: torch.Tensor,
+        future_factual_fine_action_values: torch.Tensor,
+        future_factual_fine_action_mask: torch.Tensor,
+        future_factual_fine_action_dt: torch.Tensor,
+        future_factual_fine_sample_mask: torch.Tensor,
+        future_factual_coarse_action_values: torch.Tensor,
+        future_factual_coarse_action_mask: torch.Tensor,
+        action_group_ids: torch.Tensor,
+        action_group_mask: torch.Tensor,
+        action_semantic_ids: torch.Tensor,
+        embodiment_ids: torch.Tensor,
+        appearance_context_tokens: Optional[torch.Tensor],
+        appearance_context_mask: Optional[torch.Tensor],
+        target_appearance_tokens: Optional[torch.Tensor],
+        target_appearance_mask: Optional[torch.Tensor],
+        teacher_geometry_tokens: Optional[torch.Tensor],
+        context_rgb_latent: Optional[torch.Tensor],
+        rgb_frame_indices: Optional[Sequence[int]],
+        rgb_view_mask: Optional[torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Train the renderer against true future visual state, bypassing dynamics."""
+
+        cfg = self.cfg
+        if cfg.rgb_renderer_mode != "latent_flow":
+            raise ValueError("Teacher RGB-only mode requires the latent-flow renderer")
+        if (
+            appearance_context_tokens is None
+            or appearance_context_mask is None
+            or target_appearance_tokens is None
+            or target_appearance_mask is None
+            or teacher_geometry_tokens is None
+            or context_rgb_latent is None
+        ):
+            raise ValueError(
+                "Teacher RGB-only mode requires appearance, geometry and RGB latent inputs"
+            )
+        batch = target_appearance_tokens.shape[0]
+        expected_target = (
+            batch,
+            cfg.K,
+            cfg.num_views,
+            cfg.appearance_P,
+            cfg.token_dim,
+        )
+        if tuple(target_appearance_tokens.shape) != expected_target:
+            raise ValueError(f"Teacher appearance targets must be {expected_target}")
+        if target_appearance_mask.shape != target_appearance_tokens.shape[:-1]:
+            raise ValueError("Teacher appearance target mask must align to targets")
+        if tuple(teacher_geometry_tokens.shape) != (
+            batch,
+            cfg.K,
+            cfg.P,
+            cfg.token_dim,
+        ):
+            raise ValueError("Teacher geometry tokens must be [B,K,P,token_dim]")
+        if appearance_context_mask.shape != appearance_context_tokens.shape[:-1]:
+            raise ValueError("Teacher appearance context mask is incompatible")
+
+        context_appearance = torch.zeros_like(appearance_context_tokens[:, 0])
+        for context_index in range(int(appearance_context_tokens.shape[1])):
+            context_appearance = torch.where(
+                appearance_context_mask[:, context_index, ..., None].bool(),
+                appearance_context_tokens[:, context_index],
+                context_appearance,
+            )
+        context_appearance = F.layer_norm(
+            context_appearance.float(), (context_appearance.shape[-1],)
+        ).to(dtype=target_appearance_tokens.dtype)
+        future_appearance = F.layer_norm(
+            target_appearance_tokens.detach().float(),
+            (target_appearance_tokens.shape[-1],),
+        ).to(dtype=target_appearance_tokens.dtype)
+        future_appearance = future_appearance * target_appearance_mask[
+            ..., None
+        ].to(dtype=future_appearance.dtype)
+
+        def action_summary(
+            fine_values: torch.Tensor,
+            coarse_values: torch.Tensor,
+        ) -> torch.Tensor:
+            encoded, encoded_mask = self.factual_action(
+                fine_values=fine_values,
+                fine_dim_mask=future_factual_fine_action_mask,
+                fine_dt=future_factual_fine_action_dt,
+                fine_sample_mask=future_factual_fine_sample_mask,
+                coarse_values=coarse_values,
+                coarse_dim_mask=future_factual_coarse_action_mask,
+                action_semantic_ids=action_semantic_ids,
+                group_ids=action_group_ids,
+                group_mask=action_group_mask,
+                embodiment_ids=embodiment_ids,
+            )
+            weight = encoded_mask[..., None].to(dtype=encoded.dtype)
+            return (encoded * weight).sum(dim=2) / weight.sum(dim=2).clamp_min(1.0)
+
+        factual_summary = action_summary(
+            future_factual_fine_action_values,
+            future_factual_coarse_action_values,
+        )
+        zero_summary = action_summary(
+            torch.zeros_like(future_factual_fine_action_values),
+            torch.zeros_like(future_factual_coarse_action_values),
+        )
+        relative_time = self._validate_world_times(world_times_s, batch)
+        renderer_output = self.rgb_head(
+            appearance_tokens=future_appearance,
+            appearance_context_tokens=context_appearance,
+            geometry_tokens=teacher_geometry_tokens.detach(),
+            factual_action_summary=factual_summary - zero_summary,
+            task_embedding=task_embedding,
+            future_times_s=relative_time[:, cfg.T :],
+            context_latent=context_rgb_latent,
+            frame_indices=rgb_frame_indices,
+            target_view_mask=rgb_view_mask,
+        )
+        empty_rgb = target_appearance_tokens.new_empty(
+            batch, 0, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+        )
+        return {
+            **renderer_output,
+            "rgb": empty_rgb,
+            "appearance_teacher_ratio": target_appearance_tokens.new_ones(()),
+            "rgb_renderer_teacher_only": target_appearance_tokens.new_ones(()),
+        }
+
     def forward(
         self,
         *,
@@ -2534,10 +2703,44 @@ class NativeWorldModel(nn.Module):
         appearance_context_mask: Optional[torch.Tensor] = None,
         target_appearance_tokens: Optional[torch.Tensor] = None,
         target_appearance_mask: Optional[torch.Tensor] = None,
+        teacher_geometry_tokens: Optional[torch.Tensor] = None,
+        context_rgb_latent: Optional[torch.Tensor] = None,
         appearance_teacher_ratio: float | torch.Tensor = 0.0,
         compute_zero_action_control: bool = False,
+        rgb_teacher_renderer_only: bool = False,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
+        if not isinstance(rgb_teacher_renderer_only, bool):
+            raise ValueError("rgb_teacher_renderer_only must be boolean")
+        if rgb_teacher_renderer_only:
+            return self._forward_teacher_rgb_renderer(
+                world_times_s=world_times_s,
+                task_embedding=task_embedding,
+                future_factual_fine_action_values=(
+                    future_factual_fine_action_values
+                ),
+                future_factual_fine_action_mask=future_factual_fine_action_mask,
+                future_factual_fine_action_dt=future_factual_fine_action_dt,
+                future_factual_fine_sample_mask=future_factual_fine_sample_mask,
+                future_factual_coarse_action_values=(
+                    future_factual_coarse_action_values
+                ),
+                future_factual_coarse_action_mask=(
+                    future_factual_coarse_action_mask
+                ),
+                action_group_ids=action_group_ids,
+                action_group_mask=action_group_mask,
+                action_semantic_ids=action_semantic_ids,
+                embodiment_ids=embodiment_ids,
+                appearance_context_tokens=appearance_context_tokens,
+                appearance_context_mask=appearance_context_mask,
+                target_appearance_tokens=target_appearance_tokens,
+                target_appearance_mask=target_appearance_mask,
+                teacher_geometry_tokens=teacher_geometry_tokens,
+                context_rgb_latent=context_rgb_latent,
+                rgb_frame_indices=rgb_frame_indices,
+                rgb_view_mask=rgb_view_mask,
+            )
         expected_world = (cfg.T, cfg.num_views, cfg.P, cfg.token_dim)
         if tuple(world_tokens.shape[1:]) != expected_world:
             raise ValueError(f"world_tokens suffix must be {expected_world}")
@@ -2976,6 +3179,32 @@ class NativeWorldModel(nn.Module):
             )
         )
         output.update(self.geometry_head(render_future))
+        if cfg.rgb_renderer_mode == "latent_flow":
+            if (
+                appearance_for_rgb is None
+                or appearance_context_for_rgb is None
+                or rgb_action_summary is None
+                or context_rgb_latent is None
+            ):
+                raise ValueError(
+                    "latent-flow RGB requires appearance, action and context latent"
+                )
+            latent_output = self.rgb_head(
+                appearance_tokens=appearance_for_rgb,
+                appearance_context_tokens=appearance_context_for_rgb,
+                geometry_tokens=render_pred_tokens,
+                factual_action_summary=rgb_action_summary,
+                task_embedding=task_embedding,
+                future_times_s=relative_world_time[:, cfg.T :],
+                context_latent=context_rgb_latent,
+                frame_indices=rgb_frame_indices,
+                target_view_mask=rgb_view_mask,
+            )
+            output.update(latent_output)
+            output["rgb"] = pred_tokens.new_empty(
+                batch, 0, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+            )
+            return output
         rgb, rgb_indices, rgb_motion_logit, rgb_blend = self._run(
             self.rgb_head,
             render_pred_tokens,
@@ -3011,7 +3240,10 @@ class NativeWorldModel(nn.Module):
         yield from self.dynamics_blocks
         if self.appearance_dynamics is not None:
             yield from self.appearance_dynamics.blocks
-        yield self.rgb_head.image_decoder
+        if self.cfg.rgb_renderer_mode == "latent_flow":
+            yield self.rgb_head
+        else:
+            yield self.rgb_head.image_decoder
         yield self.geometry_head
 
     def iter_activation_checkpoint_units(self) -> Iterable[nn.Module]:
@@ -3025,7 +3257,10 @@ class NativeWorldModel(nn.Module):
         yield from self.dynamics_blocks
         if self.appearance_dynamics is not None:
             yield from self.appearance_dynamics.blocks
-        yield self.rgb_head.image_decoder
+        if self.cfg.rgb_renderer_mode == "latent_flow":
+            yield self.rgb_head
+        else:
+            yield self.rgb_head.image_decoder
 
     def parameter_counts(self) -> dict[str, int]:
         groups: dict[str, nn.Module] = {

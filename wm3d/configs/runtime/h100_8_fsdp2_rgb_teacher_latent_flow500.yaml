@@ -1,0 +1,82 @@
+schema: wm3d_v8_runtime_profile_v1
+name: h100_8_fsdp2_rgb_teacher_latent_flow500
+expected_world_size: 8
+distributed:
+  strategy: fsdp2
+  initialization: meta_sharded
+  shard_degree: 8
+  param_dtype: bf16
+  reduce_dtype: fp32
+  output_dtype: bf16
+  reshard_after_forward: false
+  find_unused_parameters: false
+  broadcast_buffers: false
+  timeout_minutes: 30
+resources:
+  gpu_name_substring: H100
+  minimum_gpu_memory_mib: 80000
+  require_zero_uncorrected_ecc: true
+  require_idle_gpu: true
+  require_full_local_nvlink_clique: true
+  minimum_ib_rate_gbps: 400
+  forbid_nccl_ib_disable: true
+  minimum_memlock_bytes: 1073741824
+  minimum_nofile: 1048576
+  minimum_shm_bytes: 34359738368
+  minimum_data_free_bytes: 53687091200
+  minimum_output_free_bytes: 21474836480
+  minimum_allreduce_gbps: 100
+  maximum_preflight_age_seconds: 1800
+train:
+  micro_batch_size: 1
+  validation_micro_batch_size: 1
+  gradient_accumulation: 1
+  global_batch_size: 8
+  total_steps: 500
+  seed: 3407
+  validation_seed: 7340
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
+  gradient_clip: 1.0
+  log_every: 5
+  validate_every: 100
+  validation_steps: 5
+  checkpoint_interval: 500
+  checkpoint_steps: [1, 20, 100, 250, 500]
+  activation_checkpointing: false
+  rgb_decode_chunk_size: 8
+  rgb_teacher_renderer_only: true
+  rgb_teacher_warmstart_checkpoint: /data/Minko/wm3d_formal_1b_p256_norml1_causalar_operatoropt_2node16_20260827/training/checkpoints/step_00002000
+  rgb_tokenizer:
+    source_root: /data/Minko/external/cosmos-predict2
+    checkpoint: /data/Minko/models/cosmos_predict2_2b_ac/tokenizer/tokenizer.pth
+    encode_chunk: 4
+    decode_chunk: 2
+    latent_channels: 16
+    spatial_compression: 8
+  rgb_flow_teacher:
+    source_root: /data/Minko/external/WorldArena/video_quality/WorldArena/third_party/RAFT
+    checkpoint: /data/Minko/models/worldarena_v1/raft/RAFT/models/raft-things.pth
+    input_size: 256
+    iterations: 12
+    output_grid: 32
+    batch_chunk: 4
+    flow_max_pixels: 128.0
+    consistency_relative: 0.01
+    consistency_absolute: 0.5
+optimizer:
+  name: adamw
+  start_lr: 0.00002
+  peak_lr: 0.0002
+  min_lr: 0.00002
+  betas: [0.9, 0.95]
+  eps: 0.00000001
+  weight_decay: 0.05
+schedule:
+  name: warmup_stable_cosine
+  warmup_steps: 20
+  stable_fraction: 0.6
+checkpoint:
+  allow_topology_reshard: false
+  async_save: false

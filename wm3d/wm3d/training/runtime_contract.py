@@ -31,6 +31,10 @@ from wm3d.models.model_factory import (
 )
 from wm3d.training.distributed_runtime import strategy_from_mapping
 from wm3d.training.native_objective import objective_config_from_mapping
+from wm3d.training.rgb_latent_runtime import (
+    cosmos_config_from_mapping,
+    raft_config_from_mapping,
+)
 
 
 RUNTIME_PROFILE_SCHEMA = "wm3d_v8_runtime_profile_v1"
@@ -61,6 +65,12 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "rgb_context_motion_blend_gain",
     "rgb_context_action_scale",
     "rgb_context_appearance_delta_scale",
+    "rgb_renderer_mode",
+    "rgb_latent_channels",
+    "rgb_latent_grid",
+    "rgb_latent_hidden",
+    "rgb_flow_max_pixels",
+    "rgb_tokenizer_spatial_compression",
 }
 
 
@@ -221,6 +231,10 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "appearance_teacher_decay_steps",
         "appearance_teacher0_every_steps",
         "appearance_validation_three_way",
+        "rgb_teacher_renderer_only",
+        "rgb_teacher_warmstart_checkpoint",
+        "rgb_tokenizer",
+        "rgb_flow_teacher",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
@@ -338,6 +352,54 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
     if appearance_validation_three_way and not present_appearance_schedule:
         raise RuntimeContractError(
             "three-way appearance validation requires an appearance teacher schedule"
+        )
+    rgb_teacher_only = train.get("rgb_teacher_renderer_only", False)
+    if not isinstance(rgb_teacher_only, bool):
+        raise RuntimeContractError("train.rgb_teacher_renderer_only must be boolean")
+    rgb_teacher_fields = {
+        "rgb_teacher_warmstart_checkpoint",
+        "rgb_tokenizer",
+        "rgb_flow_teacher",
+    }
+    present_rgb_teacher_fields = rgb_teacher_fields & set(train)
+    if rgb_teacher_only:
+        if present_rgb_teacher_fields != rgb_teacher_fields:
+            raise RuntimeContractError(
+                "Teacher RGB-only runtime requires warmstart, tokenizer and flow teacher"
+            )
+        warmstart = Path(str(train["rgb_teacher_warmstart_checkpoint"]))
+        if not warmstart.is_absolute() or re.fullmatch(
+            r"step_[0-9]{8}", warmstart.name
+        ) is None:
+            raise RuntimeContractError(
+                "Teacher RGB warmstart must be an absolute numbered checkpoint"
+            )
+        tokenizer_mapping = train["rgb_tokenizer"]
+        flow_mapping = train["rgb_flow_teacher"]
+        if not isinstance(tokenizer_mapping, dict) or not isinstance(
+            flow_mapping, dict
+        ):
+            raise RuntimeContractError(
+                "Teacher RGB tokenizer/flow configs must be mappings"
+            )
+        try:
+            tokenizer_cfg = cosmos_config_from_mapping(tokenizer_mapping)
+            flow_cfg = raft_config_from_mapping(flow_mapping)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeContractError("Teacher RGB target runtime is invalid") from exc
+        for path in (
+            tokenizer_cfg.source_root,
+            tokenizer_cfg.checkpoint,
+            flow_cfg.source_root,
+            flow_cfg.checkpoint,
+        ):
+            if not Path(path).is_absolute():
+                raise RuntimeContractError(
+                    "Teacher RGB target runtime paths must be absolute"
+                )
+    elif present_rgb_teacher_fields:
+        raise RuntimeContractError(
+            "Teacher RGB target runtimes cannot be configured while the stage is disabled"
         )
     if optimizer.get("name") != "adamw":
         raise RuntimeContractError("optimizer.name must be adamw")

@@ -75,6 +75,12 @@ from wm3d.training.resource_preflight import (
     validate_current_rank_identities,
     validate_resource_receipt,
 )
+from wm3d.training.rgb_latent_runtime import (
+    FrozenBidirectionalRAFTRuntime,
+    FrozenCosmosRGBTokenizerRuntime,
+    cosmos_config_from_mapping,
+    raft_config_from_mapping,
+)
 from wm3d.training.launch_qualification import (
     LaunchQualificationError,
     build_launch_qualification,
@@ -442,6 +448,7 @@ _MODEL_INPUTS = {
 _APPEARANCE_MODEL_INPUTS = (
     "context_rgb",
     "context_rgb_mask",
+    "context_rgb_latent",
     "appearance_context_tokens",
     "appearance_context_mask",
     "target_appearance_tokens",
@@ -516,6 +523,7 @@ def _forward(
     *,
     appearance_teacher_ratio: float = 0.0,
     compute_zero_action_control: bool = False,
+    rgb_teacher_renderer_only: bool = False,
 ) -> Mapping[str, torch.Tensor]:
     indices = batch["rgb_frame_indices"]
     if indices.ndim != 2 or not bool((indices == indices[:1]).all()):
@@ -536,6 +544,13 @@ def _forward(
             kwargs[name] = batch[name]
     if "appearance_context_tokens" in batch:
         kwargs["appearance_teacher_ratio"] = appearance_teacher_ratio
+    if rgb_teacher_renderer_only:
+        if "target_tokens" not in batch or "context_rgb_latent" not in batch:
+            raise PretrainError(
+                "Teacher RGB-only forward requires geometry targets and context latent"
+            )
+        kwargs["teacher_geometry_tokens"] = batch["target_tokens"]
+        kwargs["rgb_teacher_renderer_only"] = True
     if compute_zero_action_control:
         kwargs["compute_zero_action_control"] = True
     return model(**kwargs)
@@ -568,15 +583,21 @@ def _forward_with_action_counterfactual(
     *,
     appearance_teacher_ratio: float,
     objective: Any,
+    rgb_teacher_renderer_only: bool = False,
 ) -> Mapping[str, torch.Tensor]:
+    forward_options = {
+        "appearance_teacher_ratio": appearance_teacher_ratio,
+        "compute_zero_action_control": (
+            objective.action_counterfactual_token_advantage > 0.0
+        ),
+    }
+    if rgb_teacher_renderer_only:
+        forward_options["rgb_teacher_renderer_only"] = True
     output = dict(
         _forward(
             model,
             batch,
-            appearance_teacher_ratio=appearance_teacher_ratio,
-            compute_zero_action_control=(
-                objective.action_counterfactual_token_advantage > 0.0
-            ),
+            **forward_options,
         )
     )
     if not _action_counterfactual_enabled(objective):
@@ -586,13 +607,35 @@ def _forward_with_action_counterfactual(
             raise PretrainError("model did not return the zero-action token control")
     if objective.action_counterfactual_rgb_advantage > 0.0:
         with torch.no_grad():
+            zero_options = {
+                "appearance_teacher_ratio": appearance_teacher_ratio,
+            }
+            if rgb_teacher_renderer_only:
+                zero_options["rgb_teacher_renderer_only"] = True
             zero_output = _forward(
                 model,
                 _zero_future_factual_action(batch),
-                appearance_teacher_ratio=appearance_teacher_ratio,
+                **zero_options,
             )
         output["zero_action_rgb"] = zero_output["rgb"].detach()
     return output
+
+
+def _materialize_rgb_latent_targets(
+    batch: Mapping[str, Any],
+    *,
+    tokenizer: FrozenCosmosRGBTokenizerRuntime | None,
+    flow_teacher: FrozenBidirectionalRAFTRuntime | None,
+) -> dict[str, Any]:
+    if tokenizer is None and flow_teacher is None:
+        return dict(batch)
+    if tokenizer is None or flow_teacher is None:
+        raise PretrainError(
+            "latent RGB training requires both Cosmos and bidirectional RAFT"
+        )
+    value = tokenizer.materialize_batch(batch)
+    value.update(flow_teacher.targets(value["context_rgb"], value["target_rgb"]))
+    return value
 
 
 def _build_mixed_dataset(
@@ -849,6 +892,8 @@ def _validate(
     context: Any,
     input_adapter: Any | None = None,
     training_step: int = 0,
+    rgb_tokenizer: FrozenCosmosRGBTokenizerRuntime | None = None,
+    rgb_flow_teacher: FrozenBidirectionalRAFTRuntime | None = None,
 ) -> dict[str, Any]:
     count = int(runtime_profile["train"]["validation_steps"])
     loader = _make_loader(
@@ -863,8 +908,18 @@ def _validate(
         gradient_accumulation=1,
         micro_batch_size=_validation_micro_batch_size(runtime_profile),
     )
-    settings = [("teacher0", 0.0)]
-    if bool(runtime_profile["train"].get("appearance_validation_three_way", False)):
+    rgb_teacher_only = bool(
+        runtime_profile["train"].get("rgb_teacher_renderer_only", False)
+    )
+    settings = [("teacher1", 1.0)] if rgb_teacher_only else [("teacher0", 0.0)]
+    if (
+        not rgb_teacher_only
+        and bool(
+            runtime_profile["train"].get(
+                "appearance_validation_three_way", False
+            )
+        )
+    ):
         settings.extend(
             (
                 (
@@ -882,6 +937,11 @@ def _validate(
         if input_adapter is not None:
             cpu_batch = input_adapter.materialize(cpu_batch)
         batch = _batch_to_device(cpu_batch, context.device)
+        batch = _materialize_rgb_latent_targets(
+            batch,
+            tokenizer=rgb_tokenizer,
+            flow_teacher=rgb_flow_teacher,
+        )
         for label, ratio in settings:
             with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
                 losses = compute_native_objective(
@@ -890,6 +950,7 @@ def _validate(
                         batch,
                         appearance_teacher_ratio=ratio,
                         objective=objective,
+                        rgb_teacher_renderer_only=rgb_teacher_only,
                     ),
                     batch=batch,
                     config=objective,
@@ -909,7 +970,7 @@ def _validate(
         )
         for label, label_totals in totals.items()
     }
-    result: dict[str, Any] = dict(reduced["teacher0"])
+    result: dict[str, Any] = dict(reduced[settings[0][0]])
     if len(settings) > 1:
         result["appearance_three_way"] = {
             label: {"teacher_ratio": ratio, "metrics": reduced[label]}
@@ -922,8 +983,9 @@ def _run_contract(
     config: Mapping[str, Any],
     parameter_counts: Mapping[str, int],
     native_model: NativeWorldModel,
+    warmstart_model: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    contract = {
         "schema": RUN_CONTRACT_SCHEMA,
         "name": config["run"]["name"],
         "lineage": config["run"]["lineage"],
@@ -938,6 +1000,9 @@ def _run_contract(
         "parameter_counts": dict(parameter_counts),
         "required_gradient_owners": list(required_gradient_owner_names(native_model)),
     }
+    if warmstart_model is not None:
+        contract["warmstart_model"] = dict(warmstart_model)
+    return contract
 
 
 def _resume_expectations(
@@ -1218,6 +1283,29 @@ def main() -> None:
             )
             input_adapter.eval()
 
+        rgb_teacher_only = bool(
+            runtime["train"].get("rgb_teacher_renderer_only", False)
+        )
+        rgb_tokenizer: FrozenCosmosRGBTokenizerRuntime | None = None
+        rgb_flow_teacher: FrozenBidirectionalRAFTRuntime | None = None
+        if rgb_teacher_only:
+            tokenizer_mapping = runtime["train"].get("rgb_tokenizer")
+            flow_mapping = runtime["train"].get("rgb_flow_teacher")
+            if not isinstance(tokenizer_mapping, Mapping) or not isinstance(
+                flow_mapping, Mapping
+            ):
+                raise PretrainError(
+                    "Teacher RGB-only training requires tokenizer and flow configs"
+                )
+            rgb_tokenizer = FrozenCosmosRGBTokenizerRuntime(
+                cosmos_config_from_mapping(tokenizer_mapping),
+                context.device,
+            )
+            rgb_flow_teacher = FrozenBidirectionalRAFTRuntime(
+                raft_config_from_mapping(flow_mapping),
+                context.device,
+            )
+
         seed = int(runtime["train"]["seed"])
         _configure_reproducibility(
             seed,
@@ -1253,6 +1341,13 @@ def main() -> None:
         if not isinstance(model, NativeWorldModel):
             raise PretrainError("unified pretrain currently requires native_world_model")
         native_model = model
+        if rgb_teacher_only:
+            if native_model.cfg.rgb_renderer_mode != "latent_flow":
+                raise PretrainError(
+                    "Teacher RGB-only runtime requires a latent-flow model profile"
+                )
+            native_model.requires_grad_(False)
+            native_model.rgb_head.requires_grad_(True)
         parameter_counts = native_model.parameter_counts()
         wrapped = wrap_model(
             model,
@@ -1263,9 +1358,28 @@ def main() -> None:
             ),
         )
         model = wrapped.model
+        warmstart_model: Mapping[str, Any] | None = None
+        warmstart_path = runtime["train"].get("rgb_teacher_warmstart_checkpoint")
+        if warmstart_path is not None:
+            source_path = Path(str(warmstart_path)).resolve(strict=True)
+            source_manager = DistributedCheckpointManager(source_path.parent)
+            warmstart_model = source_manager.load_model_warmstart(
+                path=source_path,
+                model=model,
+                new_parameter_prefixes=("rgb_head.",),
+            )
+        elif rgb_teacher_only:
+            raise PretrainError(
+                "Teacher RGB-only training requires an explicit committed warmstart"
+            )
         optimizer_cfg = runtime["optimizer"]
+        optimizer_parameters = tuple(
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        )
+        if not optimizer_parameters:
+            raise PretrainError("training stage has no trainable parameters")
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            optimizer_parameters,
             lr=float(optimizer_cfg["peak_lr"]),
             betas=tuple(float(value) for value in optimizer_cfg["betas"]),
             eps=float(optimizer_cfg["eps"]),
@@ -1285,7 +1399,12 @@ def main() -> None:
                 output_root.mkdir(parents=True, exist_ok=True)
                 if output_root.is_symlink():
                     raise PretrainError("output root cannot be a symlink")
-                contract = _run_contract(config, parameter_counts, native_model)
+                contract = _run_contract(
+                    config,
+                    parameter_counts,
+                    native_model,
+                    warmstart_model=warmstart_model,
+                )
                 _atomic_json_no_clobber(output_root / "run_contract.json", contract)
                 status[0] = {"ok": True, "contract": contract}
             except Exception as exc:
@@ -1432,6 +1551,11 @@ def main() -> None:
                     batch = _batch_to_device(cpu_batch, context.device)
                 else:
                     batch = async_pipeline.consume()
+                batch = _materialize_rgb_latent_targets(
+                    batch,
+                    tokenizer=rgb_tokenizer,
+                    flow_teacher=rgb_flow_teacher,
+                )
                 unique = torch.unique(batch["source_id"])
                 if unique.numel() != 1:
                     raise PretrainError("one micro-batch mixed multiple sources")
@@ -1454,6 +1578,7 @@ def main() -> None:
                                     step, runtime
                                 ),
                                 objective=objective,
+                                rgb_teacher_renderer_only=rgb_teacher_only,
                             ),
                             batch=batch,
                             config=objective,
@@ -1541,6 +1666,8 @@ def main() -> None:
                     context,
                     input_adapter=input_adapter,
                     training_step=completed,
+                    rgb_tokenizer=rgb_tokenizer,
+                    rgb_flow_teacher=rgb_flow_teacher,
                 )
                 if context.is_rank0:
                     record = {"step": completed, "validation": validation}

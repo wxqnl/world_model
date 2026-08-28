@@ -40,6 +40,16 @@ class NativeObjectiveConfig:
     rgb_motion_pos_weight: float = 1.0
     rgb_motion_threshold: float = 0.03
     rgb_motion_gain: float = 3.0
+    rgb_latent_charbonnier: float = 0.0
+    rgb_latent_delta: float = 0.0
+    rgb_latent_temporal_delta: float = 0.0
+    rgb_flow_teacher: float = 0.0
+    rgb_flow_smoothness: float = 0.0
+    rgb_disocclusion_bce: float = 0.0
+    rgb_disocclusion_dice: float = 0.0
+    rgb_disocclusion_pos_weight: float = 1.0
+    rgb_visible_warp: float = 0.0
+    rgb_disocclusion_synthesis: float = 0.0
     depth_log: float = 1.5
     point: float = 0.5
     camera_pose: float = 0.1
@@ -65,6 +75,10 @@ class NativeObjectiveConfig:
             raise NativeObjectiveError("rgb_motion_pos_weight must be positive")
         if self.rgb_motion_threshold <= 0.0:
             raise NativeObjectiveError("rgb_motion_threshold must be positive")
+        if self.rgb_disocclusion_pos_weight <= 0.0:
+            raise NativeObjectiveError(
+                "rgb_disocclusion_pos_weight must be positive"
+            )
         if self.action_velocity != 0.0:
             raise NativeObjectiveError(
                 "action_velocity must remain 0: mixed delta/absolute semantics and "
@@ -196,6 +210,271 @@ def _charbonnier(value: torch.Tensor, epsilon: float) -> torch.Tensor:
 
 def _image_gradient(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return value[..., 1:, :] - value[..., :-1, :], value[..., :, 1:] - value[..., :, :-1]
+
+
+def _compute_latent_rgb_objective(
+    *,
+    output: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+    config: NativeObjectiveConfig,
+    zero: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    names = (
+        "rgb_latent_charbonnier",
+        "rgb_latent_delta",
+        "rgb_latent_temporal_delta",
+        "rgb_flow_teacher",
+        "rgb_flow_epe",
+        "rgb_flow_smoothness",
+        "rgb_disocclusion_bce",
+        "rgb_disocclusion_dice",
+        "rgb_disocclusion_fraction",
+        "rgb_visible_warp",
+        "rgb_disocclusion_synthesis",
+        "rgb_latent_supervised_elements",
+    )
+    result = {name: zero for name in names}
+    weights = (
+        config.rgb_latent_charbonnier,
+        config.rgb_latent_delta,
+        config.rgb_latent_temporal_delta,
+        config.rgb_flow_teacher,
+        config.rgb_flow_smoothness,
+        config.rgb_disocclusion_bce,
+        config.rgb_disocclusion_dice,
+        config.rgb_visible_warp,
+        config.rgb_disocclusion_synthesis,
+    )
+    enabled = any(weight > 0.0 for weight in weights)
+    has_latent = "rgb_latent" in output or "target_rgb_latent" in batch
+    if not enabled:
+        if has_latent and not (
+            "rgb_latent" in output and "target_rgb_latent" in batch
+        ):
+            raise NativeObjectiveError(
+                "latent RGB prediction and target must be provided together"
+            )
+        return result
+    required_output = (
+        "rgb_latent",
+        "rgb_flow_pixels",
+        "rgb_disocclusion_logit",
+        "rgb_warped_latent",
+        "rgb_synthesis_latent",
+        "rgb_warp_valid",
+    )
+    required_batch = (
+        "target_rgb_latent",
+        "context_rgb_latent",
+        "target_rgb",
+        "context_rgb",
+        "rgb_flow_target_pixels",
+        "rgb_disocclusion_target",
+    )
+    missing = [
+        name
+        for name in (*required_output, *required_batch)
+        if name not in output and name not in batch
+    ]
+    if missing:
+        raise NativeObjectiveError(
+            "latent RGB objective requires " + ", ".join(missing)
+        )
+
+    prediction = output["rgb_latent"]
+    target = batch["target_rgb_latent"].to(dtype=prediction.dtype)
+    if prediction.shape != target.shape or prediction.ndim != 6:
+        raise NativeObjectiveError(
+            "latent RGB prediction/target must align as [B,F,V,C,H,W]"
+        )
+    context = batch["context_rgb_latent"].to(dtype=prediction.dtype)
+    if context.shape != prediction.shape[:1] + prediction.shape[2:]:
+        raise NativeObjectiveError("context RGB latent must be [B,V,C,H,W]")
+    rgb_mask = batch.get(
+        "target_rgb_mask",
+        torch.ones(
+            prediction.shape[:3] + (1, 1, 1),
+            dtype=torch.bool,
+            device=prediction.device,
+        ),
+    ).bool()
+    if rgb_mask.shape != prediction.shape[:3] + (1, 1, 1):
+        raise NativeObjectiveError("latent RGB mask must be [B,F,V,1,1,1]")
+    context_mask = batch.get(
+        "context_rgb_mask",
+        torch.ones(
+            prediction.shape[0],
+            prediction.shape[2],
+            dtype=torch.bool,
+            device=prediction.device,
+        ),
+    ).bool()
+    if context_mask.shape != prediction.shape[:1] + prediction.shape[2:3]:
+        raise NativeObjectiveError("context RGB latent mask must be [B,V]")
+    valid = rgb_mask & context_mask[:, None, :, None, None, None]
+
+    target_rgb = batch["target_rgb"].float()
+    context_rgb = batch["context_rgb"].float()
+    if target_rgb.shape[:3] != prediction.shape[:3] or (
+        context_rgb.shape[:2] != prediction.shape[:1] + prediction.shape[2:3]
+    ):
+        raise NativeObjectiveError("RGB motion targets do not align to latents")
+    motion = (target_rgb - context_rgb[:, None]).abs().mean(dim=3, keepdim=True)
+    motion = F.adaptive_avg_pool2d(
+        motion.reshape(-1, 1, *motion.shape[-2:]),
+        output_size=prediction.shape[-2:],
+    ).reshape(prediction.shape[:3] + (1,) + prediction.shape[-2:])
+    motion_weight = 1.0 + config.rgb_motion_gain * (
+        motion > config.rgb_motion_threshold
+    ).to(dtype=prediction.dtype)
+
+    latent_error = prediction - target
+    result["rgb_latent_charbonnier"] = _masked_mean(
+        _charbonnier(latent_error, config.rgb_charbonnier_epsilon) * motion_weight,
+        valid,
+        epsilon=config.epsilon,
+    )
+    expanded_context = context[:, None].expand_as(prediction)
+    result["rgb_latent_delta"] = _masked_mean(
+        _charbonnier(
+            (prediction - expanded_context) - (target - expanded_context),
+            config.rgb_charbonnier_epsilon,
+        )
+        * motion_weight,
+        valid,
+        epsilon=config.epsilon,
+    )
+    if prediction.shape[1] > 1:
+        temporal_valid = valid[:, 1:] & valid[:, :-1]
+        temporal_error = (prediction[:, 1:] - prediction[:, :-1]) - (
+            target[:, 1:] - target[:, :-1]
+        )
+        result["rgb_latent_temporal_delta"] = _masked_mean(
+            _charbonnier(temporal_error, config.rgb_charbonnier_epsilon),
+            temporal_valid,
+            epsilon=config.epsilon,
+        )
+
+    flow = output["rgb_flow_pixels"].float()
+    flow_target = batch["rgb_flow_target_pixels"].float()
+    if flow.shape != flow_target.shape or flow.shape != (
+        *prediction.shape[:3],
+        2,
+        *prediction.shape[-2:],
+    ):
+        raise NativeObjectiveError("RGB flow prediction/target shapes differ")
+    flow_delta = flow - flow_target
+    flow_epe_map = torch.sqrt(
+        flow_delta.square().sum(dim=3, keepdim=True)
+        + config.rgb_charbonnier_epsilon**2
+    )
+    flow_motion = motion_weight.to(dtype=flow_epe_map.dtype)
+    result["rgb_flow_teacher"] = _masked_mean(
+        flow_epe_map * flow_motion,
+        valid,
+        epsilon=config.epsilon,
+    )
+    result["rgb_flow_epe"] = _masked_mean(
+        flow_epe_map,
+        valid,
+        epsilon=config.epsilon,
+    )
+    flow_dy, flow_dx = _image_gradient(flow)
+    result["rgb_flow_smoothness"] = 0.5 * (
+        _masked_mean(
+            _charbonnier(flow_dy, config.rgb_charbonnier_epsilon),
+            valid,
+            epsilon=config.epsilon,
+        )
+        + _masked_mean(
+            _charbonnier(flow_dx, config.rgb_charbonnier_epsilon),
+            valid,
+            epsilon=config.epsilon,
+        )
+    )
+
+    disocclusion_target = batch["rgb_disocclusion_target"].float()
+    disocclusion_logit = output["rgb_disocclusion_logit"].float()
+    if disocclusion_logit.shape != disocclusion_target.shape or (
+        disocclusion_logit.shape
+        != prediction.shape[:3] + (1,) + prediction.shape[-2:]
+    ):
+        raise NativeObjectiveError("RGB disocclusion prediction/target shapes differ")
+    disocclusion_loss = F.binary_cross_entropy_with_logits(
+        disocclusion_logit,
+        disocclusion_target,
+        pos_weight=torch.as_tensor(
+            config.rgb_disocclusion_pos_weight,
+            dtype=disocclusion_logit.dtype,
+            device=disocclusion_logit.device,
+        ),
+        reduction="none",
+    )
+    result["rgb_disocclusion_bce"] = _masked_mean(
+        disocclusion_loss,
+        valid,
+        epsilon=config.epsilon,
+    )
+    probability = torch.sigmoid(disocclusion_logit)
+    valid_float = valid.to(dtype=probability.dtype)
+    intersection = (probability * disocclusion_target * valid_float).flatten(1).sum(1)
+    denominator = (
+        (probability + disocclusion_target) * valid_float
+    ).flatten(1).sum(1)
+    sample_valid = valid.flatten(1).any(1)
+    result["rgb_disocclusion_dice"] = _masked_mean(
+        1.0 - (2.0 * intersection + config.epsilon) / (
+            denominator + config.epsilon
+        ),
+        sample_valid,
+        epsilon=config.epsilon,
+    )
+    result["rgb_disocclusion_fraction"] = _masked_mean(
+        disocclusion_target,
+        valid,
+        epsilon=config.epsilon,
+    )
+
+    warp_valid = output["rgb_warp_valid"].bool()
+    visible = valid & warp_valid & (disocclusion_target < 0.5)
+    result["rgb_visible_warp"] = _masked_mean(
+        _charbonnier(
+            output["rgb_warped_latent"] - target,
+            config.rgb_charbonnier_epsilon,
+        ),
+        visible,
+        epsilon=config.epsilon,
+    )
+    synthesis_region = valid & (disocclusion_target >= 0.5)
+    result["rgb_disocclusion_synthesis"] = _masked_mean(
+        _charbonnier(
+            output["rgb_synthesis_latent"] - target,
+            config.rgb_charbonnier_epsilon,
+        ),
+        synthesis_region,
+        epsilon=config.epsilon,
+    )
+    result["rgb_latent_supervised_elements"] = torch.broadcast_to(
+        valid, prediction.shape
+    ).sum().to(dtype=zero.dtype)
+    return result
+
+
+def _latent_rgb_total(
+    losses: Mapping[str, torch.Tensor], config: NativeObjectiveConfig
+) -> torch.Tensor:
+    return (
+        config.rgb_latent_charbonnier * losses["rgb_latent_charbonnier"]
+        + config.rgb_latent_delta * losses["rgb_latent_delta"]
+        + config.rgb_latent_temporal_delta * losses["rgb_latent_temporal_delta"]
+        + config.rgb_flow_teacher * losses["rgb_flow_teacher"]
+        + config.rgb_flow_smoothness * losses["rgb_flow_smoothness"]
+        + config.rgb_disocclusion_bce * losses["rgb_disocclusion_bce"]
+        + config.rgb_disocclusion_dice * losses["rgb_disocclusion_dice"]
+        + config.rgb_visible_warp * losses["rgb_visible_warp"]
+        + config.rgb_disocclusion_synthesis
+        * losses["rgb_disocclusion_synthesis"]
+    )
 
 
 def _masked_rgb_perceptual(
@@ -571,6 +850,22 @@ def compute_native_objective(
     """Compute finite, mask-aware Stage0 world and policy losses."""
 
     config.validate()
+    if "rgb_renderer_teacher_only" in output:
+        zero = batch["target_tokens"].new_zeros(())
+        latent_losses = _compute_latent_rgb_objective(
+            output=output,
+            batch=batch,
+            config=config,
+            zero=zero,
+        )
+        total = _latent_rgb_total(latent_losses, config)
+        if not bool(torch.isfinite(total)):
+            raise FloatingPointError("WM3D Teacher RGB objective is non-finite")
+        return {
+            **latent_losses,
+            "appearance_teacher_ratio": output["appearance_teacher_ratio"],
+            "total": total,
+        }
     epsilon = config.epsilon
     target_tokens = batch["target_tokens"]
     token_mask = batch.get(
@@ -584,6 +879,12 @@ def compute_native_objective(
     token_cosine = _masked_mean(cosine, token_mask, epsilon=epsilon)
 
     zero = token_mse.new_zeros(())
+    latent_rgb_losses = _compute_latent_rgb_objective(
+        output=output,
+        batch=batch,
+        config=config,
+        zero=zero,
+    )
     zero_action_token_mse = zero
     action_counterfactual_token_gain = zero
     action_counterfactual_token_advantage = zero
@@ -1216,6 +1517,7 @@ def compute_native_objective(
         "rgb_motion_bce": rgb_motion_bce,
         "rgb_motion_dice": rgb_motion_dice,
         "rgb_motion_fraction": rgb_motion_fraction,
+        **latent_rgb_losses,
         "zero_action_rgb_l1": zero_action_rgb_l1,
         "action_counterfactual_rgb_gain": action_counterfactual_rgb_gain,
         "action_counterfactual_rgb_advantage": (
@@ -1294,6 +1596,7 @@ def compute_native_objective(
         + config.rgb_motion_l1 * rgb_motion_l1
         + config.rgb_motion_bce * rgb_motion_bce
         + config.rgb_motion_dice * rgb_motion_dice
+        + _latent_rgb_total(latent_rgb_losses, config)
         + config.depth_log * depth_log
         + config.point * point
         + config.camera_pose * camera_pose

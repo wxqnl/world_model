@@ -90,10 +90,7 @@ def _required_owner_parameters(
 def required_gradient_owner_names(model: NativeWorldModel) -> tuple[str, ...]:
     return tuple(
         name
-        for name in (
-            tuple(_required_owner_modules(model))
-            + tuple(_required_owner_parameters(model))
-        )
+        for name in _owner_parameters(model)
         if name not in _OPTIONAL_OWNERS
     )
 
@@ -102,19 +99,25 @@ def _owner_parameters(
     model: NativeWorldModel,
 ) -> Mapping[str, tuple[nn.Parameter, ...]]:
     owners = {
-        name: tuple(_unique_parameters(modules))
+        name: parameters
         for name, modules in _required_owner_modules(model).items()
+        if (parameters := tuple(_unique_parameters(modules)))
     }
     owners.update(
         {
-            name: tuple(parameter for parameter in parameters if parameter.requires_grad)
+            name: trainable
             for name, parameters in _required_owner_parameters(model).items()
+            if (
+                trainable := tuple(
+                    parameter for parameter in parameters if parameter.requires_grad
+                )
+            )
         }
     )
+    if not owners:
+        raise GradientOwnershipError("model has no trainable gradient owner")
     by_parameter: dict[int, list[str]] = {}
     for owner, parameters in owners.items():
-        if not parameters:
-            raise GradientOwnershipError(f"gradient owner {owner} has no parameters")
         for parameter in parameters:
             by_parameter.setdefault(id(parameter), []).append(owner)
     duplicated = {
