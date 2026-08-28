@@ -142,6 +142,9 @@ class NativeWorldModelConfig:
     rgb_latent_grid: int = 32
     rgb_latent_hidden: int = 384
     rgb_flow_max_pixels: float = 128.0
+    rgb_flow_correlation_channels: int = 64
+    rgb_flow_correlation_radius: int = 8
+    rgb_flow_correlation_temperature: float = 0.1
     rgb_tokenizer_spatial_compression: int = 8
     geom_hidden: int = 768
 
@@ -287,6 +290,25 @@ class NativeWorldModelConfig:
                 or self.rgb_flow_max_pixels <= 0.0
             ):
                 raise ValueError("rgb_flow_max_pixels must be finite and positive")
+            if (
+                self.rgb_flow_correlation_channels <= 0
+                or self.rgb_flow_correlation_channels > self.token_dim
+            ):
+                raise ValueError(
+                    "RGB flow correlation channels must lie in (0, token_dim]"
+                )
+            appearance_grid = isqrt(self.appearance_P)
+            if not 0 < self.rgb_flow_correlation_radius < appearance_grid:
+                raise ValueError(
+                    "RGB flow correlation radius must lie inside the appearance grid"
+                )
+            if (
+                not isfinite(self.rgb_flow_correlation_temperature)
+                or self.rgb_flow_correlation_temperature <= 0.0
+            ):
+                raise ValueError(
+                    "RGB flow correlation temperature must be finite and positive"
+                )
             if self.rgb_tokenizer_spatial_compression <= 0 or (
                 self.rgb_size // self.rgb_tokenizer_spatial_compression
                 != self.rgb_latent_grid

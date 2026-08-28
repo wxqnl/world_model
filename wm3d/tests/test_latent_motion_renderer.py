@@ -31,6 +31,9 @@ def _renderer_config() -> SimpleNamespace:
         rgb_latent_grid=4,
         rgb_latent_hidden=48,
         rgb_flow_max_pixels=32.0,
+        rgb_flow_correlation_channels=8,
+        rgb_flow_correlation_radius=1,
+        rgb_flow_correlation_temperature=0.1,
         rgb_size=32,
         rgb_decode_indices=(0, 1),
     )
@@ -84,7 +87,7 @@ def test_out_of_bounds_transport_is_forced_to_synthesis() -> None:
     decoder = NativeLatentFlowRGBDecoder(cfg).eval()
     with torch.no_grad():
         decoder.flow_head.weight.zero_()
-        decoder.flow_head.bias.fill_(10.0)
+        decoder.flow_head.bias.fill_(1.0e4)
         decoder.synthesis_head.weight.zero_()
         decoder.synthesis_head.bias.fill_(7.0)
 
@@ -114,6 +117,9 @@ def test_teacher_latent_objective_supervises_all_renderer_branches() -> None:
     mask_shape = (1, 2, 1, 1, 4, 4)
     prediction = torch.randn(shape, requires_grad=True)
     flow = torch.randn(flow_shape, requires_grad=True)
+    correlation_logits = torch.zeros(
+        1, 2, 1, 9, 2, 2, requires_grad=True
+    )
     disocclusion_logit = torch.zeros(mask_shape, requires_grad=True)
     warped = torch.randn(shape, requires_grad=True)
     synthesis = torch.randn(shape, requires_grad=True)
@@ -124,6 +130,7 @@ def test_teacher_latent_objective_supervises_all_renderer_branches() -> None:
         "appearance_teacher_ratio": torch.ones(()),
         "rgb_latent": prediction,
         "rgb_flow_pixels": flow,
+        "rgb_flow_correlation_logits": correlation_logits,
         "rgb_disocclusion_logit": disocclusion_logit,
         "rgb_warped_latent": warped,
         "rgb_synthesis_latent": synthesis,
@@ -137,18 +144,63 @@ def test_teacher_latent_objective_supervises_all_renderer_branches() -> None:
         "context_rgb": torch.rand(1, 1, 3, 8, 8),
         "target_rgb_mask": torch.ones(1, 2, 1, 1, 1, 1, dtype=torch.bool),
         "context_rgb_mask": torch.ones(1, 1, dtype=torch.bool),
-        "rgb_flow_target_pixels": torch.zeros(flow_shape),
+        "rgb_flow_target_pixels": torch.cat(
+            (
+                torch.full(flow_shape[:3] + (1, 4, 4), 4.0),
+                torch.zeros(flow_shape[:3] + (1, 4, 4)),
+            ),
+            dim=3,
+        ),
         "rgb_disocclusion_target": disocclusion_target,
     }
 
     losses = compute_native_objective(output=output, batch=batch, config=config)
     assert torch.isfinite(losses["total"])
+    assert losses["rgb_disocclusion_predicted_fraction"].item() == pytest.approx(0.5)
+    assert losses["rgb_disocclusion_fraction"].item() == pytest.approx(0.25)
+    assert losses["rgb_disocclusion_calibration"].item() == pytest.approx(0.25)
     losses["total"].backward()
 
-    for value in (prediction, flow, disocclusion_logit, warped, synthesis):
+    for value in (
+        prediction,
+        flow,
+        correlation_logits,
+        disocclusion_logit,
+        warped,
+        synthesis,
+    ):
         assert value.grad is not None
         assert torch.isfinite(value.grad).all()
         assert value.grad.abs().sum() > 0
+
+
+def test_reconstruction_cannot_expand_disocclusion_mask() -> None:
+    cfg = _renderer_config()
+    decoder = NativeLatentFlowRGBDecoder(cfg).train()
+    output = decoder(**_renderer_inputs(cfg), frame_indices=(0,))
+
+    output["rgb_latent"].sum().backward()
+
+    assert decoder.disocclusion_head.weight.grad is None
+    assert decoder.disocclusion_head.bias.grad is None
+    assert decoder.synthesis_head.weight.grad is not None
+    assert decoder.synthesis_head.weight.grad.abs().sum() > 0
+
+
+def test_renderer_emits_relative_p256_cost_volume() -> None:
+    cfg = _renderer_config()
+    decoder = NativeLatentFlowRGBDecoder(cfg).eval()
+    output = decoder(**_renderer_inputs(cfg), frame_indices=(0, 1))
+
+    assert output["rgb_flow_correlation_logits"].shape == (
+        1,
+        2,
+        cfg.num_views,
+        9,
+        2,
+        2,
+    )
+    assert torch.isfinite(output["rgb_flow_correlation_logits"]).all()
 
 
 def test_teacher_runtime_profile_is_sealed_and_valid() -> None:

@@ -44,9 +44,11 @@ class NativeObjectiveConfig:
     rgb_latent_delta: float = 0.0
     rgb_latent_temporal_delta: float = 0.0
     rgb_flow_teacher: float = 0.0
+    rgb_flow_correlation: float = 0.0
     rgb_flow_smoothness: float = 0.0
     rgb_disocclusion_bce: float = 0.0
     rgb_disocclusion_dice: float = 0.0
+    rgb_disocclusion_calibration: float = 0.0
     rgb_disocclusion_pos_weight: float = 1.0
     rgb_visible_warp: float = 0.0
     rgb_disocclusion_synthesis: float = 0.0
@@ -224,11 +226,18 @@ def _compute_latent_rgb_objective(
         "rgb_latent_delta",
         "rgb_latent_temporal_delta",
         "rgb_flow_teacher",
+        "rgb_flow_correlation",
+        "rgb_flow_correlation_accuracy",
         "rgb_flow_epe",
+        "rgb_flow_prediction_magnitude",
+        "rgb_flow_target_magnitude",
+        "rgb_flow_magnitude_ratio",
         "rgb_flow_smoothness",
         "rgb_disocclusion_bce",
         "rgb_disocclusion_dice",
+        "rgb_disocclusion_calibration",
         "rgb_disocclusion_fraction",
+        "rgb_disocclusion_predicted_fraction",
         "rgb_visible_warp",
         "rgb_disocclusion_synthesis",
         "rgb_latent_supervised_elements",
@@ -239,9 +248,11 @@ def _compute_latent_rgb_objective(
         config.rgb_latent_delta,
         config.rgb_latent_temporal_delta,
         config.rgb_flow_teacher,
+        config.rgb_flow_correlation,
         config.rgb_flow_smoothness,
         config.rgb_disocclusion_bce,
         config.rgb_disocclusion_dice,
+        config.rgb_disocclusion_calibration,
         config.rgb_visible_warp,
         config.rgb_disocclusion_synthesis,
     )
@@ -263,6 +274,8 @@ def _compute_latent_rgb_objective(
         "rgb_synthesis_latent",
         "rgb_warp_valid",
     )
+    if config.rgb_flow_correlation > 0.0:
+        required_output = (*required_output, "rgb_flow_correlation_logits")
     required_batch = (
         "target_rgb_latent",
         "context_rgb_latent",
@@ -379,6 +392,21 @@ def _compute_latent_rgb_objective(
         valid,
         epsilon=config.epsilon,
     )
+    flow_magnitude = flow.square().sum(dim=3, keepdim=True).sqrt()
+    target_flow_magnitude = flow_target.square().sum(dim=3, keepdim=True).sqrt()
+    result["rgb_flow_prediction_magnitude"] = _masked_mean(
+        flow_magnitude,
+        valid,
+        epsilon=config.epsilon,
+    )
+    result["rgb_flow_target_magnitude"] = _masked_mean(
+        target_flow_magnitude,
+        valid,
+        epsilon=config.epsilon,
+    )
+    result["rgb_flow_magnitude_ratio"] = result[
+        "rgb_flow_prediction_magnitude"
+    ] / (result["rgb_flow_target_magnitude"] + config.epsilon)
     flow_dy, flow_dx = _image_gradient(flow)
     result["rgb_flow_smoothness"] = 0.5 * (
         _masked_mean(
@@ -392,6 +420,94 @@ def _compute_latent_rgb_objective(
             epsilon=config.epsilon,
         )
     )
+
+    if config.rgb_flow_correlation > 0.0:
+        correlation = output["rgb_flow_correlation_logits"].float()
+        if correlation.ndim != 6 or correlation.shape[:3] != prediction.shape[:3]:
+            raise NativeObjectiveError(
+                "RGB flow correlation must be [B,F,V,D,H,W]"
+            )
+        bins = int(correlation.shape[3])
+        side = isqrt(bins)
+        if side * side != bins or side % 2 != 1:
+            raise NativeObjectiveError(
+                "RGB flow correlation bins must form an odd square"
+            )
+        radius = side // 2
+        correlation_grid = int(correlation.shape[-1])
+        if correlation.shape[-2] != correlation_grid:
+            raise NativeObjectiveError("RGB flow correlation grid must be square")
+        pair_count = prediction.shape[0] * prediction.shape[1] * prediction.shape[2]
+        flow_for_correlation = F.interpolate(
+            flow_target.reshape(pair_count, 2, *flow_target.shape[-2:]),
+            size=(correlation_grid, correlation_grid),
+            mode="bilinear",
+            align_corners=True,
+        )
+        pixel_to_grid = float(correlation_grid - 1) / float(
+            max(1, target_rgb.shape[-1] - 1)
+        )
+        offset_x_float = flow_for_correlation[:, 0] * pixel_to_grid
+        offset_y_float = flow_for_correlation[:, 1] * pixel_to_grid
+        offset_x = offset_x_float.round().long()
+        offset_y = offset_y_float.round().long()
+        within_radius = (
+            (offset_x >= -radius)
+            & (offset_x <= radius)
+            & (offset_y >= -radius)
+            & (offset_y <= radius)
+        )
+        axis = torch.arange(correlation_grid, device=correlation.device)
+        target_y, target_x = torch.meshgrid(axis, axis, indexing="ij")
+        source_x = target_x[None] + offset_x
+        source_y = target_y[None] + offset_y
+        source_valid = (
+            (source_x >= 0)
+            & (source_x < correlation_grid)
+            & (source_y >= 0)
+            & (source_y < correlation_grid)
+        )
+        moving = torch.sqrt(
+            offset_x_float.square() + offset_y_float.square()
+        ) >= 0.5
+        disocclusion_for_correlation = F.interpolate(
+            batch["rgb_disocclusion_target"].float().reshape(
+                pair_count, 1, *flow_target.shape[-2:]
+            ),
+            size=(correlation_grid, correlation_grid),
+            mode="nearest",
+        )[:, 0] < 0.5
+        slot_valid = valid[..., 0, 0, 0].reshape(pair_count, 1, 1)
+        correlation_valid = (
+            slot_valid
+            & within_radius
+            & source_valid
+            & moving
+            & disocclusion_for_correlation
+        )
+        labels = (
+            (offset_y.clamp(-radius, radius) + radius) * side
+            + offset_x.clamp(-radius, radius)
+            + radius
+        )
+        correlation_flat = correlation.reshape(
+            pair_count, bins, correlation_grid, correlation_grid
+        )
+        cross_entropy = F.cross_entropy(
+            correlation_flat,
+            labels,
+            reduction="none",
+        )
+        result["rgb_flow_correlation"] = _masked_mean(
+            cross_entropy,
+            correlation_valid,
+            epsilon=config.epsilon,
+        )
+        result["rgb_flow_correlation_accuracy"] = _masked_mean(
+            correlation_flat.argmax(dim=1).eq(labels).float(),
+            correlation_valid,
+            epsilon=config.epsilon,
+        )
 
     disocclusion_target = batch["rgb_disocclusion_target"].float()
     disocclusion_logit = output["rgb_disocclusion_logit"].float()
@@ -429,8 +545,26 @@ def _compute_latent_rgb_objective(
         sample_valid,
         epsilon=config.epsilon,
     )
+    expanded_valid = torch.broadcast_to(valid_float, probability.shape)
+    valid_per_sample = expanded_valid.flatten(1).sum(1).clamp_min(1.0)
+    predicted_fraction = (probability * expanded_valid).flatten(1).sum(1) / (
+        valid_per_sample
+    )
+    target_fraction = (
+        disocclusion_target * expanded_valid
+    ).flatten(1).sum(1) / valid_per_sample
+    result["rgb_disocclusion_calibration"] = _masked_mean(
+        (predicted_fraction - target_fraction).abs(),
+        sample_valid,
+        epsilon=config.epsilon,
+    )
     result["rgb_disocclusion_fraction"] = _masked_mean(
         disocclusion_target,
+        valid,
+        epsilon=config.epsilon,
+    )
+    result["rgb_disocclusion_predicted_fraction"] = _masked_mean(
+        probability,
         valid,
         epsilon=config.epsilon,
     )
@@ -468,9 +602,12 @@ def _latent_rgb_total(
         + config.rgb_latent_delta * losses["rgb_latent_delta"]
         + config.rgb_latent_temporal_delta * losses["rgb_latent_temporal_delta"]
         + config.rgb_flow_teacher * losses["rgb_flow_teacher"]
+        + config.rgb_flow_correlation * losses["rgb_flow_correlation"]
         + config.rgb_flow_smoothness * losses["rgb_flow_smoothness"]
         + config.rgb_disocclusion_bce * losses["rgb_disocclusion_bce"]
         + config.rgb_disocclusion_dice * losses["rgb_disocclusion_dice"]
+        + config.rgb_disocclusion_calibration
+        * losses["rgb_disocclusion_calibration"]
         + config.rgb_visible_warp * losses["rgb_visible_warp"]
         + config.rgb_disocclusion_synthesis
         * losses["rgb_disocclusion_synthesis"]

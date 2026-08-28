@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_latent_flow
 architecture: native_world_model
-expected_parameter_count: 1226858499
+expected_parameter_count: 1230589187
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -75,6 +75,11 @@ model:
   rgb_latent_grid: 32
   rgb_latent_hidden: 384
   rgb_flow_max_pixels: 128.0
+  # Explicit relative P256 correspondence volume. The radius spans the full
+  # 128 px transport budget at the 16x16 appearance grid.
+  rgb_flow_correlation_channels: 64
+  rgb_flow_correlation_radius: 8
+  rgb_flow_correlation_temperature: 0.1
   rgb_tokenizer_spatial_compression: 8
   geom_hidden: 512
   appearance_enabled: true

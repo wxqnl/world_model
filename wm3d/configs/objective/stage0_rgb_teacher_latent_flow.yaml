@@ -28,13 +28,19 @@ objective:
   rgb_latent_temporal_delta: 0.5
   # RAFT target-to-context transport plus standard forward/backward occlusion.
   rgb_flow_teacher: 0.05
+  # Visible moving patches must select their factual relative displacement in
+  # the P256 cost volume; zero flow is no longer an acceptable median shortcut.
+  rgb_flow_correlation: 0.1
   rgb_flow_smoothness: 0.002
-  rgb_disocclusion_bce: 0.1
+  rgb_disocclusion_bce: 0.2
   rgb_disocclusion_dice: 0.1
-  rgb_disocclusion_pos_weight: 2.0
+  rgb_disocclusion_calibration: 0.2
+  # The compositor consumes probabilities, so keep BCE calibrated rather than
+  # shifting the optimum upward with a positive-class weight.
+  rgb_disocclusion_pos_weight: 1.0
   # Visible content must be explained by aligned transport; newly visible
   # content must be explained by synthesis rather than an unwarped old frame.
-  rgb_visible_warp: 0.25
+  rgb_visible_warp: 0.5
   rgb_disocclusion_synthesis: 0.5
   depth_log: 0.0
   point: 0.0

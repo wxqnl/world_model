@@ -136,6 +136,10 @@ class NativeLatentFlowRGBDecoder(nn.Module):
         self.geometry_grid = isqrt(int(cfg.P))
         self.latent_grid = int(cfg.rgb_latent_grid)
         self.hidden = int(cfg.rgb_latent_hidden)
+        self.correlation_channels = int(cfg.rgb_flow_correlation_channels)
+        self.correlation_radius = int(cfg.rgb_flow_correlation_radius)
+        self.correlation_temperature = float(cfg.rgb_flow_correlation_temperature)
+        self.correlation_bins = (2 * self.correlation_radius + 1) ** 2
         self.context_high_channels = self.hidden // 3
         self.context_low_channels = self.hidden // 2
 
@@ -165,6 +169,37 @@ class NativeLatentFlowRGBDecoder(nn.Module):
         )
         self.condition_blocks = nn.Sequential(
             _ResidualBlock(self.hidden),
+            _ResidualBlock(self.hidden),
+        )
+        # P256 is a spatial grid, but an additive future-minus-context feature
+        # cannot identify where a moved patch came from.  Build the same kind
+        # of explicit correspondence volume used by PWC-Net/RAFT before flow
+        # regression.  A shared projection keeps context/future descriptors in
+        # one matching space; the relative volume makes displacement channels
+        # translation equivariant.
+        self.correlation_projection = nn.Linear(
+            cfg.token_dim, self.correlation_channels, bias=False
+        )
+        self.correlation_encoder = nn.Sequential(
+            nn.Conv2d(
+                self.correlation_bins,
+                self.context_low_channels,
+                1,
+            ),
+            nn.GroupNorm(
+                _groups(self.context_low_channels), self.context_low_channels
+            ),
+            nn.SiLU(inplace=True),
+            _ResidualBlock(self.context_low_channels),
+        )
+        self.flow_fusion = nn.Sequential(
+            nn.Conv2d(
+                self.hidden + self.context_low_channels,
+                self.hidden,
+                1,
+            ),
+            nn.GroupNorm(_groups(self.hidden), self.hidden),
+            nn.SiLU(inplace=True),
             _ResidualBlock(self.hidden),
         )
 
@@ -297,6 +332,93 @@ class NativeLatentFlowRGBDecoder(nn.Module):
         )
         return self.condition_blocks(value)
 
+    def _relative_correlation(
+        self,
+        future_appearance: torch.Tensor,
+        context_appearance: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return relative cost features, logits, and a confidence-gated prior."""
+
+        if future_appearance.shape != context_appearance.shape:
+            raise ValueError("correlation context/future appearance must align")
+        count = future_appearance.shape[0]
+        grid = self.appearance_grid
+        tokens = grid * grid
+        if future_appearance.shape[1] != tokens:
+            raise ValueError("appearance token count does not match its grid")
+
+        def descriptors(value: torch.Tensor) -> torch.Tensor:
+            normalized = F.layer_norm(
+                value.float(), (value.shape[-1],)
+            ).to(dtype=value.dtype)
+            projected = self.correlation_projection(normalized)
+            return F.normalize(projected.float(), dim=-1)
+
+        query = descriptors(future_appearance)
+        key = descriptors(context_appearance)
+        all_pairs = torch.bmm(query, key.transpose(1, 2))
+
+        axis = torch.arange(grid, device=all_pairs.device)
+        target_y, target_x = torch.meshgrid(axis, axis, indexing="ij")
+        target_y = target_y.reshape(tokens, 1)
+        target_x = target_x.reshape(tokens, 1)
+        offsets = torch.arange(
+            -self.correlation_radius,
+            self.correlation_radius + 1,
+            device=all_pairs.device,
+        )
+        offset_y, offset_x = torch.meshgrid(offsets, offsets, indexing="ij")
+        offset_y = offset_y.reshape(1, self.correlation_bins)
+        offset_x = offset_x.reshape(1, self.correlation_bins)
+        source_y = target_y + offset_y
+        source_x = target_x + offset_x
+        valid = (
+            (source_y >= 0)
+            & (source_y < grid)
+            & (source_x >= 0)
+            & (source_x < grid)
+        )
+        source_index = (
+            source_y.clamp(0, grid - 1) * grid
+            + source_x.clamp(0, grid - 1)
+        ).long()
+        relative = all_pairs.gather(
+            2, source_index[None].expand(count, -1, -1)
+        )
+        logits = relative / self.correlation_temperature
+        logits = logits.masked_fill(~valid[None], -1.0e4)
+        volume = relative.masked_fill(~valid[None], 0.0)
+        features = self.correlation_encoder(
+            volume.transpose(1, 2).reshape(
+                count,
+                self.correlation_bins,
+                grid,
+                grid,
+            ).to(dtype=future_appearance.dtype)
+        )
+
+        probability = torch.softmax(logits, dim=-1)
+        displacement = torch.stack(
+            (offset_x.reshape(-1), offset_y.reshape(-1)), dim=0
+        ).to(dtype=probability.dtype)
+        displacement = displacement * (
+            float(self.cfg.rgb_size - 1) / float(max(1, grid - 1))
+        )
+        expected = torch.einsum("ntd,cd->nct", probability, displacement)
+        valid_count = valid.sum(dim=-1).clamp_min(1).to(probability.dtype)
+        uniform_peak = valid_count.reciprocal()[None]
+        peak = probability.amax(dim=-1)
+        confidence = ((peak - uniform_peak) / (1.0 - uniform_peak).clamp_min(1.0e-6))
+        confidence = confidence.clamp(0.0, 1.0)
+        prior = (expected * confidence[:, None]).reshape(count, 2, grid, grid)
+        return (
+            features,
+            logits.transpose(1, 2).reshape(
+                count, self.correlation_bins, grid, grid
+            ),
+            prior,
+        )
+
     def forward(
         self,
         *,
@@ -376,6 +498,14 @@ class NativeLatentFlowRGBDecoder(nn.Module):
             empty_mask = appearance_tokens.new_empty(
                 batch, 0, cfg.num_views, 1, self.latent_grid, self.latent_grid
             )
+            empty_correlation = appearance_tokens.new_empty(
+                batch,
+                0,
+                cfg.num_views,
+                self.correlation_bins,
+                self.appearance_grid,
+                self.appearance_grid,
+            )
             return {
                 "rgb_latent": empty_latent,
                 "rgb_frame_indices": index_tensor,
@@ -385,6 +515,7 @@ class NativeLatentFlowRGBDecoder(nn.Module):
                 "rgb_warped_latent": empty_latent,
                 "rgb_synthesis_latent": empty_latent,
                 "rgb_warp_valid": empty_mask.bool(),
+                "rgb_flow_correlation_logits": empty_correlation,
             }
 
         views = int(cfg.num_views)
@@ -446,14 +577,34 @@ class NativeLatentFlowRGBDecoder(nn.Module):
             future_time=time_flat,
             view_ids=view_ids,
         )
-        flow_low = self.flow_head(self.flow_tower(condition))
-        flow = F.interpolate(
-            flow_low.float(),
+        correlation_features, correlation_logits, correlation_prior = (
+            self._relative_correlation(future_flat, context_appearance_flat)
+        )
+        flow_features = self.flow_fusion(
+            torch.cat((condition, correlation_features), dim=1)
+        )
+        flow_low = self.flow_head(self.flow_tower(flow_features)).float()
+        # Regress residuals in pixel units.  Dividing before tanh keeps the
+        # zero-point derivative at one instead of rgb_flow_max_pixels, which
+        # avoids the early overshoot followed by zero-flow collapse seen in
+        # the first Teacher run.
+        max_flow = float(cfg.rgb_flow_max_pixels)
+        flow_residual = max_flow * torch.tanh(flow_low / max_flow)
+        flow_residual = F.interpolate(
+            flow_residual,
             size=(self.latent_grid, self.latent_grid),
             mode="bilinear",
             align_corners=True,
+        )
+        correlation_prior = F.interpolate(
+            correlation_prior,
+            size=(self.latent_grid, self.latent_grid),
+            mode="bilinear",
+            align_corners=True,
+        )
+        flow = (flow_residual + correlation_prior).clamp(
+            -max_flow, max_flow
         ).to(dtype=condition.dtype)
-        flow = torch.tanh(flow) * float(cfg.rgb_flow_max_pixels)
 
         context_high = self.context_high(context_latent_flat)
         context_low = self.context_low(context_high)
@@ -498,7 +649,15 @@ class NativeLatentFlowRGBDecoder(nn.Module):
         disocclusion = 1.0 - (
             (1.0 - predicted_disocclusion) * valid.to(predicted_disocclusion.dtype)
         )
-        latent = (1.0 - disocclusion) * warped_latent + disocclusion * synthesis
+        # Reconstruction must not be allowed to expand the mask just because
+        # synthesis is easier than correspondence.  The mask is trained by its
+        # factual occlusion losses; its forward value still controls the exact
+        # inference compositor.
+        composition_mask = disocclusion.detach()
+        latent = (
+            (1.0 - composition_mask) * warped_latent
+            + composition_mask * synthesis
+        )
 
         if target_view_mask is None:
             slot_valid = torch.ones(
@@ -545,6 +704,19 @@ class NativeLatentFlowRGBDecoder(nn.Module):
                     self.latent_grid,
                 )
                 & slot_valid
+            ),
+            "rgb_flow_correlation_logits": (
+                correlation_logits.reshape(
+                    batch,
+                    frames,
+                    views,
+                    self.correlation_bins,
+                    self.appearance_grid,
+                    self.appearance_grid,
+                )
+                * slot_valid[..., :1, :1, :1].to(
+                    dtype=correlation_logits.dtype
+                )
             ),
         }
 
