@@ -70,6 +70,9 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "rgb_latent_grid",
     "rgb_latent_hidden",
     "rgb_flow_max_pixels",
+    "rgb_flow_correlation_channels",
+    "rgb_flow_correlation_radius",
+    "rgb_flow_correlation_temperature",
     "rgb_tokenizer_spatial_compression",
 }
 

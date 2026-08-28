@@ -399,6 +399,9 @@ def test_streaming_data_contract_ignores_model_only_conditioning_scales() -> Non
             "policy_task_modulation": True,
             "rgb_context_action_scale": 1.0,
             "rgb_context_appearance_delta_scale": 1.0,
+            "rgb_flow_correlation_channels": 64,
+            "rgb_flow_correlation_radius": 8,
+            "rgb_flow_correlation_temperature": 0.1,
         }
     )
 
