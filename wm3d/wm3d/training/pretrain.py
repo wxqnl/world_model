@@ -1363,10 +1363,17 @@ def main() -> None:
         if warmstart_path is not None:
             source_path = Path(str(warmstart_path)).resolve(strict=True)
             source_manager = DistributedCheckpointManager(source_path.parent)
+            reuse_rgb_head = bool(
+                runtime["train"].get(
+                    "rgb_teacher_warmstart_reuse_rgb_head", False
+                )
+            )
             warmstart_model = source_manager.load_model_warmstart(
                 path=source_path,
                 model=model,
-                new_parameter_prefixes=("rgb_head.",),
+                new_parameter_prefixes=(
+                    () if reuse_rgb_head else ("rgb_head.",)
+                ),
             )
         elif rgb_teacher_only:
             raise PretrainError(

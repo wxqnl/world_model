@@ -1133,11 +1133,11 @@ class DistributedCheckpointManager:
 
         if not dist.is_initialized():
             raise CheckpointIntegrityError("distributed checkpoint requires process group")
-        if not new_parameter_prefixes or any(
+        if any(
             not prefix or prefix.startswith(".") for prefix in new_parameter_prefixes
         ):
             raise CheckpointIntegrityError(
-                "warmstart new parameter prefixes must be explicit non-empty names"
+                "warmstart new parameter prefixes must be explicit names"
             )
         checkpoint_path = Path(path).resolve(strict=True)
         root = self.root.resolve(strict=True)

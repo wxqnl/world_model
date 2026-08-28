@@ -236,6 +236,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "appearance_validation_three_way",
         "rgb_teacher_renderer_only",
         "rgb_teacher_warmstart_checkpoint",
+        "rgb_teacher_warmstart_reuse_rgb_head",
         "rgb_tokenizer",
         "rgb_flow_teacher",
     }
@@ -359,6 +360,15 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
     rgb_teacher_only = train.get("rgb_teacher_renderer_only", False)
     if not isinstance(rgb_teacher_only, bool):
         raise RuntimeContractError("train.rgb_teacher_renderer_only must be boolean")
+    reuse_rgb_head = train.get("rgb_teacher_warmstart_reuse_rgb_head", False)
+    if not isinstance(reuse_rgb_head, bool):
+        raise RuntimeContractError(
+            "train.rgb_teacher_warmstart_reuse_rgb_head must be boolean"
+        )
+    if reuse_rgb_head and "rgb_teacher_warmstart_checkpoint" not in train:
+        raise RuntimeContractError(
+            "reusing the RGB head requires an explicit warmstart checkpoint"
+        )
     rgb_teacher_fields = {
         "rgb_teacher_warmstart_checkpoint",
         "rgb_tokenizer",
