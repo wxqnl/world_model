@@ -22,11 +22,11 @@ cache 或未审计的数据 profile 混入新 run。当前默认数据路径是�
 默认不加入 AgiBotWorld 2026 和 AgiBotWorld Beta。OXE 新 source 各自权重为 1；已有五个
 source 的权重保持 `14/6/4/8/8`，不会让某一个 OXE 数据集仅凭体量压倒其它来源。
 
-模型使用 `configs/model/native_1b_dual_path.yaml`：融合 P64 geometry 继续承担 3D、动作、
-状态和动力学；逐视角 P256 appearance latent 专门保留 RGB 高频信息。RGB decoder 同时读取
-预测 appearance 与 3D future state，输出 8 个 256×256 future RGB 帧。目标使用
-`configs/objective/stage0_native_dual_path.yaml`。默认 site 文件已填好这些配置，操作者不需要
-手动替换。数据访问使用 `direct_raw`。
+模型使用 `configs/model/native_1b_latent_flow.yaml`：融合 P64 geometry 继续承担 3D、动作、
+状态和动力学；逐视角 P256 appearance、geometry 和 factual action 预测显式 flow 与
+disocclusion。冻结 Cosmos tokenizer 提供 32×32 可重建 latent，renderer 先对齐观测外观，
+再只在新显露区域合成内容，输出 8 个 256×256 future RGB 帧。目标使用
+`configs/objective/stage0_native_latent_flow.yaml`。默认 site 文件已填好这些配置。
 
 ### PCA 与磁盘
 
@@ -50,7 +50,7 @@ LRU。每个 rank 只随机访问当前 sealed `T+K` RGB window，并用 rank-lo
 ## 2. 安装与 site 文件
 
 ```bash
-git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
+git clone --branch codex/rgb-latent-flow-20260828 --single-branch https://github.com/wxqnl/world_model.git
 cd world_model/wm3d
 ./run_wm3d.sh env
 source .venv/bin/activate
@@ -71,6 +71,7 @@ vim "$SITE"
 - `WORK_ROOT`、`RAW_ROOT` 指向容量足够的真实存储；
 - `HF_TOKEN_FILE` 存在、权限为 `0600`，并已接受所有上游许可；
 - `WM3D_VGGT_SOURCE_ROOT`、VGGT 权重和 Qwen embedding 权重存在；
+- Cosmos tokenizer 与 RAFT 的 source root/checkpoint 四个字段都指向本地只读资产；
 - node43 使用 `NNODES=1`、`GPUS_PER_NODE=8`、`MASTER_ADDR=127.0.0.1`；
 - `WM3D_DATA_MODE=direct_raw`；
 - `DIRECT_PREFETCH_WINDOWS=16`、`DIRECT_ENCODE_CHUNK_ROWS=32`；

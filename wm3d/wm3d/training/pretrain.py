@@ -1288,19 +1288,25 @@ def main() -> None:
         )
         rgb_tokenizer: FrozenCosmosRGBTokenizerRuntime | None = None
         rgb_flow_teacher: FrozenBidirectionalRAFTRuntime | None = None
-        if rgb_teacher_only:
-            tokenizer_mapping = runtime["train"].get("rgb_tokenizer")
-            flow_mapping = runtime["train"].get("rgb_flow_teacher")
-            if not isinstance(tokenizer_mapping, Mapping) or not isinstance(
-                flow_mapping, Mapping
-            ):
-                raise PretrainError(
-                    "Teacher RGB-only training requires tokenizer and flow configs"
-                )
+        tokenizer_mapping = runtime["train"].get("rgb_tokenizer")
+        flow_mapping = runtime["train"].get("rgb_flow_teacher")
+        if rgb_teacher_only and (
+            not isinstance(tokenizer_mapping, Mapping)
+            or not isinstance(flow_mapping, Mapping)
+        ):
+            raise PretrainError(
+                "Teacher RGB-only training requires tokenizer and flow configs"
+            )
+        if tokenizer_mapping is not None:
+            if not isinstance(tokenizer_mapping, Mapping):
+                raise PretrainError("RGB tokenizer config must be a mapping")
             rgb_tokenizer = FrozenCosmosRGBTokenizerRuntime(
                 cosmos_config_from_mapping(tokenizer_mapping),
                 context.device,
             )
+        if flow_mapping is not None:
+            if not isinstance(flow_mapping, Mapping):
+                raise PretrainError("RGB flow teacher config must be a mapping")
             rgb_flow_teacher = FrozenBidirectionalRAFTRuntime(
                 raft_config_from_mapping(flow_mapping),
                 context.device,
@@ -1341,6 +1347,15 @@ def main() -> None:
         if not isinstance(model, NativeWorldModel):
             raise PretrainError("unified pretrain currently requires native_world_model")
         native_model = model
+        if native_model.cfg.rgb_renderer_mode == "latent_flow":
+            if rgb_tokenizer is None or rgb_flow_teacher is None:
+                raise PretrainError(
+                    "latent-flow training requires frozen tokenizer and flow targets"
+                )
+        elif rgb_tokenizer is not None or rgb_flow_teacher is not None:
+            raise PretrainError(
+                "RGB latent target runtimes require a latent-flow model profile"
+            )
         if rgb_teacher_only:
             if native_model.cfg.rgb_renderer_mode != "latent_flow":
                 raise PretrainError(

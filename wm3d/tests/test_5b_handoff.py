@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
         ),
     ],
 )
-def test_5b_presets_match_dual_path_5b_and_64_h200(
+def test_5b_presets_match_latent_flow_5b_and_64_h200(
     profile: str,
     total_steps: int,
     checkpoint_steps: list[int],
@@ -38,15 +38,15 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     teacher_decay_steps: int,
 ) -> None:
     model = yaml.safe_load(
-        (ROOT / "configs/model/native_5b_dual_path.yaml").read_text()
+        (ROOT / "configs/model/native_5b_latent_flow.yaml").read_text()
     )
     objective = yaml.safe_load(
-        (ROOT / "configs/objective/stage0_native_dual_path.yaml").read_text()
+        (ROOT / "configs/objective/stage0_native_latent_flow.yaml").read_text()
     )
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_557_073_784
+    assert model["expected_parameter_count"] == 5_171_457_411
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_P"] == 256
@@ -63,18 +63,20 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75
     assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
-    assert model["model"]["rgb_context_appearance_delta_scale"] == 1.0
-    assert objective["objective"]["rgb_l1"] == 0.5
-    assert objective["objective"]["rgb_charbonnier"] == 1.0
-    assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
+    assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
+    assert model["model"]["rgb_renderer_mode"] == "latent_flow"
+    assert model["model"]["rgb_latent_grid"] == 48
+    assert model["model"]["rgb_tokenizer_spatial_compression"] == 8
+    assert objective["objective"]["rgb_l1"] == 0.0
+    assert objective["objective"]["rgb_charbonnier"] == 0.0
+    assert objective["objective"]["rgb_latent_charbonnier"] == 1.0
+    assert objective["objective"]["rgb_flow_teacher"] == 0.05
     assert objective["objective"]["action_counterfactual_token_advantage"] == 1.0
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
-    assert objective["objective"]["rgb_perceptual"] == 0.1
-    assert objective["objective"]["rgb_motion_l1"] == 1.0
-    assert objective["objective"]["rgb_motion_bce"] == 0.03
-    assert objective["objective"]["rgb_motion_dice"] == 0.03
+    assert objective["objective"]["rgb_perceptual"] == 0.0
+    assert objective["objective"]["rgb_motion_l1"] == 0.0
     assert objective["objective"]["appearance_l1"] == 0.0
     assert objective["objective"]["appearance_teacher_l1"] == 1.0
     assert objective["objective"]["appearance_autoregressive_l1"] == 1.0
@@ -100,6 +102,8 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert runtime["train"]["appearance_teacher_end_ratio"] == 0.0
     assert runtime["train"]["appearance_validation_three_way"] is True
     assert runtime["train"]["appearance_teacher_decay_steps"] == teacher_decay_steps
+    assert runtime["train"]["rgb_tokenizer"]["spatial_compression"] == 8
+    assert runtime["train"]["rgb_flow_teacher"]["output_grid"] == 48
 
 
 def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
@@ -282,11 +286,13 @@ def test_5b_site_defaults_to_oxe_and_direct_p144_p256() -> None:
     assert "DIRECT_APPEARANCE_FEATURE_LAYER=4" in site
     assert "STREAMING_LRU_ROOT=" not in site
     assert "STREAMING_LRU_GIB_PER_RANK=" not in site
-    assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_latent_flow.yaml" in site
     assert (
         "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
     )
-    assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in site
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_latent_flow.yaml" in site
+    assert "RGB_TOKENIZER_SOURCE_ROOT=" in site
+    assert "RGB_FLOW_CHECKPOINT=" in site
     assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
     assert "DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe.template.yaml" in site
 
@@ -296,7 +302,7 @@ def test_5b_direct_template_has_optimized_runtime_defaults() -> None:
     assert "WM3D_DATA_MODE=direct_raw" in site
     assert "DIRECT_DECODE_WORKERS=1" in site
     assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
-    assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_latent_flow.yaml" in site
     assert (
         "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
     )

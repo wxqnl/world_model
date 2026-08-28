@@ -44,6 +44,23 @@ train:
   validation_steps: 20
   checkpoint_interval: 10000
   checkpoint_steps: [1000, 5000]
+  rgb_tokenizer:
+    source_root: /data/models/cosmos-predict2
+    checkpoint: /data/models/cosmos_predict2_2b_ac/tokenizer/tokenizer.pth
+    encode_chunk: 4
+    decode_chunk: 2
+    latent_channels: 16
+    spatial_compression: 8
+  rgb_flow_teacher:
+    source_root: /data/models/WorldArena/third_party/RAFT
+    checkpoint: /data/models/WorldArena/raft/RAFT/models/raft-things.pth
+    input_size: 256
+    iterations: 12
+    output_grid: 32
+    batch_chunk: 4
+    flow_max_pixels: 128.0
+    consistency_relative: 0.01
+    consistency_absolute: 0.5
 optimizer:
   name: adamw
   peak_lr: 0.00012

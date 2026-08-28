@@ -1,19 +1,17 @@
 # WM3D 5B 训练流程
 
-WM3D 5B 使用 `configs/model/native_5b_dual_path.yaml`，参数量为 `5,323,627,059`。
+WM3D 5B 使用 `configs/model/native_5b_latent_flow.yaml`，参数量为 `5,171,457,411`。
 默认训练规模为 8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做
 8-way FSDP2 分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，
 不做梯度累积，global batch 为 256。
 
-该 profile 使用正式 dual-path RGB：P144 融合 geometry 主干继续负责 3D、动作和动力学，
-逐视角 P256 appearance latent 保留高频纹理，RGB decoder 同时接受两者。decoder hidden
-为 1536，每个上采样层含 2 个 residual blocks，并监督未来全部 16 帧。RGB 目标使用
-`configs/objective/stage0_native_dual_path.yaml`，同时启用 appearance MSE/cosine、L1、
-Charbonnier、spatial gradient 和冻结的 VGG LPIPS；不依赖 Wan。默认 site 文件已经填好
-model、encoder 和 objective，拉取代码后无需手工调整。训练只解码数据中实际有 RGB
-监督的相机，decoder 与 LPIPS 都按小块执行 activation checkpoint，因此不能为了省显存
-把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
-[原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
+该 profile 与 1B 共用 latent-flow RGB renderer：P144 geometry 主干负责 3D、动作和动力学，
+逐视角 P256 appearance、geometry 和 factual action 共同预测 future-to-context flow；观测
+RGB 先经冻结的 Cosmos tokenizer 进入可重建 latent，再按 flow 对齐。可见区域使用对齐后的
+latent，新显露区域由 synthesis 分支生成，不存在未经对齐的旧 RGB skip。5B 的输出为
+384×384，latent 网格为 48×48，监督未来全部 16 帧。目标使用
+`configs/objective/stage0_native_latent_flow.yaml`，保留世界、appearance 和 action 目标，并
+加入 latent reconstruction、temporal delta、RAFT flow 与 disocclusion 监督。
 
 1B/5B 还共用 `factual_dynamics_repeats=2`：单个 factual-only dynamics block 共享权重
 执行两次，增强动作条件深度，但不增加参数，也不把 future action 写回 policy lane。
@@ -42,13 +40,13 @@ episode visual cache、LRU 或 sidecar。完整 episode cache 与 `streaming_raw
 三套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
 和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
 
-三套 runtime 都显式使用 validation micro batch 1、RGB decode chunk 2、RGB perceptual
-chunk 8，并从
+三套 runtime 都显式使用 validation micro batch 1、RGB decode chunk 2，并从
 `appearance_teacher_start_ratio=1.0` 线性切换到
 `appearance_teacher_end_ratio=0.0`。`canary1k` 在前 750 step 完成切换，
 `validation100k` 与 `formal600k` 在前 10,000 step 完成切换。这样 decoder 先学习
-真值 appearance latent 到 RGB 的稳定重建，再进入完全由模型预测 latent 驱动的训练；
-appearance dynamics 在整个过程中持续接受 MSE 与 cosine 监督。
+真值 appearance latent 条件逐步切换到模型预测条件；appearance dynamics 在整个过程中
+持续接受稳健 L1 与 motion-aware 监督。Cosmos tokenizer 与 RAFT 都是冻结的 target-side
+运行时，不进入 optimizer、FSDP 或 checkpoint。
 
 默认 global batch 为 256，因此 1K、100K 和 600K 分别对应约 25.6 万、2,560 万和
 1.536 亿个全局采样位置。
@@ -68,7 +66,7 @@ appearance dynamics 在整个过程中持续接受 MSE 与 cosine 监督。
 克隆项目：
 
 ```bash
-git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
+git clone --branch codex/rgb-latent-flow-20260828 --single-branch https://github.com/wxqnl/world_model.git
 cd world_model/wm3d
 ```
 
@@ -99,6 +97,10 @@ MASTER_ADDR=TRAIN_NODE_0
 WM3D_VGGT_SOURCE_ROOT=/data/models/vggt
 WM3D_VGGT_MODEL_SNAPSHOT=/data/models/facebook-VGGT-1B
 QWEN3_VL_EMBEDDING_PATH=/data/models/Qwen3-VL-Embedding-2B
+RGB_TOKENIZER_SOURCE_ROOT=/data/models/cosmos-predict2
+RGB_TOKENIZER_CHECKPOINT=/data/models/cosmos_predict2_2b_ac/tokenizer/tokenizer.pth
+RGB_FLOW_SOURCE_ROOT=/data/models/WorldArena/third_party/RAFT
+RGB_FLOW_CHECKPOINT=/data/models/WorldArena/raft/RAFT/models/raft-things.pth
 ```
 
 默认值已经设置为 `NNODES=8`、`GPUS_PER_NODE=8`，不需要再改 world size。

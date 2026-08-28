@@ -38,6 +38,23 @@ train:
   # batches retain the validated 10k teacher decay.
   appearance_teacher0_every_steps: 4
   appearance_validation_three_way: true
+  rgb_tokenizer:
+    source_root: /data/models/cosmos-predict2
+    checkpoint: /data/models/cosmos_predict2_2b_ac/tokenizer/tokenizer.pth
+    encode_chunk: 4
+    decode_chunk: 2
+    latent_channels: 16
+    spatial_compression: 8
+  rgb_flow_teacher:
+    source_root: /data/models/WorldArena/third_party/RAFT
+    checkpoint: /data/models/WorldArena/raft/RAFT/models/raft-things.pth
+    input_size: 256
+    iterations: 12
+    output_grid: 32
+    batch_chunk: 4
+    flow_max_pixels: 128.0
+    consistency_relative: 0.01
+    consistency_absolute: 0.5
 optimizer:
   name: adamw
   # Start at the stable floor instead of spending the whole 500-step canary

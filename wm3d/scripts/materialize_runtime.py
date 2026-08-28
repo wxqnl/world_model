@@ -138,6 +138,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--direct-appearance-feature-layer", type=int, default=4)
     parser.add_argument("--environment-lock", type=Path, required=True)
+    parser.add_argument("--rgb-tokenizer-source-root", type=Path)
+    parser.add_argument("--rgb-tokenizer-checkpoint", type=Path)
+    parser.add_argument("--rgb-flow-source-root", type=Path)
+    parser.add_argument("--rgb-flow-checkpoint", type=Path)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--run-lineage", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
@@ -162,6 +166,35 @@ def main() -> None:
 
     model = load_yaml(args.model)
     runtime = load_yaml(args.runtime)
+    train = runtime.get("train")
+    if not isinstance(train, dict):
+        raise RuntimeError("runtime train section must be a mapping")
+
+    def bind_rgb_runtime(
+        key: str,
+        source_root: Path | None,
+        checkpoint: Path | None,
+    ) -> None:
+        if source_root is None and checkpoint is None:
+            return
+        if source_root is None or checkpoint is None:
+            raise RuntimeError(f"{key} source root and checkpoint must be set together")
+        mapping = train.get(key)
+        if not isinstance(mapping, dict):
+            raise RuntimeError(f"runtime profile does not define {key}")
+        mapping["source_root"] = str(source_root.absolute())
+        mapping["checkpoint"] = str(checkpoint.absolute())
+
+    bind_rgb_runtime(
+        "rgb_tokenizer",
+        args.rgb_tokenizer_source_root,
+        args.rgb_tokenizer_checkpoint,
+    )
+    bind_rgb_runtime(
+        "rgb_flow_teacher",
+        args.rgb_flow_source_root,
+        args.rgb_flow_checkpoint,
+    )
     validate_runtime_profile(runtime)
     objective = load_yaml(args.objective)
     data_profile = load_data_profile(args.data, verify_source_manifests=True)

@@ -369,14 +369,11 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError(
             "reusing the RGB head requires an explicit warmstart checkpoint"
         )
-    rgb_teacher_fields = {
-        "rgb_teacher_warmstart_checkpoint",
-        "rgb_tokenizer",
-        "rgb_flow_teacher",
-    }
-    present_rgb_teacher_fields = rgb_teacher_fields & set(train)
+    warmstart_present = "rgb_teacher_warmstart_checkpoint" in train
+    tokenizer_present = "rgb_tokenizer" in train
+    flow_teacher_present = "rgb_flow_teacher" in train
     if rgb_teacher_only:
-        if present_rgb_teacher_fields != rgb_teacher_fields:
+        if not (warmstart_present and tokenizer_present and flow_teacher_present):
             raise RuntimeContractError(
                 "Teacher RGB-only runtime requires warmstart, tokenizer and flow teacher"
             )
@@ -387,33 +384,36 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             raise RuntimeContractError(
                 "Teacher RGB warmstart must be an absolute numbered checkpoint"
             )
+    elif warmstart_present or reuse_rgb_head:
+        raise RuntimeContractError(
+            "Teacher RGB warmstart fields require the Teacher renderer-only stage"
+        )
+    if tokenizer_present:
         tokenizer_mapping = train["rgb_tokenizer"]
-        flow_mapping = train["rgb_flow_teacher"]
-        if not isinstance(tokenizer_mapping, dict) or not isinstance(
-            flow_mapping, dict
-        ):
-            raise RuntimeContractError(
-                "Teacher RGB tokenizer/flow configs must be mappings"
-            )
+        if not isinstance(tokenizer_mapping, dict):
+            raise RuntimeContractError("RGB tokenizer config must be a mapping")
         try:
             tokenizer_cfg = cosmos_config_from_mapping(tokenizer_mapping)
-            flow_cfg = raft_config_from_mapping(flow_mapping)
         except (TypeError, ValueError) as exc:
-            raise RuntimeContractError("Teacher RGB target runtime is invalid") from exc
-        for path in (
-            tokenizer_cfg.source_root,
-            tokenizer_cfg.checkpoint,
-            flow_cfg.source_root,
-            flow_cfg.checkpoint,
-        ):
+            raise RuntimeContractError("RGB tokenizer runtime is invalid") from exc
+        for path in (tokenizer_cfg.source_root, tokenizer_cfg.checkpoint):
             if not Path(path).is_absolute():
                 raise RuntimeContractError(
-                    "Teacher RGB target runtime paths must be absolute"
+                    "RGB tokenizer runtime paths must be absolute"
                 )
-    elif present_rgb_teacher_fields:
-        raise RuntimeContractError(
-            "Teacher RGB target runtimes cannot be configured while the stage is disabled"
-        )
+    if flow_teacher_present:
+        flow_mapping = train["rgb_flow_teacher"]
+        if not isinstance(flow_mapping, dict):
+            raise RuntimeContractError("RGB flow teacher config must be a mapping")
+        try:
+            flow_cfg = raft_config_from_mapping(flow_mapping)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeContractError("RGB flow teacher runtime is invalid") from exc
+        for path in (flow_cfg.source_root, flow_cfg.checkpoint):
+            if not Path(path).is_absolute():
+                raise RuntimeContractError(
+                    "RGB flow teacher runtime paths must be absolute"
+                )
     if optimizer.get("name") != "adamw":
         raise RuntimeContractError("optimizer.name must be adamw")
     start_lr = float(optimizer.get("start_lr", 0.0))

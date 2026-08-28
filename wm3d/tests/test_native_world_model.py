@@ -1608,6 +1608,24 @@ def test_dual_path_1b_and_5b_profiles_are_materializable() -> None:
     assert counts["native_5b_dual_path.yaml"] > 5_000_000_000
 
 
+def test_latent_flow_1b_and_5b_profiles_are_materializable() -> None:
+    root = Path(__file__).resolve().parents[1]
+    counts = {}
+    for name, latent_grid in (
+        ("native_1b_latent_flow.yaml", 32),
+        ("native_5b_latent_flow.yaml", 48),
+    ):
+        profile = yaml.safe_load((root / "configs/model" / name).read_text())
+        with torch.device("meta"):
+            model = build_world_model(profile)
+        counts[name] = sum(parameter.numel() for parameter in model.parameters())
+        assert model.cfg.rgb_renderer_mode == "latent_flow"
+        assert model.cfg.rgb_latent_grid == latent_grid
+        assert counts[name] == profile["expected_parameter_count"]
+    assert 1_000_000_000 < counts["native_1b_latent_flow.yaml"] < 2_000_000_000
+    assert counts["native_5b_latent_flow.yaml"] > 5_000_000_000
+
+
 def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
     cfg = replace(_tiny_config(), factual_dynamics_repeats=3)
     torch.manual_seed(41)

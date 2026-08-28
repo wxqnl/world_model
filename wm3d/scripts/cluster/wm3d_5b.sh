@@ -191,7 +191,9 @@ load_site() {
     HF_TOKEN_FILE ACCEPT_DATA_LICENSES SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
     TASK_BANK_INDEX TASK_MANIFEST EPISODE_INDEX EPISODE_SEAL WINDOW_INDEX WINDOW_SEAL \
     GROUPED_NORMALIZATION MODEL_PROFILE ENCODER_CONTRACT \
-    TASK_ENCODER_CONTRACT OBJECTIVE_PROFILE NNODES \
+    TASK_ENCODER_CONTRACT OBJECTIVE_PROFILE \
+    RGB_TOKENIZER_SOURCE_ROOT RGB_TOKENIZER_CHECKPOINT \
+    RGB_FLOW_SOURCE_ROOT RGB_FLOW_CHECKPOINT NNODES \
     GPUS_PER_NODE MASTER_ADDR PREFLIGHT_PORT TRAIN_PORT EVAL_PORT; do
     require_var "${name}"
   done
@@ -343,6 +345,12 @@ PY
       die "VGGT model snapshot 缺失或是符号链接：${WM3D_VGGT_MODEL_SNAPSHOT}"
     [[ -d "${QWEN3_VL_EMBEDDING_PATH}" && ! -L "${QWEN3_VL_EMBEDDING_PATH}" ]] || \
       die "Qwen embedding snapshot 缺失或是符号链接：${QWEN3_VL_EMBEDDING_PATH}"
+    [[ -d "${RGB_TOKENIZER_SOURCE_ROOT}" && ! -L "${RGB_TOKENIZER_SOURCE_ROOT}" ]] || \
+      die "Cosmos tokenizer source root 缺失或是符号链接：${RGB_TOKENIZER_SOURCE_ROOT}"
+    require_file "Cosmos tokenizer checkpoint" "${RGB_TOKENIZER_CHECKPOINT}"
+    [[ -d "${RGB_FLOW_SOURCE_ROOT}" && ! -L "${RGB_FLOW_SOURCE_ROOT}" ]] || \
+      die "RAFT source root 缺失或是符号链接：${RGB_FLOW_SOURCE_ROOT}"
+    require_file "RAFT checkpoint" "${RGB_FLOW_CHECKPOINT}"
     if [[ -f "${DATA_PROFILE}" && ! -L "${DATA_PROFILE}" ]]; then
       "${PYTHON_BIN}" - "${DATA_PROFILE}" <<'PY'
 from pathlib import Path
@@ -540,6 +548,10 @@ EOF
     mkdir -p "${CONTROL_ROOT}" "${RUN_ROOT}"
     common=(runtime --model "${MODEL_PROFILE}" --data "${DATA_PROFILE}" \
       --runtime "${RUNTIME_PROFILE}" --objective "${OBJECTIVE_PROFILE}" \
+      --rgb-tokenizer-source-root "${RGB_TOKENIZER_SOURCE_ROOT}" \
+      --rgb-tokenizer-checkpoint "${RGB_TOKENIZER_CHECKPOINT}" \
+      --rgb-flow-source-root "${RGB_FLOW_SOURCE_ROOT}" \
+      --rgb-flow-checkpoint "${RGB_FLOW_CHECKPOINT}" \
       --environment-lock "${ENV_DIR}/environment_receipt.json" --run-name "${RUN_NAME}" \
       --run-lineage "${RUN_LINEAGE}" --output-root "${RUN_ROOT}" --output "${RUNTIME_YAML}")
     if [[ "${WM3D_DATA_MODE}" == streaming_raw ]]; then

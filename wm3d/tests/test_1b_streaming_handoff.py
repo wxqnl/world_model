@@ -31,12 +31,12 @@ def _oxe_info(action_dim: int = 7, state_dim: int = 7) -> dict:
     }
 
 
-def test_1b_streaming_presets_use_dual_path_1b_and_saturating_batch() -> None:
+def test_1b_streaming_presets_use_latent_flow_1b_and_saturating_batch() -> None:
     model = yaml.safe_load(
-        (ROOT / "configs/model/native_1b_dual_path.yaml").read_text()
+        (ROOT / "configs/model/native_1b_latent_flow.yaml").read_text()
     )
     validate_model_profile(model)
-    assert model["expected_parameter_count"] == 1_489_911_832
+    assert model["expected_parameter_count"] == 1_230_589_187
     assert model["model"]["P"] == 64
     assert model["model"]["appearance_P"] == 256
     assert model["model"]["appearance_autoregressive_steps"] == 2
@@ -44,7 +44,9 @@ def test_1b_streaming_presets_use_dual_path_1b_and_saturating_batch() -> None:
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75
     assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
-    assert model["model"]["rgb_context_appearance_delta_scale"] == 1.0
+    assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
+    assert model["model"]["rgb_renderer_mode"] == "latent_flow"
+    assert model["model"]["rgb_latent_grid"] == 32
 
     expected = {
         "h100_8_fsdp2_streaming_canary1k.yaml": 1_000,
@@ -60,6 +62,8 @@ def test_1b_streaming_presets_use_dual_path_1b_and_saturating_batch() -> None:
         assert runtime["train"]["gradient_accumulation"] == 1
         assert runtime["train"]["global_batch_size"] == 64
         assert runtime["train"]["total_steps"] == steps
+        assert runtime["train"]["rgb_tokenizer"]["spatial_compression"] == 8
+        assert runtime["train"]["rgb_flow_teacher"]["output_grid"] == 32
 
 
 def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
@@ -80,12 +84,12 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
     assert init.returncode == 0, init.stderr
     payload = site.read_text()
     assert "WM3D_1B_PRESET=formal100k" in payload
-    assert "MODEL_PROFILE=configs/model/native_1b_dual_path.yaml" in payload
+    assert "MODEL_PROFILE=configs/model/native_1b_latent_flow.yaml" in payload
     assert (
         "ENCODER_CONTRACT=configs/encoder/vggt_native_p64_appearance_p256.yaml"
         in payload
     )
-    assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in payload
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_latent_flow.yaml" in payload
     assert "WM3D_DATA_MODE=direct_raw" in payload
     assert "MINIMUM_RAW_FILESYSTEM_BYTES=0" in payload
     assert "DIRECT_PREFETCH_WINDOWS=16" in payload
@@ -143,7 +147,7 @@ def test_1b_oxe_mix_is_60_sources_without_agibot_or_pca() -> None:
     )
     representation = _representation_from_profiles(
         base=base_data["cache_representation"],
-        model_path=ROOT / "configs/model/native_1b_dual_path.yaml",
+        model_path=ROOT / "configs/model/native_1b_latent_flow.yaml",
         encoder_path=ROOT / "configs/encoder/vggt_native_p64_appearance_p256.yaml",
     )
     repos = ("lerobot/droid_1.0.1",) + tuple(

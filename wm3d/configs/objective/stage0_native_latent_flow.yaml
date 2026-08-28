@@ -1,0 +1,62 @@
+schema: wm3d_v8_objective_profile_v1
+name: stage0_native_latent_flow
+objective:
+  # RGB is supervised in the frozen reconstructable latent space. The formal
+  # model never revives the old unaligned raw-RGB residual compositor.
+  rgb_l1: 0.0
+  rgb_perceptual: 0.0
+  token_mse: 1.0
+  token_cosine: 0.1
+  # Match the mature action-conditioned JEPA objective: normalize every
+  # token, train one-step teacher forcing and a short autoregressive rollout
+  # together, and use robust L1 rather than raw-feature MSE.
+  appearance_l1: 0.0
+  appearance_teacher_l1: 1.0
+  appearance_autoregressive_l1: 1.0
+  # Pixel-change patches receive extra weight so a mostly static scene cannot
+  # make copy-last the aggregate optimum.
+  appearance_motion_l1: 0.5
+  appearance_mse: 0.0
+  appearance_cosine: 0.0
+  appearance_motion_mse: 0.0
+  appearance_delta_cosine: 0.0
+  rgb_charbonnier: 0.0
+  rgb_gradient: 0.0
+  rgb_motion_l1: 0.0
+  rgb_motion_bce: 0.0
+  rgb_motion_dice: 0.0
+  rgb_motion_pos_weight: 1.0
+  rgb_motion_threshold: 0.03
+  rgb_motion_gain: 3.0
+  rgb_latent_charbonnier: 1.0
+  rgb_latent_delta: 1.0
+  rgb_latent_temporal_delta: 0.5
+  rgb_flow_teacher: 0.05
+  rgb_flow_correlation: 0.1
+  rgb_flow_smoothness: 0.002
+  rgb_disocclusion_bce: 0.2
+  rgb_disocclusion_dice: 0.1
+  rgb_disocclusion_calibration: 0.2
+  rgb_disocclusion_pos_weight: 1.0
+  rgb_visible_warp: 0.5
+  rgb_disocclusion_synthesis: 0.5
+  depth_log: 1.5
+  point: 0.5
+  camera_pose: 0.1
+  action_fine: 2.0
+  action_coarse: 1.0
+  # Compare the factual world with the same model/dynamics under zero future
+  # action values.  Both token branches stay in the graph, so the hinge learns
+  # their relative action-conditioned difference while sharing the action-free
+  # trunk.  The policy prior is not a valid control for this ranking.
+  action_counterfactual_token_advantage: 1.0
+  action_counterfactual_token_margin: 0.005
+  # Scheduled teacher appearance can reveal the true future to RGB.  Keep RGB
+  # quality training unchanged and measure RGB action causality at teacher=0.
+  action_counterfactual_rgb_advantage: 0.0
+  action_counterfactual_rgb_margin: 0.002
+  # 不同 source-native cadence 及 delta/absolute semantic 没有统一速度正则定义。
+  action_velocity: 0.0
+  epsilon: 0.000001
+  rgb_charbonnier_epsilon: 0.001
+  huber_delta: 0.05
