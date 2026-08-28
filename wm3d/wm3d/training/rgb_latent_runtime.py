@@ -57,7 +57,7 @@ class FrozenCosmosRGBTokenizerRuntime:
     def parameter_count(self) -> int:
         return int(self.interface.model.count_param())
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def encode_images(self, images: torch.Tensor) -> torch.Tensor:
         """Encode [N,3,H,W] RGB in [0,1] to [N,C,H/8,W/8]."""
 
@@ -87,7 +87,7 @@ class FrozenCosmosRGBTokenizerRuntime:
             raise RuntimeError("Cosmos RGB latent contract failed")
         return result
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def decode_images(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode [N,C,h,w] normalized latents to RGB in [0,1]."""
 
@@ -189,7 +189,7 @@ class FrozenBidirectionalRAFTRuntime:
             result = result / 255.0
         return result.clamp(0.0, 1.0)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def targets(
         self,
         context_rgb: torch.Tensor,
