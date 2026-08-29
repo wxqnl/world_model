@@ -40,7 +40,6 @@ NEW_ALIGNMENT_PREFIXES = (
     "rgb_head.image_decoder.motion_task_proj.",
     "rgb_head.image_decoder.motion_to_synthesis.",
     "rgb_head.image_decoder.motion_ups.",
-    "rgb_head.image_decoder.motion_head.",
     "rgb_head.image_decoder.flow_head.",
     "rgb_head.image_decoder.disocclusion_head.",
 )
