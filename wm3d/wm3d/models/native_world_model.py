@@ -1976,7 +1976,10 @@ class NativeContextRGBImageDecoder(nn.Module):
             if cfg.rgb_context_alignment_enabled
             else channels[-1]
         )
-        self.motion_head = nn.Conv2d(motion_output_channels, 1, 3, padding=1)
+        # Preserve the V7 learned motion/blend path on the synthesis features.
+        # The transport tower predicts only alignment and visibility; it must
+        # not replace the renderer path that already produces moving RGB.
+        self.motion_head = nn.Conv2d(channels[-1], 1, 3, padding=1)
         self.flow_head = (
             _RGBFlowHead(motion_output_channels, 2, 3, padding=1)
             if cfg.rgb_context_alignment_enabled
@@ -2212,7 +2215,6 @@ class NativeContextRGBImageDecoder(nn.Module):
             flow_pixels = max_flow_pixels * torch.tanh(
                 raw_flow / max_flow_pixels
             )
-            motion_logit = self.motion_head(motion_features)
             disocclusion_logit = self.disocclusion_head(motion_features)
             disocclusion = torch.sigmoid(disocclusion_logit)
 
@@ -2270,31 +2272,36 @@ class NativeContextRGBImageDecoder(nn.Module):
                 )
                 value = value + delta_scale * torch.tanh(delta_at_scale)
 
+        motion_logit = self.motion_head(value)
+        motion_hint = torch.sigmoid(motion_logit)
         raw = self.head(value)
         direct = torch.sigmoid(raw[:, :3])
         residual = torch.tanh(raw[:, 3:6]) * float(self.cfg.rgb_context_residual_scale)
         residual_rgb = torch.clamp(warped_context + residual, 0.0, 1.0)
+        legacy_blend = torch.sigmoid(raw[:, 6:7])
+        if self.cfg.rgb_context_motion_blend_gain > 0.0:
+            legacy_blend = torch.clamp(
+                legacy_blend
+                + motion_hint.to(dtype=legacy_blend.dtype)
+                * float(self.cfg.rgb_context_motion_blend_gain),
+                0.0,
+                1.0,
+            )
         if self.cfg.rgb_context_alignment_enabled:
-            assert motion_logit is not None
             assert disocclusion is not None
             assert warp_valid is not None
             transport = (
                 1.0 - disocclusion.to(dtype=value.dtype)
             ) * warp_valid.to(dtype=value.dtype)
-            blend = 1.0 - transport
-            rgb = transport * residual_rgb + blend * direct
+            # V7's direct/context learned blend remains the base renderer.
+            # Alignment replaces only the context-detail share that V7 would
+            # otherwise take from the unwarped observation.  Therefore an
+            # identity flow exactly falls back to V7 instead of copy-last.
+            context_detail_weight = (1.0 - legacy_blend) * transport
+            blend = 1.0 - context_detail_weight
+            rgb = context_detail_weight * residual_rgb + blend * direct
         else:
-            motion_logit = self.motion_head(value)
-            motion_hint = torch.sigmoid(motion_logit)
-            blend = torch.sigmoid(raw[:, 6:7])
-            if self.cfg.rgb_context_motion_blend_gain > 0.0:
-                blend = torch.clamp(
-                    blend
-                    + motion_hint.to(dtype=blend.dtype)
-                    * float(self.cfg.rgb_context_motion_blend_gain),
-                    0.0,
-                    1.0,
-                )
+            blend = legacy_blend
             rgb = blend * direct + (1.0 - blend) * residual_rgb
         return rgb, motion_logit, blend, flow_pixels, disocclusion_logit
 

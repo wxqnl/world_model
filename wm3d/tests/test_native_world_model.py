@@ -1034,10 +1034,12 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
     with torch.no_grad():
         decoder.head.weight.zero_()
         decoder.head.bias.zero_()
+        decoder.head.bias[6].fill_(-20.0)
         decoder.flow_head.weight.zero_()
         decoder.flow_head.bias.zero_()
         decoder.disocclusion_head.weight.zero_()
         decoder.disocclusion_head.bias.fill_(-20.0)
+        decoder.motion_head.weight.zero_()
         decoder.motion_head.bias.fill_(-20.0)
 
     output = model(**batch, appearance_teacher_ratio=0.0)
@@ -1077,6 +1079,46 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
     )
     assert output["rgb_flow_pixels"][0, :, 1].count_nonzero() == 0
     assert output["rgb_disocclusion_logit"][0, :, 1].count_nonzero() == 0
+
+
+def test_zero_flow_alignment_preserves_v7_learned_rgb_blend() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_alignment_enabled=True,
+        rgb_context_motion_blend_gain=0.0,
+    )
+    torch.manual_seed(137)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    decoder = model.rgb_head.image_decoder
+    direct_logits = torch.tensor((2.0, -2.0, 1.0))
+    with torch.no_grad():
+        decoder.head.weight.zero_()
+        decoder.head.bias.zero_()
+        decoder.head.bias[:3].copy_(direct_logits)
+        decoder.flow_head.weight.zero_()
+        decoder.flow_head.bias.zero_()
+        decoder.disocclusion_head.weight.zero_()
+        decoder.disocclusion_head.bias.fill_(-20.0)
+        decoder.motion_head.weight.zero_()
+        decoder.motion_head.bias.fill_(-20.0)
+
+    output = model(**batch, appearance_teacher_ratio=0.0)
+
+    direct = torch.sigmoid(direct_logits).view(1, 1, 1, 3, 1, 1)
+    context = batch["context_rgb"][:, None].expand(
+        -1, cfg.K, -1, -1, -1, -1
+    )
+    expected = 0.5 * direct + 0.5 * context
+    torch.testing.assert_close(output["rgb"], expected, rtol=0, atol=2.0e-6)
+    assert not torch.allclose(output["rgb"], context)
 
 
 def test_pixel_flow_warp_moves_context_without_unaligned_mixture() -> None:
