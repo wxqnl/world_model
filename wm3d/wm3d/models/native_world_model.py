@@ -2212,9 +2212,10 @@ class NativeContextRGBImageDecoder(nn.Module):
                 )
             max_flow_pixels = 0.5 * float(self.cfg.rgb_size)
             raw_flow = self.flow_head(motion_features).float()
-            flow_pixels = max_flow_pixels * torch.tanh(
-                raw_flow / max_flow_pixels
-            )
+            # The head predicts normalized displacement. Scaling raw logits
+            # down by the image radius would make a unit activation equal one
+            # pixel and delay visible transport by roughly rgb_size / 2.
+            flow_pixels = max_flow_pixels * torch.tanh(raw_flow)
             disocclusion_logit = self.disocclusion_head(motion_features)
             disocclusion = torch.sigmoid(disocclusion_logit)
 
@@ -3246,12 +3247,10 @@ class NativeWorldModel(nn.Module):
                 (appearance_context_for_rgb.shape[-1],),
             ).to(dtype=appearance_context_tokens.dtype)
 
-            rollout_steps = (
-                cfg.K
-                if target_appearance_tokens is None
-                or bool(appearance_ratio == 0)
-                else cfg.appearance_autoregressive_steps
-            )
+            # RGB always consumes the same full autoregressive rollout used
+            # at serving time. Future target appearance remains available to
+            # the separate one-step teacher loss, but never enters rendering.
+            rollout_steps = cfg.K
             (
                 appearance_pred,
                 appearance_pred_mask,
@@ -3270,25 +3269,9 @@ class NativeWorldModel(nn.Module):
                 target_appearance_tokens,
                 rollout_steps,
             )
-            if target_appearance_tokens is None:
-                appearance_for_rgb = appearance_pred
-            else:
-                if target_appearance_tokens.shape != appearance_pred.shape:
-                    raise ValueError(
-                        "target appearance tokens must align to predictions"
-                    )
-                normalized_target = F.layer_norm(
-                    target_appearance_tokens.detach().float(),
-                    (target_appearance_tokens.shape[-1],),
-                ).to(dtype=appearance_pred.dtype)
-                appearance_for_rgb = torch.lerp(
-                    appearance_pred,
-                    normalized_target,
-                    appearance_ratio.to(dtype=appearance_pred.dtype),
-                )
-                appearance_for_rgb = appearance_for_rgb * target_appearance_mask[
-                    ..., None
-                ].to(dtype=appearance_for_rgb.dtype)
+            appearance_for_rgb = appearance_pred * appearance_pred_mask[..., None].to(
+                dtype=appearance_pred.dtype
+            )
         elif any(
             value is not None
             for value in (

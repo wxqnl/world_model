@@ -1122,8 +1122,11 @@ def compute_native_objective(
                 flow_weight = 1.0 + config.rgb_motion_gain * moving.to(
                     dtype=flow_epe_map.dtype
                 )
+                # Pair normalized head displacement with a dimensionless
+                # teacher loss so its raw-logit gradient is resolution stable.
+                flow_range_pixels = 0.5 * float(max(target_rgb.shape[-2:]))
                 rgb_flow_teacher = _masked_mean(
-                    flow_epe_map * flow_weight,
+                    (flow_epe_map / flow_range_pixels) * flow_weight,
                     visible,
                     epsilon=epsilon,
                 )

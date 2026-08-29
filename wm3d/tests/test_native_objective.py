@@ -169,7 +169,7 @@ def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None
     )
 
     assert losses["rgb_flow_epe"].item() == pytest.approx(4.0, rel=1.0e-5)
-    assert losses["rgb_flow_teacher"].item() == pytest.approx(16.0, rel=1.0e-5)
+    assert losses["rgb_flow_teacher"].item() == pytest.approx(8.0, rel=1.0e-5)
     assert losses["rgb_flow_prediction_magnitude"].item() == pytest.approx(0.0)
     assert losses["rgb_flow_target_magnitude"].item() == pytest.approx(4.0)
     assert losses["rgb_flow_magnitude_ratio"].item() == pytest.approx(0.0)

@@ -980,7 +980,7 @@ def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> No
     assert predicted["appearance_pred_mask"].all()
     assert predicted["appearance_teacher_ratio"].item() == 0.0
     assert teacher["appearance_teacher_ratio"].item() == 1.0
-    assert not torch.allclose(predicted["rgb"], teacher["rgb"])
+    torch.testing.assert_close(predicted["rgb"], teacher["rgb"], rtol=0, atol=0)
 
     changed = dict(batch)
     changed_target = batch["target_appearance_tokens"].clone()
@@ -988,9 +988,18 @@ def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> No
     changed["target_appearance_tokens"] = changed_target
     changed_teacher = model(**changed, appearance_teacher_ratio=1.0)
     torch.testing.assert_close(
-        teacher["rgb"][:, :, 0], changed_teacher["rgb"][:, :, 0], rtol=0, atol=0
+        teacher["rgb"], changed_teacher["rgb"], rtol=0, atol=0
     )
-    assert not torch.allclose(teacher["rgb"][:, :, 1], changed_teacher["rgb"][:, :, 1])
+    torch.testing.assert_close(
+        teacher["appearance_teacher_pred_tokens"][:, 0],
+        changed_teacher["appearance_teacher_pred_tokens"][:, 0],
+        rtol=0,
+        atol=0,
+    )
+    assert not torch.allclose(
+        teacher["appearance_teacher_pred_tokens"][:, 1],
+        changed_teacher["appearance_teacher_pred_tokens"][:, 1],
+    )
 
     loss = (
         predicted["appearance_pred_tokens"].square().mean()
@@ -1346,16 +1355,19 @@ def test_context_renderer_rgb_loss_reaches_per_view_p256_appearance_lane() -> No
     batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
 
-    teacher = model(**batch, appearance_teacher_ratio=1.0)
+    baseline = model(**batch, appearance_teacher_ratio=1.0)
     changed = dict(batch)
     changed_target = batch["target_appearance_tokens"].clone()
     changed_target[:, :, 1] = changed_target[:, :, 1].roll(1, dims=0)
     changed["target_appearance_tokens"] = changed_target
-    changed_teacher = model(**changed, appearance_teacher_ratio=1.0)
+    changed_output = model(**changed, appearance_teacher_ratio=1.0)
     torch.testing.assert_close(
-        teacher["rgb"][:, :, 0], changed_teacher["rgb"][:, :, 0], rtol=0, atol=0
+        baseline["rgb"], changed_output["rgb"], rtol=0, atol=0
     )
-    assert not torch.allclose(teacher["rgb"][:, :, 1], changed_teacher["rgb"][:, :, 1])
+    assert not torch.allclose(
+        baseline["appearance_teacher_pred_tokens"][:, 1],
+        changed_output["appearance_teacher_pred_tokens"][:, 1],
+    )
 
     model.zero_grad(set_to_none=True)
     predicted = model(**batch, appearance_teacher_ratio=0.0)
