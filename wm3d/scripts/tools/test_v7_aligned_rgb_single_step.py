@@ -30,6 +30,10 @@ from wm3d.training.pretrain import (
     _configure_reproducibility,
     _forward_with_action_counterfactual,
 )
+from wm3d.training.rgb_flow_runtime import (
+    FrozenBidirectionalRAFTRuntime,
+    raft_config_from_mapping,
+)
 
 
 NEW_ALIGNMENT_PREFIXES = (
@@ -50,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--materialized-batch", type=Path, required=True)
     parser.add_argument("--warmstart", type=Path, required=True)
     parser.add_argument("--model-profile", type=Path, required=True)
+    parser.add_argument("--runtime-profile", type=Path, required=True)
     parser.add_argument("--objective-profile", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -136,6 +141,14 @@ def main() -> None:
         device,
     )
     del cpu_batch
+    runtime_profile = yaml.safe_load(
+        args.runtime_profile.read_text(encoding="utf-8")
+    )
+    flow_teacher = FrozenBidirectionalRAFTRuntime(
+        raft_config_from_mapping(runtime_profile["train"]["rgb_flow_teacher"]),
+        device,
+    )
+    batch.update(flow_teacher.targets(batch["context_rgb"], batch["target_rgb"]))
     if int(batch["source_id"][0]) != 5:
         raise RuntimeError("fixed validation source is not Austin Sailor")
 
