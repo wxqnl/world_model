@@ -53,7 +53,10 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "appearance_autoregressive_steps",
     "appearance_action_residual_scale",
     "appearance_flow_aligned_detail",
+    "appearance_state_detail",
+    "appearance_detail_dim",
     "policy_task_modulation",
+    "policy_calibration_conditioning",
     "factual_dynamics_repeats",
     "factual_action_residual_scale",
     "render_factual_dynamics_repeats",
@@ -65,6 +68,13 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "rgb_context_motion_blend_gain",
     "rgb_context_action_scale",
     "rgb_context_appearance_delta_scale",
+    "rgb_detail_residual_scale",
+    # Decoder capacity, batching, and the subset of raw-video horizons decoded
+    # for RGB supervision do not alter the sealed window/token metadata.
+    "rgb_hidden",
+    "rgb_res_blocks",
+    "rgb_decode_chunk_size",
+    "rgb_decode_indices",
 }
 
 
