@@ -965,6 +965,28 @@ def test_v8_core_detail_is_target_free_zero_preserving_and_trainable() -> None:
     assert torch.isfinite(decoder.detail_output.weight.grad).all()
     assert decoder.detail_output.weight.grad.abs().sum() > 0
 
+    full_model = NativeWorldModel(cfg).eval()
+    full_batch = _batch(cfg)
+    full_batch["target_appearance_mask"] = torch.ones(
+        2, cfg.K, cfg.num_views, cfg.appearance_P, dtype=torch.bool
+    )
+    full_output = full_model(**full_batch)
+    assert full_output["appearance_pred_tokens"].shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        cfg.appearance_P,
+        cfg.appearance_detail_dim,
+    )
+    assert full_output["rgb"].shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        3,
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+
 
 def test_flow_aligned_p256_detail_is_target_free_v7_fallback() -> None:
     cfg = replace(

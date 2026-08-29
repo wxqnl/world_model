@@ -3817,7 +3817,7 @@ class NativeWorldModel(nn.Module):
             if cfg.appearance_state_detail:
                 if self.appearance_dynamics is None:
                     raise RuntimeError("state detail predictor is unavailable")
-                view_present = view_mask.bool().any(dim=(1, 3))
+                view_present = view_mask.bool().any(dim=1)
                 detail_mask = view_present[:, None, :, None].expand(
                     -1, cfg.K, -1, cfg.appearance_P
                 )
