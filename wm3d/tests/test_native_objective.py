@@ -10,10 +10,32 @@ from wm3d.training.native_objective import (
     _charbonnier,
     _factual_zero_advantage,
     _masked_rgb_perceptual,
+    _warp_token_grid_with_pixel_flow,
     compose_axis_angle_sequence,
     compose_policy_to_world_intervals,
     compute_native_objective,
 )
+
+
+def test_flow_aligned_p256_target_uses_backward_pixel_transport() -> None:
+    source = torch.tensor([1.0, 2.0, 3.0, 4.0]).view(1, 1, 1, 4, 1)
+    zero_flow = torch.zeros(1, 1, 1, 2, 2, 2)
+    torch.testing.assert_close(
+        _warp_token_grid_with_pixel_flow(
+            source, zero_flow, image_height=2, image_width=2
+        ),
+        source,
+        rtol=0,
+        atol=0,
+    )
+
+    right_flow = zero_flow.clone()
+    right_flow[:, :, :, 0] = 1.0
+    warped = _warp_token_grid_with_pixel_flow(
+        source, right_flow, image_height=2, image_width=2
+    )
+    expected = torch.tensor([2.0, 0.0, 4.0, 0.0]).view_as(source)
+    torch.testing.assert_close(warped, expected, rtol=0, atol=1.0e-6)
 
 
 def test_rgb_charbonnier_uses_its_own_meaningful_epsilon() -> None:

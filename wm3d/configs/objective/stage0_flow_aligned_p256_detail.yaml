@@ -1,0 +1,44 @@
+schema: wm3d_v8_objective_profile_v1
+name: stage0_flow_aligned_p256_detail
+objective:
+  rgb_l1: 0.5
+  rgb_perceptual: 0.1
+  token_mse: 1.0
+  token_cosine: 0.1
+  # One direct K8 residual objective replaces the conflicting absolute-token
+  # teacher/AR pair. The motion-region term only reweights the same target.
+  appearance_l1: 1.0
+  appearance_teacher_l1: 0.0
+  appearance_autoregressive_l1: 0.0
+  appearance_motion_l1: 0.5
+  appearance_mse: 0.0
+  appearance_cosine: 0.0
+  appearance_motion_mse: 0.0
+  appearance_delta_cosine: 0.0
+  rgb_charbonnier: 1.0
+  rgb_charbonnier_epsilon: 0.000001
+  rgb_gradient: 0.25
+  rgb_motion_l1: 1.0
+  rgb_motion_bce: 0.03
+  rgb_motion_dice: 0.03
+  rgb_motion_pos_weight: 2.0
+  rgb_motion_threshold: 0.03
+  rgb_motion_gain: 3.0
+  # Direct supervision for the exact fields used by the renderer's warp and
+  # redraw decision. The frozen target generator is training-only.
+  rgb_flow_teacher: 0.05
+  rgb_disocclusion_bce: 0.2
+  rgb_disocclusion_dice: 0.1
+  rgb_disocclusion_pos_weight: 1.0
+  depth_log: 1.5
+  point: 0.5
+  camera_pose: 0.1
+  action_fine: 2.0
+  action_coarse: 1.0
+  action_counterfactual_token_advantage: 1.0
+  action_counterfactual_token_margin: 0.005
+  action_counterfactual_rgb_advantage: 0.0
+  action_counterfactual_rgb_margin: 0.002
+  action_velocity: 0.0
+  epsilon: 0.000001
+  huber_delta: 0.05

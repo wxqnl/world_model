@@ -132,6 +132,62 @@ def _masked_mean(
     return (value * weight).sum() / weight.sum().clamp_min(epsilon)
 
 
+def _warp_token_grid_with_pixel_flow(
+    source: torch.Tensor,
+    flow_pixels: torch.Tensor,
+    *,
+    image_height: int,
+    image_width: int,
+) -> torch.Tensor:
+    """Backward-warp [B,K,V,P,D] source features with RGB-pixel flow."""
+
+    if source.ndim != 5 or flow_pixels.ndim != 6:
+        raise NativeObjectiveError(
+            "flow-aligned appearance target requires [B,K,V,P,D] and flow"
+        )
+    batch, horizon, views, patches, dim = source.shape
+    grid = isqrt(patches)
+    if grid * grid != patches or tuple(flow_pixels.shape[:3]) != (
+        batch,
+        horizon,
+        views,
+    ) or flow_pixels.shape[3] != 2:
+        raise NativeObjectiveError("appearance token grid and RGB flow differ")
+    count = batch * horizon * views
+    feature = source.reshape(count, grid, grid, dim).permute(0, 3, 1, 2)
+    flow = flow_pixels.reshape(count, 2, *flow_pixels.shape[-2:]).float()
+    if flow.shape[-2:] != (grid, grid):
+        flow = F.interpolate(
+            flow,
+            size=(grid, grid),
+            mode="bilinear",
+            align_corners=True,
+        )
+    y, x = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, grid, device=flow.device, dtype=flow.dtype),
+        torch.linspace(-1.0, 1.0, grid, device=flow.device, dtype=flow.dtype),
+        indexing="ij",
+    )
+    sample_grid = torch.stack((x, y), dim=-1)[None].expand(count, -1, -1, -1)
+    sample_grid = sample_grid + torch.stack(
+        (
+            2.0 * flow[:, 0] / max(float(image_width - 1), 1.0),
+            2.0 * flow[:, 1] / max(float(image_height - 1), 1.0),
+        ),
+        dim=-1,
+    )
+    warped = F.grid_sample(
+        feature.float(),
+        sample_grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return warped.permute(0, 2, 3, 1).reshape(
+        batch, horizon, views, patches, dim
+    ).to(dtype=source.dtype)
+
+
 def _masked_per_sample_mean(
     value: torch.Tensor,
     mask: torch.Tensor,
@@ -659,12 +715,57 @@ def compute_native_objective(
         raw_appearance_target = batch["target_appearance_tokens"]
         if appearance_prediction.shape != raw_appearance_target.shape:
             raise NativeObjectiveError("appearance prediction/target shapes differ")
-        appearance_target = F.layer_norm(
+        normalized_appearance_target = F.layer_norm(
             raw_appearance_target.float(), (raw_appearance_target.shape[-1],)
         ).to(dtype=appearance_prediction.dtype)
         appearance_mask = batch["target_appearance_mask"].bool()
         if "appearance_pred_mask" in output:
             appearance_mask = appearance_mask & output["appearance_pred_mask"].bool()
+        flow_aligned_detail = "appearance_flow_aligned_detail" in output
+        if flow_aligned_detail:
+            required = (
+                "appearance_context_tokens",
+                "appearance_context_mask",
+                "rgb_flow_target_pixels",
+                "target_rgb",
+            )
+            missing = [name for name in required if name not in batch]
+            if missing:
+                raise NativeObjectiveError(
+                    "flow-aligned appearance detail requires " + ", ".join(missing)
+                )
+            context_tokens = batch["appearance_context_tokens"]
+            context_mask = batch["appearance_context_mask"].bool()
+            if context_mask.shape != context_tokens.shape[:-1]:
+                raise NativeObjectiveError(
+                    "appearance context mask must align to context tokens"
+                )
+            normalized_context = F.layer_norm(
+                context_tokens.float(), (context_tokens.shape[-1],)
+            ).to(dtype=appearance_prediction.dtype)
+            latest_context = torch.zeros_like(normalized_context[:, 0])
+            for index in range(int(normalized_context.shape[1])):
+                latest_context = torch.where(
+                    context_mask[:, index, ..., None],
+                    normalized_context[:, index],
+                    latest_context,
+                )
+            latest_context = latest_context[:, None].expand_as(
+                normalized_appearance_target
+            )
+            target_rgb = batch["target_rgb"]
+            aligned_context = _warp_token_grid_with_pixel_flow(
+                latest_context,
+                batch["rgb_flow_target_pixels"],
+                image_height=int(target_rgb.shape[-2]),
+                image_width=int(target_rgb.shape[-1]),
+            )
+            appearance_target = normalized_appearance_target - aligned_context
+            appearance_target = appearance_target * appearance_mask[..., None].to(
+                dtype=appearance_target.dtype
+            )
+        else:
+            appearance_target = normalized_appearance_target
         appearance_error = appearance_prediction - appearance_target
         appearance_l1 = _masked_mean(
             appearance_error.abs(), appearance_mask[..., None], epsilon=epsilon
@@ -790,8 +891,12 @@ def compute_native_objective(
                     latest_context,
                 )
             context_token_valid = context_mask.any(dim=1)
-            predicted_delta = appearance_prediction - latest_context[:, None]
-            target_delta = appearance_target - latest_context[:, None]
+            if flow_aligned_detail:
+                predicted_delta = appearance_prediction
+                target_delta = appearance_target
+            else:
+                predicted_delta = appearance_prediction - latest_context[:, None]
+                target_delta = appearance_target - latest_context[:, None]
 
             target_rgb = batch["target_rgb"].float()
             context_rgb = batch["context_rgb"].float()

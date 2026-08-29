@@ -148,6 +148,10 @@ class NativeWorldModelConfig:
     appearance_heads: int = 8
     appearance_ff_mult: float = 2.0
     appearance_autoregressive_steps: int = 2
+    # Keep V7/P64 as the motion owner. The P256 lane predicts only the future
+    # detail left after transporting the last observed P256 feature with the
+    # teacher backward flow. Zero detail is therefore an exact V7 fallback.
+    appearance_flow_aligned_detail: bool = False
 
     dropout: float = 0.0
     activation_checkpointing: bool = True
@@ -286,6 +290,17 @@ class NativeWorldModelConfig:
             if not 0 < self.appearance_autoregressive_steps <= self.K:
                 raise ValueError(
                     "appearance_autoregressive_steps must lie within K"
+                )
+            if not isinstance(self.appearance_flow_aligned_detail, bool):
+                raise ValueError("appearance_flow_aligned_detail must be boolean")
+            if self.appearance_flow_aligned_detail and (
+                not self.rgb_context_enabled
+                or not self.rgb_context_alignment_enabled
+                or self.rgb_context_appearance_delta_scale <= 0.0
+            ):
+                raise ValueError(
+                    "appearance_flow_aligned_detail requires aligned context RGB "
+                    "and positive appearance detail conditioning"
                 )
             if self.appearance_P < self.P:
                 raise ValueError("appearance_P cannot be smaller than geometry P")
@@ -1083,6 +1098,8 @@ class PerViewAppearanceDynamics(nn.Module):
         self.blocks = nn.ModuleList(blocks)
         self.norm = RMSNorm(cfg.appearance_hidden)
         self.output = nn.Linear(cfg.appearance_hidden, cfg.token_dim, bias=False)
+        if cfg.appearance_flow_aligned_detail:
+            nn.init.zeros_(self.output.weight)
 
     def reset_parameters(self) -> None:
         for parameter in (self.view_embed, self.patch_embed):
@@ -1164,6 +1181,50 @@ class PerViewAppearanceDynamics(nn.Module):
 
     def _project(self, value: torch.Tensor) -> torch.Tensor:
         return self._normalize_tokens(self.output(self.norm(value)))
+
+    def _flow_aligned_detail(
+        self,
+        context_tokens: torch.Tensor,
+        context_mask: torch.Tensor,
+        context_time: torch.Tensor,
+        future_state: torch.Tensor,
+        future_time: torch.Tensor,
+        future_mask: torch.Tensor,
+        centered_action_tokens: Optional[torch.Tensor],
+        centered_action_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict all K detail residuals without an absolute-token feedback loop."""
+
+        cfg = self.cfg
+        batch = context_tokens.shape[0]
+        queries = context_tokens.new_zeros(
+            batch,
+            cfg.K,
+            cfg.num_views,
+            cfg.appearance_P,
+            cfg.token_dim,
+        )
+        source = torch.cat((context_tokens, queries), dim=1)
+        source_mask = torch.cat((context_mask, future_mask), dim=1)
+        source_time = torch.cat((context_time, future_time), dim=1)
+        value = self._conditioned_sequence(
+            source,
+            source_mask,
+            source_time,
+            transition_start=cfg.appearance_context_frames,
+            future_state=future_state,
+            future_time=future_time,
+            centered_action_tokens=centered_action_tokens,
+            centered_action_mask=centered_action_mask,
+        )
+        prediction_mask = future_mask & context_mask.any(dim=1)[:, None]
+        prediction = self.output(
+            self.norm(value[:, cfg.appearance_context_frames :])
+        )
+        prediction = prediction * prediction_mask[..., None].to(
+            dtype=prediction.dtype
+        )
+        return prediction, prediction_mask
 
     def _teacher_forced(
         self,
@@ -1359,6 +1420,32 @@ class PerViewAppearanceDynamics(nn.Module):
             steps = cfg.K
         if not 0 < steps <= cfg.K:
             raise ValueError("appearance rollout steps must lie within K")
+
+        if cfg.appearance_flow_aligned_detail:
+            if steps != cfg.K:
+                raise ValueError(
+                    "flow-aligned appearance detail requires full K rollout"
+                )
+            prediction, prediction_mask = self._flow_aligned_detail(
+                context_tokens,
+                context_mask.bool(),
+                context_time,
+                future_state,
+                future_time,
+                future_mask.bool(),
+                centered_action_tokens,
+                centered_action_mask,
+            )
+            empty_prediction = prediction[:, :0]
+            empty_mask = prediction_mask[:, :0]
+            return (
+                prediction,
+                prediction_mask,
+                empty_prediction,
+                empty_mask,
+                empty_prediction,
+                empty_mask,
+            )
 
         teacher_prediction = context_tokens.new_empty(
             batch, 0, cfg.num_views, cfg.appearance_P, cfg.token_dim
@@ -1799,7 +1886,12 @@ class NativeContextRGBImageDecoder(nn.Module):
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.grid = isqrt(cfg.appearance_P if cfg.appearance_enabled else cfg.P)
+        self.grid = isqrt(
+            cfg.P
+            if cfg.appearance_flow_aligned_detail
+            else (cfg.appearance_P if cfg.appearance_enabled else cfg.P)
+        )
+        self.appearance_grid = isqrt(cfg.appearance_P)
         self.motion_grid = isqrt(cfg.P)
         self.geometry_grid = isqrt(cfg.P)
         stages = (cfg.rgb_size // self.grid).bit_length() - 1
@@ -2004,6 +2096,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         context_rgb: torch.Tensor,
         context_indices: Optional[torch.Tensor] = None,
         motion_tokens: Optional[torch.Tensor] = None,
+        appearance_detail_residual_tokens: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -2056,7 +2149,36 @@ class NativeContextRGBImageDecoder(nn.Module):
         elif motion_tokens is not None:
             raise ValueError("motion tokens require aligned context RGB")
         appearance_delta: Optional[torch.Tensor] = None
-        if self.appearance_delta_stem is not None:
+        if self.cfg.appearance_flow_aligned_detail:
+            if appearance_context_tokens is not None:
+                raise ValueError(
+                    "flow-aligned detail mode does not consume absolute P256 context"
+                )
+            if (
+                appearance_detail_residual_tokens is None
+                or tuple(appearance_detail_residual_tokens.shape[1:])
+                != (self.cfg.appearance_P, self.cfg.token_dim)
+                or appearance_detail_residual_tokens.shape[0] != tokens.shape[0]
+            ):
+                raise ValueError(
+                    "flow-aligned P256 detail residuals must end in "
+                    "[appearance_P,token_dim]"
+                )
+            assert self.appearance_delta_stem is not None
+            delta = appearance_detail_residual_tokens.transpose(1, 2).reshape(
+                tokens.shape[0],
+                self.cfg.token_dim,
+                self.appearance_grid,
+                self.appearance_grid,
+            )
+            appearance_delta = self.appearance_delta_stem(delta).to(
+                dtype=value.dtype
+            )
+        elif self.appearance_delta_stem is not None:
+            if appearance_detail_residual_tokens is not None:
+                raise ValueError(
+                    "appearance detail residuals require flow-aligned mode"
+                )
             if appearance_context_tokens is None or tuple(
                 appearance_context_tokens.shape
             ) != tuple(tokens.shape):
@@ -2065,10 +2187,16 @@ class NativeContextRGBImageDecoder(nn.Module):
                 )
             delta = tokens - appearance_context_tokens.to(dtype=tokens.dtype)
             delta = delta.transpose(1, 2).reshape(
-                tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
+                tokens.shape[0],
+                self.cfg.token_dim,
+                self.appearance_grid,
+                self.appearance_grid,
             )
             appearance_delta = self.appearance_delta_stem(delta).to(dtype=value.dtype)
-        elif appearance_context_tokens is not None:
+        elif (
+            appearance_context_tokens is not None
+            or appearance_detail_residual_tokens is not None
+        ):
             raise ValueError(
                 "appearance context was supplied while RGB delta conditioning is disabled"
             )
@@ -2147,13 +2275,16 @@ class NativeContextRGBImageDecoder(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             ).to(dtype=tokens.dtype)
-            if appearance_delta is not None:
-                appearance_delta = F.interpolate(
-                    appearance_delta.float(),
-                    size=(self.decode_grid, self.decode_grid),
-                    mode="bilinear",
-                    align_corners=False,
-                ).to(dtype=tokens.dtype)
+        if appearance_delta is not None and appearance_delta.shape[-2:] != (
+            self.decode_grid,
+            self.decode_grid,
+        ):
+            appearance_delta = F.interpolate(
+                appearance_delta.float(),
+                size=(self.decode_grid, self.decode_grid),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=tokens.dtype)
         if motion_value is not None and self.decode_grid != self.motion_grid:
             assert motion_tokens is not None
             motion_value = F.interpolate(
@@ -2397,6 +2528,7 @@ class NativeRGBDecoder(nn.Module):
         )
         expanded_geometry: Optional[torch.Tensor] = None
         expanded_appearance_context: Optional[torch.Tensor] = None
+        expanded_appearance_detail: Optional[torch.Tensor] = None
         if self.cfg.appearance_enabled:
             expected = (
                 future_tokens.shape[0],
@@ -2417,13 +2549,23 @@ class NativeRGBDecoder(nn.Module):
             appearance_batch, appearance_frames, _, patches, token_dim = selected.shape
             if (appearance_batch, appearance_frames) != (batch, frames):
                 raise ValueError("appearance and motion RGB horizons must align")
-            expanded = selected.reshape(batch * frames * views, patches, token_dim)
+            selected_appearance = selected.reshape(
+                batch * frames * views, patches, token_dim
+            )
+            if self.cfg.appearance_flow_aligned_detail:
+                expanded = expanded_motion
+                expanded_appearance_detail = selected_appearance
+            else:
+                expanded = selected_appearance
             geometry = geometry_state.index_select(1, index_tensor)
             geometry = geometry[:, :, None].expand(-1, -1, views, -1, -1)
             expanded_geometry = geometry.reshape(
                 batch * frames * views, self.cfg.P, self.cfg.state_hidden
             )
-            if self.cfg.rgb_context_appearance_delta_scale > 0.0:
+            if (
+                self.cfg.rgb_context_appearance_delta_scale > 0.0
+                and not self.cfg.appearance_flow_aligned_detail
+            ):
                 expected_context_appearance = (
                     batch,
                     views,
@@ -2444,7 +2586,10 @@ class NativeRGBDecoder(nn.Module):
                     .expand(-1, frames, -1, -1, -1)
                     .reshape(batch * frames * views, patches, token_dim)
                 )
-            elif appearance_context_tokens is not None:
+            elif (
+                appearance_context_tokens is not None
+                and not self.cfg.appearance_flow_aligned_detail
+            ):
                 raise ValueError(
                     "appearance context was supplied while RGB delta conditioning is disabled"
                 )
@@ -2622,6 +2767,11 @@ class NativeRGBDecoder(nn.Module):
                         expanded_motion.index_select(0, chunk_indices)
                         if self.cfg.rgb_context_alignment_enabled
                         else None
+                    ),
+                    appearance_detail_residual_tokens=(
+                        None
+                        if expanded_appearance_detail is None
+                        else expanded_appearance_detail.index_select(0, chunk_indices)
                     ),
                 )
             else:
@@ -3221,6 +3371,8 @@ class NativeWorldModel(nn.Module):
                 ((appearance_ratio >= 0) & (appearance_ratio <= 1)).all()
             ):
                 raise ValueError("appearance teacher ratio must be a scalar in [0,1]")
+            if cfg.appearance_flow_aligned_detail:
+                appearance_ratio = appearance_ratio * 0.0
             if target_appearance_tokens is None:
                 if bool(appearance_ratio > 0):
                     raise ValueError(
@@ -3297,6 +3449,10 @@ class NativeWorldModel(nn.Module):
         if appearance_pred is not None and appearance_pred_mask is not None:
             output["appearance_pred_tokens"] = appearance_pred
             output["appearance_pred_mask"] = appearance_pred_mask
+            if cfg.appearance_flow_aligned_detail:
+                output["appearance_flow_aligned_detail"] = (
+                    appearance_pred.new_ones(())
+                )
         if (
             appearance_teacher_pred is not None
             and appearance_teacher_mask is not None
@@ -3340,6 +3496,7 @@ class NativeWorldModel(nn.Module):
             (
                 appearance_context_for_rgb
                 if cfg.rgb_context_appearance_delta_scale > 0.0
+                and not cfg.appearance_flow_aligned_detail
                 else None
             ),
             render_future if cfg.appearance_enabled else None,

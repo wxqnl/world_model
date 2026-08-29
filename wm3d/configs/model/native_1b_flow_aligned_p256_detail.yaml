@@ -1,0 +1,81 @@
+schema: wm3d_v8_model_profile_v1
+name: native_1b_flow_aligned_p256_detail
+architecture: native_world_model
+expected_parameter_count: 1505781891
+sampling:
+  mode: observed_monotonic_subsequence
+  history_action_leading_boundary: observed_previous_state
+  context_horizon_seconds: 3.2
+  future_horizon_seconds: 1.6
+  minimum_horizon_coverage: 0.9
+  minimum_anchor_separation_seconds: 0.2
+  policy_target_horizon_seconds: 1.6
+  policy_training_times: observed_action_timestamps
+  interpolation: forbidden
+model:
+  schema: wm3d_native_world_model_v2
+  T: 16
+  P: 64
+  K: 8
+  token_dim: 2048
+  task_dim: 2048
+  num_views: 3
+  state_hidden: 1600
+  state_layers: 18
+  state_heads: 16
+  state_ff_mult: 2.5
+  action_hidden: 1280
+  action_layers: 14
+  action_heads: 16
+  action_ff_mult: 2.6666666666666665
+  policy_task_modulation: true
+  bridge_layers_state: [2, 5, 8, 11, 14, 17]
+  bridge_heads: 16
+  dynamics_layers: 1
+  factual_dynamics_repeats: 2
+  factual_action_residual_scale: 0.3
+  appearance_action_residual_scale: 0.3
+  view_hidden: 768
+  view_heads: 12
+  view_ff_mult: 2.5
+  max_action_groups: 8
+  max_action_dim: 16
+  max_state_dim: 32
+  max_action_substeps: 128
+  max_policy_queries: 256
+  max_group_id: 128
+  max_embodiments: 512
+  max_action_semantic_id: 64
+  max_state_semantic_id: 64
+  time_fourier_dim: 128
+  time_min_period_s: 0.01
+  time_max_period_s: 120.0
+  max_aux_tokens: 16
+  aux_dim: 256
+  max_aux_type_id: 128
+  rgb_hidden: 1280
+  rgb_res_blocks: 2
+  rgb_decode_chunk_size: 4
+  rgb_size: 256
+  rgb_decode_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+  rgb_context_enabled: true
+  # P64 factual dynamics exclusively control backward flow and visibility;
+  # P256 remains a synthesis/detail condition.
+  rgb_context_alignment_enabled: true
+  rgb_context_residual_scale: 0.75
+  # Keep V7 motion redraw; aligned transport sharpens its visible context share.
+  rgb_context_motion_blend_gain: 0.5
+  rgb_context_action_scale: 1.0
+  rgb_context_appearance_delta_scale: 1.0
+  geom_hidden: 512
+  appearance_enabled: true
+  appearance_P: 256
+  appearance_context_frames: 4
+  appearance_hidden: 512
+  appearance_layers: 2
+  appearance_heads: 8
+  appearance_ff_mult: 2.0
+  appearance_autoregressive_steps: 2
+  appearance_flow_aligned_detail: true
+  dropout: 0.0
+  activation_checkpointing: true

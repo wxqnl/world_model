@@ -832,6 +832,50 @@ def _dual_path_batch(cfg: NativeWorldModelConfig) -> dict[str, torch.Tensor]:
     return batch
 
 
+def test_flow_aligned_p256_detail_is_target_free_v7_fallback() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_alignment_enabled=True,
+        rgb_context_appearance_delta_scale=1.0,
+        appearance_flow_aligned_detail=True,
+    )
+    torch.manual_seed(136)
+    model = NativeWorldModel(cfg).train()
+    batch = _dual_path_batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+
+    output = model(**batch, appearance_teacher_ratio=1.0)
+    changed = dict(batch)
+    changed["target_appearance_tokens"] = torch.randn_like(
+        batch["target_appearance_tokens"]
+    )
+    changed_output = model(**changed, appearance_teacher_ratio=1.0)
+
+    assert output["appearance_teacher_ratio"].item() == 0.0
+    assert output["appearance_pred_tokens"].count_nonzero() == 0
+    assert "appearance_teacher_pred_tokens" not in output
+    torch.testing.assert_close(
+        output["appearance_pred_tokens"],
+        changed_output["appearance_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(output["rgb"], changed_output["rgb"], rtol=0, atol=0)
+
+    output["rgb"].float().mean().backward()
+    assert model.appearance_dynamics is not None
+    gradient = model.appearance_dynamics.output.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
+
+
 def _take_appearance_output_step(
     model: NativeWorldModel, batch: dict[str, torch.Tensor]
 ) -> None:
