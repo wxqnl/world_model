@@ -3463,6 +3463,7 @@ class NativeWorldModel(nn.Module):
         if (
             appearance_autoregressive_pred is not None
             and appearance_autoregressive_mask is not None
+            and appearance_autoregressive_pred.shape[1]
         ):
             output["appearance_autoregressive_pred_tokens"] = (
                 appearance_autoregressive_pred

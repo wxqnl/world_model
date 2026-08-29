@@ -860,6 +860,7 @@ def test_flow_aligned_p256_detail_is_target_free_v7_fallback() -> None:
     assert output["appearance_teacher_ratio"].item() == 0.0
     assert output["appearance_pred_tokens"].count_nonzero() == 0
     assert "appearance_teacher_pred_tokens" not in output
+    assert "appearance_autoregressive_pred_tokens" not in output
     torch.testing.assert_close(
         output["appearance_pred_tokens"],
         changed_output["appearance_pred_tokens"],
