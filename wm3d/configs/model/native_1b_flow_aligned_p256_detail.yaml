@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_flow_aligned_p256_detail
 architecture: native_world_model
-expected_parameter_count: 1505781891
+expected_parameter_count: 1500281211
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -59,9 +59,12 @@ model:
   rgb_size: 256
   rgb_decode_indices: [0, 1, 2, 3, 4, 5, 6, 7]
   rgb_context_enabled: true
-  # P64 factual dynamics exclusively control backward flow and visibility;
-  # P256 remains a synthesis/detail condition.
+  # P64/V7 time dynamics and centered physical action exclusively control
+  # backward flow and visibility; P256 remains a detail condition.
   rgb_context_alignment_enabled: true
+  # Preserve V7's horizon-varying action-free prior for RGB transport. The
+  # centered physical command still conditions the renderer directly.
+  rgb_render_action_free_prior: true
   rgb_context_residual_scale: 0.75
   # Keep V7 motion redraw; aligned transport sharpens its visible context share.
   rgb_context_motion_blend_gain: 0.5

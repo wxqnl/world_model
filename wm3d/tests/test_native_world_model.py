@@ -1197,6 +1197,8 @@ def test_p256_appearance_cannot_change_p64_flow_or_visibility() -> None:
         _tiny_dual_path_config(),
         rgb_context_enabled=True,
         rgb_context_alignment_enabled=True,
+        rgb_context_appearance_delta_scale=1.0,
+        appearance_flow_aligned_detail=True,
     )
     torch.manual_seed(136)
     decoder = NativeWorldModel(cfg).rgb_head.eval()
@@ -1220,7 +1222,7 @@ def test_p256_appearance_cannot_change_p64_flow_or_visibility() -> None:
         )
     )
     try:
-        baseline = decoder(
+        baseline_output = decoder(
             future_tokens,
             None,
             appearance_tokens=appearance,
@@ -1228,9 +1230,9 @@ def test_p256_appearance_cannot_change_p64_flow_or_visibility() -> None:
             task_embedding=task,
             context_rgb=context,
             context_rgb_mask=context_mask,
-        )[0]
+        )
         split = len(flow_outputs)
-        changed = decoder(
+        changed_output = decoder(
             future_tokens,
             None,
             appearance_tokens=appearance * 100.0,
@@ -1238,7 +1240,7 @@ def test_p256_appearance_cannot_change_p64_flow_or_visibility() -> None:
             task_embedding=task,
             context_rgb=context,
             context_rgb_mask=context_mask,
-        )[0]
+        )
     finally:
         flow_handle.remove()
         visibility_handle.remove()
@@ -1252,7 +1254,13 @@ def test_p256_appearance_cannot_change_p64_flow_or_visibility() -> None:
         visibility_outputs[:split], visibility_outputs[split:]
     ):
         torch.testing.assert_close(after, before, rtol=0, atol=0)
-    assert not torch.allclose(changed, baseline)
+    # P256 is post-transport detail: it may sharpen RGB, but it cannot alter
+    # V7 motion support, blend, flow or visibility.
+    for index in (2, 3, 4, 5):
+        torch.testing.assert_close(
+            changed_output[index], baseline_output[index], rtol=0, atol=0
+        )
+    assert not torch.allclose(changed_output[0], baseline_output[0])
 
 
 def test_context_renderer_builds_one_pyramid_per_batch_view_and_chunk() -> None:
@@ -1428,7 +1436,7 @@ def test_context_renderer_rgb_loss_reaches_per_view_p256_appearance_lane() -> No
     assert token_stem.weight.grad.abs().sum() > 0
 
 
-def test_context_renderer_p256_delta_has_persistent_multiscale_ownership() -> None:
+def test_context_renderer_p256_delta_has_post_transport_detail_ownership() -> None:
     cfg = replace(
         _tiny_dual_path_config(),
         rgb_context_enabled=True,
@@ -1478,7 +1486,7 @@ def test_context_renderer_p256_delta_has_persistent_multiscale_ownership() -> No
     delta_gradients = [
         parameter.grad
         for name, parameter in decoder.named_parameters()
-        if "appearance_delta" in name
+        if "appearance_delta" in name or "appearance_detail" in name
     ]
     assert delta_gradients
     assert all(gradient is not None for gradient in delta_gradients)
@@ -1932,3 +1940,65 @@ def test_render_refinement_is_stable_while_token_refinement_stays_causal() -> No
     assert not torch.allclose(
         split_output["pred_tokens"], reference_output["pred_tokens"]
     )
+
+
+def test_rgb_action_free_prior_preserves_time_and_uses_only_direct_action() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_alignment_enabled=True,
+        rgb_render_action_free_prior=True,
+        rgb_context_action_scale=1.0,
+        factual_dynamics_repeats=2,
+        factual_action_residual_scale=0.3,
+        dropout=0.0,
+    )
+    torch.manual_seed(149)
+    model = NativeWorldModel(cfg).eval()
+    batch = _dual_path_batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        batch["world_tokens"].shape[0],
+        cfg.num_views,
+        3,
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        batch["world_tokens"].shape[0], cfg.num_views, dtype=torch.bool
+    )
+
+    observed_motion_inputs: list[torch.Tensor] = []
+    stem = model.rgb_head.image_decoder.motion_token_stem
+    assert stem is not None
+    handle = stem.register_forward_pre_hook(
+        lambda _module, inputs: observed_motion_inputs.append(
+            inputs[0].detach().clone()
+        )
+    )
+    try:
+        factual = model(**batch)
+        split = len(observed_motion_inputs)
+        zero_batch = dict(batch)
+        zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
+            batch["future_factual_fine_action_values"]
+        )
+        zero_batch["future_factual_coarse_action_values"] = torch.zeros_like(
+            batch["future_factual_coarse_action_values"]
+        )
+        zero = model(**zero_batch)
+    finally:
+        handle.remove()
+
+    assert split > 0 and len(observed_motion_inputs) == 2 * split
+    for physical, neutral in zip(
+        observed_motion_inputs[:split], observed_motion_inputs[split:]
+    ):
+        torch.testing.assert_close(physical, neutral, rtol=0, atol=0)
+    for key in (
+        "policy_latent",
+        "action_free_native_state",
+        "action_free_pred_tokens",
+    ):
+        torch.testing.assert_close(factual[key], zero[key], rtol=0, atol=0)
+    assert not torch.allclose(factual["pred_tokens"], zero["pred_tokens"])
+    assert not torch.allclose(factual["rgb"], zero["rgb"])

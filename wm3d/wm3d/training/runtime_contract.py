@@ -60,6 +60,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "render_factual_action_residual_scale",
     "rgb_context_enabled",
     "rgb_context_alignment_enabled",
+    "rgb_render_action_free_prior",
     "rgb_context_residual_scale",
     "rgb_context_motion_blend_gain",
     "rgb_context_action_scale",

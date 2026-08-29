@@ -420,6 +420,7 @@ def test_streaming_data_contract_ignores_model_only_conditioning_scales() -> Non
             "appearance_autoregressive_steps": 2,
             "policy_task_modulation": True,
             "rgb_context_alignment_enabled": True,
+            "rgb_render_action_free_prior": True,
             "rgb_context_action_scale": 1.0,
             "rgb_context_appearance_delta_scale": 1.0,
         }

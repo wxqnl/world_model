@@ -123,6 +123,11 @@ class NativeWorldModelConfig:
     # Align the V7 observed frame with motion from the factual P64 dynamics
     # before any context RGB/feature skip enters the future renderer.
     rgb_context_alignment_enabled: bool = False
+    # Keep the V7 action-free temporal prior as the RGB transport owner.  The
+    # factual world lane remains action-causal, while centered physical action
+    # reaches RGB through the renderer-only action conditioner below.  This
+    # prevents repeated factual refinement from homogenizing RGB horizons.
+    rgb_render_action_free_prior: bool = False
     rgb_context_residual_scale: float = 0.75
     rgb_context_motion_blend_gain: float = 0.5
     # V7 conditions the context-residual renderer directly on the future
@@ -130,10 +135,9 @@ class NativeWorldModelConfig:
     # action summary reaches the RGB bottleneck but never the action-free
     # state or policy trunks.
     rgb_context_action_scale: float = 0.0
-    # Preserve the last observed RGB as the static carrier, while giving the
-    # future-minus-last P256 appearance residual an explicit spatial path at
-    # every decoder scale.  This prevents the full-resolution context skips
-    # from becoming a complete shortcut around future appearance dynamics.
+    # Preserve the last observed RGB as the static carrier. P256 contributes a
+    # post-transport, high-frequency RGB correction and cannot change the V7
+    # motion, flow, visibility or blend owners.
     rgb_context_appearance_delta_scale: float = 0.0
     geom_hidden: int = 768
 
@@ -239,6 +243,10 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_context_alignment_enabled must be boolean")
         if self.rgb_context_alignment_enabled and not self.rgb_context_enabled:
             raise ValueError("RGB context alignment requires context RGB")
+        if not isinstance(self.rgb_render_action_free_prior, bool):
+            raise ValueError("rgb_render_action_free_prior must be boolean")
+        if self.rgb_render_action_free_prior and not self.rgb_context_enabled:
+            raise ValueError("action-free RGB prior requires context RGB")
         if (
             not isfinite(self.rgb_context_residual_scale)
             or self.rgb_context_residual_scale <= 0.0
@@ -1808,6 +1816,38 @@ class _RGBUpBlock(nn.Module):
         return self.conv(value)
 
 
+class _RGBZeroPreservingDetailUpBlock(nn.Module):
+    """Upsample P256 detail without creating content from a zero residual."""
+
+    def __init__(self, input_channels: int, output_channels: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(
+                input_channels, output_channels, 3, padding=1, bias=False
+            ),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(
+                output_channels, output_channels, 3, padding=1, bias=False
+            ),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        value = F.interpolate(
+            value, scale_factor=2.0, mode="bilinear", align_corners=False
+        )
+        return self.conv(value)
+
+
+class _RGBDetailHead(nn.Conv2d):
+    """Start near zero while keeping detail gradients live."""
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.weight, std=1.0e-4)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
 class _RGBFlowHead(nn.Conv2d):
     """Keep a newly materialized flow field at the identity transform."""
 
@@ -1931,9 +1971,9 @@ class NativeContextRGBImageDecoder(nn.Module):
             nn.SiLU(inplace=True),
             _RGBConvBlock(channels[0], channels[0]),
         )
-        # P256 remains an appearance/synthesis condition.  The native P64
-        # factual dynamics are the sole future-position authority for flow,
-        # motion support and visibility.
+        # P256 remains an appearance/synthesis condition. The native P64 RGB
+        # prior and centered physical action are the sole future-position
+        # authorities for flow, motion support and visibility.
         self.motion_token_stem = (
             nn.Sequential(
                 nn.Conv2d(cfg.token_dim, motion_channels[0], 1),
@@ -1981,33 +2021,47 @@ class NativeContextRGBImageDecoder(nn.Module):
             if cfg.rgb_context_alignment_enabled
             else None
         )
+        # P256 is a post-transport detail lane, never a second motion owner.
+        # A narrow zero-preserving decoder is sufficient because P64/V7 owns
+        # geometry, flow, visibility and blend.  Keeping this branch out of the
+        # main U-Net also removes the former wide multiscale compute regression.
+        detail_base_channels = max(64, cfg.rgb_hidden // 8)
+        detail_stages = (
+            (cfg.rgb_size // self.appearance_grid).bit_length() - 1
+            if cfg.rgb_context_appearance_delta_scale > 0.0
+            else 0
+        )
+        self.appearance_detail_decode_grid = (
+            cfg.rgb_size // (1 << detail_stages)
+            if cfg.rgb_context_appearance_delta_scale > 0.0
+            else self.appearance_grid
+        )
+        detail_channels = tuple(
+            max(32, detail_base_channels >> min(stage, 2))
+            for stage in range(detail_stages + 1)
+        )
         self.appearance_delta_stem = (
             nn.Sequential(
-                nn.Conv2d(cfg.token_dim, channels[0], 1, bias=False),
-                nn.GroupNorm(_rgb_norm_groups(channels[0]), channels[0], affine=False),
+                nn.Conv2d(
+                    cfg.token_dim, detail_channels[0], 1, bias=False
+                ),
                 nn.SiLU(inplace=True),
             )
             if cfg.rgb_context_appearance_delta_scale > 0.0
             else None
         )
-        self.appearance_delta_projections = nn.ModuleList(
-            nn.Sequential(
-                nn.Conv2d(channels[0], output_channels, 1, bias=False),
-            )
-            for output_channels in (
-                channels[1:] if cfg.rgb_context_appearance_delta_scale > 0.0 else ()
+        self.appearance_detail_ups = nn.ModuleList(
+            _RGBZeroPreservingDetailUpBlock(input_channels, output_channels)
+            for input_channels, output_channels in zip(
+                detail_channels, detail_channels[1:]
             )
         )
-        self.appearance_delta_activations = nn.ModuleList(
-            nn.Sequential(
-                nn.GroupNorm(
-                    _rgb_norm_groups(output_channels), output_channels, affine=False
-                ),
-                nn.SiLU(inplace=True),
+        self.appearance_detail_head = (
+            _RGBDetailHead(
+                detail_channels[-1], 3, 3, padding=1, bias=False
             )
-            for output_channels in (
-                channels[1:] if cfg.rgb_context_appearance_delta_scale > 0.0 else ()
-            )
+            if cfg.rgb_context_appearance_delta_scale > 0.0
+            else None
         )
         self.geometry_stem = (
             nn.Conv2d(cfg.state_hidden, channels[0], 1, bias=False)
@@ -2275,16 +2329,6 @@ class NativeContextRGBImageDecoder(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             ).to(dtype=tokens.dtype)
-        if appearance_delta is not None and appearance_delta.shape[-2:] != (
-            self.decode_grid,
-            self.decode_grid,
-        ):
-            appearance_delta = F.interpolate(
-                appearance_delta.float(),
-                size=(self.decode_grid, self.decode_grid),
-                mode="bilinear",
-                align_corners=False,
-            ).to(dtype=tokens.dtype)
         if motion_value is not None and self.decode_grid != self.motion_grid:
             assert motion_tokens is not None
             motion_value = F.interpolate(
@@ -2302,17 +2346,6 @@ class NativeContextRGBImageDecoder(nn.Module):
                 dtype=value.dtype
             )
 
-        # A bias-free pointwise projection commutes with bilinear resize.
-        # Project once on the token grid so high-resolution stages resize only
-        # their required channel width.  GroupNorm and SiLU remain after each
-        # resize because their spatial semantics must not move.
-        projected_appearance_deltas: tuple[torch.Tensor, ...] = ()
-        if appearance_delta is not None:
-            projected_appearance_deltas = tuple(
-                projection(appearance_delta)
-                for projection in self.appearance_delta_projections
-            )
-
         # One observed image conditions every decoded future for the same
         # batch/view pair. Legacy mode can reuse its raw context pyramid;
         # aligned mode must first move the RGB and derives every skip from that
@@ -2325,9 +2358,9 @@ class NativeContextRGBImageDecoder(nn.Module):
         context = context_rgb.to(dtype=value.dtype)
         if self.cfg.rgb_context_alignment_enabled:
             # Predict transport before the appearance branch sees any context
-            # feature.  This tower is driven only by factual P64 dynamics,
-            # geometry, action, task and view identity; unreliable P256
-            # appearance cannot shrink motion or move visibility boundaries.
+            # feature. This tower is driven only by the P64 RGB prior,
+            # geometry, centered action, task and view identity; unreliable
+            # P256 detail cannot shrink motion or move visibility boundaries.
             assert motion_value is not None
             assert self.flow_head is not None
             assert self.disocclusion_head is not None
@@ -2384,25 +2417,11 @@ class NativeContextRGBImageDecoder(nn.Module):
         value = self.bottleneck_fuse(
             torch.cat((value, warped_skips[-1]), dim=1)
         )
-        delta_scale = float(self.cfg.rgb_context_appearance_delta_scale)
-        if appearance_delta is not None:
-            value = value + delta_scale * torch.tanh(appearance_delta)
-        for stage_index, (upsample, fuse, context_skip) in enumerate(
-            zip(self.ups, self.skip_fuses, reversed(warped_skips[:-1]))
+        for upsample, fuse, context_skip in zip(
+            self.ups, self.skip_fuses, reversed(warped_skips[:-1])
         ):
             value = upsample(value)
             value = fuse(torch.cat((value, context_skip), dim=1))
-            if appearance_delta is not None:
-                delta_at_scale = F.interpolate(
-                    projected_appearance_deltas[stage_index].float(),
-                    size=value.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                ).to(dtype=value.dtype)
-                delta_at_scale = self.appearance_delta_activations[stage_index](
-                    delta_at_scale
-                )
-                value = value + delta_scale * torch.tanh(delta_at_scale)
 
         motion_logit = self.motion_head(value)
         motion_hint = torch.sigmoid(motion_logit)
@@ -2435,6 +2454,44 @@ class NativeContextRGBImageDecoder(nn.Module):
         else:
             blend = legacy_blend
             rgb = blend * direct + (1.0 - blend) * residual_rgb
+        if appearance_delta is not None:
+            assert self.appearance_detail_head is not None
+            detail = appearance_delta
+            if detail.shape[-2:] != (
+                self.appearance_detail_decode_grid,
+                self.appearance_detail_decode_grid,
+            ):
+                detail = F.interpolate(
+                    detail.float(),
+                    size=(
+                        self.appearance_detail_decode_grid,
+                        self.appearance_detail_decode_grid,
+                    ),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=value.dtype)
+            for detail_upsample in self.appearance_detail_ups:
+                detail = detail_upsample(detail)
+            if detail.shape[-2:] != (self.cfg.rgb_size, self.cfg.rgb_size):
+                raise ValueError("P256 detail decoder does not reach RGB resolution")
+            detail_logits = self.appearance_detail_head(detail).float()
+            low_frequency = F.avg_pool2d(
+                detail_logits,
+                kernel_size=5,
+                stride=1,
+                padding=2,
+                count_include_pad=False,
+            )
+            detail_correction = torch.tanh(detail_logits - low_frequency).to(
+                dtype=rgb.dtype
+            )
+            rgb = torch.clamp(
+                rgb
+                + float(self.cfg.rgb_context_appearance_delta_scale)
+                * detail_correction,
+                0.0,
+                1.0,
+            )
         return rgb, motion_logit, blend, flow_pixels, disocclusion_logit
 
 
@@ -3293,6 +3350,11 @@ class NativeWorldModel(nn.Module):
                 repeats=render_repeats,
                 residual_scale=render_residual_scale,
             )
+        rgb_render_future = (
+            action_free_future
+            if cfg.rgb_render_action_free_prior
+            else render_future
+        )
         zero_action_pred_tokens: Optional[torch.Tensor] = None
         zero_encoded: Optional[torch.Tensor] = None
         zero_encoded_mask: Optional[torch.Tensor] = None
@@ -3343,6 +3405,11 @@ class NativeWorldModel(nn.Module):
             pred_tokens
             if render_future is factual_future
             else self.token_output(render_future)
+        )
+        rgb_render_pred_tokens = (
+            action_free_pred_tokens
+            if rgb_render_future is action_free_future
+            else render_pred_tokens
         )
         appearance_for_rgb: Optional[torch.Tensor] = None
         appearance_context_for_rgb: Optional[torch.Tensor] = None
@@ -3413,7 +3480,7 @@ class NativeWorldModel(nn.Module):
             ) = self.appearance_dynamics(
                 appearance_context_tokens,
                 appearance_context_mask,
-                render_future,
+                rgb_render_future,
                 relative_world_time,
                 target_appearance_mask,
                 appearance_action_tokens,
@@ -3490,7 +3557,7 @@ class NativeWorldModel(nn.Module):
             rgb_disocclusion_logit,
         ) = self._run(
             self.rgb_head,
-            render_pred_tokens,
+            rgb_render_pred_tokens,
             rgb_frame_indices,
             rgb_view_mask,
             appearance_for_rgb,
@@ -3500,7 +3567,7 @@ class NativeWorldModel(nn.Module):
                 and not cfg.appearance_flow_aligned_detail
                 else None
             ),
-            render_future if cfg.appearance_enabled else None,
+            rgb_render_future if cfg.appearance_enabled else None,
             rgb_action_summary,
             task_embedding if cfg.rgb_context_enabled else None,
             context_rgb,

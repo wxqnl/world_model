@@ -46,7 +46,7 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_557_073_784
+    assert model["expected_parameter_count"] == 5_550_292_872
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_P"] == 256
