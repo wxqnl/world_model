@@ -922,8 +922,9 @@ def _run_contract(
     config: Mapping[str, Any],
     parameter_counts: Mapping[str, int],
     native_model: NativeWorldModel,
+    warmstart_model: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    contract = {
         "schema": RUN_CONTRACT_SCHEMA,
         "name": config["run"]["name"],
         "lineage": config["run"]["lineage"],
@@ -938,6 +939,9 @@ def _run_contract(
         "parameter_counts": dict(parameter_counts),
         "required_gradient_owners": list(required_gradient_owner_names(native_model)),
     }
+    if warmstart_model is not None:
+        contract["warmstart_model"] = dict(warmstart_model)
+    return contract
 
 
 def _resume_expectations(
@@ -1263,6 +1267,24 @@ def main() -> None:
             ),
         )
         model = wrapped.model
+        if args.resume is not None and "model_warmstart_checkpoint" in runtime["train"]:
+            raise PretrainError("exact resume and model warmstart are mutually exclusive")
+        warmstart_model: Mapping[str, Any] | None = None
+        warmstart_path = runtime["train"].get("model_warmstart_checkpoint")
+        if warmstart_path is not None:
+            source_path = Path(str(warmstart_path)).resolve(strict=True)
+            source_manager = DistributedCheckpointManager(source_path.parent)
+            prefixes = tuple(
+                str(value)
+                for value in runtime["train"][
+                    "model_warmstart_new_parameter_prefixes"
+                ]
+            )
+            warmstart_model = source_manager.load_model_warmstart(
+                path=source_path,
+                model=model,
+                new_parameter_prefixes=prefixes,
+            )
         optimizer_cfg = runtime["optimizer"]
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -1285,7 +1307,12 @@ def main() -> None:
                 output_root.mkdir(parents=True, exist_ok=True)
                 if output_root.is_symlink():
                     raise PretrainError("output root cannot be a symlink")
-                contract = _run_contract(config, parameter_counts, native_model)
+                contract = _run_contract(
+                    config,
+                    parameter_counts,
+                    native_model,
+                    warmstart_model=warmstart_model,
+                )
                 _atomic_json_no_clobber(output_root / "run_contract.json", contract)
                 status[0] = {"ok": True, "contract": contract}
             except Exception as exc:

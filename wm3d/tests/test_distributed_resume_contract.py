@@ -216,6 +216,64 @@ def _small_dcp_expected() -> ResumeExpectations:
     )
 
 
+def test_model_warmstart_loads_shared_tensors_and_preserves_declared_new_ones(
+    tmp_path: Path,
+) -> None:
+    rendezvous = tmp_path / "warmstart-process-group"
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=0, world_size=1
+    )
+    try:
+        manager = DistributedCheckpointManager(tmp_path / "checkpoints")
+
+        class Source(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.shared = torch.nn.Linear(2, 2, bias=False)
+
+        class Target(Source):
+            def __init__(self) -> None:
+                super().__init__()
+                self.alignment = torch.nn.Linear(2, 1, bias=False)
+
+        source = Source()
+        with torch.no_grad():
+            source.shared.weight.fill_(3.0)
+        optimizer = torch.optim.SGD(source.parameters(), lr=0.1)
+        checkpoint = manager.save(
+            step=1,
+            model=source,
+            optimizer=optimizer,
+            metadata=_small_dcp_metadata(progress=1),
+            rank_state={"next_optimizer_step": 1},
+        )
+
+        target = Target()
+        with torch.no_grad():
+            target.shared.weight.zero_()
+            target.alignment.weight.fill_(7.0)
+        receipt = manager.load_model_warmstart(
+            path=checkpoint,
+            model=target,
+            new_parameter_prefixes=("alignment.",),
+        )
+
+        torch.testing.assert_close(
+            target.shared.weight,
+            torch.full_like(target.shared.weight, 3.0),
+        )
+        torch.testing.assert_close(
+            target.alignment.weight,
+            torch.full_like(target.alignment.weight, 7.0),
+        )
+        assert receipt["optimizer_rng_sampler_restored"] is False
+        assert receipt["matched_tensors"] == 1
+        assert receipt["new_tensors"] == ["alignment.weight"]
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def _replace_regular_file(source: Path, destination: Path) -> None:
     temporary = destination.with_name(destination.name + ".attacker")
     shutil.copyfile(source, temporary)

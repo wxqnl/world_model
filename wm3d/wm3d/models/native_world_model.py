@@ -120,6 +120,9 @@ class NativeWorldModelConfig:
     rgb_size: int = 384
     rgb_decode_indices: tuple[int, ...] = tuple(range(16))
     rgb_context_enabled: bool = False
+    # Align the V7 observed frame with motion from the factual P64 dynamics
+    # before any context RGB/feature skip enters the future renderer.
+    rgb_context_alignment_enabled: bool = False
     rgb_context_residual_scale: float = 0.75
     rgb_context_motion_blend_gain: float = 0.5
     # V7 conditions the context-residual renderer directly on the future
@@ -228,6 +231,10 @@ class NativeWorldModelConfig:
             )
         if not isinstance(self.rgb_context_enabled, bool):
             raise ValueError("rgb_context_enabled must be boolean")
+        if not isinstance(self.rgb_context_alignment_enabled, bool):
+            raise ValueError("rgb_context_alignment_enabled must be boolean")
+        if self.rgb_context_alignment_enabled and not self.rgb_context_enabled:
+            raise ValueError("RGB context alignment requires context RGB")
         if (
             not isfinite(self.rgb_context_residual_scale)
             or self.rgb_context_residual_scale <= 0.0
@@ -1714,13 +1721,86 @@ class _RGBUpBlock(nn.Module):
         return self.conv(value)
 
 
+class _RGBFlowHead(nn.Conv2d):
+    """Keep a newly materialized flow field at the identity transform."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class _RGBDisocclusionHead(nn.Conv2d):
+    """Begin with observed pixels visible and learn only genuine redraws."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, -2.0)
+
+
+def _warp_rgb_feature_with_pixel_flow(
+    source: torch.Tensor,
+    flow_pixels: torch.Tensor,
+    *,
+    image_height: int,
+    image_width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Backward-warp an RGB feature using flow measured in RGB pixels."""
+
+    if source.ndim != 4 or flow_pixels.ndim != 4:
+        raise ValueError("RGB feature and pixel flow must be rank four")
+    if source.shape[0] != flow_pixels.shape[0] or flow_pixels.shape[1] != 2:
+        raise ValueError("RGB feature and [N,2,H,W] flow must share a batch")
+    if source.shape[-2:] != flow_pixels.shape[-2:]:
+        flow_pixels = F.interpolate(
+            flow_pixels.float(),
+            size=source.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+    height, width = source.shape[-2:]
+    y = torch.linspace(
+        -1.0, 1.0, height, device=source.device, dtype=torch.float32
+    )
+    x = torch.linspace(
+        -1.0, 1.0, width, device=source.device, dtype=torch.float32
+    )
+    grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
+    base_grid = torch.stack((grid_x, grid_y), dim=-1)[None]
+    flow = flow_pixels.float()
+    displacement = torch.stack(
+        (
+            2.0 * flow[:, 0] / float(max(1, image_width - 1)),
+            2.0 * flow[:, 1] / float(max(1, image_height - 1)),
+        ),
+        dim=-1,
+    )
+    sampling_grid = base_grid + displacement
+    valid = (
+        (sampling_grid[..., 0] >= -1.0)
+        & (sampling_grid[..., 0] <= 1.0)
+        & (sampling_grid[..., 1] >= -1.0)
+        & (sampling_grid[..., 1] <= 1.0)
+    )[:, None]
+    warped = F.grid_sample(
+        source.float(),
+        sampling_grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return warped.to(dtype=source.dtype), valid
+
+
 class NativeContextRGBImageDecoder(nn.Module):
-    """Preserve observed detail and learn only future RGB changes."""
+    """Align V7 observed detail before synthesizing future RGB changes."""
 
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.cfg = cfg
         self.grid = isqrt(cfg.appearance_P if cfg.appearance_enabled else cfg.P)
+        self.motion_grid = isqrt(cfg.P)
         self.geometry_grid = isqrt(cfg.P)
         stages = (cfg.rgb_size // self.grid).bit_length() - 1
         self.decode_grid = cfg.rgb_size // (1 << stages)
@@ -1749,11 +1829,65 @@ class NativeContextRGBImageDecoder(nn.Module):
                     for index in range(stages)
                 ]
             )
+        motion_floor = min(32, channels[-1])
+        motion_channels = tuple(
+            max(motion_floor, channel // 4) for channel in channels
+        )
         self.token_stem = nn.Sequential(
             nn.Conv2d(cfg.token_dim, channels[0], 1),
             nn.GroupNorm(_rgb_norm_groups(channels[0]), channels[0]),
             nn.SiLU(inplace=True),
             _RGBConvBlock(channels[0], channels[0]),
+        )
+        # P256 remains an appearance/synthesis condition.  The native P64
+        # factual dynamics are the sole future-position authority for flow,
+        # motion support and visibility.
+        self.motion_token_stem = (
+            nn.Sequential(
+                nn.Conv2d(cfg.token_dim, motion_channels[0], 1),
+                nn.GroupNorm(
+                    _rgb_norm_groups(motion_channels[0]), motion_channels[0]
+                ),
+                nn.SiLU(inplace=True),
+                _RGBConvBlock(motion_channels[0], motion_channels[0]),
+            )
+            if cfg.rgb_context_alignment_enabled
+            else None
+        )
+        self.motion_view_proj = (
+            nn.Conv2d(channels[0], motion_channels[0], 1, bias=False)
+            if cfg.rgb_context_alignment_enabled
+            else None
+        )
+        self.motion_geometry_stem = (
+            nn.Conv2d(cfg.state_hidden, motion_channels[0], 1, bias=False)
+            if cfg.rgb_context_alignment_enabled and cfg.appearance_enabled
+            else None
+        )
+        self.motion_action_proj = (
+            nn.Sequential(
+                nn.Linear(cfg.state_hidden, motion_channels[0]),
+                nn.SiLU(inplace=True),
+                nn.Linear(motion_channels[0], motion_channels[0]),
+            )
+            if cfg.rgb_context_alignment_enabled
+            and cfg.rgb_context_action_scale > 0.0
+            else None
+        )
+        self.motion_task_proj = (
+            nn.Sequential(
+                nn.LayerNorm(cfg.task_dim),
+                nn.Linear(cfg.task_dim, motion_channels[0]),
+                nn.SiLU(inplace=True),
+                nn.Linear(motion_channels[0], motion_channels[0]),
+            )
+            if cfg.rgb_context_alignment_enabled
+            else None
+        )
+        self.motion_to_synthesis = (
+            nn.Conv2d(motion_channels[0], channels[0], 1, bias=False)
+            if cfg.rgb_context_alignment_enabled
+            else None
         )
         self.appearance_delta_stem = (
             nn.Sequential(
@@ -1826,8 +1960,33 @@ class NativeContextRGBImageDecoder(nn.Module):
             _RGBConvBlock(output_channels * 2, output_channels)
             for output_channels in channels[1:]
         )
+        self.motion_ups = nn.ModuleList(
+            (
+                _RGBUpBlock(input_channels, output_channels)
+                for input_channels, output_channels in zip(
+                    motion_channels, motion_channels[1:]
+                )
+            )
+            if cfg.rgb_context_alignment_enabled
+            else ()
+        )
         self.head = nn.Conv2d(channels[-1], 7, 3, padding=1)
-        self.motion_head = nn.Conv2d(channels[-1], 1, 3, padding=1)
+        motion_output_channels = (
+            motion_channels[-1]
+            if cfg.rgb_context_alignment_enabled
+            else channels[-1]
+        )
+        self.motion_head = nn.Conv2d(motion_output_channels, 1, 3, padding=1)
+        self.flow_head = (
+            _RGBFlowHead(motion_output_channels, 2, 3, padding=1)
+            if cfg.rgb_context_alignment_enabled
+            else None
+        )
+        self.disocclusion_head = (
+            _RGBDisocclusionHead(motion_output_channels, 1, 3, padding=1)
+            if cfg.rgb_context_alignment_enabled
+            else None
+        )
         nn.init.zeros_(self.motion_head.weight)
         nn.init.constant_(self.motion_head.bias, -4.0)
 
@@ -1841,6 +2000,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         task_embedding: torch.Tensor,
         context_rgb: torch.Tensor,
         context_indices: Optional[torch.Tensor] = None,
+        motion_tokens: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if tuple(context_rgb.shape[1:]) != (
             3,
@@ -1862,6 +2022,30 @@ class NativeContextRGBImageDecoder(nn.Module):
             tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
         )
         value = self.token_stem(value) + view_embedding
+        motion_value: Optional[torch.Tensor] = None
+        if self.cfg.rgb_context_alignment_enabled:
+            if (
+                motion_tokens is None
+                or tuple(motion_tokens.shape[1:])
+                != (self.cfg.P, self.cfg.token_dim)
+                or motion_tokens.shape[0] != tokens.shape[0]
+            ):
+                raise ValueError(
+                    "context RGB motion tokens must align and end in [P,token_dim]"
+                )
+            assert self.motion_token_stem is not None
+            assert self.motion_view_proj is not None
+            motion_value = motion_tokens.transpose(1, 2).reshape(
+                motion_tokens.shape[0],
+                self.cfg.token_dim,
+                self.motion_grid,
+                self.motion_grid,
+            )
+            motion_value = self.motion_token_stem(
+                motion_value
+            ) + self.motion_view_proj(view_embedding)
+        elif motion_tokens is not None:
+            raise ValueError("motion tokens require aligned context RGB")
         appearance_delta: Optional[torch.Tensor] = None
         if self.appearance_delta_stem is not None:
             if appearance_context_tokens is None or tuple(
@@ -1883,6 +2067,12 @@ class NativeContextRGBImageDecoder(nn.Module):
             raise ValueError("context RGB task embedding must be [N,task_dim]")
         task = self.task_proj(task_embedding).to(dtype=value.dtype)
         value = value + task[:, :, None, None]
+        if motion_value is not None:
+            assert self.motion_task_proj is not None
+            motion_task = self.motion_task_proj(task_embedding).to(
+                dtype=motion_value.dtype
+            )
+            motion_value = motion_value + motion_task[:, :, None, None]
         if self.action_proj is not None:
             if factual_action_summary is None or tuple(
                 factual_action_summary.shape
@@ -1894,6 +2084,15 @@ class NativeContextRGBImageDecoder(nn.Module):
             value = value + (
                 float(self.cfg.rgb_context_action_scale) * action[:, :, None, None]
             )
+            if motion_value is not None:
+                assert self.motion_action_proj is not None
+                motion_action = self.motion_action_proj(
+                    factual_action_summary
+                ).to(dtype=motion_value.dtype)
+                motion_value = motion_value + (
+                    float(self.cfg.rgb_context_action_scale)
+                    * motion_action[:, :, None, None]
+                )
         elif factual_action_summary is not None:
             raise ValueError(
                 "factual action summary was supplied while RGB action conditioning is disabled"
@@ -1912,15 +2111,26 @@ class NativeContextRGBImageDecoder(nn.Module):
                 self.geometry_grid,
                 self.geometry_grid,
             )
-            geometry = self.geometry_stem(geometry)
+            synthesis_geometry = self.geometry_stem(geometry)
             if self.geometry_grid != self.grid:
-                geometry = F.interpolate(
-                    geometry.float(),
+                synthesis_geometry = F.interpolate(
+                    synthesis_geometry.float(),
                     size=(self.grid, self.grid),
                     mode="bilinear",
                     align_corners=False,
                 ).to(dtype=value.dtype)
-            value = value + geometry
+            value = value + synthesis_geometry
+            if motion_value is not None:
+                assert self.motion_geometry_stem is not None
+                motion_geometry = self.motion_geometry_stem(geometry)
+                if self.geometry_grid != self.motion_grid:
+                    motion_geometry = F.interpolate(
+                        motion_geometry.float(),
+                        size=(self.motion_grid, self.motion_grid),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).to(dtype=motion_value.dtype)
+                motion_value = motion_value + motion_geometry
         if self.decode_grid != self.grid:
             value = F.interpolate(
                 value.float(),
@@ -1935,6 +2145,22 @@ class NativeContextRGBImageDecoder(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 ).to(dtype=tokens.dtype)
+        if motion_value is not None and self.decode_grid != self.motion_grid:
+            assert motion_tokens is not None
+            motion_value = F.interpolate(
+                motion_value.float(),
+                size=(self.decode_grid, self.decode_grid),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=motion_tokens.dtype)
+
+        # Motion/action information enters synthesis, but the P256 appearance
+        # lane never enters the transport/visibility tower below.
+        if motion_value is not None:
+            assert self.motion_to_synthesis is not None
+            value = value + self.motion_to_synthesis(motion_value).to(
+                dtype=value.dtype
+            )
 
         # A bias-free pointwise projection commutes with bilinear resize.
         # Project once on the token grid so high-resolution stages resize only
@@ -1947,36 +2173,80 @@ class NativeContextRGBImageDecoder(nn.Module):
                 for projection in self.appearance_delta_projections
             )
 
-        context = context_rgb.to(dtype=value.dtype)
-        skips = [self.context_stem(context)]
-        for downsample in self.context_downs:
-            skips.append(downsample(skips[-1]))
-        if skips[-1].shape[-2:] != value.shape[-2:]:
-            raise ValueError("context pyramid does not align with RGB token grid")
-
         # One observed image conditions every decoded future for the same
-        # batch/view pair.  Build its convolutional pyramid once per chunk and
-        # expand only the already-computed feature maps.  Convolutions and
-        # GroupNorm are sample-local, so this is mathematically identical to
-        # repeating the RGB image before the pyramid.
+        # batch/view pair. Legacy mode can reuse its raw context pyramid;
+        # aligned mode must first move the RGB and derives every skip from that
+        # aligned image, so no unwarped high-dimensional feature is materialized.
         def expand_context(value_to_expand: torch.Tensor) -> torch.Tensor:
             if context_indices is None:
                 return value_to_expand
             return value_to_expand.index_select(0, context_indices)
 
+        context = context_rgb.to(dtype=value.dtype)
+        if self.cfg.rgb_context_alignment_enabled:
+            # Predict transport before the appearance branch sees any context
+            # feature.  This tower is driven only by factual P64 dynamics,
+            # geometry, action, task and view identity; unreliable P256
+            # appearance cannot shrink motion or move visibility boundaries.
+            assert motion_value is not None
+            assert self.flow_head is not None
+            assert self.disocclusion_head is not None
+            motion_features = motion_value
+            for motion_upsample in self.motion_ups:
+                motion_features = motion_upsample(motion_features)
+            if motion_features.shape[-2:] != (
+                self.cfg.rgb_size,
+                self.cfg.rgb_size,
+            ):
+                raise ValueError(
+                    "RGB motion tower does not reach the output resolution"
+                )
+            max_flow_pixels = 0.5 * float(self.cfg.rgb_size)
+            raw_flow = self.flow_head(motion_features).float()
+            flow_pixels = max_flow_pixels * torch.tanh(
+                raw_flow / max_flow_pixels
+            )
+            motion_logit = self.motion_head(motion_features)
+            disocclusion = torch.sigmoid(
+                self.disocclusion_head(motion_features)
+            )
+
+            # Warp three RGB channels once, then derive the entire feature
+            # pyramid from the aligned image. This is both stricter and much
+            # cheaper than grid-sampling every wide U-Net skip separately.
+            warped_context, warp_valid = _warp_rgb_feature_with_pixel_flow(
+                expand_context(context),
+                flow_pixels,
+                image_height=self.cfg.rgb_size,
+                image_width=self.cfg.rgb_size,
+            )
+            aligned_skips = [self.context_stem(warped_context)]
+            for downsample in self.context_downs:
+                aligned_skips.append(downsample(aligned_skips[-1]))
+            warped_skips = tuple(aligned_skips)
+        else:
+            skips = [self.context_stem(context)]
+            for downsample in self.context_downs:
+                skips.append(downsample(skips[-1]))
+            warped_context = expand_context(context)
+            warped_skips = tuple(expand_context(skip) for skip in skips)
+            warp_valid = None
+            disocclusion = None
+            motion_logit = None
+        if warped_skips[-1].shape[-2:] != value.shape[-2:]:
+            raise ValueError("context pyramid does not align with RGB token grid")
+
         value = self.bottleneck_fuse(
-            torch.cat((value, expand_context(skips[-1])), dim=1)
+            torch.cat((value, warped_skips[-1]), dim=1)
         )
         delta_scale = float(self.cfg.rgb_context_appearance_delta_scale)
         if appearance_delta is not None:
             value = value + delta_scale * torch.tanh(appearance_delta)
         for stage_index, (upsample, fuse, context_skip) in enumerate(
-            zip(self.ups, self.skip_fuses, reversed(skips[:-1]))
+            zip(self.ups, self.skip_fuses, reversed(warped_skips[:-1]))
         ):
             value = upsample(value)
-            value = fuse(
-                torch.cat((value, expand_context(context_skip)), dim=1)
-            )
+            value = fuse(torch.cat((value, context_skip), dim=1))
             if appearance_delta is not None:
                 delta_at_scale = F.interpolate(
                     projected_appearance_deltas[stage_index].float(),
@@ -1992,21 +2262,29 @@ class NativeContextRGBImageDecoder(nn.Module):
         raw = self.head(value)
         direct = torch.sigmoid(raw[:, :3])
         residual = torch.tanh(raw[:, 3:6]) * float(self.cfg.rgb_context_residual_scale)
-        motion_logit = self.motion_head(value)
-        motion_hint = torch.sigmoid(motion_logit)
-        blend = torch.sigmoid(raw[:, 6:7])
-        if self.cfg.rgb_context_motion_blend_gain > 0.0:
-            blend = torch.clamp(
-                blend
-                + motion_hint.to(dtype=blend.dtype)
-                * float(self.cfg.rgb_context_motion_blend_gain),
-                0.0,
-                1.0,
-            )
-        residual_rgb = torch.clamp(
-            expand_context(context) + residual, 0.0, 1.0
-        )
-        rgb = blend * direct + (1.0 - blend) * residual_rgb
+        residual_rgb = torch.clamp(warped_context + residual, 0.0, 1.0)
+        if self.cfg.rgb_context_alignment_enabled:
+            assert motion_logit is not None
+            assert disocclusion is not None
+            assert warp_valid is not None
+            transport = (
+                1.0 - disocclusion.to(dtype=value.dtype)
+            ) * warp_valid.to(dtype=value.dtype)
+            blend = 1.0 - transport
+            rgb = transport * residual_rgb + blend * direct
+        else:
+            motion_logit = self.motion_head(value)
+            motion_hint = torch.sigmoid(motion_logit)
+            blend = torch.sigmoid(raw[:, 6:7])
+            if self.cfg.rgb_context_motion_blend_gain > 0.0:
+                blend = torch.clamp(
+                    blend
+                    + motion_hint.to(dtype=blend.dtype)
+                    * float(self.cfg.rgb_context_motion_blend_gain),
+                    0.0,
+                    1.0,
+                )
+            rgb = blend * direct + (1.0 - blend) * residual_rgb
         return rgb, motion_logit, blend
 
 
@@ -2072,6 +2350,17 @@ class NativeRGBDecoder(nn.Module):
             )
             return empty, index_tensor, empty_aux, empty_aux
         views = self.cfg.num_views
+        selected_motion = future_tokens.index_select(1, index_tensor)
+        batch, frames, motion_patches, motion_token_dim = selected_motion.shape
+        expanded_motion = (
+            selected_motion[:, :, None]
+            .expand(-1, -1, views, -1, -1)
+            .reshape(
+                batch * frames * views,
+                motion_patches,
+                motion_token_dim,
+            )
+        )
         expanded_geometry: Optional[torch.Tensor] = None
         expanded_appearance_context: Optional[torch.Tensor] = None
         if self.cfg.appearance_enabled:
@@ -2091,7 +2380,9 @@ class NativeRGBDecoder(nn.Module):
             ):
                 raise ValueError("dual-path RGB geometry state is incompatible")
             selected = appearance_tokens.index_select(1, index_tensor)
-            batch, frames, _, patches, token_dim = selected.shape
+            appearance_batch, appearance_frames, _, patches, token_dim = selected.shape
+            if (appearance_batch, appearance_frames) != (batch, frames):
+                raise ValueError("appearance and motion RGB horizons must align")
             expanded = selected.reshape(batch * frames * views, patches, token_dim)
             geometry = geometry_state.index_select(1, index_tensor)
             geometry = geometry[:, :, None].expand(-1, -1, views, -1, -1)
@@ -2128,10 +2419,9 @@ class NativeRGBDecoder(nn.Module):
                 raise ValueError(
                     "appearance context was supplied to a fused-only RGB decoder"
                 )
-            selected = future_tokens.index_select(1, index_tensor)
-            batch, frames, patches, token_dim = selected.shape
-            expanded = selected[:, :, None].expand(-1, -1, views, -1, -1)
-            expanded = expanded.reshape(batch * frames * views, patches, token_dim)
+            patches = motion_patches
+            token_dim = motion_token_dim
+            expanded = expanded_motion
         view_ids = torch.arange(views, device=future_tokens.device)
         view_ids = view_ids.view(1, 1, views).expand(batch, frames, -1).reshape(-1)
         expanded_action: Optional[torch.Tensor] = None
@@ -2270,7 +2560,9 @@ class NativeRGBDecoder(nn.Module):
                     )
                 )
                 decoded, motion_logit, blend = self.image_decoder(
-                    *decoder_inputs,
+                    decoder_inputs[0],
+                    decoder_inputs[1],
+                    decoder_inputs[2],
                     (
                         None
                         if expanded_appearance_context is None
@@ -2284,6 +2576,11 @@ class NativeRGBDecoder(nn.Module):
                     expanded_task.index_select(0, chunk_indices),
                     context_bank.index_select(0, unique_context_ids),
                     local_context_indices,
+                    motion_tokens=(
+                        expanded_motion.index_select(0, chunk_indices)
+                        if self.cfg.rgb_context_alignment_enabled
+                        else None
+                    ),
                 )
             else:
                 decoded = self.image_decoder(*decoder_inputs)

@@ -57,6 +57,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "render_factual_dynamics_repeats",
     "render_factual_action_residual_scale",
     "rgb_context_enabled",
+    "rgb_context_alignment_enabled",
     "rgb_context_residual_scale",
     "rgb_context_motion_blend_gain",
     "rgb_context_action_scale",
@@ -221,6 +222,8 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "appearance_teacher_decay_steps",
         "appearance_teacher0_every_steps",
         "appearance_validation_three_way",
+        "model_warmstart_checkpoint",
+        "model_warmstart_new_parameter_prefixes",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
@@ -339,6 +342,37 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError(
             "three-way appearance validation requires an appearance teacher schedule"
         )
+    warmstart_path = train.get("model_warmstart_checkpoint")
+    warmstart_prefixes = train.get("model_warmstart_new_parameter_prefixes")
+    if (warmstart_path is None) != (warmstart_prefixes is None):
+        raise RuntimeContractError(
+            "model warmstart checkpoint and new parameter prefixes are required together"
+        )
+    if warmstart_path is not None:
+        checkpoint_path = Path(str(warmstart_path))
+        if not checkpoint_path.is_absolute() or re.fullmatch(
+            r"step_[0-9]{8}", checkpoint_path.name
+        ) is None:
+            raise RuntimeContractError(
+                "model warmstart must be an absolute numbered checkpoint"
+            )
+        if (
+            not isinstance(warmstart_prefixes, list)
+            or not warmstart_prefixes
+            or any(
+                not isinstance(prefix, str)
+                or not prefix
+                or prefix.startswith(".")
+                for prefix in warmstart_prefixes
+            )
+        ):
+            raise RuntimeContractError(
+                "model warmstart new parameter prefixes must be explicit names"
+            )
+        if len(set(warmstart_prefixes)) != len(warmstart_prefixes):
+            raise RuntimeContractError(
+                "model warmstart new parameter prefixes contain duplicates"
+            )
     if optimizer.get("name") != "adamw":
         raise RuntimeContractError("optimizer.name must be adamw")
     start_lr = float(optimizer.get("start_lr", 0.0))

@@ -98,6 +98,28 @@ def test_cudnn_benchmark_is_an_optional_boolean_execution_tuning() -> None:
             validate_runtime_profile(invalid_value)
 
 
+def test_v7_aligned_rgb_warmstart_is_explicit_and_model_only() -> None:
+    value = _load("h100_16_fsdp2_v7_aligned_rgb500.yaml")
+    validate_runtime_profile(value)
+    train = value["train"]
+    assert Path(train["model_warmstart_checkpoint"]).name == "step_00002000"
+    prefixes = train["model_warmstart_new_parameter_prefixes"]
+    assert prefixes
+    assert all(prefix.startswith("rgb_head.image_decoder.") for prefix in prefixes)
+
+    missing_prefixes = copy.deepcopy(value)
+    missing_prefixes["train"].pop("model_warmstart_new_parameter_prefixes")
+    with pytest.raises(RuntimeContractError, match="required together"):
+        validate_runtime_profile(missing_prefixes)
+
+    duplicate = copy.deepcopy(value)
+    duplicate["train"]["model_warmstart_new_parameter_prefixes"].append(
+        duplicate["train"]["model_warmstart_new_parameter_prefixes"][0]
+    )
+    with pytest.raises(RuntimeContractError, match="duplicates"):
+        validate_runtime_profile(duplicate)
+
+
 def test_nonzero_start_lr_survives_formal_warmup() -> None:
     value = _load("h100_16_fsdp2_dual_path_mb16_50k.yaml")
     validate_runtime_profile(value)
@@ -397,6 +419,7 @@ def test_streaming_data_contract_ignores_model_only_conditioning_scales() -> Non
             "appearance_action_residual_scale": 0.5,
             "appearance_autoregressive_steps": 2,
             "policy_task_modulation": True,
+            "rgb_context_alignment_enabled": True,
             "rgb_context_action_scale": 1.0,
             "rgb_context_appearance_delta_scale": 1.0,
         }

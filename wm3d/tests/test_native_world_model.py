@@ -16,6 +16,7 @@ from wm3d.models.native_world_model import (
     NativeContextRGBImageDecoder,
     NativeWorldModel,
     NativeWorldModelConfig,
+    _warp_rgb_feature_with_pixel_flow,
 )
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.model_factory import validate_model_data_compatibility
@@ -1017,7 +1018,11 @@ def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> No
 def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views() -> (
     None
 ):
-    cfg = replace(_tiny_dual_path_config(), rgb_context_enabled=True)
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_alignment_enabled=True,
+    )
     torch.manual_seed(37)
     model = NativeWorldModel(cfg).eval()
     batch = _dual_path_batch(cfg)
@@ -1029,7 +1034,10 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
     with torch.no_grad():
         decoder.head.weight.zero_()
         decoder.head.bias.zero_()
-        decoder.head.bias[6] = -20.0
+        decoder.flow_head.weight.zero_()
+        decoder.flow_head.bias.zero_()
+        decoder.disocclusion_head.weight.zero_()
+        decoder.disocclusion_head.bias.fill_(-20.0)
         decoder.motion_head.bias.fill_(-20.0)
 
     output = model(**batch, appearance_teacher_ratio=0.0)
@@ -1039,7 +1047,7 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
         output["rgb"][0, :, 0],
         expected[0, :, 0],
         rtol=0,
-        atol=1.0e-6,
+        atol=2.0e-6,
     )
     assert output["rgb"][0, :, 1].count_nonzero() == 0
     assert output["rgb_motion_logit"].shape == (
@@ -1051,6 +1059,86 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
         cfg.rgb_size,
     )
     assert output["rgb_blend"][0, :, 1].count_nonzero() == 0
+
+
+def test_pixel_flow_warp_moves_context_without_unaligned_mixture() -> None:
+    source = torch.arange(5, dtype=torch.float32).view(1, 1, 1, 5)
+    flow = torch.zeros(1, 2, 1, 5)
+    flow[:, 0] = 1.0
+
+    warped, valid = _warp_rgb_feature_with_pixel_flow(
+        source,
+        flow,
+        image_height=1,
+        image_width=5,
+    )
+
+    torch.testing.assert_close(warped[..., :-1], source[..., 1:], rtol=0, atol=0)
+    assert valid[..., :-1].all()
+    assert not valid[..., -1].any()
+
+
+def test_p256_appearance_cannot_change_p64_flow_or_visibility() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        rgb_context_enabled=True,
+        rgb_context_alignment_enabled=True,
+    )
+    torch.manual_seed(136)
+    decoder = NativeWorldModel(cfg).rgb_head.eval()
+    batch = 2
+    future_tokens = torch.randn(batch, cfg.K, cfg.P, cfg.token_dim)
+    appearance = torch.randn(
+        batch, cfg.K, cfg.num_views, cfg.appearance_P, cfg.token_dim
+    )
+    geometry = torch.randn(batch, cfg.K, cfg.P, cfg.state_hidden)
+    context = torch.rand(batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    context_mask = torch.ones(batch, cfg.num_views, dtype=torch.bool)
+    task = torch.randn(batch, cfg.task_dim)
+    flow_outputs: list[torch.Tensor] = []
+    visibility_outputs: list[torch.Tensor] = []
+    flow_handle = decoder.image_decoder.flow_head.register_forward_hook(
+        lambda _module, _inputs, output: flow_outputs.append(output.detach().clone())
+    )
+    visibility_handle = decoder.image_decoder.disocclusion_head.register_forward_hook(
+        lambda _module, _inputs, output: visibility_outputs.append(
+            output.detach().clone()
+        )
+    )
+    try:
+        baseline = decoder(
+            future_tokens,
+            None,
+            appearance_tokens=appearance,
+            geometry_state=geometry,
+            task_embedding=task,
+            context_rgb=context,
+            context_rgb_mask=context_mask,
+        )[0]
+        split = len(flow_outputs)
+        changed = decoder(
+            future_tokens,
+            None,
+            appearance_tokens=appearance * 100.0,
+            geometry_state=geometry,
+            task_embedding=task,
+            context_rgb=context,
+            context_rgb_mask=context_mask,
+        )[0]
+    finally:
+        flow_handle.remove()
+        visibility_handle.remove()
+
+    assert split > 0
+    assert len(flow_outputs) == 2 * split
+    assert len(visibility_outputs) == 2 * split
+    for before, after in zip(flow_outputs[:split], flow_outputs[split:]):
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
+    for before, after in zip(
+        visibility_outputs[:split], visibility_outputs[split:]
+    ):
+        torch.testing.assert_close(after, before, rtol=0, atol=0)
+    assert not torch.allclose(changed, baseline)
 
 
 def test_context_renderer_builds_one_pyramid_per_batch_view_and_chunk() -> None:
@@ -1606,6 +1694,27 @@ def test_dual_path_1b_and_5b_profiles_are_materializable() -> None:
         assert counts[name] == profile["expected_parameter_count"]
     assert 1_000_000_000 < counts["native_1b_dual_path.yaml"] < 2_000_000_000
     assert counts["native_5b_dual_path.yaml"] > 5_000_000_000
+
+
+def test_v7_aligned_rgb_profile_is_isolated_and_materializable() -> None:
+    root = Path(__file__).resolve().parents[1]
+    profile = yaml.safe_load(
+        (root / "configs/model/native_1b_v7_aligned_rgb.yaml").read_text()
+    )
+    with torch.device("meta"):
+        model = build_world_model(profile)
+    assert model.cfg.rgb_context_alignment_enabled is True
+    assert sum(parameter.numel() for parameter in model.parameters()) == profile[
+        "expected_parameter_count"
+    ]
+
+    with pytest.raises(ValueError, match="requires context RGB"):
+        NativeWorldModel(
+            replace(
+                _tiny_config(),
+                rgb_context_alignment_enabled=True,
+            )
+        )
 
 
 def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:

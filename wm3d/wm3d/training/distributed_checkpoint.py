@@ -23,6 +23,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -1112,5 +1114,141 @@ class DistributedCheckpointManager:
                 error = exc
             _collective_error("evaluation model restore", error)
             return metadata
+        finally:
+            self._cleanup_load_snapshot(container)
+
+    def load_model_warmstart(
+        self,
+        *,
+        path: Path,
+        model: torch.nn.Module,
+        new_parameter_prefixes: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Load all shared model tensors while leaving declared new modules fresh."""
+
+        if not dist.is_initialized():
+            raise CheckpointIntegrityError(
+                "distributed checkpoint requires process group"
+            )
+        if any(
+            not prefix or prefix.startswith(".")
+            for prefix in new_parameter_prefixes
+        ):
+            raise CheckpointIntegrityError(
+                "warmstart new parameter prefixes must be explicit names"
+            )
+        checkpoint_path = Path(path).resolve(strict=True)
+        root = self.root.resolve(strict=True)
+        if checkpoint_path.parent != root:
+            raise CheckpointIntegrityError(
+                f"warmstart checkpoint escaped run root: {checkpoint_path}"
+            )
+        controls: list[Any] = [None]
+        if dist.get_rank() == 0:
+            try:
+                metadata, _files = self._verify_controls(checkpoint_path)
+                controls[0] = {
+                    "ok": True,
+                    "metadata": metadata,
+                    "committed_sha256": sha256_file(
+                        checkpoint_path / "COMMITTED.json"
+                    ),
+                }
+            except Exception as exc:
+                controls[0] = {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+        dist.broadcast_object_list(controls, src=0)
+        if not controls[0]["ok"]:
+            raise CheckpointIntegrityError(
+                f"warmstart checkpoint inspection failed: {controls[0]}"
+            )
+        metadata = dict(controls[0]["metadata"])
+        expected = ResumeExpectations(
+            step=int(metadata["step"]),
+            run_lineage=str(metadata["run_lineage"]),
+            runtime_config_sha256=str(metadata["runtime_config_sha256"]),
+            data_closure_sha256=str(metadata["data_closure_sha256"]),
+            model_contract_sha256=str(metadata["model_contract_sha256"]),
+            world_size=int(metadata["world_size"]),
+            shard_degree=int(metadata["shard_degree"]),
+            distributed_strategy=str(metadata["distributed_strategy"]),
+            global_batch_size=int(metadata["global_batch_size"]),
+            topology_contract_sha256=str(metadata["topology_contract_sha256"]),
+            allow_topology_reshard=False,
+        )
+        container, snapshot, _metadata, _mode = self._snapshot_for_load(
+            checkpoint_path=checkpoint_path,
+            expected=expected,
+            require_exact=True,
+        )
+        try:
+            options = StateDictOptions(
+                full_state_dict=False,
+                cpu_offload=False,
+                strict=False,
+            )
+            error: Optional[Exception] = None
+            model_state: dict[str, Any] = {}
+            try:
+                model_state = get_model_state_dict(model, options=options)
+            except Exception as exc:
+                error = exc
+            _collective_error("warmstart state-dict preparation", error)
+
+            source_metadata = FileSystemReader(
+                snapshot / "distcp"
+            ).read_metadata().state_dict_metadata
+            source_model_names = {
+                name.removeprefix("model.")
+                for name in source_metadata
+                if name.startswith("model.")
+            }
+            current_names = set(model_state)
+            new_names = {
+                name
+                for name in current_names
+                if any(
+                    name.startswith(prefix)
+                    for prefix in new_parameter_prefixes
+                )
+            }
+            required_names = current_names - new_names
+            missing_required = sorted(required_names - source_model_names)
+            if missing_required:
+                raise CheckpointIntegrityError(
+                    "warmstart source is missing non-new model tensors: "
+                    + ", ".join(missing_required[:16])
+                )
+            matched = required_names & source_model_names
+            if not matched:
+                raise CheckpointIntegrityError(
+                    "warmstart loaded no shared model tensors"
+                )
+            load_state = {name: model_state[name] for name in sorted(matched)}
+
+            error = None
+            try:
+                dcp.load(
+                    {"model": load_state},
+                    checkpoint_id=snapshot / "distcp",
+                    planner=DefaultLoadPlanner(allow_partial_load=True),
+                )
+                set_model_state_dict(model, load_state, options=options)
+            except Exception as exc:
+                error = exc
+            _collective_error("warmstart model restore", error)
+            return {
+                "path": str(checkpoint_path),
+                "step": int(metadata["step"]),
+                "run_lineage": str(metadata["run_lineage"]),
+                "committed_sha256": str(controls[0]["committed_sha256"]),
+                "matched_tensors": len(matched),
+                "new_tensors": sorted(new_names),
+                "new_parameter_prefixes": list(new_parameter_prefixes),
+                "optimizer_rng_sampler_restored": False,
+            }
         finally:
             self._cleanup_load_snapshot(container)
