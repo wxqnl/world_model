@@ -13,7 +13,9 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS, STATE_SEMANTIC_IDS
 from wm3d.models.native_world_model import (
     ActionBlock,
+    FutureSpatialDetailPredictor,
     NativeContextRGBImageDecoder,
+    NativeRGBImageDecoder,
     NativeWorldModel,
     NativeWorldModelConfig,
     _warp_rgb_feature_with_pixel_flow,
@@ -908,6 +910,60 @@ def _dual_path_batch(cfg: NativeWorldModelConfig) -> dict[str, torch.Tensor]:
         dtype=torch.bool,
     )
     return batch
+
+
+def test_v8_core_detail_is_target_free_zero_preserving_and_trainable() -> None:
+    cfg = replace(
+        _tiny_dual_path_config(),
+        appearance_state_detail=True,
+        appearance_detail_dim=8,
+        rgb_detail_residual_scale=0.25,
+        appearance_action_residual_scale=0.0,
+    )
+    cfg.validate()
+    predictor = FutureSpatialDetailPredictor(cfg).train()
+    future = torch.randn(2, cfg.K, cfg.P, cfg.state_hidden, requires_grad=True)
+    mask = torch.ones(
+        2, cfg.K, cfg.num_views, cfg.appearance_P, dtype=torch.bool
+    )
+    detail, detail_mask = predictor(future, mask)
+    assert detail.shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        cfg.appearance_P,
+        cfg.appearance_detail_dim,
+    )
+    assert torch.equal(detail_mask, mask)
+    zero_detail, zero_mask = predictor(future, torch.zeros_like(mask))
+    assert zero_detail.count_nonzero() == 0
+    assert zero_mask.count_nonzero() == 0
+
+    decoder = NativeRGBImageDecoder(cfg).train()
+    slots = 2
+    tokens = torch.randn(slots, cfg.P, cfg.token_dim)
+    views = torch.randn(slots, cfg.rgb_hidden, 1, 1)
+    geometry = torch.randn(slots, cfg.P, cfg.state_hidden)
+    flat_detail = detail[:1, :1].reshape(
+        slots, cfg.appearance_P, cfg.appearance_detail_dim
+    )
+    rgb = decoder(tokens, views, geometry, flat_detail)
+    zero_rgb = decoder(tokens, views, geometry, torch.zeros_like(flat_detail))
+    original_cfg = decoder.cfg
+    decoder.cfg = replace(cfg, rgb_detail_residual_scale=0.0)
+    fallback_rgb = decoder(tokens, views, geometry, flat_detail)
+    decoder.cfg = original_cfg
+    torch.testing.assert_close(zero_rgb, fallback_rgb, rtol=0, atol=0)
+    assert not torch.equal(rgb, zero_rgb)
+
+    rgb.float().mean().backward()
+    assert future.grad is not None
+    assert torch.isfinite(future.grad).all()
+    assert future.grad.abs().sum() > 0
+    assert decoder.detail_output is not None
+    assert decoder.detail_output.weight.grad is not None
+    assert torch.isfinite(decoder.detail_output.weight.grad).all()
+    assert decoder.detail_output.weight.grad.abs().sum() > 0
 
 
 def test_flow_aligned_p256_detail_is_target_free_v7_fallback() -> None:

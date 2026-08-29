@@ -713,8 +713,6 @@ def compute_native_objective(
             )
         appearance_prediction = output["appearance_pred_tokens"]
         raw_appearance_target = batch["target_appearance_tokens"]
-        if appearance_prediction.shape != raw_appearance_target.shape:
-            raise NativeObjectiveError("appearance prediction/target shapes differ")
         normalized_appearance_target = F.layer_norm(
             raw_appearance_target.float(), (raw_appearance_target.shape[-1],)
         ).to(dtype=appearance_prediction.dtype)
@@ -722,7 +720,64 @@ def compute_native_objective(
         if "appearance_pred_mask" in output:
             appearance_mask = appearance_mask & output["appearance_pred_mask"].bool()
         flow_aligned_detail = "appearance_flow_aligned_detail" in output
-        if flow_aligned_detail:
+        state_detail = "appearance_state_detail" in output
+        if state_detail:
+            if (
+                appearance_prediction.shape[:-1]
+                != raw_appearance_target.shape[:-1]
+                or raw_appearance_target.shape[-1]
+                % appearance_prediction.shape[-1]
+            ):
+                raise NativeObjectiveError(
+                    "state detail prediction is incompatible with P256 targets"
+                )
+            channel_group = (
+                raw_appearance_target.shape[-1]
+                // appearance_prediction.shape[-1]
+            )
+            compressed_target = normalized_appearance_target.reshape(
+                *normalized_appearance_target.shape[:-1],
+                appearance_prediction.shape[-1],
+                channel_group,
+            ).mean(dim=-1)
+            detail_patches = int(compressed_target.shape[-2])
+            detail_grid = isqrt(detail_patches)
+            state_patches = int(output["pred_tokens"].shape[-2])
+            state_grid = isqrt(state_patches)
+            if (
+                detail_grid * detail_grid != detail_patches
+                or state_grid * state_grid != state_patches
+            ):
+                raise NativeObjectiveError(
+                    "state/P256 detail targets require square spatial grids"
+                )
+            target_map = compressed_target.reshape(
+                -1,
+                detail_grid,
+                detail_grid,
+                appearance_prediction.shape[-1],
+            ).permute(0, 3, 1, 2)
+            low_frequency = F.interpolate(
+                F.interpolate(
+                    target_map,
+                    size=(state_grid, state_grid),
+                    mode="area",
+                ),
+                size=(detail_grid, detail_grid),
+                mode="bilinear",
+                align_corners=False,
+            )
+            appearance_target = (
+                target_map - low_frequency
+            ).permute(0, 2, 3, 1).reshape_as(appearance_prediction)
+            appearance_target = appearance_target * appearance_mask[..., None].to(
+                dtype=appearance_target.dtype
+            )
+        elif flow_aligned_detail:
+            if appearance_prediction.shape != raw_appearance_target.shape:
+                raise NativeObjectiveError(
+                    "appearance prediction/target shapes differ"
+                )
             required = (
                 "appearance_context_tokens",
                 "appearance_context_mask",
@@ -765,6 +820,10 @@ def compute_native_objective(
                 dtype=appearance_target.dtype
             )
         else:
+            if appearance_prediction.shape != raw_appearance_target.shape:
+                raise NativeObjectiveError(
+                    "appearance prediction/target shapes differ"
+                )
             appearance_target = normalized_appearance_target
         appearance_error = appearance_prediction - appearance_target
         appearance_l1 = _masked_mean(
@@ -853,50 +912,59 @@ def compute_native_objective(
             or config.appearance_delta_cosine > 0.0
         ):
             required = (
-                "appearance_context_tokens",
-                "appearance_context_mask",
-                "target_rgb",
-                "context_rgb",
+                ("target_rgb", "context_rgb")
+                if state_detail
+                else (
+                    "appearance_context_tokens",
+                    "appearance_context_mask",
+                    "target_rgb",
+                    "context_rgb",
+                )
             )
             missing = [name for name in required if name not in batch]
             if missing:
                 raise NativeObjectiveError(
                     "motion-aware appearance loss requires " + ", ".join(missing)
                 )
-            context_tokens = batch["appearance_context_tokens"]
-            context_mask = batch["appearance_context_mask"].bool()
-            if (
-                context_tokens.ndim != 5
-                or context_tokens.shape[0] != appearance_target.shape[0]
-            ):
-                raise NativeObjectiveError(
-                    "appearance context tokens must be [B,C,V,P,D]"
-                )
-            if context_mask.shape != context_tokens.shape[:-1]:
-                raise NativeObjectiveError(
-                    "appearance context mask must align to context tokens"
-                )
-            if context_tokens.shape[2:] != appearance_target.shape[2:]:
-                raise NativeObjectiveError(
-                    "appearance context and target view/patch/token shapes differ"
-                )
-            normalized_context = F.layer_norm(
-                context_tokens.float(), (context_tokens.shape[-1],)
-            ).to(dtype=appearance_prediction.dtype)
-            latest_context = torch.zeros_like(normalized_context[:, 0])
-            for index in range(int(normalized_context.shape[1])):
-                latest_context = torch.where(
-                    context_mask[:, index, ..., None],
-                    normalized_context[:, index],
-                    latest_context,
-                )
-            context_token_valid = context_mask.any(dim=1)
-            if flow_aligned_detail:
+            if state_detail:
+                context_token_valid = appearance_mask.any(dim=1)
                 predicted_delta = appearance_prediction
                 target_delta = appearance_target
             else:
-                predicted_delta = appearance_prediction - latest_context[:, None]
-                target_delta = appearance_target - latest_context[:, None]
+                context_tokens = batch["appearance_context_tokens"]
+                context_mask = batch["appearance_context_mask"].bool()
+                if (
+                    context_tokens.ndim != 5
+                    or context_tokens.shape[0] != appearance_target.shape[0]
+                ):
+                    raise NativeObjectiveError(
+                        "appearance context tokens must be [B,C,V,P,D]"
+                    )
+                if context_mask.shape != context_tokens.shape[:-1]:
+                    raise NativeObjectiveError(
+                        "appearance context mask must align to context tokens"
+                    )
+                if context_tokens.shape[2:-1] != appearance_target.shape[2:-1]:
+                    raise NativeObjectiveError(
+                        "appearance context and target view/patch shapes differ"
+                    )
+                normalized_context = F.layer_norm(
+                    context_tokens.float(), (context_tokens.shape[-1],)
+                ).to(dtype=appearance_prediction.dtype)
+                latest_context = torch.zeros_like(normalized_context[:, 0])
+                for index in range(int(normalized_context.shape[1])):
+                    latest_context = torch.where(
+                        context_mask[:, index, ..., None],
+                        normalized_context[:, index],
+                        latest_context,
+                    )
+                context_token_valid = context_mask.any(dim=1)
+                if flow_aligned_detail:
+                    predicted_delta = appearance_prediction
+                    target_delta = appearance_target
+                else:
+                    predicted_delta = appearance_prediction - latest_context[:, None]
+                    target_delta = appearance_target - latest_context[:, None]
 
             target_rgb = batch["target_rgb"].float()
             context_rgb = batch["context_rgb"].float()

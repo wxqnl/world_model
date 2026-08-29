@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
-name: native_1b_dual_path
+name: native_1b_v8_core
 architecture: native_world_model
-expected_parameter_count: 1485005072
+expected_parameter_count: 1206327539
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -35,9 +35,9 @@ model:
   dynamics_layers: 1
   factual_dynamics_repeats: 2
   factual_action_residual_scale: 0.3
-  # Condition future P256 patches on the same centered grouped physical action
-  # before appearance space/time reasoning. The same-mask zero command is exact 0.
-  appearance_action_residual_scale: 0.3
+  # The factual P64 state is the single motion owner. Appearance consumes that
+  # state and must not introduce a second action skip.
+  appearance_action_residual_scale: 0.0
   view_hidden: 768
   view_heads: 12
   view_ff_mult: 2.5
@@ -56,30 +56,34 @@ model:
   max_aux_tokens: 16
   aux_dim: 256
   max_aux_type_id: 128
-  # V7 used 1152 channels.  Native RGB v2 restores that token-to-pixel path
-  # and adds a modest width increase for sharper output.
-  rgb_hidden: 1280
-  rgb_res_blocks: 2
-  rgb_decode_chunk_size: 4
+  # Decode a compact set of training horizons. The full K8 factual state and
+  # detail targets are still trained; serving can render any requested horizon.
+  rgb_hidden: 512
+  rgb_res_blocks: 1
+  rgb_decode_chunk_size: 32
   rgb_size: 256
-  rgb_decode_indices: [0, 1, 2, 3, 4, 5, 6, 7]
-  # Preserve observed high-frequency appearance; predict and blend only change.
-  rgb_context_enabled: true
-  rgb_context_residual_scale: 0.75
-  rgb_context_motion_blend_gain: 0.5
-  # Restore V7's direct renderer-only future-action condition.
-  rgb_context_action_scale: 1.0
-  # Carry future-minus-last P256 motion through every decoder scale so the
-  # full-resolution context skips cannot bypass future appearance dynamics.
-  rgb_context_appearance_delta_scale: 1.0
+  rgb_decode_indices: [0, 2, 4, 7]
+  # Canonical V7-style direct future-state rendering is the base. No context
+  # copy, learned flow, disocclusion, blend, or renderer-only action owner.
+  rgb_context_enabled: false
+  rgb_context_alignment_enabled: false
+  rgb_render_action_free_prior: false
+  rgb_context_action_scale: 0.0
+  rgb_context_appearance_delta_scale: 0.0
+  # P256 is a bounded high-frequency correction. Zero detail exactly recovers
+  # the direct factual-state decoder, so it cannot suppress motion.
+  rgb_detail_residual_scale: 0.25
   geom_hidden: 512
   appearance_enabled: true
   appearance_P: 256
   appearance_context_frames: 4
-  appearance_hidden: 512
+  appearance_hidden: 256
   appearance_layers: 2
   appearance_heads: 8
   appearance_ff_mult: 2.0
   appearance_autoregressive_steps: 2
+  appearance_flow_aligned_detail: false
+  appearance_state_detail: true
+  appearance_detail_dim: 256
   dropout: 0.0
   activation_checkpointing: true

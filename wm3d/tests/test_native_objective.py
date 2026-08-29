@@ -38,6 +38,75 @@ def test_flow_aligned_p256_target_uses_backward_pixel_transport() -> None:
     torch.testing.assert_close(warped, expected, rtol=0, atol=1.0e-6)
 
 
+def test_v8_core_detail_supervises_only_spatial_high_frequency() -> None:
+    prediction = torch.zeros(1, 1, 1, 4, 2, requires_grad=True)
+    raw_target = torch.tensor(
+        [
+            [
+                [
+                    [3.0, 1.0, -1.0, -3.0],
+                    [-3.0, -1.0, 1.0, 3.0],
+                    [2.0, 1.0, -1.0, -2.0],
+                    [-2.0, -1.0, 1.0, 2.0],
+                ]
+            ]
+        ]
+    ).view(1, 1, 1, 4, 4)
+    policy = torch.zeros(1, 1, 1, 1)
+    output = {
+        "pred_tokens": torch.zeros(1, 1, 1, 2),
+        "appearance_pred_tokens": prediction,
+        "appearance_pred_mask": torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        "appearance_state_detail": torch.ones(()),
+        "rgb": torch.empty(1, 0, 1, 3, 2, 2),
+        "policy_action_raw": policy,
+        "policy_action_normalized": policy,
+        "policy_action": policy,
+        "policy_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "policy_gripper_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_binary_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_query_dt": torch.tensor([[[0.5]]]),
+    }
+    batch = {
+        "target_tokens": torch.zeros(1, 1, 1, 2),
+        "target_appearance_tokens": raw_target,
+        "target_appearance_mask": torch.ones(1, 1, 1, 4, dtype=torch.bool),
+        "target_fine_action": torch.zeros_like(policy),
+        "target_fine_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "future_world_boundaries_dt": torch.tensor([[0.0, 1.0]]),
+        "composition_operator_ids": torch.tensor(
+            [[[COMPOSITION_OPERATOR_IDS["last"]]]]
+        ),
+        "target_coarse_action_normalized": torch.zeros(1, 1, 1, 1),
+        "target_coarse_action_mask": torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        "action_normalization_offset": torch.zeros(1, 1, 1),
+        "action_normalization_scale": torch.ones(1, 1, 1),
+    }
+    losses = compute_native_objective(
+        output=output,
+        batch=batch,
+        config=NativeObjectiveConfig(
+            token_mse=0.0,
+            token_cosine=0.0,
+            appearance_l1=1.0,
+            rgb_l1=0.0,
+            rgb_charbonnier=0.0,
+            rgb_gradient=0.0,
+            depth_log=0.0,
+            point=0.0,
+            camera_pose=0.0,
+            action_fine=0.0,
+            action_coarse=0.0,
+        ),
+    )
+    assert losses["appearance_l1"].item() > 0.0
+    assert losses["appearance_supervised_elements"].item() == 8
+    losses["total"].backward()
+    assert prediction.grad is not None
+    assert torch.isfinite(prediction.grad).all()
+    assert prediction.grad.abs().sum() > 0
+
+
 def test_rgb_charbonnier_uses_its_own_meaningful_epsilon() -> None:
     value = torch.tensor([0.0, 1.0e-4, 0.1])
     legacy = _charbonnier(value, 1.0e-6)

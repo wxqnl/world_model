@@ -145,6 +145,10 @@ class NativeWorldModelConfig:
     # post-transport, high-frequency RGB correction and cannot change the V7
     # motion, flow, visibility or blend owners.
     rgb_context_appearance_delta_scale: float = 0.0
+    # V8 core keeps the factual P64 state as the sole motion owner.  A bounded
+    # P256 high-frequency residual may sharpen that base image, but it cannot
+    # carry a full frame, context copy, flow field, or a second motion path.
+    rgb_detail_residual_scale: float = 0.0
     geom_hidden: int = 768
 
     # Optional high-resolution, per-view appearance lane.  The geometry/action
@@ -162,6 +166,12 @@ class NativeWorldModelConfig:
     # detail left after transporting the last observed P256 feature with the
     # teacher backward flow. Zero detail is therefore an exact V7 fallback.
     appearance_flow_aligned_detail: bool = False
+    # Predict only the spatial high-pass component of future P256 features
+    # directly from the factual future state.  This path is train/serve
+    # identical, has no future-target or last-frame input, and is deliberately
+    # mutually exclusive with the legacy appearance dynamics paths.
+    appearance_state_detail: bool = False
+    appearance_detail_dim: int = 256
 
     dropout: float = 0.0
     activation_checkpointing: bool = True
@@ -287,6 +297,13 @@ class NativeWorldModelConfig:
             raise ValueError(
                 "rgb_context_appearance_delta_scale requires context RGB and appearance"
             )
+        if (
+            not isfinite(self.rgb_detail_residual_scale)
+            or self.rgb_detail_residual_scale < 0.0
+        ):
+            raise ValueError(
+                "rgb_detail_residual_scale must be finite and non-negative"
+            )
         if not isinstance(self.appearance_enabled, bool):
             raise ValueError("appearance_enabled must be boolean")
         if self.appearance_enabled:
@@ -309,6 +326,8 @@ class NativeWorldModelConfig:
                 )
             if not isinstance(self.appearance_flow_aligned_detail, bool):
                 raise ValueError("appearance_flow_aligned_detail must be boolean")
+            if not isinstance(self.appearance_state_detail, bool):
+                raise ValueError("appearance_state_detail must be boolean")
             if self.appearance_flow_aligned_detail and (
                 not self.rgb_context_enabled
                 or not self.rgb_context_alignment_enabled
@@ -318,6 +337,33 @@ class NativeWorldModelConfig:
                     "appearance_flow_aligned_detail requires aligned context RGB "
                     "and positive appearance detail conditioning"
                 )
+            if self.appearance_state_detail:
+                if self.appearance_detail_dim <= 0 or (
+                    self.token_dim % self.appearance_detail_dim
+                ):
+                    raise ValueError(
+                        "appearance_detail_dim must positively divide token_dim"
+                    )
+                if self.appearance_flow_aligned_detail:
+                    raise ValueError(
+                        "state detail and flow-aligned appearance are mutually exclusive"
+                    )
+                if self.rgb_context_enabled:
+                    raise ValueError(
+                        "state detail uses the direct RGB decoder, not context RGB"
+                    )
+                if self.rgb_render_action_free_prior:
+                    raise ValueError(
+                        "state detail requires the factual RGB future state"
+                    )
+                if self.rgb_detail_residual_scale <= 0.0:
+                    raise ValueError(
+                        "state detail requires a positive RGB detail residual scale"
+                    )
+                if self.appearance_action_residual_scale != 0.0:
+                    raise ValueError(
+                        "state detail already consumes the factual state; a second action skip is forbidden"
+                    )
             if self.appearance_P < self.P:
                 raise ValueError("appearance_P cannot be smaller than geometry P")
             if appearance_grid > self.rgb_size:
@@ -1638,6 +1684,112 @@ class PerViewAppearanceDynamics(nn.Module):
             autoregressive_mask,
         )
 
+
+class _SpatialDetailBlock(nn.Module):
+    """Cheap local refinement for a future high-frequency feature map."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(_rgb_norm_groups(channels), channels)
+        self.depthwise = nn.Conv2d(
+            channels, channels, 3, padding=1, groups=channels, bias=False
+        )
+        self.pointwise = nn.Conv2d(channels, channels, 1, bias=False)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        update = F.silu(self.norm(value))
+        update = self.pointwise(F.silu(self.depthwise(update)))
+        return value + update
+
+
+class FutureSpatialDetailPredictor(nn.Module):
+    """Predict future P256 high-frequency detail from the factual P64 state.
+
+    The module deliberately has no observed-P256, target-P256, flow, or
+    autoregressive input.  Motion and horizon semantics therefore stay owned
+    by the factual future state, while this small spatial head only restores
+    detail that is absent at the P64 grid.
+    """
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.state_grid = isqrt(cfg.P)
+        self.detail_grid = isqrt(cfg.appearance_P)
+        channels = cfg.appearance_detail_dim
+        self.input = nn.Conv2d(cfg.state_hidden, channels, 1, bias=False)
+        self.view_embed = nn.Parameter(
+            torch.empty(1, 1, cfg.num_views, channels, 1, 1)
+        )
+        nn.init.normal_(self.view_embed, std=0.02)
+        self.blocks = nn.Sequential(
+            _SpatialDetailBlock(channels),
+            _SpatialDetailBlock(channels),
+        )
+        self.output = nn.Conv2d(channels, channels, 1, bias=False)
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.view_embed, std=0.02)
+
+    def forward(
+        self,
+        future_state: torch.Tensor,
+        future_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        batch = future_state.shape[0]
+        if tuple(future_state.shape[1:]) != (
+            cfg.K,
+            cfg.P,
+            cfg.state_hidden,
+        ):
+            raise ValueError("future detail state must be [B,K,P,state_hidden]")
+        if tuple(future_mask.shape) != (
+            batch,
+            cfg.K,
+            cfg.num_views,
+            cfg.appearance_P,
+        ):
+            raise ValueError("future detail mask must be [B,K,V,appearance_P]")
+        value = future_state.reshape(
+            batch * cfg.K, cfg.P, cfg.state_hidden
+        ).transpose(1, 2)
+        value = value.reshape(
+            batch * cfg.K,
+            cfg.state_hidden,
+            self.state_grid,
+            self.state_grid,
+        )
+        value = self.input(value)
+        if self.state_grid != self.detail_grid:
+            value = F.interpolate(
+                value.float(),
+                size=(self.detail_grid, self.detail_grid),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=future_state.dtype)
+        value = value.view(
+            batch, cfg.K, 1, cfg.appearance_detail_dim, self.detail_grid, self.detail_grid
+        )
+        value = value.expand(-1, -1, cfg.num_views, -1, -1, -1)
+        value = value + self.view_embed.to(dtype=value.dtype)
+        value = value.reshape(
+            batch * cfg.K * cfg.num_views,
+            cfg.appearance_detail_dim,
+            self.detail_grid,
+            self.detail_grid,
+        )
+        value = self.output(self.blocks(value))
+        value = value.flatten(2).transpose(1, 2).reshape(
+            batch,
+            cfg.K,
+            cfg.num_views,
+            cfg.appearance_P,
+            cfg.appearance_detail_dim,
+        )
+        mask = future_mask.bool()
+        return value * mask[..., None].to(dtype=value.dtype), mask
+
 class UnifiedActionHead(nn.Module):
     """The sole policy owner; semantic decoding is a deterministic transform."""
 
@@ -1768,7 +1920,11 @@ class NativeRGBImageDecoder(nn.Module):
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.grid = isqrt(cfg.appearance_P if cfg.appearance_enabled else cfg.P)
+        self.grid = isqrt(
+            cfg.P
+            if cfg.appearance_state_detail
+            else (cfg.appearance_P if cfg.appearance_enabled else cfg.P)
+        )
         self.geometry_grid = isqrt(cfg.P)
         self.stem = nn.Sequential(
             nn.Conv2d(cfg.token_dim, cfg.rgb_hidden, 1),
@@ -1822,12 +1978,42 @@ class NativeRGBImageDecoder(nn.Module):
             ups.append(nn.Sequential(*stage))
         self.ups = nn.ModuleList(ups)
         self.output = nn.Conv2d(channels[-1], 3, 1)
+        self.detail_grid = isqrt(cfg.appearance_P)
+        detail_channels = max(32, min(128, cfg.rgb_hidden // 8))
+        self.detail_stem = (
+            nn.Sequential(
+                nn.Conv2d(
+                    cfg.appearance_detail_dim,
+                    detail_channels,
+                    1,
+                    bias=False,
+                ),
+                nn.SiLU(inplace=True),
+            )
+            if cfg.appearance_state_detail
+            else None
+        )
+        detail_stages = (
+            (cfg.rgb_size // self.detail_grid).bit_length() - 1
+            if cfg.appearance_state_detail
+            else 0
+        )
+        self.detail_ups = nn.ModuleList(
+            _RGBZeroPreservingDetailUpBlock(detail_channels, detail_channels)
+            for _ in range(detail_stages)
+        )
+        self.detail_output = (
+            _RGBDetailHead(detail_channels, 3, 3, padding=1, bias=False)
+            if cfg.appearance_state_detail
+            else None
+        )
 
     def forward(
         self,
         tokens: torch.Tensor,
         view_embedding: torch.Tensor,
         geometry_tokens: Optional[torch.Tensor] = None,
+        appearance_detail_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         value = tokens.transpose(1, 2).reshape(
             tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
@@ -1873,7 +2059,55 @@ class NativeRGBImageDecoder(nn.Module):
                 align_corners=False,
                 antialias=True,
             ).to(dtype=tokens.dtype)
-        return torch.sigmoid(self.output(value))
+        rgb = torch.sigmoid(self.output(value))
+        if self.detail_stem is not None:
+            if appearance_detail_tokens is None or tuple(
+                appearance_detail_tokens.shape[1:]
+            ) != (
+                self.cfg.appearance_P,
+                self.cfg.appearance_detail_dim,
+            ):
+                raise ValueError(
+                    "state detail RGB input must end in [appearance_P,appearance_detail_dim]"
+                )
+            detail = appearance_detail_tokens.transpose(1, 2).reshape(
+                appearance_detail_tokens.shape[0],
+                self.cfg.appearance_detail_dim,
+                self.detail_grid,
+                self.detail_grid,
+            )
+            detail = self.detail_stem(detail).to(dtype=rgb.dtype)
+            for upsample in self.detail_ups:
+                detail = upsample(detail)
+            if detail.shape[-2:] != (self.cfg.rgb_size, self.cfg.rgb_size):
+                detail = F.interpolate(
+                    detail.float(),
+                    size=(self.cfg.rgb_size, self.cfg.rgb_size),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=rgb.dtype)
+            assert self.detail_output is not None
+            detail_logits = self.detail_output(detail).float()
+            low_frequency = F.avg_pool2d(
+                detail_logits,
+                kernel_size=5,
+                stride=1,
+                padding=2,
+                count_include_pad=False,
+            )
+            correction = torch.tanh(detail_logits - low_frequency).to(
+                dtype=rgb.dtype
+            )
+            rgb = torch.clamp(
+                rgb + float(self.cfg.rgb_detail_residual_scale) * correction,
+                0.0,
+                1.0,
+            )
+        elif appearance_detail_tokens is not None:
+            raise ValueError(
+                "appearance detail was supplied while state detail is disabled"
+            )
+        return rgb
 
 
 def _rgb_norm_groups(channels: int) -> int:
@@ -2696,12 +2930,17 @@ class NativeRGBDecoder(nn.Module):
         expanded_appearance_context: Optional[torch.Tensor] = None
         expanded_appearance_detail: Optional[torch.Tensor] = None
         if self.cfg.appearance_enabled:
+            appearance_dim = (
+                self.cfg.appearance_detail_dim
+                if self.cfg.appearance_state_detail
+                else self.cfg.token_dim
+            )
             expected = (
                 future_tokens.shape[0],
                 self.cfg.K,
                 views,
                 self.cfg.appearance_P,
-                self.cfg.token_dim,
+                appearance_dim,
             )
             if appearance_tokens is None or tuple(appearance_tokens.shape) != expected:
                 raise ValueError(f"appearance RGB tokens must be {expected}")
@@ -2718,7 +2957,10 @@ class NativeRGBDecoder(nn.Module):
             selected_appearance = selected.reshape(
                 batch * frames * views, patches, token_dim
             )
-            if self.cfg.appearance_flow_aligned_detail:
+            if (
+                self.cfg.appearance_flow_aligned_detail
+                or self.cfg.appearance_state_detail
+            ):
                 expanded = expanded_motion
                 expanded_appearance_detail = selected_appearance
             else:
@@ -2731,6 +2973,7 @@ class NativeRGBDecoder(nn.Module):
             if (
                 self.cfg.rgb_context_appearance_delta_scale > 0.0
                 and not self.cfg.appearance_flow_aligned_detail
+                and not self.cfg.appearance_state_detail
             ):
                 expected_context_appearance = (
                     batch,
@@ -2755,6 +2998,7 @@ class NativeRGBDecoder(nn.Module):
             elif (
                 appearance_context_tokens is not None
                 and not self.cfg.appearance_flow_aligned_detail
+                and not self.cfg.appearance_state_detail
             ):
                 raise ValueError(
                     "appearance context was supplied while RGB delta conditioning is disabled"
@@ -2941,7 +3185,16 @@ class NativeRGBDecoder(nn.Module):
                     ),
                 )
             else:
-                decoded = self.image_decoder(*decoder_inputs)
+                decoded = self.image_decoder(
+                    *decoder_inputs,
+                    (
+                        None
+                        if expanded_appearance_detail is None
+                        else expanded_appearance_detail.index_select(
+                            0, chunk_indices
+                        )
+                    ),
+                )
                 motion_logit = decoded.new_zeros(
                     decoded.shape[0], 1, decoded.shape[-2], decoded.shape[-1]
                 )
@@ -3077,9 +3330,13 @@ class NativeWorldModel(nn.Module):
         self.state_norm = RMSNorm(cfg.state_hidden)
         self.action_norm = RMSNorm(cfg.action_hidden)
         self.token_output = nn.Linear(cfg.state_hidden, cfg.token_dim, bias=False)
-        self.appearance_dynamics: Optional[PerViewAppearanceDynamics] = (
-            PerViewAppearanceDynamics(cfg) if cfg.appearance_enabled else None
-        )
+        self.appearance_dynamics: Optional[nn.Module] = None
+        if cfg.appearance_enabled:
+            self.appearance_dynamics = (
+                FutureSpatialDetailPredictor(cfg)
+                if cfg.appearance_state_detail
+                else PerViewAppearanceDynamics(cfg)
+            )
         self.action_head = UnifiedActionHead(cfg)
         self.geometry_head = NativeGeometryHead(cfg)
         self.rgb_head = NativeRGBDecoder(cfg)
@@ -3557,76 +3814,102 @@ class NativeWorldModel(nn.Module):
         appearance_autoregressive_pred: Optional[torch.Tensor] = None
         appearance_autoregressive_mask: Optional[torch.Tensor] = None
         if cfg.appearance_enabled:
-            if (
-                self.appearance_dynamics is None
-                or appearance_context_tokens is None
-                or appearance_context_mask is None
-            ):
-                raise ValueError(
-                    "dual-path model requires appearance context tokens and mask"
+            if cfg.appearance_state_detail:
+                if self.appearance_dynamics is None:
+                    raise RuntimeError("state detail predictor is unavailable")
+                view_present = view_mask.bool().any(dim=(1, 3))
+                detail_mask = view_present[:, None, :, None].expand(
+                    -1, cfg.K, -1, cfg.appearance_P
                 )
-            appearance_ratio = torch.as_tensor(
-                appearance_teacher_ratio,
-                dtype=pred_tokens.dtype,
-                device=pred_tokens.device,
-            )
-            if appearance_ratio.numel() != 1 or not bool(
-                ((appearance_ratio >= 0) & (appearance_ratio <= 1)).all()
-            ):
-                raise ValueError("appearance teacher ratio must be a scalar in [0,1]")
-            if cfg.appearance_flow_aligned_detail:
-                appearance_ratio = appearance_ratio * 0.0
-            if target_appearance_tokens is None:
-                if bool(appearance_ratio > 0):
+                if target_appearance_mask is not None:
+                    if tuple(target_appearance_mask.shape) != tuple(
+                        detail_mask.shape
+                    ):
+                        raise ValueError(
+                            "target appearance mask must align to state detail"
+                        )
+                    detail_mask = detail_mask & target_appearance_mask.bool()
+                appearance_pred, appearance_pred_mask = self.appearance_dynamics(
+                    rgb_render_future,
+                    detail_mask,
+                )
+                appearance_for_rgb = appearance_pred
+            else:
+                if (
+                    self.appearance_dynamics is None
+                    or appearance_context_tokens is None
+                    or appearance_context_mask is None
+                ):
                     raise ValueError(
-                        "teacher forcing requires target appearance tokens"
+                        "dual-path model requires appearance context tokens and mask"
                     )
-            elif (
-                target_appearance_mask is None
-                or target_appearance_mask.shape
-                != target_appearance_tokens.shape[:-1]
-            ):
-                raise ValueError("target appearance mask must align to targets")
-
-            appearance_context_for_rgb = torch.zeros_like(
-                appearance_context_tokens[:, 0]
-            )
-            for context_index in range(int(appearance_context_tokens.shape[1])):
-                appearance_context_for_rgb = torch.where(
-                    appearance_context_mask[:, context_index, ..., None].bool(),
-                    appearance_context_tokens[:, context_index],
-                    appearance_context_for_rgb,
+                appearance_ratio = torch.as_tensor(
+                    appearance_teacher_ratio,
+                    dtype=pred_tokens.dtype,
+                    device=pred_tokens.device,
                 )
-            appearance_context_for_rgb = F.layer_norm(
-                appearance_context_for_rgb.float(),
-                (appearance_context_for_rgb.shape[-1],),
-            ).to(dtype=appearance_context_tokens.dtype)
+                if appearance_ratio.numel() != 1 or not bool(
+                    ((appearance_ratio >= 0) & (appearance_ratio <= 1)).all()
+                ):
+                    raise ValueError(
+                        "appearance teacher ratio must be a scalar in [0,1]"
+                    )
+                if cfg.appearance_flow_aligned_detail:
+                    appearance_ratio = appearance_ratio * 0.0
+                if target_appearance_tokens is None:
+                    if bool(appearance_ratio > 0):
+                        raise ValueError(
+                            "teacher forcing requires target appearance tokens"
+                        )
+                elif (
+                    target_appearance_mask is None
+                    or target_appearance_mask.shape
+                    != target_appearance_tokens.shape[:-1]
+                ):
+                    raise ValueError("target appearance mask must align to targets")
 
-            # RGB always consumes the same full autoregressive rollout used
-            # at serving time. Future target appearance remains available to
-            # the separate one-step teacher loss, but never enters rendering.
-            rollout_steps = cfg.K
-            (
-                appearance_pred,
-                appearance_pred_mask,
-                appearance_teacher_pred,
-                appearance_teacher_mask,
-                appearance_autoregressive_pred,
-                appearance_autoregressive_mask,
-            ) = self.appearance_dynamics(
-                appearance_context_tokens,
-                appearance_context_mask,
-                rgb_render_future,
-                relative_world_time,
-                target_appearance_mask,
-                appearance_action_tokens,
-                appearance_action_mask,
-                target_appearance_tokens,
-                rollout_steps,
-            )
-            appearance_for_rgb = appearance_pred * appearance_pred_mask[..., None].to(
-                dtype=appearance_pred.dtype
-            )
+                appearance_context_for_rgb = torch.zeros_like(
+                    appearance_context_tokens[:, 0]
+                )
+                for context_index in range(
+                    int(appearance_context_tokens.shape[1])
+                ):
+                    appearance_context_for_rgb = torch.where(
+                        appearance_context_mask[
+                            :, context_index, ..., None
+                        ].bool(),
+                        appearance_context_tokens[:, context_index],
+                        appearance_context_for_rgb,
+                    )
+                appearance_context_for_rgb = F.layer_norm(
+                    appearance_context_for_rgb.float(),
+                    (appearance_context_for_rgb.shape[-1],),
+                ).to(dtype=appearance_context_tokens.dtype)
+
+                # Legacy appearance profiles remain readable for old evidence,
+                # but V8 core never selects this target/context-dependent path.
+                rollout_steps = cfg.K
+                (
+                    appearance_pred,
+                    appearance_pred_mask,
+                    appearance_teacher_pred,
+                    appearance_teacher_mask,
+                    appearance_autoregressive_pred,
+                    appearance_autoregressive_mask,
+                ) = self.appearance_dynamics(
+                    appearance_context_tokens,
+                    appearance_context_mask,
+                    rgb_render_future,
+                    relative_world_time,
+                    target_appearance_mask,
+                    appearance_action_tokens,
+                    appearance_action_mask,
+                    target_appearance_tokens,
+                    rollout_steps,
+                )
+                appearance_for_rgb = appearance_pred * appearance_pred_mask[
+                    ..., None
+                ].to(dtype=appearance_pred.dtype)
         elif any(
             value is not None
             for value in (
@@ -3656,6 +3939,8 @@ class NativeWorldModel(nn.Module):
                 output["appearance_flow_aligned_detail"] = (
                     appearance_pred.new_ones(())
                 )
+            if cfg.appearance_state_detail:
+                output["appearance_state_detail"] = appearance_pred.new_ones(())
         if (
             appearance_teacher_pred is not None
             and appearance_teacher_mask is not None
@@ -3701,13 +3986,14 @@ class NativeWorldModel(nn.Module):
                 appearance_context_for_rgb
                 if cfg.rgb_context_appearance_delta_scale > 0.0
                 and not cfg.appearance_flow_aligned_detail
+                and not cfg.appearance_state_detail
                 else None
             ),
             rgb_render_future if cfg.appearance_enabled else None,
             rgb_action_summary,
             task_embedding if cfg.rgb_context_enabled else None,
-            context_rgb,
-            context_rgb_mask,
+            context_rgb if cfg.rgb_context_enabled else None,
+            context_rgb_mask if cfg.rgb_context_enabled else None,
             enabled=cfg.activation_checkpointing,
         )
         output["rgb"] = rgb
@@ -3729,7 +4015,10 @@ class NativeWorldModel(nn.Module):
         yield from self.bridges
         yield from self.dynamics_blocks
         if self.appearance_dynamics is not None:
-            yield from self.appearance_dynamics.blocks
+            if self.cfg.appearance_state_detail:
+                yield self.appearance_dynamics
+            else:
+                yield from self.appearance_dynamics.blocks
         yield self.rgb_head.image_decoder
         yield self.geometry_head
 
@@ -3742,7 +4031,10 @@ class NativeWorldModel(nn.Module):
         yield from self.action_blocks
         yield from self.bridges
         yield from self.dynamics_blocks
-        if self.appearance_dynamics is not None:
+        if (
+            self.appearance_dynamics is not None
+            and not self.cfg.appearance_state_detail
+        ):
             yield from self.appearance_dynamics.blocks
         yield self.rgb_head.image_decoder
 
