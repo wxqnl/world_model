@@ -40,6 +40,10 @@ class NativeObjectiveConfig:
     rgb_motion_pos_weight: float = 1.0
     rgb_motion_threshold: float = 0.03
     rgb_motion_gain: float = 3.0
+    rgb_flow_teacher: float = 0.0
+    rgb_disocclusion_bce: float = 0.0
+    rgb_disocclusion_dice: float = 0.0
+    rgb_disocclusion_pos_weight: float = 1.0
     depth_log: float = 1.5
     point: float = 0.5
     camera_pose: float = 0.1
@@ -65,6 +69,10 @@ class NativeObjectiveConfig:
             raise NativeObjectiveError("rgb_motion_pos_weight must be positive")
         if self.rgb_motion_threshold <= 0.0:
             raise NativeObjectiveError("rgb_motion_threshold must be positive")
+        if self.rgb_disocclusion_pos_weight <= 0.0:
+            raise NativeObjectiveError(
+                "rgb_disocclusion_pos_weight must be positive"
+            )
         if self.action_velocity != 0.0:
             raise NativeObjectiveError(
                 "action_velocity must remain 0: mixed delta/absolute semantics and "
@@ -883,6 +891,15 @@ def compute_native_objective(
     rgb_motion_bce = zero
     rgb_motion_dice = zero
     rgb_motion_fraction = zero
+    rgb_flow_teacher = zero
+    rgb_flow_epe = zero
+    rgb_flow_prediction_magnitude = zero
+    rgb_flow_target_magnitude = zero
+    rgb_flow_magnitude_ratio = zero
+    rgb_disocclusion_bce = zero
+    rgb_disocclusion_dice = zero
+    rgb_disocclusion_fraction = zero
+    rgb_disocclusion_predicted_fraction = zero
     zero_action_rgb_l1 = zero
     action_counterfactual_rgb_gain = zero
     action_counterfactual_rgb_advantage = zero
@@ -898,6 +915,11 @@ def compute_native_objective(
             config.rgb_motion_l1 > 0.0
             or config.rgb_motion_bce > 0.0
             or config.rgb_motion_dice > 0.0
+        )
+        transport_objective_enabled = (
+            config.rgb_flow_teacher > 0.0
+            or config.rgb_disocclusion_bce > 0.0
+            or config.rgb_disocclusion_dice > 0.0
         )
         if "context_rgb" in batch:
             context_rgb = batch["context_rgb"]
@@ -1005,7 +1027,161 @@ def compute_native_objective(
                     rgb_motion_dice = _masked_mean(
                         dice_per_sample, valid_sample, epsilon=epsilon
                     )
-        elif motion_objective_enabled:
+            if transport_objective_enabled:
+                required_output = (
+                    "rgb_flow_pixels",
+                    "rgb_disocclusion_logit",
+                )
+                required_batch = (
+                    "rgb_flow_target_pixels",
+                    "rgb_disocclusion_target",
+                )
+                missing = [
+                    *(name for name in required_output if name not in output),
+                    *(name for name in required_batch if name not in batch),
+                ]
+                if missing:
+                    raise NativeObjectiveError(
+                        "RGB transport supervision requires " + ", ".join(missing)
+                    )
+                flow_prediction = output["rgb_flow_pixels"].float()
+                disocclusion_prediction = output[
+                    "rgb_disocclusion_logit"
+                ].float()
+                flow_target = batch["rgb_flow_target_pixels"].float()
+                disocclusion_target = batch["rgb_disocclusion_target"].float()
+                expected_flow_prefix = target_rgb.shape[:3] + (2,)
+                expected_disocclusion_prefix = target_rgb.shape[:3] + (1,)
+                if (
+                    flow_prediction.ndim != 6
+                    or flow_prediction.shape[:4] != expected_flow_prefix
+                    or flow_target.ndim != 6
+                    or flow_target.shape[:4] != expected_flow_prefix
+                ):
+                    raise NativeObjectiveError(
+                        "RGB flow tensors must align as [B,F,V,2,H,W]"
+                    )
+                if (
+                    disocclusion_prediction.ndim != 6
+                    or disocclusion_prediction.shape[:4]
+                    != expected_disocclusion_prefix
+                    or disocclusion_target.ndim != 6
+                    or disocclusion_target.shape[:4]
+                    != expected_disocclusion_prefix
+                    or disocclusion_target.shape[-2:] != flow_target.shape[-2:]
+                ):
+                    raise NativeObjectiveError(
+                        "RGB disocclusion tensors must align as [B,F,V,1,H,W]"
+                    )
+                pair_count = int(
+                    target_rgb.shape[0]
+                    * target_rgb.shape[1]
+                    * target_rgb.shape[2]
+                )
+                teacher_grid = tuple(flow_target.shape[-2:])
+                flow_at_teacher_grid = F.interpolate(
+                    flow_prediction.reshape(
+                        pair_count, 2, *flow_prediction.shape[-2:]
+                    ),
+                    size=teacher_grid,
+                    mode="bilinear",
+                    align_corners=True,
+                ).reshape_as(flow_target)
+                disocclusion_at_teacher_grid = F.interpolate(
+                    disocclusion_prediction.reshape(
+                        pair_count, 1, *disocclusion_prediction.shape[-2:]
+                    ),
+                    size=teacher_grid,
+                    mode="bilinear",
+                    align_corners=True,
+                ).reshape_as(disocclusion_target)
+                slot_valid = valid_rgb_mask[..., 0, 0, 0]
+                transport_valid = torch.broadcast_to(
+                    slot_valid[..., None, None, None], disocclusion_target.shape
+                )
+                finite_flow = torch.isfinite(flow_target).all(
+                    dim=3, keepdim=True
+                )
+                finite_disocclusion = torch.isfinite(disocclusion_target)
+                transport_valid = (
+                    transport_valid & finite_flow & finite_disocclusion
+                )
+                visible = transport_valid & (disocclusion_target < 0.5)
+                flow_delta = flow_at_teacher_grid - flow_target
+                flow_epe_map = torch.sqrt(
+                    flow_delta.square().sum(dim=3, keepdim=True)
+                    + config.rgb_charbonnier_epsilon**2
+                )
+                target_flow_magnitude = flow_target.square().sum(
+                    dim=3, keepdim=True
+                ).sqrt()
+                prediction_flow_magnitude = flow_at_teacher_grid.square().sum(
+                    dim=3, keepdim=True
+                ).sqrt()
+                moving = target_flow_magnitude >= 1.0
+                flow_weight = 1.0 + config.rgb_motion_gain * moving.to(
+                    dtype=flow_epe_map.dtype
+                )
+                rgb_flow_teacher = _masked_mean(
+                    flow_epe_map * flow_weight,
+                    visible,
+                    epsilon=epsilon,
+                )
+                rgb_flow_epe = _masked_mean(
+                    flow_epe_map, visible, epsilon=epsilon
+                )
+                rgb_flow_prediction_magnitude = _masked_mean(
+                    prediction_flow_magnitude, visible, epsilon=epsilon
+                )
+                rgb_flow_target_magnitude = _masked_mean(
+                    target_flow_magnitude, visible, epsilon=epsilon
+                )
+                rgb_flow_magnitude_ratio = rgb_flow_prediction_magnitude / (
+                    rgb_flow_target_magnitude + epsilon
+                )
+                disocclusion_loss = F.binary_cross_entropy_with_logits(
+                    disocclusion_at_teacher_grid,
+                    disocclusion_target,
+                    pos_weight=torch.as_tensor(
+                        config.rgb_disocclusion_pos_weight,
+                        dtype=disocclusion_at_teacher_grid.dtype,
+                        device=disocclusion_at_teacher_grid.device,
+                    ),
+                    reduction="none",
+                )
+                rgb_disocclusion_bce = _masked_mean(
+                    disocclusion_loss, transport_valid, epsilon=epsilon
+                )
+                disocclusion_probability = torch.sigmoid(
+                    disocclusion_at_teacher_grid
+                )
+                valid_float = transport_valid.to(
+                    dtype=disocclusion_probability.dtype
+                )
+                intersection = (
+                    disocclusion_probability
+                    * disocclusion_target
+                    * valid_float
+                ).flatten(1).sum(dim=1)
+                denominator = (
+                    (disocclusion_probability + disocclusion_target)
+                    * valid_float
+                ).flatten(1).sum(dim=1)
+                valid_sample = transport_valid.flatten(1).any(dim=1)
+                rgb_disocclusion_dice = _masked_mean(
+                    1.0
+                    - (2.0 * intersection + epsilon)
+                    / (denominator + epsilon),
+                    valid_sample,
+                    epsilon=epsilon,
+                )
+                rgb_disocclusion_fraction = _masked_mean(
+                    disocclusion_target, transport_valid, epsilon=epsilon
+                )
+                rgb_disocclusion_predicted_fraction = _masked_mean(
+                    disocclusion_probability, transport_valid, epsilon=epsilon
+                )
+        elif motion_objective_enabled or transport_objective_enabled:
             raise NativeObjectiveError(
                 "RGB motion supervision requires context_rgb"
             )
@@ -1072,6 +1248,9 @@ def compute_native_objective(
         config.rgb_motion_l1 > 0.0
         or config.rgb_motion_bce > 0.0
         or config.rgb_motion_dice > 0.0
+        or config.rgb_flow_teacher > 0.0
+        or config.rgb_disocclusion_bce > 0.0
+        or config.rgb_disocclusion_dice > 0.0
     ):
         raise NativeObjectiveError(
             "RGB motion objective is enabled but RGB supervision is absent"
@@ -1216,6 +1395,17 @@ def compute_native_objective(
         "rgb_motion_bce": rgb_motion_bce,
         "rgb_motion_dice": rgb_motion_dice,
         "rgb_motion_fraction": rgb_motion_fraction,
+        "rgb_flow_teacher": rgb_flow_teacher,
+        "rgb_flow_epe": rgb_flow_epe,
+        "rgb_flow_prediction_magnitude": rgb_flow_prediction_magnitude,
+        "rgb_flow_target_magnitude": rgb_flow_target_magnitude,
+        "rgb_flow_magnitude_ratio": rgb_flow_magnitude_ratio,
+        "rgb_disocclusion_bce": rgb_disocclusion_bce,
+        "rgb_disocclusion_dice": rgb_disocclusion_dice,
+        "rgb_disocclusion_fraction": rgb_disocclusion_fraction,
+        "rgb_disocclusion_predicted_fraction": (
+            rgb_disocclusion_predicted_fraction
+        ),
         "zero_action_rgb_l1": zero_action_rgb_l1,
         "action_counterfactual_rgb_gain": action_counterfactual_rgb_gain,
         "action_counterfactual_rgb_advantage": (
@@ -1294,6 +1484,9 @@ def compute_native_objective(
         + config.rgb_motion_l1 * rgb_motion_l1
         + config.rgb_motion_bce * rgb_motion_bce
         + config.rgb_motion_dice * rgb_motion_dice
+        + config.rgb_flow_teacher * rgb_flow_teacher
+        + config.rgb_disocclusion_bce * rgb_disocclusion_bce
+        + config.rgb_disocclusion_dice * rgb_disocclusion_dice
         + config.depth_log * depth_log
         + config.point * point
         + config.camera_pose * camera_pose

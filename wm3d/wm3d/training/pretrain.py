@@ -61,6 +61,10 @@ from wm3d.training.native_objective import (
     compute_native_objective,
     objective_config_from_mapping,
 )
+from wm3d.training.rgb_flow_runtime import (
+    FrozenBidirectionalRAFTRuntime,
+    raft_config_from_mapping,
+)
 from wm3d.training.gradient_ownership import (
     GradientOwnershipError,
     audit_gradient_ownership,
@@ -404,6 +408,21 @@ def _batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str
         name: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
         for name, value in batch.items()
     }
+
+
+def _materialize_rgb_flow_targets(
+    batch: Mapping[str, Any],
+    runtime: FrozenBidirectionalRAFTRuntime | None,
+) -> dict[str, Any]:
+    if runtime is None:
+        return dict(batch)
+    if "context_rgb" not in batch or "target_rgb" not in batch:
+        raise PretrainError(
+            "RGB flow supervision requires context_rgb and target_rgb"
+        )
+    result = dict(batch)
+    result.update(runtime.targets(batch["context_rgb"], batch["target_rgb"]))
+    return result
 
 
 _MODEL_INPUTS = {
@@ -848,6 +867,7 @@ def _validate(
     perceptual_model: torch.nn.Module | None,
     context: Any,
     input_adapter: Any | None = None,
+    rgb_flow_teacher: FrozenBidirectionalRAFTRuntime | None = None,
     training_step: int = 0,
 ) -> dict[str, Any]:
     count = int(runtime_profile["train"]["validation_steps"])
@@ -882,6 +902,7 @@ def _validate(
         if input_adapter is not None:
             cpu_batch = input_adapter.materialize(cpu_batch)
         batch = _batch_to_device(cpu_batch, context.device)
+        batch = _materialize_rgb_flow_targets(batch, rgb_flow_teacher)
         for label, ratio in settings:
             with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
                 losses = compute_native_objective(
@@ -1222,6 +1243,14 @@ def main() -> None:
             )
             input_adapter.eval()
 
+        rgb_flow_teacher = None
+        rgb_flow_mapping = runtime["train"].get("rgb_flow_teacher")
+        if rgb_flow_mapping is not None:
+            rgb_flow_teacher = FrozenBidirectionalRAFTRuntime(
+                raft_config_from_mapping(rgb_flow_mapping),
+                device=context.device,
+            )
+
         seed = int(runtime["train"]["seed"])
         _configure_reproducibility(
             seed,
@@ -1479,6 +1508,9 @@ def main() -> None:
                     batch = _batch_to_device(cpu_batch, context.device)
                 else:
                     batch = async_pipeline.consume()
+                batch = _materialize_rgb_flow_targets(
+                    batch, rgb_flow_teacher
+                )
                 unique = torch.unique(batch["source_id"])
                 if unique.numel() != 1:
                     raise PretrainError("one micro-batch mixed multiple sources")
@@ -1587,6 +1619,7 @@ def main() -> None:
                     perceptual_model,
                     context,
                     input_adapter=input_adapter,
+                    rgb_flow_teacher=rgb_flow_teacher,
                     training_step=completed,
                 )
                 if context.is_rank0:

@@ -1059,6 +1059,24 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
         cfg.rgb_size,
     )
     assert output["rgb_blend"][0, :, 1].count_nonzero() == 0
+    assert output["rgb_flow_pixels"].shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        2,
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+    assert output["rgb_disocclusion_logit"].shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        1,
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+    assert output["rgb_flow_pixels"][0, :, 1].count_nonzero() == 0
+    assert output["rgb_disocclusion_logit"][0, :, 1].count_nonzero() == 0
 
 
 def test_pixel_flow_warp_moves_context_without_unaligned_mixture() -> None:

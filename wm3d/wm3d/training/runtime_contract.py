@@ -31,6 +31,7 @@ from wm3d.models.model_factory import (
 )
 from wm3d.training.distributed_runtime import strategy_from_mapping
 from wm3d.training.native_objective import objective_config_from_mapping
+from wm3d.training.rgb_flow_runtime import raft_config_from_mapping
 
 
 RUNTIME_PROFILE_SCHEMA = "wm3d_v8_runtime_profile_v1"
@@ -217,6 +218,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "cudnn_benchmark",
         "rgb_decode_chunk_size",
         "rgb_perceptual_chunk_size",
+        "rgb_flow_teacher",
         "appearance_teacher_start_ratio",
         "appearance_teacher_end_ratio",
         "appearance_teacher_decay_steps",
@@ -287,6 +289,42 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError(
             "train.rgb_perceptual_chunk_size must be a positive integer"
         )
+    rgb_flow_teacher = train.get("rgb_flow_teacher")
+    if rgb_flow_teacher is not None:
+        if not isinstance(rgb_flow_teacher, dict):
+            raise RuntimeContractError("train.rgb_flow_teacher must be a mapping")
+        try:
+            flow_config = raft_config_from_mapping(rgb_flow_teacher)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeContractError(
+                f"invalid train.rgb_flow_teacher: {exc}"
+            ) from exc
+        for field in ("source_root", "checkpoint"):
+            path = Path(str(getattr(flow_config, field)))
+            if not path.is_absolute():
+                raise RuntimeContractError(
+                    f"train.rgb_flow_teacher.{field} must be absolute"
+                )
+        if flow_config.input_size <= 0 or flow_config.input_size % 8:
+            raise RuntimeContractError(
+                "train.rgb_flow_teacher.input_size must be positive and divisible by 8"
+            )
+        if (
+            flow_config.iterations <= 0
+            or flow_config.output_grid <= 0
+            or flow_config.batch_chunk <= 0
+            or flow_config.flow_max_pixels <= 0.0
+        ):
+            raise RuntimeContractError(
+                "train.rgb_flow_teacher numeric fields must be positive"
+            )
+        if (
+            flow_config.consistency_relative < 0.0
+            or flow_config.consistency_absolute < 0.0
+        ):
+            raise RuntimeContractError(
+                "train.rgb_flow_teacher consistency fields cannot be negative"
+            )
     if int(train["num_workers"]) < 0 or int(train["prefetch_factor"]) <= 0:
         raise RuntimeContractError("dataloader worker/prefetch values are invalid")
     if float(train["gradient_clip"]) <= 0:

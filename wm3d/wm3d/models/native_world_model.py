@@ -2001,7 +2001,13 @@ class NativeContextRGBImageDecoder(nn.Module):
         context_rgb: torch.Tensor,
         context_indices: Optional[torch.Tensor] = None,
         motion_tokens: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         if tuple(context_rgb.shape[1:]) != (
             3,
             self.cfg.rgb_size,
@@ -2207,9 +2213,8 @@ class NativeContextRGBImageDecoder(nn.Module):
                 raw_flow / max_flow_pixels
             )
             motion_logit = self.motion_head(motion_features)
-            disocclusion = torch.sigmoid(
-                self.disocclusion_head(motion_features)
-            )
+            disocclusion_logit = self.disocclusion_head(motion_features)
+            disocclusion = torch.sigmoid(disocclusion_logit)
 
             # Warp three RGB channels once, then derive the entire feature
             # pyramid from the aligned image. This is both stricter and much
@@ -2232,6 +2237,12 @@ class NativeContextRGBImageDecoder(nn.Module):
             warped_skips = tuple(expand_context(skip) for skip in skips)
             warp_valid = None
             disocclusion = None
+            disocclusion_logit = value.new_zeros(
+                value.shape[0], 1, self.cfg.rgb_size, self.cfg.rgb_size
+            )
+            flow_pixels = value.new_zeros(
+                value.shape[0], 2, self.cfg.rgb_size, self.cfg.rgb_size
+            )
             motion_logit = None
         if warped_skips[-1].shape[-2:] != value.shape[-2:]:
             raise ValueError("context pyramid does not align with RGB token grid")
@@ -2285,7 +2296,7 @@ class NativeContextRGBImageDecoder(nn.Module):
                     1.0,
                 )
             rgb = blend * direct + (1.0 - blend) * residual_rgb
-        return rgb, motion_logit, blend
+        return rgb, motion_logit, blend, flow_pixels, disocclusion_logit
 
 
 class NativeRGBDecoder(nn.Module):
@@ -2320,7 +2331,14 @@ class NativeRGBDecoder(nn.Module):
         task_embedding: Optional[torch.Tensor] = None,
         context_rgb: Optional[torch.Tensor] = None,
         context_rgb_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         indices = tuple(
             self.cfg.rgb_decode_indices if frame_indices is None else frame_indices
         )
@@ -2348,7 +2366,15 @@ class NativeRGBDecoder(nn.Module):
                 self.cfg.rgb_size,
                 self.cfg.rgb_size,
             )
-            return empty, index_tensor, empty_aux, empty_aux
+            empty_flow = future_tokens.new_empty(
+                future_tokens.shape[0],
+                0,
+                self.cfg.num_views,
+                2,
+                self.cfg.rgb_size,
+                self.cfg.rgb_size,
+            )
+            return empty, index_tensor, empty_aux, empty_aux, empty_flow, empty_aux
         views = self.cfg.num_views
         selected_motion = future_tokens.index_select(1, index_tensor)
         batch, frames, motion_patches, motion_token_dim = selected_motion.shape
@@ -2530,6 +2556,8 @@ class NativeRGBDecoder(nn.Module):
         decoded_chunks: list[torch.Tensor] = []
         motion_chunks: list[torch.Tensor] = []
         blend_chunks: list[torch.Tensor] = []
+        flow_chunks: list[torch.Tensor] = []
+        disocclusion_chunks: list[torch.Tensor] = []
         for start in range(
             0, int(dense_indices.numel()), self.cfg.rgb_decode_chunk_size
         ):
@@ -2559,7 +2587,13 @@ class NativeRGBDecoder(nn.Module):
                         chunk_context_ids, return_inverse=True
                     )
                 )
-                decoded, motion_logit, blend = self.image_decoder(
+                (
+                    decoded,
+                    motion_logit,
+                    blend,
+                    flow_pixels,
+                    disocclusion_logit,
+                ) = self.image_decoder(
                     decoder_inputs[0],
                     decoder_inputs[1],
                     decoder_inputs[2],
@@ -2588,15 +2622,28 @@ class NativeRGBDecoder(nn.Module):
                     decoded.shape[0], 1, decoded.shape[-2], decoded.shape[-1]
                 )
                 blend = torch.zeros_like(motion_logit)
+                flow_pixels = decoded.new_zeros(
+                    decoded.shape[0], 2, decoded.shape[-2], decoded.shape[-1]
+                )
+                disocclusion_logit = torch.zeros_like(motion_logit)
             chunk_valid = valid.index_select(0, chunk_indices)[:, None, None, None]
             decoded_chunks.append(decoded * chunk_valid.to(dtype=decoded.dtype))
             motion_chunks.append(
                 motion_logit * chunk_valid.to(dtype=motion_logit.dtype)
             )
             blend_chunks.append(blend * chunk_valid.to(dtype=blend.dtype))
+            flow_chunks.append(
+                flow_pixels * chunk_valid.to(dtype=flow_pixels.dtype)
+            )
+            disocclusion_chunks.append(
+                disocclusion_logit
+                * chunk_valid.to(dtype=disocclusion_logit.dtype)
+            )
         dense = torch.cat(decoded_chunks, dim=0)
         dense_motion = torch.cat(motion_chunks, dim=0)
         dense_blend = torch.cat(blend_chunks, dim=0)
+        dense_flow = torch.cat(flow_chunks, dim=0)
+        dense_disocclusion = torch.cat(disocclusion_chunks, dim=0)
         if self.cfg.rgb_context_enabled:
             rgb = dense.view(
                 batch, views, frames, 3, self.cfg.rgb_size, self.cfg.rgb_size
@@ -2605,6 +2652,12 @@ class NativeRGBDecoder(nn.Module):
                 batch, views, frames, 1, self.cfg.rgb_size, self.cfg.rgb_size
             ).permute(0, 2, 1, 3, 4, 5)
             blend = dense_blend.view(
+                batch, views, frames, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            ).permute(0, 2, 1, 3, 4, 5)
+            flow = dense_flow.view(
+                batch, views, frames, 2, self.cfg.rgb_size, self.cfg.rgb_size
+            ).permute(0, 2, 1, 3, 4, 5)
+            disocclusion_logit = dense_disocclusion.view(
                 batch, views, frames, 1, self.cfg.rgb_size, self.cfg.rgb_size
             ).permute(0, 2, 1, 3, 4, 5)
         else:
@@ -2617,11 +2670,19 @@ class NativeRGBDecoder(nn.Module):
             blend = dense_blend.view(
                 batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
             )
+            flow = dense_flow.view(
+                batch, frames, views, 2, self.cfg.rgb_size, self.cfg.rgb_size
+            )
+            disocclusion_logit = dense_disocclusion.view(
+                batch, frames, views, 1, self.cfg.rgb_size, self.cfg.rgb_size
+            )
         return (
             rgb,
             index_tensor,
             motion,
             blend,
+            flow,
+            disocclusion_logit,
         )
 
 
@@ -3273,7 +3334,14 @@ class NativeWorldModel(nn.Module):
             )
         )
         output.update(self.geometry_head(render_future))
-        rgb, rgb_indices, rgb_motion_logit, rgb_blend = self._run(
+        (
+            rgb,
+            rgb_indices,
+            rgb_motion_logit,
+            rgb_blend,
+            rgb_flow_pixels,
+            rgb_disocclusion_logit,
+        ) = self._run(
             self.rgb_head,
             render_pred_tokens,
             rgb_frame_indices,
@@ -3296,6 +3364,9 @@ class NativeWorldModel(nn.Module):
         if cfg.rgb_context_enabled:
             output["rgb_motion_logit"] = rgb_motion_logit
             output["rgb_blend"] = rgb_blend
+        if cfg.rgb_context_alignment_enabled:
+            output["rgb_flow_pixels"] = rgb_flow_pixels
+            output["rgb_disocclusion_logit"] = rgb_disocclusion_logit
         return output
 
     def iter_fsdp_units(self) -> Iterable[nn.Module]:
