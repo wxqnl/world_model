@@ -1267,10 +1267,12 @@ def main() -> None:
             ),
         )
         model = wrapped.model
-        if args.resume is not None and "model_warmstart_checkpoint" in runtime["train"]:
-            raise PretrainError("exact resume and model warmstart are mutually exclusive")
         warmstart_model: Mapping[str, Any] | None = None
-        warmstart_path = runtime["train"].get("model_warmstart_checkpoint")
+        warmstart_path = (
+            None
+            if args.resume is not None
+            else runtime["train"].get("model_warmstart_checkpoint")
+        )
         if warmstart_path is not None:
             source_path = Path(str(warmstart_path)).resolve(strict=True)
             source_manager = DistributedCheckpointManager(source_path.parent)
@@ -1307,11 +1309,29 @@ def main() -> None:
                 output_root.mkdir(parents=True, exist_ok=True)
                 if output_root.is_symlink():
                     raise PretrainError("output root cannot be a symlink")
+                contract_warmstart = warmstart_model
+                existing_contract_path = output_root / "run_contract.json"
+                if args.resume is not None and existing_contract_path.exists():
+                    try:
+                        existing_contract = json.loads(
+                            existing_contract_path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise PretrainError(
+                            "existing run contract is unreadable during exact resume"
+                        ) from exc
+                    existing_warmstart = existing_contract.get("warmstart_model")
+                    if existing_warmstart is not None:
+                        if not isinstance(existing_warmstart, Mapping):
+                            raise PretrainError(
+                                "existing warmstart receipt must be a mapping"
+                            )
+                        contract_warmstart = dict(existing_warmstart)
                 contract = _run_contract(
                     config,
                     parameter_counts,
                     native_model,
-                    warmstart_model=warmstart_model,
+                    warmstart_model=contract_warmstart,
                 )
                 _atomic_json_no_clobber(output_root / "run_contract.json", contract)
                 status[0] = {"ok": True, "contract": contract}
