@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_v7_aligned_rgb
 architecture: native_world_model
-expected_parameter_count: 1503027611
+expected_parameter_count: 1534621659
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -31,8 +31,8 @@ model:
   policy_task_modulation: true
   bridge_layers_state: [2, 5, 8, 11, 14, 17]
   bridge_heads: 16
-  dynamics_layers: 1
-  factual_dynamics_repeats: 2
+  dynamics_layers: 2
+  factual_dynamics_repeats: 1
   factual_action_residual_scale: 0.3
   appearance_action_residual_scale: 0.3
   view_hidden: 768

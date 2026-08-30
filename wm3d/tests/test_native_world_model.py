@@ -13,7 +13,6 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS, STATE_SEMANTIC_IDS
 from wm3d.models.native_world_model import (
     ActionBlock,
-    DynamicsConditionBlock,
     FutureSpatialDetailPredictor,
     NativeContextRGBImageDecoder,
     NativeOriginalV7ContextRGBImageDecoder,
@@ -21,6 +20,7 @@ from wm3d.models.native_world_model import (
     NativeRGBImageDecoder,
     NativeWorldModel,
     NativeWorldModelConfig,
+    OriginalV7FactualDecoderLayer,
     _warp_rgb_feature_with_pixel_flow,
 )
 from wm3d.models.model_factory import build_world_model
@@ -215,9 +215,9 @@ def test_rgb_decoder_uses_native_tokens_and_skips_unsupervised_views() -> None:
     assert output["rgb"][:, :, 0].abs().sum() > 0
     assert output["rgb"][:, :, 1].count_nonzero() == 0
     output["rgb"][:, :, 0].square().mean().backward()
-    assert model.token_output.weight.grad is not None
-    assert torch.isfinite(model.token_output.weight.grad).all()
-    assert model.token_output.weight.grad.abs().sum() > 0
+    assert model.factual_token_output.weight.grad is not None
+    assert torch.isfinite(model.factual_token_output.weight.grad).all()
+    assert model.factual_token_output.weight.grad.abs().sum() > 0
 
 
 def test_rgb_decoder_uses_rank_invariant_chunk_calls_for_sparse_views() -> None:
@@ -609,7 +609,7 @@ def test_policy_and_world_losses_reach_current_state_action_and_native_modules()
         "state_blocks.0",
         "dynamics_blocks.0",
         "action_head.output",
-        "token_output",
+        "factual_token_output",
         "geometry_head",
     )
     for prefix in required_prefixes:
@@ -640,6 +640,7 @@ def test_policy_and_world_losses_reach_current_state_action_and_native_modules()
     } <= set(audit["owners"])
     assert {
         "native_state_inputs",
+        "factual_decoder_inputs",
         "policy_action_inputs",
         "auxiliary_inputs",
     } <= set(audit["owners"])
@@ -1293,6 +1294,9 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
 def _tiny_original_v7_rgb_config() -> NativeWorldModelConfig:
     return replace(
         _tiny_config(),
+        dynamics_layers=2,
+        factual_dynamics_repeats=1,
+        factual_action_residual_scale=1.0,
         rgb_hidden=32,
         rgb_size=32,
         rgb_context_enabled=True,
@@ -2254,34 +2258,52 @@ def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
 def test_factual_decoder_reads_observed_memory_and_backpropagates() -> None:
     cfg = replace(_tiny_config(), dropout=0.0)
     torch.manual_seed(42)
-    block = DynamicsConditionBlock(cfg).train()
+    block = OriginalV7FactualDecoderLayer(cfg).train()
     future = torch.randn(2, cfg.K, cfg.P, cfg.state_hidden, requires_grad=True)
-    action = torch.randn(
-        2, cfg.K, cfg.max_action_groups, cfg.state_hidden, requires_grad=True
+    memory = torch.randn(
+        2,
+        1 + cfg.T * cfg.P + cfg.K * cfg.max_action_groups,
+        cfg.state_hidden,
+        requires_grad=True,
     )
-    mask = torch.ones(2, cfg.K, cfg.max_action_groups, dtype=torch.bool)
-    context = torch.randn(2, cfg.T, cfg.P, cfg.state_hidden, requires_grad=True)
+    mask = torch.ones(memory.shape[:2], dtype=torch.bool)
 
-    baseline = block(future, action, mask, context)
-    changed = block(future, action, mask, context + 3.0 * torch.randn_like(context))
+    baseline = block(future, memory, mask)
+    changed = block(future, memory + 3.0 * torch.randn_like(memory), mask)
     assert not torch.allclose(baseline, changed)
 
     baseline.square().mean().backward()
-    assert context.grad is not None
-    assert torch.isfinite(context.grad).all()
-    assert context.grad.abs().sum() > 0
-    context_gradients = [
+    assert memory.grad is not None
+    assert torch.isfinite(memory.grad).all()
+    assert memory.grad.abs().sum() > 0
+    gradients = [
         parameter.grad
-        for parameter in block.context_cross.parameters()
+        for parameter in block.layer.multihead_attn.parameters()
         if parameter.requires_grad
     ]
-    assert context_gradients
-    assert all(gradient is not None for gradient in context_gradients)
-    assert all(torch.isfinite(gradient).all() for gradient in context_gradients)
-    assert sum(gradient.abs().sum() for gradient in context_gradients) > 0
+    assert gradients
+    assert all(gradient is not None for gradient in gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert sum(gradient.abs().sum() for gradient in gradients) > 0
 
 
-def test_centered_zero_action_has_exactly_zero_decoder_update() -> None:
+def test_v7_factual_decoder_layers_do_not_share_parameters() -> None:
+    cfg = replace(_tiny_config(), dynamics_layers=2, dropout=0.0)
+    model = NativeWorldModel(cfg)
+    assert len(model.dynamics_blocks) == 2
+    first = dict(model.dynamics_blocks[0].named_parameters())
+    second = dict(model.dynamics_blocks[1].named_parameters())
+    assert first.keys() == second.keys()
+    for name in first:
+        assert first[name] is not second[name]
+        assert first[name].data_ptr() != second[name].data_ptr()
+    assert model.factual_token_output is not model.token_output
+    assert model.factual_token_output.bias is not None
+    assert model.factual_decoder_queries is not model.future_queries
+    assert model.factual_decoder_queries.data_ptr() != model.future_queries.data_ptr()
+
+
+def test_centered_zero_action_is_exactly_zero_in_decoder_memory() -> None:
     cfg = replace(_tiny_config(), dropout=0.0)
     torch.manual_seed(421)
     model = NativeWorldModel(cfg).eval()
@@ -2292,21 +2314,24 @@ def test_centered_zero_action_has_exactly_zero_decoder_update() -> None:
     batch["future_factual_coarse_action_values"] = torch.zeros_like(
         batch["future_factual_coarse_action_values"]
     )
-    action_updates: list[torch.Tensor] = []
-    handle = model.dynamics_blocks[0].action_cross.register_forward_hook(
-        lambda _module, _inputs, output: action_updates.append(output.detach())
-    )
+    action_memory: list[torch.Tensor] = []
+
+    def record(_module, inputs) -> None:
+        memory = inputs[1]
+        action_memory.append(memory[:, -(cfg.K * cfg.max_action_groups) :].detach())
+
+    handle = model.dynamics_blocks[0].register_forward_pre_hook(record)
     try:
         model(**batch)
     finally:
         handle.remove()
 
-    assert action_updates
-    for update in action_updates:
-        torch.testing.assert_close(update, torch.zeros_like(update), rtol=0, atol=0)
+    assert action_memory
+    for value in action_memory:
+        torch.testing.assert_close(value, torch.zeros_like(value), rtol=0, atol=0)
 
 
-def test_future_action_horizon_changes_only_present_and_causal_future() -> None:
+def test_future_action_changes_only_factual_world_not_policy_or_prior() -> None:
     cfg = replace(
         _tiny_config(),
         factual_dynamics_repeats=2,
@@ -2323,16 +2348,7 @@ def test_future_action_horizon_changes_only_present_and_causal_future() -> None:
     changed["future_factual_fine_action_values"] = changed_values
     counterfactual = model(**changed)
 
-    torch.testing.assert_close(
-        baseline["pred_tokens"][:, 0],
-        counterfactual["pred_tokens"][:, 0],
-        rtol=0,
-        atol=0,
-    )
-    assert not torch.allclose(
-        baseline["pred_tokens"][:, 1],
-        counterfactual["pred_tokens"][:, 1],
-    )
+    assert not torch.allclose(baseline["pred_tokens"], counterfactual["pred_tokens"])
     torch.testing.assert_close(
         baseline["action_free_pred_tokens"],
         counterfactual["action_free_pred_tokens"],
@@ -2376,6 +2392,26 @@ def test_zero_action_control_reuses_the_exact_factual_path() -> None:
         rtol=0,
         atol=0,
     )
+
+
+def test_zero_action_control_keeps_factual_encoder_gradient() -> None:
+    cfg = replace(_tiny_config(), dynamics_layers=2, dropout=0.0)
+    torch.manual_seed(431)
+    model = NativeWorldModel(cfg).train()
+    batch = _batch(cfg)
+
+    output = model(**batch, compute_zero_action_control=True)
+    output["zero_action_pred_tokens"].square().mean().backward()
+
+    gradients = [
+        parameter.grad
+        for parameter in model.factual_action.parameters()
+        if parameter.requires_grad
+    ]
+    assert gradients
+    assert all(gradient is not None for gradient in gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert sum(gradient.abs().sum() for gradient in gradients) > 0
 
 
 def test_render_refinement_is_stable_while_token_refinement_stays_causal() -> None:

@@ -30,7 +30,9 @@ class GradientOwnershipError(RuntimeError):
     pass
 
 
-def _required_owner_modules(model: NativeWorldModel) -> Mapping[str, tuple[nn.Module, ...]]:
+def _required_owner_modules(
+    model: NativeWorldModel,
+) -> Mapping[str, tuple[nn.Module, ...]]:
     """Return disjoint, capability-level module owners required by Stage0."""
 
     policy_modules: list[nn.Module] = [
@@ -48,7 +50,11 @@ def _required_owner_modules(model: NativeWorldModel) -> Mapping[str, tuple[nn.Mo
             model.state_blocks,
             model.token_output,
         ),
-        "factual_dynamics": (model.factual_action, model.dynamics_blocks),
+        "factual_dynamics": (
+            model.factual_action,
+            model.dynamics_blocks,
+            model.factual_token_output,
+        ),
         "policy_action_trunk": tuple(policy_modules),
         "state_action_bridges": (model.bridges,),
         "current_state_proprio": (model.current_state,),
@@ -74,6 +80,12 @@ def _required_owner_parameters(
             *tuple(model.task_state.parameters()),
             *tuple(model.state_input_norm.parameters()),
             *tuple(model.state_norm.parameters()),
+        ),
+        "factual_decoder_inputs": (
+            model.factual_decoder_queries,
+            model.factual_decoder_space,
+            *tuple(model.factual_decoder_time.parameters()),
+            *tuple(model.factual_task.parameters()),
         ),
         "policy_action_inputs": (
             model.policy_query_seed,
@@ -109,7 +121,9 @@ def _owner_parameters(
     }
     owners.update(
         {
-            name: tuple(parameter for parameter in parameters if parameter.requires_grad)
+            name: tuple(
+                parameter for parameter in parameters if parameter.requires_grad
+            )
             for name, parameters in _required_owner_parameters(model).items()
         }
     )
@@ -253,7 +267,10 @@ def validate_gradient_ownership_receipt(
 
     if set(receipt) != {"schema", "passed", "owners"}:
         raise GradientOwnershipError("gradient ownership receipt fields mismatch")
-    if receipt.get("schema") != GRADIENT_OWNERSHIP_SCHEMA or receipt.get("passed") is not True:
+    if (
+        receipt.get("schema") != GRADIENT_OWNERSHIP_SCHEMA
+        or receipt.get("passed") is not True
+    ):
         raise GradientOwnershipError("gradient ownership receipt schema/pass mismatch")
     owners = receipt.get("owners")
     # Rebuild the ownership table while validating: this simultaneously proves

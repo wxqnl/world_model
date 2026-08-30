@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_stage1_real_k8_5p6s
 architecture: native_world_model
-expected_parameter_count: 1329445043
+expected_parameter_count: 1320048691
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state

@@ -70,9 +70,9 @@ class NativeWorldModelConfig:
     bridge_layers_state: tuple[int, ...] = (2, 5, 8, 11, 14, 17, 20, 23, 26, 29)
     bridge_heads: int = 16
     dynamics_layers: int = 4
-    # Reuse the factual-only refinement stack several times. This deepens
-    # action conditioning without adding parameters or exposing future action
-    # to the action-free state/policy trunks.
+    # Compatibility knob for non-V7 profiles. The proven V7 path uses two
+    # independently parameterized layers and exactly one pass; sharing one
+    # layer across repeats is not an architectural substitute.
     factual_dynamics_repeats: int = 1
     # A parameter-free, per-horizon residual that preserves the factual action
     # value before cross-attention.  It is applied only to the world branch;
@@ -323,6 +323,21 @@ class NativeWorldModelConfig:
             if self.rgb_detail_residual_scale != 0.0:
                 raise ValueError(
                     "original V7 RGB cannot use the direct-decoder detail branch"
+                )
+            if self.dynamics_layers != 2 or self.factual_dynamics_repeats != 1:
+                raise ValueError(
+                    "original V7 RGB requires two distinct factual decoder layers"
+                )
+            if self.factual_action_residual_scale != 1.0:
+                raise ValueError(
+                    "original V7 RGB requires one unit-scale action query injection"
+                )
+            if (
+                self.render_factual_dynamics_repeats is not None
+                or self.render_factual_action_residual_scale is not None
+            ):
+                raise ValueError(
+                    "original V7 RGB cannot split token and render dynamics"
                 )
         if not isinstance(self.rgb_context_alignment_enabled, bool):
             raise ValueError("rgb_context_alignment_enabled must be boolean")
@@ -1132,73 +1147,50 @@ class StateActionBridge(nn.Module):
         return state, action
 
 
-class DynamicsConditionBlock(nn.Module):
-    """Decode an action-conditioned future without writing into the prior.
+class OriginalV7FactualDecoderLayer(nn.Module):
+    """One independently parameterized layer of the original V7 decoder.
 
-    The original V7 state decoder did two indispensable things for every
-    future query: it injected that horizon's physical action and cross-attended
-    the complete observed-state memory. The previous V8 refinement only did
-    the first operation on an already-predicted future. It could therefore
-    change token magnitude while losing the spatial direction anchored by the
-    observation. This block restores the complete decoder contract while the
-    action-free state and policy remain outside this module.
+    V7 did not refine an already-predicted action-free future.  It started from
+    learned future queries, added the physical action to those queries, and ran
+    two *distinct* pre-norm Transformer decoder layers over the complete
+    future grid.  Each layer read a memory containing task, observed state and
+    future-action tokens.  Keeping this layer factual-only preserves V8's
+    policy/action-free isolation while restoring the proven V7 world path.
     """
 
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
-        self.action_query_norm = RMSNorm(cfg.state_hidden)
-        self.action_norm = RMSNorm(cfg.state_hidden)
-        self.action_cross = CrossAttention(
-            cfg.state_hidden, cfg.state_hidden, cfg.state_heads, cfg.dropout
+        self.layer = nn.TransformerDecoderLayer(
+            d_model=cfg.state_hidden,
+            nhead=cfg.state_heads,
+            dim_feedforward=cfg.state_hidden * 4,
+            dropout=cfg.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.context_query_norm = RMSNorm(cfg.state_hidden)
-        self.context_norm = RMSNorm(cfg.state_hidden)
-        self.context_cross = CrossAttention(
-            cfg.state_hidden, cfg.state_hidden, cfg.state_heads, cfg.dropout
-        )
-        self.factorized = FactorizedStateBlock(cfg)
 
     def forward(
         self,
-        future_state: torch.Tensor,
-        factual_action: torch.Tensor,
-        factual_mask: torch.Tensor,
-        context_state: torch.Tensor,
+        future_query: torch.Tensor,
+        memory: torch.Tensor,
+        memory_valid: torch.Tensor,
     ) -> torch.Tensor:
-        batch, horizon, patches, dim = future_state.shape
-        groups = factual_action.shape[2]
-        if tuple(factual_action.shape[:3]) != (batch, horizon, groups):
-            raise ValueError("factual action must align with future horizons")
-        if tuple(factual_mask.shape) != (batch, horizon, groups):
-            raise ValueError("factual action mask must align with grouped actions")
-        if context_state.ndim != 4 or context_state.shape[0] != batch:
-            raise ValueError("context state must be [B,T,P,D]")
-        if context_state.shape[2:] != (patches, dim):
-            raise ValueError("context state must share the future patch layout")
-
-        # Same-mask centered physical action is exactly zero for the zero
-        # candidate. All projections here are bias-free, so the action update
-        # is then exactly zero without a learned null token or hidden shortcut.
-        query = future_state.reshape(batch * horizon, patches, dim)
-        action = factual_action.reshape(batch * horizon, groups, dim)
-        valid = factual_mask.reshape(batch * horizon, groups)
-        action_update = self.action_cross(
-            self.action_query_norm(query),
-            self.action_norm(action),
-            allowed_mask=valid[:, None, None, :],
+        if future_query.ndim != 4:
+            raise ValueError("future query must be [B,K,P,D]")
+        batch, horizon, patches, dim = future_query.shape
+        if memory.ndim != 3 or memory.shape[0] != batch or memory.shape[-1] != dim:
+            raise ValueError("decoder memory must be [B,M,D]")
+        if tuple(memory_valid.shape) != tuple(memory.shape[:2]):
+            raise ValueError("decoder memory mask must be [B,M]")
+        if not bool(memory_valid.any(dim=1).all()):
+            raise ValueError("every factual decoder sample needs valid memory")
+        decoded = self.layer(
+            future_query.reshape(batch, horizon * patches, dim),
+            memory,
+            memory_key_padding_mask=~memory_valid,
         )
-        future_state = (query + action_update).view(batch, horizon, patches, dim)
-
-        # Restore V7's decoder-memory read. Flattening K*P queries against T*P
-        # observed states lets action-shifted queries retrieve different
-        # spatial evidence instead of collapsing to a horizon-wide offset.
-        query = future_state.reshape(batch, horizon * patches, dim)
-        context = context_state.reshape(batch, -1, dim)
-        context_update = self.context_cross(
-            self.context_query_norm(query), self.context_norm(context)
-        )
-        future_state = (query + context_update).view(batch, horizon, patches, dim)
-        return self.factorized(future_state)
+        return decoded.view(batch, horizon, patches, dim)
 
 
 class FactorizedAppearanceBlock(nn.Module):
@@ -3635,6 +3627,16 @@ class NativeWorldModel(nn.Module):
         self.future_queries = nn.Parameter(
             torch.empty(1, cfg.K, cfg.P, cfg.state_hidden)
         )
+        # The factual V7 decoder owns its query and positional basis. Sharing
+        # the action-free future seed here would reintroduce the static-prior
+        # shortcut that this decoder is meant to avoid.
+        self.factual_decoder_queries = nn.Parameter(
+            torch.empty(1, cfg.K, cfg.P, cfg.state_hidden)
+        )
+        self.factual_decoder_space = nn.Parameter(
+            torch.empty(1, 1, cfg.P, cfg.state_hidden)
+        )
+        self.factual_decoder_time = ContinuousTimeEmbedding(cfg.state_hidden, cfg)
         # Query identity comes from physical time, group/embodiment and current
         # state.  A shared seed avoids learning discrete 20Hz-style position
         # slots and makes the capacity ceiling parameter-count independent.
@@ -3642,10 +3644,13 @@ class NativeWorldModel(nn.Module):
         for parameter in (
             self.state_space,
             self.future_queries,
+            self.factual_decoder_queries,
+            self.factual_decoder_space,
             self.policy_query_seed,
         ):
             nn.init.normal_(parameter, std=0.02)
         self.task_state = nn.Linear(cfg.task_dim, cfg.state_hidden, bias=False)
+        self.factual_task = nn.Linear(cfg.task_dim, cfg.state_hidden, bias=True)
         self.task_action = nn.Linear(cfg.task_dim, cfg.action_hidden, bias=False)
         self.state_input_norm = RMSNorm(cfg.state_hidden)
 
@@ -3682,12 +3687,18 @@ class NativeWorldModel(nn.Module):
             else None
         )
         self.dynamics_blocks = self._checkpoint_module_list(
-            (DynamicsConditionBlock(cfg) for _ in range(cfg.dynamics_layers)),
+            (OriginalV7FactualDecoderLayer(cfg) for _ in range(cfg.dynamics_layers)),
             enabled=cfg.activation_checkpointing,
         )
         self.state_norm = RMSNorm(cfg.state_hidden)
         self.action_norm = RMSNorm(cfg.action_hidden)
         self.token_output = nn.Linear(cfg.state_hidden, cfg.token_dim, bias=False)
+        # V7's factual decoder owned its own biased output projection.  Sharing
+        # the action-free token head made the factual branch compete with the
+        # policy prior and removed another part of the proven V7 contract.
+        self.factual_token_output = nn.Linear(
+            cfg.state_hidden, cfg.token_dim, bias=True
+        )
         self.appearance_dynamics: Optional[nn.Module] = None
         if cfg.appearance_enabled:
             self.appearance_dynamics = (
@@ -3720,6 +3731,8 @@ class NativeWorldModel(nn.Module):
         for parameter in (
             self.state_space,
             self.future_queries,
+            self.factual_decoder_queries,
+            self.factual_decoder_space,
             self.policy_query_seed,
         ):
             nn.init.normal_(parameter, std=0.02)
@@ -4013,6 +4026,26 @@ class NativeWorldModel(nn.Module):
         policy_query = policy_query * query_token_mask[..., None].to(policy_query.dtype)
 
         action_free_future = prior_state[:, cfg.T :]
+        # This is the V7 decoder query, not the action-free future prediction.
+        # Learned horizon/patch identity is combined with continuous physical
+        # time and spatial position.  Factual action is added below before the
+        # first decoder layer exactly once, as in V7.
+        factual_query = (
+            self.factual_decoder_queries.expand(batch, -1, -1, -1)
+            + self.factual_decoder_space
+            + self.factual_decoder_time(relative_world_time[:, cfg.T :])[:, :, None]
+        )
+        task_memory = self.state_norm(self.factual_task(task_embedding))[:, None]
+        observed_memory = prior_state[:, : cfg.T].reshape(
+            batch, cfg.T * cfg.P, cfg.state_hidden
+        )
+        decoder_memory_prefix = torch.cat((task_memory, observed_memory), dim=1)
+        decoder_prefix_valid = torch.ones(
+            batch,
+            1 + cfg.T * cfg.P,
+            dtype=torch.bool,
+            device=decoder_memory_prefix.device,
+        )
 
         def encode_factual(
             fine_values: torch.Tensor,
@@ -4049,7 +4082,21 @@ class NativeWorldModel(nn.Module):
             repeats: int,
             residual_scale: float,
         ) -> torch.Tensor:
-            refined = action_free_future
+            if tuple(encoded.shape[:3]) != (
+                batch,
+                cfg.K,
+                cfg.max_action_groups,
+            ):
+                raise ValueError("factual action memory must align to [B,K,G]")
+            if tuple(encoded_mask.shape) != tuple(encoded.shape[:3]):
+                raise ValueError("factual action mask must align to action memory")
+            action_memory = encoded.reshape(
+                batch, cfg.K * cfg.max_action_groups, cfg.state_hidden
+            )
+            action_valid = encoded_mask.reshape(batch, cfg.K * cfg.max_action_groups)
+            memory = torch.cat((decoder_memory_prefix, action_memory), dim=1)
+            memory_valid = torch.cat((decoder_prefix_valid, action_valid), dim=1)
+            refined = factual_query
             if residual_scale > 0.0:
                 assert summary is not None
                 refined = refined + (residual_scale * summary[:, :, None, :])
@@ -4058,12 +4105,11 @@ class NativeWorldModel(nn.Module):
                     refined = self._run(
                         dynamics_block,
                         refined,
-                        encoded,
-                        encoded_mask,
-                        prior_state[:, : cfg.T],
+                        memory,
+                        memory_valid,
                         enabled=cfg.activation_checkpointing,
                     )
-            return self.state_norm(refined)
+            return refined
 
         factual_encoded, factual_encoded_mask, factual_summary = encode_factual(
             future_factual_fine_action_values,
@@ -4080,15 +4126,23 @@ class NativeWorldModel(nn.Module):
         )
         if not torch.equal(factual_encoded_mask, zero_encoded_mask):
             raise RuntimeError("factual and zero action masks must be identical")
-        centered_encoded = factual_encoded - zero_encoded
-        zero_centered_encoded = zero_encoded - zero_encoded
+        # Stop-gradient applies only to the numerical centering anchor.  Both
+        # factual E(a) and zero E(0) remain live branches of the same encoder.
+        # Writing E(0)-E(0) without this anchor made the zero branch's encoder
+        # gradient identically cancel, despite the output tensor not being
+        # detached.  The straight-through form is numerically zero and still
+        # gives the symmetric zero branch its required gradient.
+        zero_encoded_anchor = zero_encoded.detach()
+        centered_encoded = factual_encoded - zero_encoded_anchor
+        zero_centered_encoded = zero_encoded - zero_encoded_anchor
         centered_summary: Optional[torch.Tensor] = None
         zero_centered_summary: Optional[torch.Tensor] = None
         if factual_summary is not None:
             if zero_summary is None:
                 raise RuntimeError("zero action summary is unavailable")
-            centered_summary = factual_summary - zero_summary
-            zero_centered_summary = zero_summary - zero_summary
+            zero_summary_anchor = zero_summary.detach()
+            centered_summary = factual_summary - zero_summary_anchor
+            zero_centered_summary = zero_summary - zero_summary_anchor
         factual_future = refine_factual(
             centered_encoded,
             factual_encoded_mask,
@@ -4150,14 +4204,14 @@ class NativeWorldModel(nn.Module):
                 repeats=cfg.factual_dynamics_repeats,
                 residual_scale=cfg.factual_action_residual_scale,
             )
-            zero_action_pred_tokens = self.token_output(zero_action_future)
+            zero_action_pred_tokens = self.factual_token_output(zero_action_future)
 
         action_free_pred_tokens = self.token_output(action_free_future)
-        pred_tokens = self.token_output(factual_future)
+        pred_tokens = self.factual_token_output(factual_future)
         render_pred_tokens = (
             pred_tokens
             if render_future is factual_future
-            else self.token_output(render_future)
+            else self.factual_token_output(render_future)
         )
         rgb_render_pred_tokens = (
             action_free_pred_tokens
