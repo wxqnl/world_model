@@ -53,7 +53,9 @@ class DistributedStrategyConfig:
             )
         for name in ("param_dtype", "reduce_dtype", "output_dtype"):
             if getattr(self, name).lower() not in _DTYPES:
-                raise DistributedRuntimeError(f"unsupported {name}={getattr(self, name)!r}")
+                raise DistributedRuntimeError(
+                    f"unsupported {name}={getattr(self, name)!r}"
+                )
         if self.timeout_minutes <= 0:
             raise DistributedRuntimeError("timeout_minutes must be positive")
         if self.initialization not in {"direct", "meta_sharded"}:
@@ -151,7 +153,9 @@ def initialize_distributed(
             timeout=timedelta(minutes=config.timeout_minutes),
         )
     if dist.get_rank() != rank or dist.get_world_size() != world_size:
-        raise DistributedRuntimeError("torchrun environment disagrees with process group")
+        raise DistributedRuntimeError(
+            "torchrun environment disagrees with process group"
+        )
     return DistributedContext(
         rank=rank,
         local_rank=local_rank,
@@ -264,8 +268,7 @@ def wrap_model(
             raise DistributedRuntimeError(
                 "activation checkpoint units must be checkpoint-wrapped before "
                 "fully_shard so mixed-precision recomputation crosses one stable "
-                "FSDP boundary: "
-                + ", ".join(not_wrapped)
+                "FSDP boundary: " + ", ".join(not_wrapped)
             )
     mesh = _build_fsdp_mesh(context, shard_degree=config.shard_degree)
     policy = MixedPrecisionPolicy(
@@ -309,6 +312,12 @@ def _materialize_meta_shards(model: torch.nn.Module, device: torch.device) -> No
             if not state or not any(value.is_meta for value in state):
                 continue
             reset = getattr(module, "reset_parameters", None)
+            if not callable(reset) and isinstance(module, torch.nn.MultiheadAttention):
+                # PyTorch's native TransformerDecoderLayer owns its QKV state in
+                # MultiheadAttention, whose initializer is intentionally private.
+                # Treat this concrete upstream module as a supported meta owner;
+                # all other modules must continue to expose the public contract.
+                reset = getattr(module, "_reset_parameters", None)
             if not callable(reset):
                 raise DistributedRuntimeError(
                     f"meta-owned module {type(module).__name__} lacks reset_parameters()"
@@ -342,6 +351,7 @@ def no_sync_context(model: torch.nn.Module, *, enabled: bool) -> ContextManager[
     if isinstance(model, DistributedDataParallel):
         return model.no_sync()
     if isinstance(model, FSDPModule):
+
         @contextmanager
         def _fsdp_no_sync():
             set_gradient_sync(model, False)
