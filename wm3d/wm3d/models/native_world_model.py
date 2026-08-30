@@ -388,9 +388,7 @@ class NativeWorldModelConfig:
             ):
                 raise ValueError("appearance capacity/head fields are invalid")
             if not 0 < self.appearance_autoregressive_steps <= self.K:
-                raise ValueError(
-                    "appearance_autoregressive_steps must lie within K"
-                )
+                raise ValueError("appearance_autoregressive_steps must lie within K")
             if not isinstance(self.appearance_flow_aligned_detail, bool):
                 raise ValueError("appearance_flow_aligned_detail must be boolean")
             if not isinstance(self.appearance_state_detail, bool):
@@ -1135,50 +1133,71 @@ class StateActionBridge(nn.Module):
 
 
 class DynamicsConditionBlock(nn.Module):
-    """Apply factual action effects only after the action-free state prior."""
+    """Decode an action-conditioned future without writing into the prior.
+
+    The original V7 state decoder did two indispensable things for every
+    future query: it injected that horizon's physical action and cross-attended
+    the complete observed-state memory. The previous V8 refinement only did
+    the first operation on an already-predicted future. It could therefore
+    change token magnitude while losing the spatial direction anchored by the
+    observation. This block restores the complete decoder contract while the
+    action-free state and policy remain outside this module.
+    """
 
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
-        self.null_action = nn.Parameter(torch.empty(1, 1, 1, cfg.state_hidden))
-        nn.init.normal_(self.null_action, std=0.02)
-        self.state_norm = RMSNorm(cfg.state_hidden)
+        self.action_query_norm = RMSNorm(cfg.state_hidden)
         self.action_norm = RMSNorm(cfg.state_hidden)
-        self.cross = CrossAttention(
+        self.action_cross = CrossAttention(
+            cfg.state_hidden, cfg.state_hidden, cfg.state_heads, cfg.dropout
+        )
+        self.context_query_norm = RMSNorm(cfg.state_hidden)
+        self.context_norm = RMSNorm(cfg.state_hidden)
+        self.context_cross = CrossAttention(
             cfg.state_hidden, cfg.state_hidden, cfg.state_heads, cfg.dropout
         )
         self.factorized = FactorizedStateBlock(cfg)
-
-    def reset_parameters(self) -> None:
-        nn.init.normal_(self.null_action, std=0.02)
 
     def forward(
         self,
         future_state: torch.Tensor,
         factual_action: torch.Tensor,
         factual_mask: torch.Tensor,
+        context_state: torch.Tensor,
     ) -> torch.Tensor:
         batch, horizon, patches, dim = future_state.shape
         groups = factual_action.shape[2]
-        null = self.null_action.expand(batch, horizon, -1, -1)
-        context = torch.cat((null, factual_action), dim=2)
-        valid = torch.cat(
-            (
-                torch.ones(
-                    batch, horizon, 1, dtype=torch.bool, device=factual_mask.device
-                ),
-                factual_mask,
-            ),
-            dim=2,
-        )
+        if tuple(factual_action.shape[:3]) != (batch, horizon, groups):
+            raise ValueError("factual action must align with future horizons")
+        if tuple(factual_mask.shape) != (batch, horizon, groups):
+            raise ValueError("factual action mask must align with grouped actions")
+        if context_state.ndim != 4 or context_state.shape[0] != batch:
+            raise ValueError("context state must be [B,T,P,D]")
+        if context_state.shape[2:] != (patches, dim):
+            raise ValueError("context state must share the future patch layout")
+
+        # Same-mask centered physical action is exactly zero for the zero
+        # candidate. All projections here are bias-free, so the action update
+        # is then exactly zero without a learned null token or hidden shortcut.
         query = future_state.reshape(batch * horizon, patches, dim)
-        context = context.reshape(batch * horizon, groups + 1, dim)
-        valid = valid.reshape(batch * horizon, groups + 1)
-        update = self.cross(
-            self.state_norm(query),
-            self.action_norm(context),
+        action = factual_action.reshape(batch * horizon, groups, dim)
+        valid = factual_mask.reshape(batch * horizon, groups)
+        action_update = self.action_cross(
+            self.action_query_norm(query),
+            self.action_norm(action),
             allowed_mask=valid[:, None, None, :],
         )
-        future_state = (query + update).view(batch, horizon, patches, dim)
+        future_state = (query + action_update).view(batch, horizon, patches, dim)
+
+        # Restore V7's decoder-memory read. Flattening K*P queries against T*P
+        # observed states lets action-shifted queries retrieve different
+        # spatial evidence instead of collapsing to a horizon-wide offset.
+        query = future_state.reshape(batch, horizon * patches, dim)
+        context = context_state.reshape(batch, -1, dim)
+        context_update = self.context_cross(
+            self.context_query_norm(query), self.context_norm(context)
+        )
+        future_state = (query + context_update).view(batch, horizon, patches, dim)
         return self.factorized(future_state)
 
 
@@ -1290,9 +1309,7 @@ class AppearanceActionConditioner(nn.Module):
         # through each patch/view representation while remaining continuous
         # and exactly neutral at zero action.
         update = condition * (1.0 + torch.tanh(normalized_query))
-        return (query + self.scale * update).view(
-            batch, horizon, views, patches, dim
-        )
+        return (query + self.scale * update).view(batch, horizon, views, patches, dim)
 
 
 class PerViewAppearanceDynamics(nn.Module):
@@ -1337,9 +1354,7 @@ class PerViewAppearanceDynamics(nn.Module):
 
     @staticmethod
     def _normalize_tokens(value: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(value.float(), (value.shape[-1],)).to(
-            dtype=value.dtype
-        )
+        return F.layer_norm(value.float(), (value.shape[-1],)).to(dtype=value.dtype)
 
     def _upsample_geometry(self, future_state: torch.Tensor) -> torch.Tensor:
         batch, horizon, patches, _ = future_state.shape
@@ -1389,9 +1404,7 @@ class PerViewAppearanceDynamics(nn.Module):
         value = self.input(tokens) + self.view_embed + self.patch_embed
         prefix = value[:, :transition_start]
         if transition_start:
-            prefix = prefix + self.time(times[:, :transition_start])[
-                :, :, None, None
-            ]
+            prefix = prefix + self.time(times[:, :transition_start])[:, :, None, None]
         transition = value[:, transition_start:]
         transition = transition + self.time(future_time)[:, :, None, None]
         transition = transition + self._upsample_geometry(future_state)[:, :, None]
@@ -1448,12 +1461,8 @@ class PerViewAppearanceDynamics(nn.Module):
             centered_action_mask=centered_action_mask,
         )
         prediction_mask = future_mask & context_mask.any(dim=1)[:, None]
-        prediction = self.output(
-            self.norm(value[:, cfg.appearance_context_frames :])
-        )
-        prediction = prediction * prediction_mask[..., None].to(
-            dtype=prediction.dtype
-        )
+        prediction = self.output(self.norm(value[:, cfg.appearance_context_frames :]))
+        prediction = prediction * prediction_mask[..., None].to(dtype=prediction.dtype)
         return prediction, prediction_mask
 
     def _teacher_forced(
@@ -1469,9 +1478,7 @@ class PerViewAppearanceDynamics(nn.Module):
         centered_action_mask: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
-        source_tokens = torch.cat(
-            (context_tokens, target_tokens[:, :-1]), dim=1
-        )
+        source_tokens = torch.cat((context_tokens, target_tokens[:, :-1]), dim=1)
         source_mask = torch.cat((context_mask, target_mask[:, :-1]), dim=1)
         source_time = torch.cat((context_time, future_time[:, :-1]), dim=1)
         transition_start = cfg.appearance_context_frames - 1
@@ -1487,9 +1494,7 @@ class PerViewAppearanceDynamics(nn.Module):
         )
         prediction_mask = target_mask & source_mask[:, transition_start:]
         prediction = self._project(value[:, transition_start:])
-        prediction = prediction * prediction_mask[..., None].to(
-            dtype=prediction.dtype
-        )
+        prediction = prediction * prediction_mask[..., None].to(dtype=prediction.dtype)
         return prediction, prediction_mask
 
     def _autoregressive(
@@ -1522,9 +1527,10 @@ class PerViewAppearanceDynamics(nn.Module):
             )
             if tuple(first_prediction.shape) != expected_prediction:
                 raise ValueError("reused appearance prediction has incompatible shape")
-            if first_prediction_mask is None or tuple(
-                first_prediction_mask.shape
-            ) != expected_prediction[:-1]:
+            if (
+                first_prediction_mask is None
+                or tuple(first_prediction_mask.shape) != expected_prediction[:-1]
+            ):
                 raise ValueError("reused appearance mask has incompatible shape")
             predictions.append(first_prediction)
             prediction_masks.append(first_prediction_mask)
@@ -1566,15 +1572,11 @@ class PerViewAppearanceDynamics(nn.Module):
             predictions.append(prediction)
             prediction_masks.append(prediction_mask)
             history_tokens = torch.cat((history_tokens, prediction[:, None]), dim=1)
-            history_mask = torch.cat(
-                (history_mask, prediction_mask[:, None]), dim=1
-            )
+            history_mask = torch.cat((history_mask, prediction_mask[:, None]), dim=1)
             history_time = torch.cat(
                 (history_time, future_time[:, index : index + 1]), dim=1
             )
-        return torch.stack(predictions, dim=1), torch.stack(
-            prediction_masks, dim=1
-        )
+        return torch.stack(predictions, dim=1), torch.stack(prediction_masks, dim=1)
 
     def forward(
         self,
@@ -1612,9 +1614,7 @@ class PerViewAppearanceDynamics(nn.Module):
             raise ValueError("appearance world times are incompatible with T/K")
         if future_mask is None:
             future_mask = (
-                context_mask.any(dim=1)[:, None]
-                .expand(-1, cfg.K, -1, -1)
-                .clone()
+                context_mask.any(dim=1)[:, None].expand(-1, cfg.K, -1, -1).clone()
             )
         elif tuple(future_mask.shape) != (
             batch,
@@ -1624,9 +1624,7 @@ class PerViewAppearanceDynamics(nn.Module):
         ):
             raise ValueError("appearance future mask must be [B,K,V,P]")
 
-        context_time = world_times_s[
-            :, cfg.T - cfg.appearance_context_frames : cfg.T
-        ]
+        context_time = world_times_s[:, cfg.T - cfg.appearance_context_frames : cfg.T]
         future_time = world_times_s[:, cfg.T :]
         context_tokens = self._normalize_tokens(context_tokens)
         context_tokens = context_tokens * context_mask[..., None].to(
@@ -1680,9 +1678,7 @@ class PerViewAppearanceDynamics(nn.Module):
         teacher_prediction = context_tokens.new_empty(
             batch, 0, cfg.num_views, cfg.appearance_P, cfg.token_dim
         )
-        teacher_mask = context_mask.new_empty(
-            batch, 0, cfg.num_views, cfg.appearance_P
-        )
+        teacher_mask = context_mask.new_empty(batch, 0, cfg.num_views, cfg.appearance_P)
         if target_tokens is not None:
             expected_target = (
                 batch,
@@ -1730,9 +1726,7 @@ class PerViewAppearanceDynamics(nn.Module):
             first_prediction=(
                 teacher_prediction[:, 0] if reuse_teacher_first else None
             ),
-            first_prediction_mask=(
-                teacher_mask[:, 0] if reuse_teacher_first else None
-            ),
+            first_prediction_mask=(teacher_mask[:, 0] if reuse_teacher_first else None),
         )
         if steps == cfg.K:
             predicted = autoregressive_prediction
@@ -1785,9 +1779,7 @@ class FutureSpatialDetailPredictor(nn.Module):
         self.detail_grid = isqrt(cfg.appearance_P)
         channels = cfg.appearance_detail_dim
         self.input = nn.Conv2d(cfg.state_hidden, channels, 1, bias=False)
-        self.view_embed = nn.Parameter(
-            torch.empty(1, 1, cfg.num_views, channels, 1, 1)
-        )
+        self.view_embed = nn.Parameter(torch.empty(1, 1, cfg.num_views, channels, 1, 1))
         nn.init.normal_(self.view_embed, std=0.02)
         self.blocks = nn.Sequential(
             _SpatialDetailBlock(channels),
@@ -1818,9 +1810,9 @@ class FutureSpatialDetailPredictor(nn.Module):
             cfg.appearance_P,
         ):
             raise ValueError("future detail mask must be [B,K,V,appearance_P]")
-        value = future_state.reshape(
-            batch * cfg.K, cfg.P, cfg.state_hidden
-        ).transpose(1, 2)
+        value = future_state.reshape(batch * cfg.K, cfg.P, cfg.state_hidden).transpose(
+            1, 2
+        )
         value = value.reshape(
             batch * cfg.K,
             cfg.state_hidden,
@@ -1836,7 +1828,12 @@ class FutureSpatialDetailPredictor(nn.Module):
                 align_corners=False,
             ).to(dtype=future_state.dtype)
         value = value.view(
-            batch, cfg.K, 1, cfg.appearance_detail_dim, self.detail_grid, self.detail_grid
+            batch,
+            cfg.K,
+            1,
+            cfg.appearance_detail_dim,
+            self.detail_grid,
+            self.detail_grid,
         )
         value = value.expand(-1, -1, cfg.num_views, -1, -1, -1)
         value = value + self.view_embed.to(dtype=value.dtype)
@@ -1847,15 +1844,20 @@ class FutureSpatialDetailPredictor(nn.Module):
             self.detail_grid,
         )
         value = self.output(self.blocks(value))
-        value = value.flatten(2).transpose(1, 2).reshape(
-            batch,
-            cfg.K,
-            cfg.num_views,
-            cfg.appearance_P,
-            cfg.appearance_detail_dim,
+        value = (
+            value.flatten(2)
+            .transpose(1, 2)
+            .reshape(
+                batch,
+                cfg.K,
+                cfg.num_views,
+                cfg.appearance_P,
+                cfg.appearance_detail_dim,
+            )
         )
         mask = future_mask.bool()
         return value * mask[..., None].to(dtype=value.dtype), mask
+
 
 class UnifiedActionHead(nn.Module):
     """The sole policy owner; semantic decoding is a deterministic transform."""
@@ -2162,9 +2164,7 @@ class NativeRGBImageDecoder(nn.Module):
                 padding=2,
                 count_include_pad=False,
             )
-            correction = torch.tanh(detail_logits - low_frequency).to(
-                dtype=rgb.dtype
-            )
+            correction = torch.tanh(detail_logits - low_frequency).to(dtype=rgb.dtype)
             rgb = torch.clamp(
                 rgb + float(self.cfg.rgb_detail_residual_scale) * correction,
                 0.0,
@@ -2232,13 +2232,9 @@ class _RGBZeroPreservingDetailUpBlock(nn.Module):
     def __init__(self, input_channels: int, output_channels: int):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(
-                input_channels, output_channels, 3, padding=1, bias=False
-            ),
+            nn.Conv2d(input_channels, output_channels, 3, padding=1, bias=False),
             nn.SiLU(inplace=True),
-            nn.Conv2d(
-                output_channels, output_channels, 3, padding=1, bias=False
-            ),
+            nn.Conv2d(output_channels, output_channels, 3, padding=1, bias=False),
             nn.SiLU(inplace=True),
         )
 
@@ -2297,12 +2293,8 @@ def _warp_rgb_feature_with_pixel_flow(
             align_corners=True,
         )
     height, width = source.shape[-2:]
-    y = torch.linspace(
-        -1.0, 1.0, height, device=source.device, dtype=torch.float32
-    )
-    x = torch.linspace(
-        -1.0, 1.0, width, device=source.device, dtype=torch.float32
-    )
+    y = torch.linspace(-1.0, 1.0, height, device=source.device, dtype=torch.float32)
+    x = torch.linspace(-1.0, 1.0, width, device=source.device, dtype=torch.float32)
     grid_y, grid_x = torch.meshgrid(y, x, indexing="ij")
     base_grid = torch.stack((grid_x, grid_y), dim=-1)[None]
     flow = flow_pixels.float()
@@ -2340,7 +2332,6 @@ class _GroupedAverageProjection(nn.Conv2d):
         )
         if self.bias is not None:
             nn.init.zeros_(self.bias)
-
 
 
 class _ZeroProjection(nn.Conv2d):
@@ -2401,7 +2392,6 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
         # Dedicated projections preserve average/zero initialization when FSDP2
         # materializes and resets their meta-owned parameter shards.
 
-
     def forward(
         self,
         factual_tokens: torch.Tensor,
@@ -2428,9 +2418,7 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
         feature_detail = self.feature_proj(decoder_features)
         basis = self.output_proj(
             F.silu(
-                self.spatial_filter(
-                    torch.cat((feature_detail, token_detail), dim=1)
-                )
+                self.spatial_filter(torch.cat((feature_detail, token_detail), dim=1))
             )
         )
         basis = torch.tanh(basis.float())
@@ -2447,11 +2435,7 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
         high_frequency = high_frequency - high_frequency.mean(
             dim=(-2, -1), keepdim=True
         )
-        correction = (
-            0.25
-            * float(self.cfg.rgb_v7_high_frequency_scale)
-            * high_frequency
-        )
+        correction = 0.25 * float(self.cfg.rgb_v7_high_frequency_scale) * high_frequency
         return correction.to(dtype=decoder_features.dtype)
 
 
@@ -2513,9 +2497,9 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
         self.motion_head = nn.Conv2d(channels_256, 1, 3, padding=1)
         nn.init.zeros_(self.motion_head.weight)
         nn.init.constant_(self.motion_head.bias, -4.0)
-        self.high_frequency_refiner: Optional[
-            NativeV7BoundedHighFrequencyRefiner
-        ] = None
+        self.high_frequency_refiner: Optional[NativeV7BoundedHighFrequencyRefiner] = (
+            None
+        )
         if cfg.rgb_v7_high_frequency_refiner:
             self.high_frequency_refiner = NativeV7BoundedHighFrequencyRefiner(
                 cfg,
@@ -2642,9 +2626,7 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
         motion_hint = torch.sigmoid(motion_logit)
         raw = self.head(value)
         direct = torch.sigmoid(raw[:, 0:3])
-        residual = torch.tanh(raw[:, 3:6]) * float(
-            self.cfg.rgb_context_residual_scale
-        )
+        residual = torch.tanh(raw[:, 3:6]) * float(self.cfg.rgb_context_residual_scale)
         blend = torch.sigmoid(raw[:, 6:7])
         if self.cfg.rgb_context_motion_blend_gain > 0.0:
             blend = torch.clamp(
@@ -2706,9 +2688,7 @@ class NativeContextRGBImageDecoder(nn.Module):
                 ]
             )
         motion_floor = min(32, channels[-1])
-        motion_channels = tuple(
-            max(motion_floor, channel // 4) for channel in channels
-        )
+        motion_channels = tuple(max(motion_floor, channel // 4) for channel in channels)
         self.token_stem = nn.Sequential(
             nn.Conv2d(cfg.token_dim, channels[0], 1),
             nn.GroupNorm(_rgb_norm_groups(channels[0]), channels[0]),
@@ -2721,9 +2701,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         self.motion_token_stem = (
             nn.Sequential(
                 nn.Conv2d(cfg.token_dim, motion_channels[0], 1),
-                nn.GroupNorm(
-                    _rgb_norm_groups(motion_channels[0]), motion_channels[0]
-                ),
+                nn.GroupNorm(_rgb_norm_groups(motion_channels[0]), motion_channels[0]),
                 nn.SiLU(inplace=True),
                 _RGBConvBlock(motion_channels[0], motion_channels[0]),
             )
@@ -2746,8 +2724,7 @@ class NativeContextRGBImageDecoder(nn.Module):
                 nn.SiLU(inplace=True),
                 nn.Linear(motion_channels[0], motion_channels[0]),
             )
-            if cfg.rgb_context_alignment_enabled
-            and cfg.rgb_context_action_scale > 0.0
+            if cfg.rgb_context_alignment_enabled and cfg.rgb_context_action_scale > 0.0
             else None
         )
         self.motion_task_proj = (
@@ -2786,9 +2763,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         )
         self.appearance_delta_stem = (
             nn.Sequential(
-                nn.Conv2d(
-                    cfg.token_dim, detail_channels[0], 1, bias=False
-                ),
+                nn.Conv2d(cfg.token_dim, detail_channels[0], 1, bias=False),
                 nn.SiLU(inplace=True),
             )
             if cfg.rgb_context_appearance_delta_scale > 0.0
@@ -2801,9 +2776,7 @@ class NativeContextRGBImageDecoder(nn.Module):
             )
         )
         self.appearance_detail_head = (
-            _RGBDetailHead(
-                detail_channels[-1], 3, 3, padding=1, bias=False
-            )
+            _RGBDetailHead(detail_channels[-1], 3, 3, padding=1, bias=False)
             if cfg.rgb_context_appearance_delta_scale > 0.0
             else None
         )
@@ -2862,9 +2835,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         )
         self.head = nn.Conv2d(channels[-1], 7, 3, padding=1)
         motion_output_channels = (
-            motion_channels[-1]
-            if cfg.rgb_context_alignment_enabled
-            else channels[-1]
+            motion_channels[-1] if cfg.rgb_context_alignment_enabled else channels[-1]
         )
         # Preserve the V7 learned motion/blend path on the synthesis features.
         # The transport tower predicts only alignment and visibility; it must
@@ -2926,8 +2897,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         if self.cfg.rgb_context_alignment_enabled:
             if (
                 motion_tokens is None
-                or tuple(motion_tokens.shape[1:])
-                != (self.cfg.P, self.cfg.token_dim)
+                or tuple(motion_tokens.shape[1:]) != (self.cfg.P, self.cfg.token_dim)
                 or motion_tokens.shape[0] != tokens.shape[0]
             ):
                 raise ValueError(
@@ -2941,9 +2911,9 @@ class NativeContextRGBImageDecoder(nn.Module):
                 self.motion_grid,
                 self.motion_grid,
             )
-            motion_value = self.motion_token_stem(
-                motion_value
-            ) + self.motion_view_proj(view_embedding)
+            motion_value = self.motion_token_stem(motion_value) + self.motion_view_proj(
+                view_embedding
+            )
         elif motion_tokens is not None:
             raise ValueError("motion tokens require aligned context RGB")
         appearance_delta: Optional[torch.Tensor] = None
@@ -2969,9 +2939,7 @@ class NativeContextRGBImageDecoder(nn.Module):
                 self.appearance_grid,
                 self.appearance_grid,
             )
-            appearance_delta = self.appearance_delta_stem(delta).to(
-                dtype=value.dtype
-            )
+            appearance_delta = self.appearance_delta_stem(delta).to(dtype=value.dtype)
         elif self.appearance_delta_stem is not None:
             if appearance_detail_residual_tokens is not None:
                 raise ValueError(
@@ -3021,9 +2989,9 @@ class NativeContextRGBImageDecoder(nn.Module):
             )
             if motion_value is not None:
                 assert self.motion_action_proj is not None
-                motion_action = self.motion_action_proj(
-                    factual_action_summary
-                ).to(dtype=motion_value.dtype)
+                motion_action = self.motion_action_proj(factual_action_summary).to(
+                    dtype=motion_value.dtype
+                )
                 motion_value = motion_value + (
                     float(self.cfg.rgb_context_action_scale)
                     * motion_action[:, :, None, None]
@@ -3086,9 +3054,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         # lane never enters the transport/visibility tower below.
         if motion_value is not None:
             assert self.motion_to_synthesis is not None
-            value = value + self.motion_to_synthesis(motion_value).to(
-                dtype=value.dtype
-            )
+            value = value + self.motion_to_synthesis(motion_value).to(dtype=value.dtype)
 
         # One observed image conditions every decoded future for the same
         # batch/view pair. Legacy mode can reuse its raw context pyramid;
@@ -3158,9 +3124,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         if warped_skips[-1].shape[-2:] != value.shape[-2:]:
             raise ValueError("context pyramid does not align with RGB token grid")
 
-        value = self.bottleneck_fuse(
-            torch.cat((value, warped_skips[-1]), dim=1)
-        )
+        value = self.bottleneck_fuse(torch.cat((value, warped_skips[-1]), dim=1))
         for upsample, fuse, context_skip in zip(
             self.ups, self.skip_fuses, reversed(warped_skips[:-1])
         ):
@@ -3185,9 +3149,9 @@ class NativeContextRGBImageDecoder(nn.Module):
         if self.cfg.rgb_context_alignment_enabled:
             assert disocclusion is not None
             assert warp_valid is not None
-            transport = (
-                1.0 - disocclusion.to(dtype=value.dtype)
-            ) * warp_valid.to(dtype=value.dtype)
+            transport = (1.0 - disocclusion.to(dtype=value.dtype)) * warp_valid.to(
+                dtype=value.dtype
+            )
             # V7's direct/context learned blend remains the base renderer.
             # Alignment replaces only the context-detail share that V7 would
             # otherwise take from the unwarped observation.  Therefore an
@@ -3514,9 +3478,9 @@ class NativeRGBDecoder(nn.Module):
             # Group all horizons for one batch/view so a decoder chunk can
             # reuse the observed context pyramid across K instead of rebuilding
             # it once per image slot.  Outputs are transposed back below.
-            dense_indices = source_indices.view(batch, frames, views).permute(
-                0, 2, 1
-            ).reshape(-1)
+            dense_indices = (
+                source_indices.view(batch, frames, views).permute(0, 2, 1).reshape(-1)
+            )
         else:
             dense_indices = source_indices
         decoded_chunks: list[torch.Tensor] = []
@@ -3545,13 +3509,9 @@ class NativeRGBDecoder(nn.Module):
                 assert context_bank is not None
                 assert context_slot_ids is not None
                 assert expanded_task is not None
-                chunk_context_ids = context_slot_ids.index_select(
-                    0, chunk_indices
-                )
-                unique_context_ids, local_context_indices = (
-                    torch.unique_consecutive(
-                        chunk_context_ids, return_inverse=True
-                    )
+                chunk_context_ids = context_slot_ids.index_select(0, chunk_indices)
+                unique_context_ids, local_context_indices = torch.unique_consecutive(
+                    chunk_context_ids, return_inverse=True
                 )
                 (
                     decoded,
@@ -3593,9 +3553,7 @@ class NativeRGBDecoder(nn.Module):
                     (
                         None
                         if expanded_appearance_detail is None
-                        else expanded_appearance_detail.index_select(
-                            0, chunk_indices
-                        )
+                        else expanded_appearance_detail.index_select(0, chunk_indices)
                     ),
                 )
                 motion_logit = decoded.new_zeros(
@@ -3612,12 +3570,9 @@ class NativeRGBDecoder(nn.Module):
                 motion_logit * chunk_valid.to(dtype=motion_logit.dtype)
             )
             blend_chunks.append(blend * chunk_valid.to(dtype=blend.dtype))
-            flow_chunks.append(
-                flow_pixels * chunk_valid.to(dtype=flow_pixels.dtype)
-            )
+            flow_chunks.append(flow_pixels * chunk_valid.to(dtype=flow_pixels.dtype))
             disocclusion_chunks.append(
-                disocclusion_logit
-                * chunk_valid.to(dtype=disocclusion_logit.dtype)
+                disocclusion_logit * chunk_valid.to(dtype=disocclusion_logit.dtype)
             )
         dense = torch.cat(decoded_chunks, dim=0)
         dense_motion = torch.cat(motion_chunks, dim=0)
@@ -3954,10 +3909,7 @@ class NativeWorldModel(nn.Module):
         )
         calibration: Optional[torch.Tensor] = None
         if self.policy_calibration is not None:
-            if (
-                state_normalization_offset is None
-                or state_normalization_scale is None
-            ):
+            if state_normalization_offset is None or state_normalization_scale is None:
                 raise ValueError(
                     "policy calibration requires state normalization statistics"
                 )
@@ -4108,6 +4060,7 @@ class NativeWorldModel(nn.Module):
                         refined,
                         encoded,
                         encoded_mask,
+                        prior_state[:, : cfg.T],
                         enabled=cfg.activation_checkpointing,
                     )
             return self.state_norm(refined)
@@ -4116,10 +4069,30 @@ class NativeWorldModel(nn.Module):
             future_factual_fine_action_values,
             future_factual_coarse_action_values,
         )
+        # Center against the exact same masked encoding of the zero physical
+        # command. This removes time/semantic/group/embodiment constants from
+        # the dynamics signal while preserving every real grouped action token.
+        # The zero branch remains differentiable through the shared decoder and
+        # token head; no counterfactual output is detached.
+        zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
+            torch.zeros_like(future_factual_fine_action_values),
+            torch.zeros_like(future_factual_coarse_action_values),
+        )
+        if not torch.equal(factual_encoded_mask, zero_encoded_mask):
+            raise RuntimeError("factual and zero action masks must be identical")
+        centered_encoded = factual_encoded - zero_encoded
+        zero_centered_encoded = zero_encoded - zero_encoded
+        centered_summary: Optional[torch.Tensor] = None
+        zero_centered_summary: Optional[torch.Tensor] = None
+        if factual_summary is not None:
+            if zero_summary is None:
+                raise RuntimeError("zero action summary is unavailable")
+            centered_summary = factual_summary - zero_summary
+            zero_centered_summary = zero_summary - zero_summary
         factual_future = refine_factual(
-            factual_encoded,
+            centered_encoded,
             factual_encoded_mask,
-            factual_summary,
+            centered_summary,
             repeats=cfg.factual_dynamics_repeats,
             residual_scale=cfg.factual_action_residual_scale,
         )
@@ -4140,36 +4113,22 @@ class NativeWorldModel(nn.Module):
             render_future = factual_future
         else:
             render_future = refine_factual(
-                factual_encoded,
+                centered_encoded,
                 factual_encoded_mask,
-                factual_summary,
+                centered_summary,
                 repeats=render_repeats,
                 residual_scale=render_residual_scale,
             )
         rgb_render_future = (
-            action_free_future
-            if cfg.rgb_render_action_free_prior
-            else render_future
+            action_free_future if cfg.rgb_render_action_free_prior else render_future
         )
         zero_action_pred_tokens: Optional[torch.Tensor] = None
-        zero_encoded: Optional[torch.Tensor] = None
-        zero_encoded_mask: Optional[torch.Tensor] = None
-        zero_summary: Optional[torch.Tensor] = None
-        if (
-            compute_zero_action_control
-            or cfg.rgb_context_action_scale > 0.0
-            or cfg.appearance_action_residual_scale > 0.0
-        ):
-            zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
-                torch.zeros_like(future_factual_fine_action_values),
-                torch.zeros_like(future_factual_coarse_action_values),
-            )
         centered_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
-            assert factual_summary is not None and zero_summary is not None
+            assert centered_summary is not None
             # The RGB renderer needs the physical command itself, not the
             # encoder's action-independent mask/time/semantic/group mixture.
-            centered_action_summary = factual_summary - zero_summary
+            centered_action_summary = centered_summary
         rgb_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
             assert centered_action_summary is not None
@@ -4177,19 +4136,17 @@ class NativeWorldModel(nn.Module):
         appearance_action_tokens: Optional[torch.Tensor] = None
         appearance_action_mask: Optional[torch.Tensor] = None
         if cfg.appearance_action_residual_scale > 0.0:
-            assert zero_encoded is not None and zero_encoded_mask is not None
             # Keep every grouped action token and remove only the same-mask
             # action-independent encoder component. The appearance lane can
             # then resolve physical direction per patch before its own
             # spatial/temporal reasoning, while a zero command stays exact 0.
-            appearance_action_tokens = factual_encoded - zero_encoded
+            appearance_action_tokens = centered_encoded
             appearance_action_mask = factual_encoded_mask
         if compute_zero_action_control:
-            assert zero_encoded is not None and zero_encoded_mask is not None
             zero_action_future = refine_factual(
-                zero_encoded,
+                zero_centered_encoded,
                 zero_encoded_mask,
-                zero_summary,
+                zero_centered_summary,
                 repeats=cfg.factual_dynamics_repeats,
                 residual_scale=cfg.factual_action_residual_scale,
             )
@@ -4225,9 +4182,7 @@ class NativeWorldModel(nn.Module):
                     -1, cfg.K, -1, cfg.appearance_P
                 )
                 if target_appearance_mask is not None:
-                    if tuple(target_appearance_mask.shape) != tuple(
-                        detail_mask.shape
-                    ):
+                    if tuple(target_appearance_mask.shape) != tuple(detail_mask.shape):
                         raise ValueError(
                             "target appearance mask must align to state detail"
                         )
@@ -4274,13 +4229,9 @@ class NativeWorldModel(nn.Module):
                 appearance_context_for_rgb = torch.zeros_like(
                     appearance_context_tokens[:, 0]
                 )
-                for context_index in range(
-                    int(appearance_context_tokens.shape[1])
-                ):
+                for context_index in range(int(appearance_context_tokens.shape[1])):
                     appearance_context_for_rgb = torch.where(
-                        appearance_context_mask[
-                            :, context_index, ..., None
-                        ].bool(),
+                        appearance_context_mask[:, context_index, ..., None].bool(),
                         appearance_context_tokens[:, context_index],
                         appearance_context_for_rgb,
                     )
@@ -4339,9 +4290,7 @@ class NativeWorldModel(nn.Module):
             output["appearance_pred_tokens"] = appearance_pred
             output["appearance_pred_mask"] = appearance_pred_mask
             if cfg.appearance_flow_aligned_detail:
-                output["appearance_flow_aligned_detail"] = (
-                    appearance_pred.new_ones(())
-                )
+                output["appearance_flow_aligned_detail"] = appearance_pred.new_ones(())
             if cfg.appearance_state_detail:
                 output["appearance_state_detail"] = appearance_pred.new_ones(())
         if (

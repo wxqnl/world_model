@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
-name: native_1b_v8_v7_high_frequency_refiner
+name: native_1b_v8_exact_v7_factual_high_frequency_refiner
 architecture: native_world_model
-expected_parameter_count: 1295841336
+expected_parameter_count: 1306082936
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -33,8 +33,12 @@ model:
   bridge_layers_state: [2, 5, 8, 11, 14, 17]
   bridge_heads: 16
   dynamics_layers: 1
+  # Two passes through the factual-only decoder match V7's two decoder layers
+  # without duplicating weights. Each pass injects the centered grouped action
+  # and re-reads the full observed-state memory.
   factual_dynamics_repeats: 2
-  factual_action_residual_scale: 0.3
+  # Preserve physical action magnitude in the future query as V7 did.
+  factual_action_residual_scale: 1.0
   # The factual P64 state is the motion owner consumed by the proven original
   # V7 context-residual renderer.
   appearance_action_residual_scale: 0.0

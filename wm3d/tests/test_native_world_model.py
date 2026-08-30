@@ -13,6 +13,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS, STATE_SEMANTIC_IDS
 from wm3d.models.native_world_model import (
     ActionBlock,
+    DynamicsConditionBlock,
     FutureSpatialDetailPredictor,
     NativeContextRGBImageDecoder,
     NativeOriginalV7ContextRGBImageDecoder,
@@ -799,7 +800,9 @@ def test_1b_and_5b_profiles_use_one_model_class_and_sealed_parameter_counts() ->
         assert isinstance(model, NativeWorldModel)
         observed[name] = sum(parameter.numel() for parameter in model.parameters())
         assert observed[name] == profile["expected_parameter_count"]
-    assert observed["native_5b.yaml"] > 4 * observed["native_1b.yaml"]
+    # Both profiles include a fixed-cost factual decoder, so their exact ratio
+    # need not exceed four while the sealed capacity classes remain clear.
+    assert observed["native_5b.yaml"] > 3.9 * observed["native_1b.yaml"]
 
 
 def test_model_data_gate_rejects_bimanual_capacity_truncation() -> None:
@@ -925,9 +928,7 @@ def test_v8_core_detail_is_target_free_zero_preserving_and_trainable() -> None:
     cfg.validate()
     predictor = FutureSpatialDetailPredictor(cfg).train()
     future = torch.randn(2, cfg.K, cfg.P, cfg.state_hidden, requires_grad=True)
-    mask = torch.ones(
-        2, cfg.K, cfg.num_views, cfg.appearance_P, dtype=torch.bool
-    )
+    mask = torch.ones(2, cfg.K, cfg.num_views, cfg.appearance_P, dtype=torch.bool)
     detail, detail_mask = predictor(future, mask)
     assert detail.shape == (
         2,
@@ -1001,12 +1002,8 @@ def test_flow_aligned_p256_detail_is_target_free_v7_fallback() -> None:
     torch.manual_seed(136)
     model = NativeWorldModel(cfg).train()
     batch = _dual_path_batch(cfg)
-    batch["context_rgb"] = torch.rand(
-        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
-    )
-    batch["context_rgb_mask"] = torch.ones(
-        2, cfg.num_views, dtype=torch.bool
-    )
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
 
     output = model(**batch, appearance_teacher_ratio=1.0)
     changed = dict(batch)
@@ -1049,8 +1046,8 @@ def _take_appearance_output_step(
         (batch["target_appearance_tokens"].shape[-1],),
     )
     loss = (
-        output["appearance_pred_tokens"].float() - normalized_target
-    ).square().mean()
+        (output["appearance_pred_tokens"].float() - normalized_target).square().mean()
+    )
     loss.backward()
     assert projection.weight.grad is not None
     assert torch.isfinite(projection.weight.grad).all()
@@ -1088,12 +1085,14 @@ def test_appearance_predictor_starts_normalized_without_copy_last_prior() -> Non
         atol=2.0e-4,
         rtol=0,
     )
-    assert output["appearance_teacher_pred_tokens"].shape == output[
-        "appearance_pred_tokens"
-    ].shape
-    assert output["appearance_autoregressive_pred_tokens"].shape == output[
-        "appearance_pred_tokens"
-    ].shape
+    assert (
+        output["appearance_teacher_pred_tokens"].shape
+        == output["appearance_pred_tokens"].shape
+    )
+    assert (
+        output["appearance_autoregressive_pred_tokens"].shape
+        == output["appearance_pred_tokens"].shape
+    )
 
     assert model.appearance_dynamics is not None
     projection = model.appearance_dynamics.output
@@ -1190,9 +1189,7 @@ def test_dual_path_preserves_view_latents_and_conditions_rgb_on_geometry() -> No
     changed_target[:, :, 1, :, 0].add_(3.0)
     changed["target_appearance_tokens"] = changed_target
     changed_teacher = model(**changed, appearance_teacher_ratio=1.0)
-    torch.testing.assert_close(
-        teacher["rgb"], changed_teacher["rgb"], rtol=0, atol=0
-    )
+    torch.testing.assert_close(teacher["rgb"], changed_teacher["rgb"], rtol=0, atol=0)
     torch.testing.assert_close(
         teacher["appearance_teacher_pred_tokens"][:, 0],
         changed_teacher["appearance_teacher_pred_tokens"][:, 0],
@@ -1313,12 +1310,8 @@ def test_original_v7_rgb_uses_p64_context_action_and_task_gradients() -> None:
     torch.manual_seed(211)
     model = NativeWorldModel(cfg).train()
     batch = _batch(cfg)
-    batch["context_rgb"] = torch.rand(
-        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
-    )
-    batch["context_rgb_mask"] = torch.ones(
-        2, cfg.num_views, dtype=torch.bool
-    )
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
 
     output = model(**batch)
     assert output["rgb"].shape == (
@@ -1349,12 +1342,8 @@ def test_original_v7_rgb_future_action_changes_rgb_not_policy_or_action_free() -
     torch.manual_seed(212)
     model = NativeWorldModel(cfg).eval()
     batch = _batch(cfg)
-    batch["context_rgb"] = torch.rand(
-        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
-    )
-    batch["context_rgb_mask"] = torch.ones(
-        2, cfg.num_views, dtype=torch.bool
-    )
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     factual = model(**batch)
     zero_batch = dict(batch)
     zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
@@ -1394,6 +1383,7 @@ def test_original_v7_rgb_rejects_competing_appearance_or_alignment_lanes() -> No
             )
         )
 
+
 def _tiny_original_v7_high_frequency_config() -> NativeWorldModelConfig:
     return replace(
         _tiny_original_v7_rgb_config(),
@@ -1416,9 +1406,7 @@ def test_v7_high_frequency_refiner_starts_exactly_at_v7_rgb() -> None:
     view_embedding = torch.randn(slots, base_cfg.rgb_hidden, 1, 1)
     action = torch.randn(slots, base_cfg.state_hidden)
     task = torch.randn(slots, base_cfg.task_dim)
-    context_rgb = torch.rand(
-        slots, 3, base_cfg.rgb_size, base_cfg.rgb_size
-    )
+    context_rgb = torch.rand(slots, 3, base_cfg.rgb_size, base_cfg.rgb_size)
     context_indices = torch.arange(slots, dtype=torch.long)
     arguments = dict(
         tokens=tokens,
@@ -1436,6 +1424,7 @@ def test_v7_high_frequency_refiner_starts_exactly_at_v7_rgb() -> None:
         torch.testing.assert_close(base_value, refined_value, rtol=0, atol=0)
     assert refined.high_frequency_refiner is not None
     assert refined.high_frequency_refiner.output_proj.weight.count_nonzero() == 0
+
 
 def test_v7_high_frequency_initialization_survives_meta_reset() -> None:
     cfg = _tiny_original_v7_high_frequency_config()
@@ -1527,12 +1516,8 @@ def test_existing_rgb_objective_opens_v7_high_frequency_refiner() -> None:
     torch.manual_seed(214)
     model = NativeWorldModel(cfg).train()
     batch = _batch(cfg)
-    batch["context_rgb"] = torch.rand(
-        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
-    )
-    batch["context_rgb_mask"] = torch.ones(
-        2, cfg.num_views, dtype=torch.bool
-    )
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     output = model(**batch)
     target = torch.rand_like(output["rgb"])
     torch.nn.functional.l1_loss(output["rgb"], target).backward()
@@ -1546,7 +1531,6 @@ def test_existing_rgb_objective_opens_v7_high_frequency_refiner() -> None:
     assert gradient.abs().sum() > 0
 
 
-
 def test_zero_flow_alignment_preserves_v7_learned_rgb_blend() -> None:
     cfg = replace(
         _tiny_dual_path_config(),
@@ -1557,12 +1541,8 @@ def test_zero_flow_alignment_preserves_v7_learned_rgb_blend() -> None:
     torch.manual_seed(137)
     model = NativeWorldModel(cfg).eval()
     batch = _dual_path_batch(cfg)
-    batch["context_rgb"] = torch.rand(
-        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
-    )
-    batch["context_rgb_mask"] = torch.ones(
-        2, cfg.num_views, dtype=torch.bool
-    )
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     decoder = model.rgb_head.image_decoder
     direct_logits = torch.tensor((2.0, -2.0, 1.0))
     with torch.no_grad():
@@ -1579,9 +1559,7 @@ def test_zero_flow_alignment_preserves_v7_learned_rgb_blend() -> None:
     output = model(**batch, appearance_teacher_ratio=0.0)
 
     direct = torch.sigmoid(direct_logits).view(1, 1, 1, 3, 1, 1)
-    context = batch["context_rgb"][:, None].expand(
-        -1, cfg.K, -1, -1, -1, -1
-    )
+    context = batch["context_rgb"][:, None].expand(-1, cfg.K, -1, -1, -1, -1)
     expected = 0.5 * direct + 0.5 * context
     torch.testing.assert_close(output["rgb"], expected, rtol=0, atol=2.0e-6)
     assert not torch.allclose(output["rgb"], context)
@@ -1662,9 +1640,7 @@ def test_p256_appearance_cannot_change_p64_flow_or_visibility() -> None:
     assert len(visibility_outputs) == 2 * split
     for before, after in zip(flow_outputs[:split], flow_outputs[split:]):
         torch.testing.assert_close(after, before, rtol=0, atol=0)
-    for before, after in zip(
-        visibility_outputs[:split], visibility_outputs[split:]
-    ):
+    for before, after in zip(visibility_outputs[:split], visibility_outputs[split:]):
         torch.testing.assert_close(after, before, rtol=0, atol=0)
     # P256 is post-transport detail: it may sharpen RGB, but it cannot alter
     # V7 motion support, blend, flow or visibility.
@@ -1689,9 +1665,7 @@ def test_context_renderer_builds_one_pyramid_per_batch_view_and_chunk() -> None:
         batch, cfg.K, cfg.num_views, cfg.appearance_P, cfg.token_dim
     )
     geometry = torch.randn(batch, cfg.K, cfg.P, cfg.state_hidden)
-    context = torch.rand(
-        batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
-    )
+    context = torch.rand(batch, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     context_mask = torch.ones(batch, cfg.num_views, dtype=torch.bool)
     task = torch.randn(batch, cfg.task_dim)
     pyramid_batches: list[int] = []
@@ -1748,13 +1722,9 @@ def test_context_pyramid_reuse_preserves_outputs_and_gradients() -> None:
         torch.randn(slots, cfg.state_hidden),
         torch.randn(slots, cfg.task_dim),
     )
-    reference_inputs = tuple(
-        value.clone().requires_grad_() for value in common_values
-    )
+    reference_inputs = tuple(value.clone().requires_grad_() for value in common_values)
     reused_inputs = tuple(value.clone().requires_grad_() for value in common_values)
-    reference_context = torch.rand(
-        2, 3, cfg.rgb_size, cfg.rgb_size, requires_grad=True
-    )
+    reference_context = torch.rand(2, 3, cfg.rgb_size, cfg.rgb_size, requires_grad=True)
     reused_context = reference_context.detach().clone().requires_grad_()
 
     reference_output = reference(
@@ -1783,9 +1753,7 @@ def test_context_pyramid_reuse_preserves_outputs_and_gradients() -> None:
     for expected, actual in zip(reference_inputs, reused_inputs):
         assert expected.grad is not None
         assert actual.grad is not None
-        torch.testing.assert_close(
-            actual.grad, expected.grad, rtol=2.0e-4, atol=2.0e-6
-        )
+        torch.testing.assert_close(actual.grad, expected.grad, rtol=2.0e-4, atol=2.0e-6)
     assert reference_context.grad is not None
     assert reused_context.grad is not None
     torch.testing.assert_close(
@@ -1806,9 +1774,7 @@ def test_context_pyramid_reuse_preserves_outputs_and_gradients() -> None:
             expected.grad,
             rtol=2.0e-4,
             atol=2.0e-6,
-            msg=lambda message, parameter_name=name: (
-                f"{parameter_name}: {message}"
-            ),
+            msg=lambda message, parameter_name=name: f"{parameter_name}: {message}",
         )
 
 
@@ -1826,9 +1792,7 @@ def test_context_renderer_rgb_loss_reaches_per_view_p256_appearance_lane() -> No
     changed_target[:, :, 1] = changed_target[:, :, 1].roll(1, dims=0)
     changed["target_appearance_tokens"] = changed_target
     changed_output = model(**changed, appearance_teacher_ratio=1.0)
-    torch.testing.assert_close(
-        baseline["rgb"], changed_output["rgb"], rtol=0, atol=0
-    )
+    torch.testing.assert_close(baseline["rgb"], changed_output["rgb"], rtol=0, atol=0)
     assert not torch.allclose(
         baseline["appearance_teacher_pred_tokens"][:, 1],
         changed_output["appearance_teacher_pred_tokens"][:, 1],
@@ -2241,9 +2205,10 @@ def test_v7_aligned_rgb_profile_is_isolated_and_materializable() -> None:
     with torch.device("meta"):
         model = build_world_model(profile)
     assert model.cfg.rgb_context_alignment_enabled is True
-    assert sum(parameter.numel() for parameter in model.parameters()) == profile[
-        "expected_parameter_count"
-    ]
+    assert (
+        sum(parameter.numel() for parameter in model.parameters())
+        == profile["expected_parameter_count"]
+    )
 
     with pytest.raises(ValueError, match="requires context RGB"):
         NativeWorldModel(
@@ -2284,6 +2249,102 @@ def test_factual_dynamics_repeats_do_not_touch_policy_branch() -> None:
         atol=0,
     )
     assert not torch.allclose(baseline["pred_tokens"], counterfactual["pred_tokens"])
+
+
+def test_factual_decoder_reads_observed_memory_and_backpropagates() -> None:
+    cfg = replace(_tiny_config(), dropout=0.0)
+    torch.manual_seed(42)
+    block = DynamicsConditionBlock(cfg).train()
+    future = torch.randn(2, cfg.K, cfg.P, cfg.state_hidden, requires_grad=True)
+    action = torch.randn(
+        2, cfg.K, cfg.max_action_groups, cfg.state_hidden, requires_grad=True
+    )
+    mask = torch.ones(2, cfg.K, cfg.max_action_groups, dtype=torch.bool)
+    context = torch.randn(2, cfg.T, cfg.P, cfg.state_hidden, requires_grad=True)
+
+    baseline = block(future, action, mask, context)
+    changed = block(future, action, mask, context + 3.0 * torch.randn_like(context))
+    assert not torch.allclose(baseline, changed)
+
+    baseline.square().mean().backward()
+    assert context.grad is not None
+    assert torch.isfinite(context.grad).all()
+    assert context.grad.abs().sum() > 0
+    context_gradients = [
+        parameter.grad
+        for parameter in block.context_cross.parameters()
+        if parameter.requires_grad
+    ]
+    assert context_gradients
+    assert all(gradient is not None for gradient in context_gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in context_gradients)
+    assert sum(gradient.abs().sum() for gradient in context_gradients) > 0
+
+
+def test_centered_zero_action_has_exactly_zero_decoder_update() -> None:
+    cfg = replace(_tiny_config(), dropout=0.0)
+    torch.manual_seed(421)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    batch["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    batch["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+    action_updates: list[torch.Tensor] = []
+    handle = model.dynamics_blocks[0].action_cross.register_forward_hook(
+        lambda _module, _inputs, output: action_updates.append(output.detach())
+    )
+    try:
+        model(**batch)
+    finally:
+        handle.remove()
+
+    assert action_updates
+    for update in action_updates:
+        torch.testing.assert_close(update, torch.zeros_like(update), rtol=0, atol=0)
+
+
+def test_future_action_horizon_changes_only_present_and_causal_future() -> None:
+    cfg = replace(
+        _tiny_config(),
+        factual_dynamics_repeats=2,
+        factual_action_residual_scale=0.3,
+        dropout=0.0,
+    )
+    torch.manual_seed(422)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    baseline = model(**batch)
+    changed = dict(batch)
+    changed_values = batch["future_factual_fine_action_values"].clone()
+    changed_values[:, 1] = changed_values[:, 1] + 5.0
+    changed["future_factual_fine_action_values"] = changed_values
+    counterfactual = model(**changed)
+
+    torch.testing.assert_close(
+        baseline["pred_tokens"][:, 0],
+        counterfactual["pred_tokens"][:, 0],
+        rtol=0,
+        atol=0,
+    )
+    assert not torch.allclose(
+        baseline["pred_tokens"][:, 1],
+        counterfactual["pred_tokens"][:, 1],
+    )
+    torch.testing.assert_close(
+        baseline["action_free_pred_tokens"],
+        counterfactual["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        baseline["policy_action_raw"],
+        counterfactual["policy_action_raw"],
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_zero_action_control_reuses_the_exact_factual_path() -> None:
