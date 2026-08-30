@@ -12,10 +12,16 @@ from wm3d.models.direct_vggt_teacher import (
 
 
 class _FakeNativeVGGT(torch.nn.Module):
-    def __init__(self, *, maximum_rows: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        maximum_rows: int | None = None,
+        include_appearance: bool = True,
+    ) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(()))
         self.maximum_rows = maximum_rows
+        self.include_appearance = include_appearance
         self.calls: list[int] = []
         self.role_masks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
@@ -66,7 +72,7 @@ class _FakeNativeVGGT(torch.nn.Module):
         camera = camera * geometry_rows[..., None, None].float()
         appearance = appearance * appearance_rows[..., None, None, None].float()
         rgb = rgb * rgb_rows[..., None, None, None, None].float()
-        return {
+        result = {
             "view_tokens": geometry.to(torch.bfloat16),
             "view_mask": view_mask.bool(),
             "rgb": rgb.mul(255).round().clamp(0, 255).to(torch.uint8),
@@ -74,8 +80,10 @@ class _FakeNativeVGGT(torch.nn.Module):
             "point": point.to(torch.float16),
             "geometry_confidence": confidence.to(torch.float16),
             "camera_pose": camera.float(),
-            "appearance_tokens": appearance.to(torch.bfloat16),
         }
+        if self.include_appearance:
+            result["appearance_tokens"] = appearance.to(torch.bfloat16)
+        return result
 
 
 def _adapter(
@@ -98,8 +106,39 @@ def _adapter(
             context_frames=2,
             future_frames=2,
             appearance_context_frames=1,
+            appearance_enabled=True,
             rgb_decode_indices=(0, 1),
             encode_chunk_rows=chunk_rows,
+            minimum_chunk_rows=1,
+        ),
+        device="cpu",
+        encoder=backend,
+    )
+
+
+def _appearance_disabled_adapter(
+    backend: _FakeNativeVGGT,
+) -> DirectVGGTTeacherAdapter:
+    encoder = NativeVGGTConfig(
+        model_revision="fixture",
+        token_grid=2,
+        appearance_token_grid=0,
+        appearance_feature_layer=-1,
+        input_rgb_size=56,
+        target_rgb_size=8,
+        token_dim=2048,
+        max_views=3,
+        dtype="bf16",
+    )
+    return DirectVGGTTeacherAdapter(
+        DirectVGGTTeacherConfig(
+            encoder=encoder,
+            context_frames=2,
+            future_frames=2,
+            appearance_context_frames=0,
+            appearance_enabled=False,
+            rgb_decode_indices=(0, 1),
+            encode_chunk_rows=3,
             minimum_chunk_rows=1,
         ),
         device="cpu",
@@ -176,6 +215,24 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
     assert adapter.metrics["rgb_resize_rows"] == 8
     assert all(not parameter.requires_grad for parameter in adapter.parameters())
     assert not torch.is_inference(result["world_tokens"])
+
+
+def test_direct_teacher_skips_appearance_when_the_model_disables_it() -> None:
+    backend = _FakeNativeVGGT(include_appearance=False)
+    adapter = _appearance_disabled_adapter(backend)
+    result = adapter.materialize(_raw_batch())
+
+    assert "appearance_context_tokens" not in result
+    assert "appearance_context_mask" not in result
+    assert "target_appearance_tokens" not in result
+    assert "target_appearance_mask" not in result
+    assert result["world_tokens"].shape == (2, 2, 3, 4, 2048)
+    assert result["target_rgb"].shape == (2, 2, 3, 3, 8, 8)
+    appearance_rows = torch.cat(
+        [entry[1] for entry in backend.role_masks], dim=1
+    )
+    assert not bool(appearance_rows.any())
+    assert adapter.metrics["appearance_pool_rows"] == 0
 
 
 def test_direct_teacher_uses_latest_available_context_per_view() -> None:

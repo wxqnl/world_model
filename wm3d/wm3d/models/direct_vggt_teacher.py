@@ -23,6 +23,7 @@ class DirectVGGTTeacherConfig:
     context_frames: int
     future_frames: int
     appearance_context_frames: int
+    appearance_enabled: bool
     rgb_decode_indices: tuple[int, ...]
     encode_chunk_rows: int = 32
     minimum_chunk_rows: int = 4
@@ -31,10 +32,15 @@ class DirectVGGTTeacherConfig:
         self.encoder.validate()
         if self.context_frames <= 0 or self.future_frames <= 0:
             raise ValueError("direct VGGT temporal sizes must be positive")
-        if not 0 < self.appearance_context_frames <= self.context_frames:
-            raise ValueError("direct VGGT appearance context is invalid")
-        if not self.encoder.appearance_token_grid:
-            raise ValueError("direct VGGT training requires appearance tokens")
+        if self.appearance_enabled:
+            if not 0 < self.appearance_context_frames <= self.context_frames:
+                raise ValueError("direct VGGT appearance context is invalid")
+            if not self.encoder.appearance_token_grid:
+                raise ValueError("direct VGGT appearance training requires tokens")
+        elif self.appearance_context_frames != 0:
+            raise ValueError("disabled direct VGGT appearance context must be zero")
+        elif self.encoder.appearance_token_grid:
+            raise ValueError("disabled direct VGGT appearance cannot pool tokens")
         if (
             not self.rgb_decode_indices
             or min(self.rgb_decode_indices) < 0
@@ -125,10 +131,12 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         )
         geometry_row_mask[:, self.config.context_frames :] = True
         appearance_row_mask = torch.zeros_like(geometry_row_mask)
-        appearance_start = (
-            self.config.context_frames - self.config.appearance_context_frames
-        )
-        appearance_row_mask[:, appearance_start:] = True
+        if self.config.appearance_enabled:
+            appearance_start = (
+                self.config.context_frames
+                - self.config.appearance_context_frames
+            )
+            appearance_row_mask[:, appearance_start:] = True
         rgb_row_mask = torch.zeros_like(geometry_row_mask)
         rgb_row_mask[:, : self.config.context_frames] = True
         for future_index in self.config.rgb_decode_indices:
@@ -394,11 +402,6 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             future_view_mask
             & torch.isfinite(target_camera).all(dim=-1)
         )
-        appearance = encoded["appearance_tokens"]
-        appearance_start = (
-            self.config.context_frames
-            - self.config.appearance_context_frames
-        )
         rgb_indices = torch.as_tensor(
             self.config.rgb_decode_indices,
             dtype=torch.long,
@@ -418,24 +421,6 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             {
                 "world_tokens": encoded["view_tokens"][:, context],
                 "view_mask": encoded["view_mask"][:, context].bool(),
-                "appearance_context_tokens": appearance[
-                    :, appearance_start : self.config.context_frames
-                ],
-                "appearance_context_mask": encoded["view_mask"][
-                    :, appearance_start : self.config.context_frames, :, None
-                ].expand(
-                    -1,
-                    -1,
-                    -1,
-                    self.config.encoder.appearance_token_grid**2,
-                ),
-                "target_appearance_tokens": appearance[:, future],
-                "target_appearance_mask": future_view_mask[..., None].expand(
-                    -1,
-                    -1,
-                    -1,
-                    self.config.encoder.appearance_token_grid**2,
-                ),
                 "target_tokens": target_tokens,
                 "target_token_mask": target_token_mask,
                 "target_depth": target_depth,
@@ -452,6 +437,30 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
                 ],
             }
         )
+        if self.config.appearance_enabled:
+            appearance = encoded["appearance_tokens"]
+            appearance_start = (
+                self.config.context_frames
+                - self.config.appearance_context_frames
+            )
+            appearance_patches = self.config.encoder.appearance_token_grid**2
+            result.update(
+                {
+                    "appearance_context_tokens": appearance[
+                        :, appearance_start : self.config.context_frames
+                    ],
+                    "appearance_context_mask": encoded["view_mask"][
+                        :,
+                        appearance_start : self.config.context_frames,
+                        :,
+                        None,
+                    ].expand(-1, -1, -1, appearance_patches),
+                    "target_appearance_tokens": appearance[:, future],
+                    "target_appearance_mask": future_view_mask[
+                        ..., None
+                    ].expand(-1, -1, -1, appearance_patches),
+                }
+            )
         return result
 
     @property
