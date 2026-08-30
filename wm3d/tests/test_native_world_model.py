@@ -15,6 +15,7 @@ from wm3d.models.native_world_model import (
     ActionBlock,
     FutureSpatialDetailPredictor,
     NativeContextRGBImageDecoder,
+    NativeOriginalV7ContextRGBImageDecoder,
     NativeRGBImageDecoder,
     NativeWorldModel,
     NativeWorldModelConfig,
@@ -1289,6 +1290,108 @@ def test_context_rgb_renderer_preserves_static_reference_and_masks_missing_views
     )
     assert output["rgb_flow_pixels"][0, :, 1].count_nonzero() == 0
     assert output["rgb_disocclusion_logit"][0, :, 1].count_nonzero() == 0
+
+
+def _tiny_original_v7_rgb_config() -> NativeWorldModelConfig:
+    return replace(
+        _tiny_config(),
+        rgb_hidden=32,
+        rgb_size=32,
+        rgb_context_enabled=True,
+        rgb_original_v7_context=True,
+        rgb_context_alignment_enabled=False,
+        rgb_context_action_scale=1.0,
+        rgb_context_appearance_delta_scale=0.0,
+        rgb_detail_residual_scale=0.0,
+        appearance_enabled=False,
+    )
+
+
+def test_original_v7_rgb_uses_p64_context_action_and_task_gradients() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    torch.manual_seed(211)
+    model = NativeWorldModel(cfg).train()
+    batch = _batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+
+    output = model(**batch)
+    assert output["rgb"].shape == (
+        2,
+        cfg.K,
+        cfg.num_views,
+        3,
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+    decoder = model.rgb_head.image_decoder
+    assert isinstance(decoder, NativeOriginalV7ContextRGBImageDecoder)
+    output["rgb"].float().mean().backward()
+    for parameter in (
+        decoder.token_proj[0].weight,
+        decoder.ctx256.net[0].weight,
+        decoder.action_proj[0].weight,
+        decoder.task_proj[1].weight,
+        decoder.head.weight,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
+
+
+def test_original_v7_rgb_future_action_changes_rgb_not_policy_or_action_free() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    torch.manual_seed(212)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    factual = model(**batch)
+    zero_batch = dict(batch)
+    zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    zero_batch["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+    zero = model(**zero_batch)
+
+    torch.testing.assert_close(
+        factual["action_free_pred_tokens"],
+        zero["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        factual["policy_action"], zero["policy_action"], rtol=0, atol=0
+    )
+    assert not torch.allclose(factual["pred_tokens"], zero["pred_tokens"])
+    assert not torch.allclose(factual["rgb"], zero["rgb"])
+
+
+def test_original_v7_rgb_rejects_competing_appearance_or_alignment_lanes() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        NativeWorldModel(
+            replace(
+                _tiny_original_v7_rgb_config(),
+                rgb_context_alignment_enabled=True,
+            )
+        )
+    with pytest.raises(ValueError, match="no appearance lane"):
+        NativeWorldModel(
+            replace(
+                _tiny_original_v7_rgb_config(),
+                appearance_enabled=True,
+            )
+        )
 
 
 def test_zero_flow_alignment_preserves_v7_learned_rgb_blend() -> None:

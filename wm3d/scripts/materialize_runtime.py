@@ -251,6 +251,9 @@ def main() -> None:
         if metadata_seal["data_profile_sha256"] != data_profile.profile_sha256:
             raise RuntimeError("streaming metadata belongs to another data profile")
         geometry_grid = int(data_profile.cache_representation["token_grid"])
+        model_uses_appearance = bool(
+            model["model"].get("appearance_enabled", False)
+        )
         configured_appearance_grid = data_profile.cache_representation.get(
             "appearance_token_grid"
         )
@@ -276,9 +279,16 @@ def main() -> None:
                     "appearance layer differs from the data profile"
                 )
             configured_appearance_layer = requested_layer
-        if configured_appearance_grid is not None:
+        if not model_uses_appearance:
+            # The direct adapter previously extracted the sealed P256 feature
+            # merely because the data profile advertised it, even when the
+            # selected model could not consume appearance tokens.  Use the
+            # geometry grid so NativeVGGTEncoder disables that extra feature
+            # tap and its host/GPU transfer while retaining the same raw video.
+            appearance_grid = geometry_grid
+        elif configured_appearance_grid is not None:
             appearance_grid = int(configured_appearance_grid)
-        elif bool(model["model"].get("appearance_enabled", False)):
+        elif model_uses_appearance:
             appearance_tokens = int(model["model"]["appearance_P"])
             appearance_grid = math.isqrt(appearance_tokens)
             if appearance_grid * appearance_grid != appearance_tokens:
@@ -288,7 +298,8 @@ def main() -> None:
         if appearance_grid < geometry_grid:
             raise RuntimeError("appearance grid cannot be below the geometry grid")
         if (
-            configured_appearance_layer is not None
+            model_uses_appearance
+            and configured_appearance_layer is not None
             and appearance_grid == geometry_grid
         ):
             raise RuntimeError(

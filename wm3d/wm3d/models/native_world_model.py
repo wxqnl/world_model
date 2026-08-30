@@ -126,6 +126,10 @@ class NativeWorldModelConfig:
     rgb_size: int = 384
     rgb_decode_indices: tuple[int, ...] = tuple(range(16))
     rgb_context_enabled: bool = False
+    # Select the renderer that is structurally identical to the original V7
+    # 60K context-residual U-Net.  The only V8 adaptation is the per-view
+    # embedding and the grouped-action summary width at the bottleneck.
+    rgb_original_v7_context: bool = False
     # Align the V7 observed frame with motion from the factual P64 dynamics
     # before any context RGB/feature skip enters the future renderer.
     rgb_context_alignment_enabled: bool = False
@@ -257,6 +261,27 @@ class NativeWorldModelConfig:
             )
         if not isinstance(self.rgb_context_enabled, bool):
             raise ValueError("rgb_context_enabled must be boolean")
+        if not isinstance(self.rgb_original_v7_context, bool):
+            raise ValueError("rgb_original_v7_context must be boolean")
+        if self.rgb_original_v7_context:
+            if not self.rgb_context_enabled:
+                raise ValueError("original V7 RGB requires context RGB")
+            if self.rgb_context_alignment_enabled:
+                raise ValueError(
+                    "original V7 RGB is mutually exclusive with learned alignment"
+                )
+            if self.appearance_enabled:
+                raise ValueError(
+                    "original V7 RGB consumes factual P64 directly and has no appearance lane"
+                )
+            if self.rgb_context_appearance_delta_scale != 0.0:
+                raise ValueError(
+                    "original V7 RGB cannot use a second appearance correction"
+                )
+            if self.rgb_detail_residual_scale != 0.0:
+                raise ValueError(
+                    "original V7 RGB cannot use the direct-decoder detail branch"
+                )
         if not isinstance(self.rgb_context_alignment_enabled, bool):
             raise ValueError("rgb_context_alignment_enabled must be boolean")
         if self.rgb_context_alignment_enabled and not self.rgb_context_enabled:
@@ -2263,6 +2288,204 @@ def _warp_rgb_feature_with_pixel_flow(
     return warped.to(dtype=source.dtype), valid
 
 
+class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
+    """Original V7 P64 + observed-RGB context-residual renderer.
+
+    The spatial path and output parameterization match the decoder used by the
+    original V7 60K checkpoint: a full-resolution observed RGB pyramid, P64
+    factual tokens interpolated into the 16x16 bottleneck, direct RGB plus a
+    bounded residual, and learned blend/motion maps.  V8 keeps its generalized
+    grouped-action ABI by projecting the centered factual action summary rather
+    than hard-coding a seven-dimensional robot action.
+    """
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.grid = isqrt(cfg.P)
+        hidden = cfg.rgb_hidden
+        channels_256 = max(32, hidden // 8)
+        channels_128 = channels_256
+        channels_64 = max(64, hidden // 4)
+        channels_32 = max(128, hidden // 2)
+
+        self.ctx256 = _RGBConvBlock(3, channels_256)
+        self.ctx128 = _RGBDownBlock(channels_256, channels_128)
+        self.ctx64 = _RGBDownBlock(channels_128, channels_64)
+        self.ctx32 = _RGBDownBlock(channels_64, channels_32)
+        self.ctx16 = _RGBDownBlock(channels_32, hidden)
+
+        self.token_proj = nn.Sequential(
+            nn.Conv2d(cfg.token_dim, hidden, 1),
+            nn.GroupNorm(_rgb_norm_groups(hidden), hidden),
+            nn.SiLU(inplace=True),
+            _RGBConvBlock(hidden, hidden),
+        )
+        self.action_proj = nn.Sequential(
+            nn.Linear(cfg.state_hidden, hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden, hidden),
+        )
+        self.task_proj = nn.Sequential(
+            nn.LayerNorm(cfg.task_dim),
+            nn.Linear(cfg.task_dim, hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden, hidden),
+        )
+
+        self.fuse16 = _RGBConvBlock(hidden + hidden, hidden)
+        self.up32 = _RGBUpBlock(hidden, channels_32)
+        self.fuse32 = _RGBConvBlock(channels_32 + channels_32, channels_32)
+        self.up64 = _RGBUpBlock(channels_32, channels_64)
+        self.fuse64 = _RGBConvBlock(channels_64 + channels_64, channels_64)
+        self.up128 = _RGBUpBlock(channels_64, channels_128)
+        self.fuse128 = _RGBConvBlock(channels_128 + channels_128, channels_128)
+        self.up256 = _RGBUpBlock(channels_128, channels_256)
+        self.fuse256 = _RGBConvBlock(channels_256 + channels_256, channels_256)
+        self.head = nn.Conv2d(channels_256, 7, 3, padding=1)
+        self.motion_head = nn.Conv2d(channels_256, 1, 3, padding=1)
+        nn.init.zeros_(self.motion_head.weight)
+        nn.init.constant_(self.motion_head.bias, -4.0)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        view_embedding: torch.Tensor,
+        geometry_tokens: Optional[torch.Tensor],
+        appearance_context_tokens: Optional[torch.Tensor],
+        factual_action_summary: Optional[torch.Tensor],
+        task_embedding: torch.Tensor,
+        context_rgb: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        motion_tokens: Optional[torch.Tensor] = None,
+        appearance_detail_residual_tokens: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if tuple(tokens.shape[1:]) != (self.cfg.P, self.cfg.token_dim):
+            raise ValueError("original V7 RGB tokens must end in [P,token_dim]")
+        if tuple(view_embedding.shape) != (
+            tokens.shape[0],
+            self.cfg.rgb_hidden,
+            1,
+            1,
+        ):
+            raise ValueError("view embedding must align to original V7 RGB slots")
+        if any(
+            value is not None
+            for value in (
+                geometry_tokens,
+                appearance_context_tokens,
+                motion_tokens,
+                appearance_detail_residual_tokens,
+            )
+        ):
+            raise ValueError(
+                "original V7 RGB has no geometry, appearance, flow, or detail side lane"
+            )
+        if tuple(context_rgb.shape[1:]) != (
+            3,
+            self.cfg.rgb_size,
+            self.cfg.rgb_size,
+        ):
+            raise ValueError("context RGB must be [N,3,rgb_size,rgb_size]")
+        if context_indices is None:
+            if context_rgb.shape[0] != tokens.shape[0]:
+                raise ValueError("context RGB must align to decoder slots")
+            context_indices = torch.arange(
+                tokens.shape[0], device=context_rgb.device, dtype=torch.long
+            )
+        elif (
+            tuple(context_indices.shape) != (tokens.shape[0],)
+            or context_indices.dtype != torch.long
+            or context_indices.device != context_rgb.device
+        ):
+            raise ValueError("context RGB indices must be aligned device-local int64")
+        if task_embedding.shape != (tokens.shape[0], self.cfg.task_dim):
+            raise ValueError("task embedding must align to original V7 RGB slots")
+        if self.cfg.rgb_context_action_scale > 0.0:
+            if factual_action_summary is None or factual_action_summary.shape != (
+                tokens.shape[0],
+                self.cfg.state_hidden,
+            ):
+                raise ValueError(
+                    "centered factual action summary must align to original V7 RGB slots"
+                )
+        elif factual_action_summary is not None:
+            raise ValueError("RGB action was supplied while its scale is zero")
+
+        # Build each observed-view pyramid once, then gather it for the selected
+        # future horizons.  This preserves the original computation while
+        # avoiding repeated full-resolution context work inside one dense chunk.
+        context_256 = self.ctx256(context_rgb)
+        context_128 = self.ctx128(context_256)
+        context_64 = self.ctx64(context_128)
+        context_32 = self.ctx32(context_64)
+        context_16 = self.ctx16(context_32)
+        context_256 = context_256.index_select(0, context_indices)
+        context_128 = context_128.index_select(0, context_indices)
+        context_64 = context_64.index_select(0, context_indices)
+        context_32 = context_32.index_select(0, context_indices)
+        context_16 = context_16.index_select(0, context_indices)
+        context_base = context_rgb.index_select(0, context_indices)
+
+        value = tokens.transpose(1, 2).reshape(
+            tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
+        )
+        value = self.token_proj(value)
+        if value.shape[-2:] != context_16.shape[-2:]:
+            value = F.interpolate(
+                value,
+                size=context_16.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        value = value + view_embedding.to(dtype=value.dtype)
+        if factual_action_summary is not None:
+            action = self.action_proj(factual_action_summary).to(dtype=value.dtype)
+            value = value + float(self.cfg.rgb_context_action_scale) * action.view(
+                tokens.shape[0], -1, 1, 1
+            )
+        task = self.task_proj(task_embedding).to(dtype=value.dtype)
+        value = value + task.view(tokens.shape[0], -1, 1, 1)
+
+        value = self.fuse16(torch.cat((value, context_16), dim=1))
+        value = self.up32(value)
+        value = self.fuse32(torch.cat((value, context_32), dim=1))
+        value = self.up64(value)
+        value = self.fuse64(torch.cat((value, context_64), dim=1))
+        value = self.up128(value)
+        value = self.fuse128(torch.cat((value, context_128), dim=1))
+        value = self.up256(value)
+        value = self.fuse256(torch.cat((value, context_256), dim=1))
+
+        motion_logit = self.motion_head(value)
+        motion_hint = torch.sigmoid(motion_logit)
+        raw = self.head(value)
+        direct = torch.sigmoid(raw[:, 0:3])
+        residual = torch.tanh(raw[:, 3:6]) * float(
+            self.cfg.rgb_context_residual_scale
+        )
+        blend = torch.sigmoid(raw[:, 6:7])
+        if self.cfg.rgb_context_motion_blend_gain > 0.0:
+            blend = torch.clamp(
+                blend
+                + motion_hint.to(dtype=blend.dtype)
+                * float(self.cfg.rgb_context_motion_blend_gain),
+                0.0,
+                1.0,
+            )
+        residual_rgb = torch.clamp(context_base + residual, 0.0, 1.0)
+        rgb = blend * direct + (1.0 - blend) * residual_rgb
+        flow = rgb.new_zeros(rgb.shape[0], 2, *rgb.shape[-2:])
+        disocclusion_logit = rgb.new_zeros(rgb.shape[0], 1, *rgb.shape[-2:])
+        return rgb, motion_logit, blend, flow, disocclusion_logit
+
+
 class NativeContextRGBImageDecoder(nn.Module):
     """Align V7 observed detail before synthesizing future RGB changes."""
 
@@ -2847,7 +3070,9 @@ class NativeRGBDecoder(nn.Module):
         self.view_embed = nn.Parameter(torch.empty(cfg.num_views, cfg.rgb_hidden, 1, 1))
         nn.init.normal_(self.view_embed, std=0.02)
         image_decoder: nn.Module
-        if cfg.rgb_context_enabled:
+        if cfg.rgb_original_v7_context:
+            image_decoder = NativeOriginalV7ContextRGBImageDecoder(cfg)
+        elif cfg.rgb_context_enabled:
             image_decoder = NativeContextRGBImageDecoder(cfg)
         else:
             image_decoder = NativeRGBImageDecoder(cfg)

@@ -1,13 +1,14 @@
 schema: wm3d_v8_objective_profile_v1
-name: stage0_v8_core
+name: stage0_v8_original_v7_rgb
 objective:
-  rgb_l1: 0.5
-  rgb_perceptual: 0.1
+  # Preserve the loss balance used by the original V7 60K renderer.  These
+  # terms all supervise the same RGB output; there is no competing P256/flow
+  # predictor or teacher-forced appearance objective.
+  rgb_l1: 1.2
+  rgb_perceptual: 0.55
   token_mse: 1.0
   token_cosine: 0.1
-  # One target for one bounded detail lane. No absolute-future, teacher-forced,
-  # autoregressive, flow-aligned, or duplicate delta objective competes here.
-  appearance_l1: 0.5
+  appearance_l1: 0.0
   appearance_teacher_l1: 0.0
   appearance_autoregressive_l1: 0.0
   appearance_motion_l1: 0.0
@@ -15,14 +16,12 @@ objective:
   appearance_cosine: 0.0
   appearance_motion_mse: 0.0
   appearance_delta_cosine: 0.0
-  rgb_charbonnier: 1.0
+  rgb_charbonnier: 0.0
   rgb_charbonnier_epsilon: 0.000001
-  rgb_gradient: 0.25
-  # Motion reweighting acts on the same RGB target; it is not a second motion
-  # model. Learned mask/flow/disocclusion objectives are deliberately absent.
+  rgb_gradient: 0.08
   rgb_motion_l1: 1.0
-  rgb_motion_bce: 0.0
-  rgb_motion_dice: 0.0
+  rgb_motion_bce: 0.03
+  rgb_motion_dice: 0.03
   rgb_motion_pos_weight: 2.0
   rgb_motion_threshold: 0.03
   rgb_motion_gain: 3.0
