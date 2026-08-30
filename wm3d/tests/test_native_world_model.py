@@ -1437,6 +1437,42 @@ def test_v7_high_frequency_refiner_starts_exactly_at_v7_rgb() -> None:
     assert refined.high_frequency_refiner is not None
     assert refined.high_frequency_refiner.output_proj.weight.count_nonzero() == 0
 
+def test_v7_high_frequency_initialization_survives_meta_reset() -> None:
+    cfg = _tiny_original_v7_high_frequency_config()
+    feature_channels = max(32, cfg.rgb_hidden // 8)
+    with torch.device("meta"):
+        refiner = NativeV7BoundedHighFrequencyRefiner(
+            cfg,
+            feature_channels=feature_channels,
+        )
+    with torch.no_grad():
+        for module in refiner.modules():
+            direct = list(module.parameters(recurse=False))
+            if not direct or not any(parameter.is_meta for parameter in direct):
+                continue
+            module.to_empty(device=torch.device("cpu"), recurse=False)
+            module.reset_parameters()
+
+    expected_average = 1.0 / float(
+        feature_channels // cfg.rgb_v7_high_frequency_channels
+    )
+    torch.testing.assert_close(
+        refiner.feature_proj.weight,
+        torch.full_like(refiner.feature_proj.weight, expected_average),
+        rtol=0,
+        atol=0,
+    )
+    expected_spatial = torch.zeros_like(refiner.spatial_filter.weight)
+    expected_spatial[:, 0, 1, 1] = 1.0
+    torch.testing.assert_close(
+        refiner.spatial_filter.weight,
+        expected_spatial,
+        rtol=0,
+        atol=0,
+    )
+    assert refiner.output_proj.weight.count_nonzero() == 0
+
+
 
 def test_v7_high_frequency_refiner_is_zero_dc_bounded_and_differentiable() -> None:
     cfg = _tiny_original_v7_high_frequency_config()

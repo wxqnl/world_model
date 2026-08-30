@@ -2330,6 +2330,40 @@ def _warp_rgb_feature_with_pixel_flow(
     return warped.to(dtype=source.dtype), valid
 
 
+class _GroupedAverageProjection(nn.Conv2d):
+    """Grouped 1x1 average whose initialization survives meta materialization."""
+
+    def reset_parameters(self) -> None:
+        nn.init.constant_(
+            self.weight,
+            1.0 / float(self.in_channels // self.groups),
+        )
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class _DepthwiseIdentityFilter(nn.Conv2d):
+    """Depthwise identity whose initialization survives meta materialization."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        center_y = self.kernel_size[0] // 2
+        center_x = self.kernel_size[1] // 2
+        with torch.no_grad():
+            self.weight[:, 0, center_y, center_x] = 1.0
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class _ZeroProjection(nn.Conv2d):
+    """Zero projection whose initialization survives meta materialization."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
 class NativeV7BoundedHighFrequencyRefiner(nn.Module):
     """Tiny factual-P64 detail head with a fixed zero-DC output contract."""
 
@@ -2346,7 +2380,7 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
         if feature_channels % detail_channels:
             raise ValueError("detail channels must divide decoder feature channels")
         self.cfg = cfg
-        self.feature_proj = nn.Conv2d(
+        self.feature_proj = _GroupedAverageProjection(
             feature_channels,
             detail_channels,
             kernel_size=1,
@@ -2360,7 +2394,7 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
             bias=False,
         )
         mixed_channels = 2 * detail_channels
-        self.spatial_filter = nn.Conv2d(
+        self.spatial_filter = _DepthwiseIdentityFilter(
             mixed_channels,
             mixed_channels,
             kernel_size=3,
@@ -2368,25 +2402,16 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
             groups=mixed_channels,
             bias=False,
         )
-        self.output_proj = nn.Conv2d(
+        self.output_proj = _ZeroProjection(
             mixed_channels,
             3,
             kernel_size=1,
             bias=False,
         )
 
-        # Average each compact feature group and start the spatial filter as an
-        # identity. The final zero projection makes an enabled refiner exactly
-        # equivalent to V7 at initialization; the existing RGB objective opens
-        # only this bounded high-frequency correction during optimization.
-        nn.init.constant_(
-            self.feature_proj.weight,
-            1.0 / float(feature_channels // detail_channels),
-        )
-        nn.init.zeros_(self.spatial_filter.weight)
-        with torch.no_grad():
-            self.spatial_filter.weight[:, 0, 1, 1] = 1.0
-        nn.init.zeros_(self.output_proj.weight)
+        # Dedicated projections preserve average/identity/zero initialization
+        # when FSDP2 materializes and resets their meta-owned parameter shards.
+
 
     def forward(
         self,
