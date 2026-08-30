@@ -751,13 +751,29 @@ def validate_streaming_data_closure(value: Mapping[str, Any]) -> None:
     profile = load_data_profile(
         Path(str(value["data_profile_path"])), verify_source_manifests=False
     )
-    for field in ("appearance_token_grid", "appearance_feature_layer"):
-        profile_value = profile.cache_representation.get(field)
-        if profile_value is not None and int(value.get(field, -1)) != int(
-            profile_value
-        ):
+    base_grid = int(profile.cache_representation["token_grid"])
+    selected_appearance_grid = int(
+        value.get("appearance_token_grid", base_grid)
+    )
+    profile_appearance_grid = int(
+        profile.cache_representation.get("appearance_token_grid", base_grid)
+    )
+    if selected_appearance_grid not in {base_grid, profile_appearance_grid}:
+        raise RuntimeContractError(
+            "streaming_raw appearance_token_grid is neither disabled nor sealed"
+        )
+    # Selecting the base geometry grid explicitly disables the optional
+    # appearance feature tap.  The layer remains sealed provenance for direct
+    # raw closures, but NativeVGGTEncoder will not materialize it.
+    if selected_appearance_grid != base_grid:
+        profile_appearance_layer = profile.cache_representation.get(
+            "appearance_feature_layer"
+        )
+        if profile_appearance_layer is not None and int(
+            value.get("appearance_feature_layer", -1)
+        ) != int(profile_appearance_layer):
             raise RuntimeContractError(
-                f"streaming_raw {field} differs from data profile"
+                "streaming_raw appearance_feature_layer differs from data profile"
             )
     if value["source_manifest_sha256_by_name"] != {
         source.name: source.manifest_sha256 for source in profile.sources
