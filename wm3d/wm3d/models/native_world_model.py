@@ -2342,18 +2342,6 @@ class _GroupedAverageProjection(nn.Conv2d):
             nn.init.zeros_(self.bias)
 
 
-class _DepthwiseIdentityFilter(nn.Conv2d):
-    """Depthwise identity whose initialization survives meta materialization."""
-
-    def reset_parameters(self) -> None:
-        nn.init.zeros_(self.weight)
-        center_y = self.kernel_size[0] // 2
-        center_x = self.kernel_size[1] // 2
-        with torch.no_grad():
-            self.weight[:, 0, center_y, center_x] = 1.0
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
 
 class _ZeroProjection(nn.Conv2d):
     """Zero projection whose initialization survives meta materialization."""
@@ -2394,12 +2382,13 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
             bias=False,
         )
         mixed_channels = 2 * detail_channels
-        self.spatial_filter = _DepthwiseIdentityFilter(
+        self.spatial_filter = nn.Conv2d(
             mixed_channels,
             mixed_channels,
             kernel_size=3,
             padding=1,
             groups=mixed_channels,
+            padding_mode="replicate",
             bias=False,
         )
         self.output_proj = _ZeroProjection(
@@ -2409,8 +2398,8 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
             bias=False,
         )
 
-        # Dedicated projections preserve average/identity/zero initialization
-        # when FSDP2 materializes and resets their meta-owned parameter shards.
+        # Dedicated projections preserve average/zero initialization when FSDP2
+        # materializes and resets their meta-owned parameter shards.
 
 
     def forward(
