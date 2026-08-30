@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
-name: native_1b_v8_original_v7_rgb
+name: native_1b_v8_v7_high_frequency_refiner
 architecture: native_world_model
-expected_parameter_count: 1295808056
+expected_parameter_count: 1295841336
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -66,6 +66,11 @@ model:
   # RGB pyramid + direct/residual/blend/motion. No flow or appearance side lane.
   rgb_context_enabled: true
   rgb_original_v7_context: true
+  # A 33K-parameter late high-pass residual may improve detail, but remains
+  # bounded to 1/16 pixel range and has no low-frequency or motion output.
+  rgb_v7_high_frequency_refiner: true
+  rgb_v7_high_frequency_channels: 16
+  rgb_v7_high_frequency_scale: 0.0625
   rgb_context_alignment_enabled: false
   rgb_render_action_free_prior: false
   rgb_context_action_scale: 1.0

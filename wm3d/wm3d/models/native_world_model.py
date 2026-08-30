@@ -130,6 +130,14 @@ class NativeWorldModelConfig:
     # 60K context-residual U-Net.  The only V8 adaptation is the per-view
     # embedding and the grouped-action summary width at the bottleneck.
     rgb_original_v7_context: bool = False
+    # Optional V8 clarity head on top of the proven V7 renderer. It consumes
+    # only factual P64 and the final 256x256 decoder feature; a fixed zero-DC
+    # high-pass operator removes low frequency before the bounded correction
+    # reaches RGB, so it cannot own motion, blend, flow, or context transport.
+    rgb_v7_high_frequency_refiner: bool = False
+    rgb_v7_high_frequency_channels: int = 16
+    rgb_v7_high_frequency_scale: float = 0.0
+
     # Align the V7 observed frame with motion from the factual P64 dynamics
     # before any context RGB/feature skip enters the future renderer.
     rgb_context_alignment_enabled: bool = False
@@ -263,6 +271,40 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_context_enabled must be boolean")
         if not isinstance(self.rgb_original_v7_context, bool):
             raise ValueError("rgb_original_v7_context must be boolean")
+        if not isinstance(self.rgb_v7_high_frequency_refiner, bool):
+            raise ValueError("rgb_v7_high_frequency_refiner must be boolean")
+        if self.rgb_v7_high_frequency_channels <= 0:
+            raise ValueError("rgb_v7_high_frequency_channels must be positive")
+        if (
+            not isfinite(self.rgb_v7_high_frequency_scale)
+            or self.rgb_v7_high_frequency_scale < 0.0
+            or self.rgb_v7_high_frequency_scale > 0.125
+        ):
+            raise ValueError(
+                "rgb_v7_high_frequency_scale must be finite and lie in [0,0.125]"
+            )
+        if self.rgb_v7_high_frequency_refiner:
+            if not self.rgb_original_v7_context:
+                raise ValueError(
+                    "V7 high-frequency refinement requires original V7 RGB"
+                )
+            if self.rgb_v7_high_frequency_scale <= 0.0:
+                raise ValueError(
+                    "V7 high-frequency refinement requires a positive bound"
+                )
+            final_channels = max(32, self.rgb_hidden // 8)
+            if (
+                self.rgb_v7_high_frequency_channels > final_channels
+                or final_channels % self.rgb_v7_high_frequency_channels
+            ):
+                raise ValueError(
+                    "V7 high-frequency channels must divide the final RGB width"
+                )
+        elif self.rgb_v7_high_frequency_scale != 0.0:
+            raise ValueError(
+                "V7 high-frequency scale must be zero when the refiner is disabled"
+            )
+
         if self.rgb_original_v7_context:
             if not self.rgb_context_enabled:
                 raise ValueError("original V7 RGB requires context RGB")
@@ -2288,6 +2330,117 @@ def _warp_rgb_feature_with_pixel_flow(
     return warped.to(dtype=source.dtype), valid
 
 
+class NativeV7BoundedHighFrequencyRefiner(nn.Module):
+    """Tiny factual-P64 detail head with a fixed zero-DC output contract."""
+
+    _HIGH_PASS_KERNEL = 5
+
+    def __init__(
+        self,
+        cfg: NativeWorldModelConfig,
+        *,
+        feature_channels: int,
+    ) -> None:
+        super().__init__()
+        detail_channels = int(cfg.rgb_v7_high_frequency_channels)
+        if feature_channels % detail_channels:
+            raise ValueError("detail channels must divide decoder feature channels")
+        self.cfg = cfg
+        self.feature_proj = nn.Conv2d(
+            feature_channels,
+            detail_channels,
+            kernel_size=1,
+            groups=detail_channels,
+            bias=False,
+        )
+        self.token_proj = nn.Conv2d(
+            cfg.token_dim,
+            detail_channels,
+            kernel_size=1,
+            bias=False,
+        )
+        mixed_channels = 2 * detail_channels
+        self.spatial_filter = nn.Conv2d(
+            mixed_channels,
+            mixed_channels,
+            kernel_size=3,
+            padding=1,
+            groups=mixed_channels,
+            bias=False,
+        )
+        self.output_proj = nn.Conv2d(
+            mixed_channels,
+            3,
+            kernel_size=1,
+            bias=False,
+        )
+
+        # Average each compact feature group and start the spatial filter as an
+        # identity. The final zero projection makes an enabled refiner exactly
+        # equivalent to V7 at initialization; the existing RGB objective opens
+        # only this bounded high-frequency correction during optimization.
+        nn.init.constant_(
+            self.feature_proj.weight,
+            1.0 / float(feature_channels // detail_channels),
+        )
+        nn.init.zeros_(self.spatial_filter.weight)
+        with torch.no_grad():
+            self.spatial_filter.weight[:, 0, 1, 1] = 1.0
+        nn.init.zeros_(self.output_proj.weight)
+
+    def forward(
+        self,
+        factual_tokens: torch.Tensor,
+        decoder_features: torch.Tensor,
+    ) -> torch.Tensor:
+        if tuple(factual_tokens.shape[1:]) != (
+            self.cfg.P,
+            self.cfg.token_dim,
+        ):
+            raise ValueError("detail factual tokens must end in [P,token_dim]")
+        if factual_tokens.shape[0] != decoder_features.shape[0]:
+            raise ValueError("detail factual tokens and RGB features must align")
+        grid = isqrt(self.cfg.P)
+        token_map = factual_tokens.transpose(1, 2).reshape(
+            factual_tokens.shape[0], self.cfg.token_dim, grid, grid
+        )
+        token_detail = self.token_proj(token_map)
+        token_detail = F.interpolate(
+            token_detail,
+            size=decoder_features.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        feature_detail = self.feature_proj(decoder_features)
+        basis = self.output_proj(
+            F.silu(
+                self.spatial_filter(
+                    torch.cat((feature_detail, token_detail), dim=1)
+                )
+            )
+        )
+        basis = torch.tanh(basis.float())
+        radius = self._HIGH_PASS_KERNEL // 2
+        low_frequency = F.avg_pool2d(
+            F.pad(basis, (radius, radius, radius, radius), mode="replicate"),
+            kernel_size=self._HIGH_PASS_KERNEL,
+            stride=1,
+        )
+        high_frequency = basis - low_frequency
+        # Remove finite-image DC remainder from boundary handling. Both terms
+        # lie in [-1,1], so the centered difference lies in [-4,4]; multiplying
+        # by 0.25 makes the configured scale a strict per-pixel bound.
+        high_frequency = high_frequency - high_frequency.mean(
+            dim=(-2, -1), keepdim=True
+        )
+        correction = (
+            0.25
+            * float(self.cfg.rgb_v7_high_frequency_scale)
+            * high_frequency
+        )
+        return correction.to(dtype=decoder_features.dtype)
+
+
 class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
     """Original V7 P64 + observed-RGB context-residual renderer.
 
@@ -2346,6 +2499,14 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
         self.motion_head = nn.Conv2d(channels_256, 1, 3, padding=1)
         nn.init.zeros_(self.motion_head.weight)
         nn.init.constant_(self.motion_head.bias, -4.0)
+        self.high_frequency_refiner: Optional[
+            NativeV7BoundedHighFrequencyRefiner
+        ] = None
+        if cfg.rgb_v7_high_frequency_refiner:
+            self.high_frequency_refiner = NativeV7BoundedHighFrequencyRefiner(
+                cfg,
+                feature_channels=channels_256,
+            )
 
     def forward(
         self,
@@ -2481,6 +2642,9 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
             )
         residual_rgb = torch.clamp(context_base + residual, 0.0, 1.0)
         rgb = blend * direct + (1.0 - blend) * residual_rgb
+        if self.high_frequency_refiner is not None:
+            detail_correction = self.high_frequency_refiner(tokens, value)
+            rgb = torch.clamp(rgb + detail_correction, 0.0, 1.0)
         flow = rgb.new_zeros(rgb.shape[0], 2, *rgb.shape[-2:])
         disocclusion_logit = rgb.new_zeros(rgb.shape[0], 1, *rgb.shape[-2:])
         return rgb, motion_logit, blend, flow, disocclusion_logit

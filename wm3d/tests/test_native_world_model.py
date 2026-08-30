@@ -16,6 +16,7 @@ from wm3d.models.native_world_model import (
     FutureSpatialDetailPredictor,
     NativeContextRGBImageDecoder,
     NativeOriginalV7ContextRGBImageDecoder,
+    NativeV7BoundedHighFrequencyRefiner,
     NativeRGBImageDecoder,
     NativeWorldModel,
     NativeWorldModelConfig,
@@ -1392,6 +1393,129 @@ def test_original_v7_rgb_rejects_competing_appearance_or_alignment_lanes() -> No
                 appearance_enabled=True,
             )
         )
+
+def _tiny_original_v7_high_frequency_config() -> NativeWorldModelConfig:
+    return replace(
+        _tiny_original_v7_rgb_config(),
+        rgb_v7_high_frequency_refiner=True,
+        rgb_v7_high_frequency_channels=16,
+        rgb_v7_high_frequency_scale=0.0625,
+    )
+
+
+def test_v7_high_frequency_refiner_starts_exactly_at_v7_rgb() -> None:
+    base_cfg = _tiny_original_v7_rgb_config()
+    refined_cfg = _tiny_original_v7_high_frequency_config()
+    torch.manual_seed(213)
+    base = NativeOriginalV7ContextRGBImageDecoder(base_cfg).eval()
+    torch.manual_seed(213)
+    refined = NativeOriginalV7ContextRGBImageDecoder(refined_cfg).eval()
+
+    slots = 2
+    tokens = torch.randn(slots, base_cfg.P, base_cfg.token_dim)
+    view_embedding = torch.randn(slots, base_cfg.rgb_hidden, 1, 1)
+    action = torch.randn(slots, base_cfg.state_hidden)
+    task = torch.randn(slots, base_cfg.task_dim)
+    context_rgb = torch.rand(
+        slots, 3, base_cfg.rgb_size, base_cfg.rgb_size
+    )
+    context_indices = torch.arange(slots, dtype=torch.long)
+    arguments = dict(
+        tokens=tokens,
+        view_embedding=view_embedding,
+        geometry_tokens=None,
+        appearance_context_tokens=None,
+        factual_action_summary=action,
+        task_embedding=task,
+        context_rgb=context_rgb,
+        context_indices=context_indices,
+    )
+    base_output = base(**arguments)
+    refined_output = refined(**arguments)
+    for base_value, refined_value in zip(base_output, refined_output):
+        torch.testing.assert_close(base_value, refined_value, rtol=0, atol=0)
+    assert refined.high_frequency_refiner is not None
+    assert refined.high_frequency_refiner.output_proj.weight.count_nonzero() == 0
+
+
+def test_v7_high_frequency_refiner_is_zero_dc_bounded_and_differentiable() -> None:
+    cfg = _tiny_original_v7_high_frequency_config()
+    refiner = NativeV7BoundedHighFrequencyRefiner(
+        cfg,
+        feature_channels=max(32, cfg.rgb_hidden // 8),
+    )
+    with torch.no_grad():
+        refiner.output_proj.weight.normal_(std=0.1)
+
+    constant_tokens = torch.ones(2, cfg.P, cfg.token_dim)
+    constant_features = torch.ones(
+        2,
+        max(32, cfg.rgb_hidden // 8),
+        cfg.rgb_size,
+        cfg.rgb_size,
+    )
+    constant_correction = refiner(constant_tokens, constant_features)
+    torch.testing.assert_close(
+        constant_correction,
+        torch.zeros_like(constant_correction),
+        rtol=0,
+        atol=2.0e-7,
+    )
+
+    tokens = torch.randn(2, cfg.P, cfg.token_dim, requires_grad=True)
+    features = torch.randn(
+        2,
+        max(32, cfg.rgb_hidden // 8),
+        cfg.rgb_size,
+        cfg.rgb_size,
+        requires_grad=True,
+    )
+    correction = refiner(tokens, features)
+    assert torch.isfinite(correction).all()
+    assert correction.abs().max() <= cfg.rgb_v7_high_frequency_scale + 1.0e-6
+    torch.testing.assert_close(
+        correction.float().mean(dim=(-2, -1)),
+        torch.zeros(2, 3),
+        rtol=0,
+        atol=1.0e-7,
+    )
+    assert correction.abs().sum() > 0
+    (correction * torch.randn_like(correction)).sum().backward()
+    for gradient in (
+        tokens.grad,
+        features.grad,
+        refiner.token_proj.weight.grad,
+        refiner.feature_proj.weight.grad,
+        refiner.output_proj.weight.grad,
+    ):
+        assert gradient is not None
+        assert torch.isfinite(gradient).all()
+        assert gradient.abs().sum() > 0
+
+
+def test_existing_rgb_objective_opens_v7_high_frequency_refiner() -> None:
+    cfg = _tiny_original_v7_high_frequency_config()
+    torch.manual_seed(214)
+    model = NativeWorldModel(cfg).train()
+    batch = _batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    output = model(**batch)
+    target = torch.rand_like(output["rgb"])
+    torch.nn.functional.l1_loss(output["rgb"], target).backward()
+
+    decoder = model.rgb_head.image_decoder
+    assert isinstance(decoder, NativeOriginalV7ContextRGBImageDecoder)
+    assert decoder.high_frequency_refiner is not None
+    gradient = decoder.high_frequency_refiner.output_proj.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
+
 
 
 def test_zero_flow_alignment_preserves_v7_learned_rgb_blend() -> None:
