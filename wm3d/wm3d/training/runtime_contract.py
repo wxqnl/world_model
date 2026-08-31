@@ -59,6 +59,8 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "policy_calibration_conditioning",
     "factual_dynamics_repeats",
     "factual_action_residual_scale",
+    "factual_v7_early_action_conditioning",
+    "factual_v7_early_action_scale",
     "render_factual_dynamics_repeats",
     "render_factual_action_residual_scale",
     "rgb_context_enabled",
