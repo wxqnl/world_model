@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path, PurePosixPath
 import stat
 import tarfile
@@ -139,18 +140,75 @@ def _inspect_archive(path: Path) -> dict[str, object]:
     return _inspect_tar(path)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--snapshot-root", type=Path, required=True)
-    parser.add_argument("--prefix", action="append", default=[])
-    parser.add_argument("--sample-archives-per-prefix", type=int, default=1)
-    args = parser.parse_args()
-    if args.sample_archives_per_prefix <= 0:
-        raise ValueError("--sample-archives-per-prefix must be positive")
-    root = _directory(args.snapshot_root, "AgiBotWorld2026 snapshot")
-    prefixes = tuple(args.prefix) if args.prefix else DEFAULT_PREFIXES
+def _first_regular_file(root: Path, suffix: str | None = None) -> Path | None:
+    if not root.is_dir() or root.is_symlink():
+        return None
+    for current, directories, files in os.walk(root, followlinks=False):
+        directories[:] = [
+            name for name in directories if not (Path(current) / name).is_symlink()
+        ]
+        for name in files:
+            candidate = Path(current) / name
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            if suffix is None or candidate.name.endswith(suffix):
+                return candidate
+    return None
+
+
+def _inspect_lerobot_root(root: Path) -> dict[str, object]:
+    root = _directory(root, "extracted LeRobot root")
+    info_path = root / "meta" / "info.json"
+    if info_path.is_symlink() or not info_path.is_file():
+        raise RuntimeError(f"missing regular meta/info.json under {root}")
+    info = _inspect_info(info_path.read_bytes(), info_path)
+    parquet = _first_regular_file(root / "data", ".parquet")
+    visual = _first_regular_file(root / "videos") or _first_regular_file(root / "images")
+    if parquet is None or visual is None:
+        raise RuntimeError(
+            f"{root} is not a usable extracted LeRobot dataset: "
+            f"data={parquet is not None}, visual={visual is not None}"
+        )
+    return {
+        "path": str(root),
+        "has_data": True,
+        "has_visual": True,
+        "info": info,
+    }
+
+
+def _find_lerobot_roots(subset: Path, *, maximum_depth: int = 10) -> list[Path]:
+    roots: list[Path] = []
+    base_depth = len(subset.parts)
+    for current, directories, _ in os.walk(subset, followlinks=False):
+        path = Path(current)
+        depth = len(path.parts) - base_depth
+        if depth >= maximum_depth:
+            directories[:] = []
+        else:
+            directories[:] = [
+                name
+                for name in directories
+                if name not in {".git", "__pycache__"}
+                and not (path / name).is_symlink()
+            ]
+        if (path / "meta" / "info.json").is_file():
+            roots.append(path)
+            directories[:] = []
+    return sorted(set(roots))
+
+
+def inspect_snapshot(
+    snapshot_root: Path,
+    *,
+    prefixes: tuple[str, ...] = DEFAULT_PREFIXES,
+    sample_archives_per_prefix: int = 1,
+) -> dict[str, object]:
+    if sample_archives_per_prefix <= 0:
+        raise ValueError("sample_archives_per_prefix must be positive")
+    root = _directory(snapshot_root, "AgiBotWorld2026 snapshot")
     if len(set(prefixes)) != len(prefixes):
-        raise ValueError("--prefix values must be unique")
+        raise ValueError("prefix values must be unique")
     evidence: dict[str, object] = {}
     for raw_prefix in prefixes:
         prefix = PurePosixPath(raw_prefix)
@@ -158,8 +216,6 @@ def main() -> None:
             raise ValueError(f"unsafe prefix: {raw_prefix!r}")
         subset = _directory(root.joinpath(*prefix.parts), f"AgiBot prefix {raw_prefix}")
         archives = sorted(path for path in subset.rglob("*") if _is_archive(path))
-        if not archives:
-            raise RuntimeError(f"no archives found under {subset}")
         regular = []
         total_bytes = 0
         for archive in archives:
@@ -167,23 +223,48 @@ def main() -> None:
                 raise RuntimeError(f"archive must be regular and non-symlink: {archive}")
             regular.append(archive)
             total_bytes += archive.stat().st_size
+        extracted = _find_lerobot_roots(subset)
+        if not regular and not extracted:
+            raise RuntimeError(
+                f"no LeRobot archives or extracted LeRobot roots found under {subset}"
+            )
         samples = [
             _inspect_archive(path)
-            for path in regular[: args.sample_archives_per_prefix]
+            for path in regular[:sample_archives_per_prefix]
+        ]
+        extracted_samples = [
+            _inspect_lerobot_root(path)
+            for path in extracted[:sample_archives_per_prefix]
         ]
         evidence[raw_prefix] = {
             "archive_count": len(regular),
-            "total_bytes": total_bytes,
+            "extracted_root_count": len(extracted),
+            "total_archive_bytes": total_bytes,
             "sampled_archives": samples,
+            "sampled_extracted_roots": extracted_samples,
         }
+    return {
+        "schema": SCHEMA,
+        "passed": True,
+        "snapshot_root": str(root),
+        "prefixes": evidence,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--snapshot-root", type=Path, required=True)
+    parser.add_argument("--prefix", action="append", default=[])
+    parser.add_argument("--sample-archives-per-prefix", type=int, default=1)
+    args = parser.parse_args()
+    prefixes = tuple(args.prefix) if args.prefix else DEFAULT_PREFIXES
     print(
         json.dumps(
-            {
-                "schema": SCHEMA,
-                "passed": True,
-                "snapshot_root": str(root),
-                "prefixes": evidence,
-            },
+            inspect_snapshot(
+                args.snapshot_root,
+                prefixes=prefixes,
+                sample_archives_per_prefix=args.sample_archives_per_prefix,
+            ),
             ensure_ascii=False,
             sort_keys=True,
         )

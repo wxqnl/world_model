@@ -29,6 +29,7 @@ usage() {
   cat <<EOF
 WM3D ${SCALE_LABEL} 集群操作入口：
 
+  ./run_wm3d.sh ${SCALE} configure <model-root> <data-root> [site.env]
   ./run_wm3d.sh ${SCALE} init <preset> <site.env> [direct_raw|streaming_raw|episode_cache]
   ./run_wm3d.sh ${SCALE} env <site.env>
   ./run_wm3d.sh ${SCALE} data-template <site.env>
@@ -48,6 +49,7 @@ WM3D ${SCALE_LABEL} 集群操作入口：
   ./run_wm3d.sh ${SCALE} train <site.env> [sealed-stop-step]
   ./run_wm3d.sh ${SCALE} resume <site.env> <step|checkpoint> [sealed-stop-step]
   ./run_wm3d.sh ${SCALE} eval <site.env> [step|checkpoint] [output.json]
+  ./run_wm3d.sh ${SCALE} slurm <site.env> <preflight|train|resume|eval> [参数...]
   ./run_wm3d.sh ${SCALE} status <site.env>
   ./run_wm3d.sh ${SCALE} verify <site.env> [step|checkpoint] [eval.json]
 
@@ -270,7 +272,7 @@ load_site() {
   esac
   for name in DATA_FAMILY WORK_ROOT CONTROL_ROOT RAW_ROOT \
     CACHE_ROOT ENV_DIR PYTHON_BIN \
-    HF_TOKEN_FILE ACCEPT_DATA_LICENSES SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
+    ACCEPT_DATA_LICENSES SOURCE_TEMPLATE SOURCE_LOCK DATA_TEMPLATE DATA_PROFILE TASK_BANK_ROOT \
     TASK_BANK_INDEX TASK_MANIFEST EPISODE_INDEX EPISODE_SEAL WINDOW_INDEX WINDOW_SEAL \
     GROUPED_NORMALIZATION MODEL_PROFILE ENCODER_CONTRACT \
     TASK_ENCODER_CONTRACT OBJECTIVE_PROFILE NNODES \
@@ -350,6 +352,22 @@ action=${1:-help}
 shift || true
 
 case "${action}" in
+  configure)
+    [[ "${SCALE}" == 5b ]] || die "configure 只用于 5B 交付"
+    [[ $# -ge 2 && $# -le 3 ]] || { usage; exit 2; }
+    configure_args=(
+      "${ROOT}/scripts/cluster/configure_5b_inputs.py"
+      --model-root "$1"
+      --data-root "$2"
+    )
+    if [[ -n "${WM3D_WORK_ROOT:-}" ]]; then
+      configure_args+=(--work-root "${WM3D_WORK_ROOT}")
+    fi
+    if [[ $# -eq 3 ]]; then
+      configure_args+=(--site-output "$3")
+    fi
+    exec "${SYSTEM_PYTHON:-python3}" "${configure_args[@]}"
+    ;;
   init)
     [[ $# -ge 2 && $# -le 3 ]] || { usage; exit 2; }
     preset=$1
@@ -383,16 +401,11 @@ load_site "${site}"
 case "${action}" in
   doctor)
     [[ $# -eq 0 ]] || { usage; exit 2; }
-    require_file "source template" "${SOURCE_TEMPLATE}"
-    require_file "data template" "${DATA_TEMPLATE}"
     require_file "model profile" "${MODEL_PROFILE}"
     require_file "vision encoder contract" "${ENCODER_CONTRACT}"
     require_file "task encoder contract" "${TASK_ENCODER_CONTRACT}"
     require_file "objective profile" "${OBJECTIVE_PROFILE}"
     require_file "runtime profile" "${RUNTIME_PROFILE}"
-    require_file "Hugging Face token" "${HF_TOKEN_FILE}"
-    token_mode=$(stat -c '%a' "${HF_TOKEN_FILE}")
-    (( (8#${token_mode} & 8#077) == 0 )) || die "HF token 禁止 group/world 权限；推荐 chmod 600"
     [[ -x "${PYTHON_BIN}" ]] || die "Python 环境不存在：${PYTHON_BIN}；先运行 ENV_DIR=... ./run_wm3d.sh env"
     validate_5b_v8_contract
     "${PYTHON_BIN}" -m pip check
@@ -483,6 +496,11 @@ EOF
     ;;
   lock)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ -n "${HF_TOKEN_FILE:-}" ]] || die "lock 需要在 site 中设置 HF_TOKEN_FILE"
+    require_file "Hugging Face token" "${HF_TOKEN_FILE}"
+    require_file "source template" "${SOURCE_TEMPLATE}"
+    token_mode=$(stat -c '%a' "${HF_TOKEN_FILE}")
+    (( (8#${token_mode} & 8#077) == 0 )) || die "HF token 禁止 group/world 权限；推荐 chmod 600"
     [[ "${ACCEPT_DATA_LICENSES}" == YES ]] || \
       die "先接受全部上游数据许可，并在 site 文件设置 ACCEPT_DATA_LICENSES=YES"
     mkdir -p "${CONTROL_ROOT}"
@@ -522,6 +540,8 @@ EOF
     ;;
   download)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    [[ -n "${HF_TOKEN_FILE:-}" ]] || die "download 需要在 site 中设置 HF_TOKEN_FILE"
+    require_file "Hugging Face token" "${HF_TOKEN_FILE}"
     require_file "source lock" "${SOURCE_LOCK}"
     mkdir -p "${RAW_ROOT}"
     HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 "${ENTRY}" download \
@@ -683,6 +703,26 @@ EOF
     mapfile -t distributed < <(torch_args "${EVAL_PORT}")
     "${ENTRY}" eval "${distributed[@]}" -- --runtime "${RUNTIME_YAML}" \
       --checkpoint "${checkpoint}" --output "${output}"
+    ;;
+  slurm)
+    [[ "${SCALE}" == 5b ]] || die "slurm 交付入口只用于 5B"
+    [[ $# -ge 1 ]] || { usage; exit 2; }
+    operation=$1
+    shift
+    case "${operation}" in
+      preflight|train|resume|eval) ;;
+      *) die "slurm operation 必须是 preflight、train、resume 或 eval" ;;
+    esac
+    [[ -n "${SLURM_JOB_NODELIST:-}" ]] || \
+      die "slurm 必须在已分配的 Slurm allocation 内运行"
+    command -v scontrol >/dev/null || die "找不到 scontrol"
+    command -v srun >/dev/null || die "找不到 srun"
+    master_addr=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)
+    [[ -n "${master_addr}" ]] || die "无法从 SLURM_JOB_NODELIST 解析 master 节点"
+    exec srun --nodes="${NNODES}" --ntasks="${NNODES}" --ntasks-per-node=1 \
+      --kill-on-bad-exit=1 --export="ALL,MASTER_ADDR=${master_addr}" \
+      bash -lc 'code_root=$1; shift; cd "$code_root"; exec "$@"' \
+      _ "${ROOT}" "${ENTRY}" "${SCALE}" "${operation}" "${site}" "$@"
     ;;
   status)
     [[ $# -eq 0 ]] || { usage; exit 2; }

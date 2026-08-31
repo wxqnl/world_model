@@ -59,6 +59,27 @@ def _run(root: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _extracted(root: Path, prefix: str) -> None:
+    episode = root / prefix / "modelscope-cache" / "lerobot"
+    (episode / "meta").mkdir(parents=True)
+    (episode / "data/chunk-000").mkdir(parents=True)
+    (episode / "videos/camera").mkdir(parents=True)
+    (episode / "meta/info.json").write_text(
+        json.dumps(
+            {
+                "codebase_version": "v2.1",
+                "fps": 30,
+                "features": {
+                    "action": {"dtype": "float32", "shape": [14]},
+                    "observation.state": {"dtype": "float32", "shape": [14]},
+                },
+            }
+        )
+    )
+    (episode / "data/chunk-000/episode_000000.parquet").write_bytes(b"fixture")
+    (episode / "videos/camera/episode_000000.mp4").write_bytes(b"fixture")
+
+
 def test_existing_agibot2026_snapshot_probe_accepts_official_archive_layout(
     tmp_path: Path,
 ) -> None:
@@ -94,3 +115,21 @@ def test_existing_agibot2026_snapshot_probe_rejects_link_members(
     result = _run(tmp_path)
     assert result.returncode != 0
     assert "link/device" in result.stderr
+
+
+def test_existing_agibot2026_snapshot_probe_accepts_extracted_modelscope_layout(
+    tmp_path: Path,
+) -> None:
+    for prefix in PREFIXES:
+        _extracted(tmp_path, prefix)
+    result = _run(tmp_path)
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout)
+    assert evidence["passed"] is True
+    assert all(
+        row["archive_count"] == 0
+        and row["extracted_root_count"] == 1
+        and row["sampled_extracted_roots"][0]["has_data"] is True
+        and row["sampled_extracted_roots"][0]["has_visual"] is True
+        for row in evidence["prefixes"].values()
+    )

@@ -39,7 +39,8 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_wm3d.sh smoke-real --work-root <空目录> --operator <姓名或工号> \
     --accept-dataset-license --confirm-adapter-semantics [--gpus 0,1]
   ./run_wm3d.sh 1b <init|doctor|download|streaming-prepare|train|status|verify...> [参数...]
-  ./run_wm3d.sh 5b <init|doctor|download|cache|train|status|verify...> [参数...]
+  ./run_wm3d.sh 5b configure <model-root> <data-root> [site.env]
+  ./run_wm3d.sh 5b <env|doctor|task-bank|runtime|slurm|status|verify...> [参数...]
   ./run_wm3d.sh stage1-seal-selection <正式四 root selection seal 参数...>
   ./run_wm3d.sh stage1-replay-authority <真实 simulator replay 参数...>
   ./run_wm3d.sh stage1-audit-rollouts <audit_robocasa_real_rollouts.py 参数...>
