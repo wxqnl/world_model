@@ -39,6 +39,11 @@ model:
   # Add the centered physical action to the learned future query once, then
   # expose the group-preserving action tokens through decoder memory.
   factual_action_residual_scale: 1.0
+  # Match V7's first action-conditioning point as well: future action owns the
+  # factual state seed before all 18 state blocks. This is a separate pass and
+  # therefore cannot alter the action-free policy prior.
+  factual_v7_early_action_conditioning: true
+  factual_v7_early_action_scale: 1.0
   # The factual P64 state is the motion owner consumed by the proven original
   # V7 context-residual renderer.
   appearance_action_residual_scale: 0.0

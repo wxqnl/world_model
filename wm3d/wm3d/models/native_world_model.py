@@ -78,6 +78,11 @@ class NativeWorldModelConfig:
     # value before cross-attention.  It is applied only to the world branch;
     # the action-free prior and policy branch remain structurally isolated.
     factual_action_residual_scale: float = 0.0
+    # V7 exposed the future command before every state encoder layer, then
+    # injected it again into the two-layer future decoder.  V8 evaluates that
+    # factual path separately so the policy prior remains action-free.
+    factual_v7_early_action_conditioning: bool = False
+    factual_v7_early_action_scale: float = 0.0
     # Rendering can use a shallower, lower-amplitude pass through the same
     # factual stack. This keeps the token lane strongly action-causal without
     # forcing RGB/geometry to consume an over-refined state. None preserves
@@ -237,6 +242,24 @@ class NativeWorldModelConfig:
             raise ValueError(
                 "factual_action_residual_scale must be finite and non-negative"
             )
+        if not isinstance(self.factual_v7_early_action_conditioning, bool):
+            raise ValueError("factual_v7_early_action_conditioning must be boolean")
+        if (
+            not isfinite(self.factual_v7_early_action_scale)
+            or self.factual_v7_early_action_scale < 0.0
+        ):
+            raise ValueError(
+                "factual_v7_early_action_scale must be finite and non-negative"
+            )
+        if self.factual_v7_early_action_conditioning:
+            if self.factual_v7_early_action_scale <= 0.0:
+                raise ValueError(
+                    "early factual action conditioning requires a positive scale"
+                )
+        elif self.factual_v7_early_action_scale != 0.0:
+            raise ValueError(
+                "early factual action scale must be zero when conditioning is disabled"
+            )
         if self.render_factual_action_residual_scale is not None and (
             not isfinite(self.render_factual_action_residual_scale)
             or self.render_factual_action_residual_scale < 0.0
@@ -331,6 +354,13 @@ class NativeWorldModelConfig:
             if self.factual_action_residual_scale != 1.0:
                 raise ValueError(
                     "original V7 RGB requires one unit-scale action query injection"
+                )
+            if (
+                not self.factual_v7_early_action_conditioning
+                or self.factual_v7_early_action_scale != 1.0
+            ):
+                raise ValueError(
+                    "original V7 RGB requires unit-scale action conditioning before the state trunk"
                 )
             if (
                 self.render_factual_dynamics_repeats is not None
@@ -3899,6 +3929,9 @@ class NativeWorldModel(nn.Module):
         )
         state = state + self.task_state(task_embedding)[:, None, None]
         state = self._encode_aux(state, aux_values, aux_mask, aux_type_ids)
+        # The factual path starts before policy/history bridges so candidate
+        # action changes cannot alter the already-computed policy prior.
+        factual_state_seed = state
 
         history, history_valid = self.history_action(
             fine_values=history_fine_action_values,
@@ -4036,15 +4069,11 @@ class NativeWorldModel(nn.Module):
             + self.factual_decoder_time(relative_world_time[:, cfg.T :])[:, :, None]
         )
         task_memory = self.state_norm(self.factual_task(task_embedding))[:, None]
-        observed_memory = prior_state[:, : cfg.T].reshape(
-            batch, cfg.T * cfg.P, cfg.state_hidden
-        )
-        decoder_memory_prefix = torch.cat((task_memory, observed_memory), dim=1)
         decoder_prefix_valid = torch.ones(
             batch,
             1 + cfg.T * cfg.P,
             dtype=torch.bool,
-            device=decoder_memory_prefix.device,
+            device=task_memory.device,
         )
 
         def encode_factual(
@@ -4078,6 +4107,7 @@ class NativeWorldModel(nn.Module):
             encoded: torch.Tensor,
             encoded_mask: torch.Tensor,
             summary: Optional[torch.Tensor],
+            observed_state: torch.Tensor,
             *,
             repeats: int,
             residual_scale: float,
@@ -4090,6 +4120,17 @@ class NativeWorldModel(nn.Module):
                 raise ValueError("factual action memory must align to [B,K,G]")
             if tuple(encoded_mask.shape) != tuple(encoded.shape[:3]):
                 raise ValueError("factual action mask must align to action memory")
+            if tuple(observed_state.shape) != (
+                batch,
+                cfg.T,
+                cfg.P,
+                cfg.state_hidden,
+            ):
+                raise ValueError("factual state memory must align to [B,T,P,D]")
+            observed_memory = observed_state.reshape(
+                batch, cfg.T * cfg.P, cfg.state_hidden
+            )
+            decoder_memory_prefix = torch.cat((task_memory, observed_memory), dim=1)
             action_memory = encoded.reshape(
                 batch, cfg.K * cfg.max_action_groups, cfg.state_hidden
             )
@@ -4143,10 +4184,52 @@ class NativeWorldModel(nn.Module):
             zero_summary_anchor = zero_summary.detach()
             centered_summary = factual_summary - zero_summary_anchor
             zero_centered_summary = zero_summary - zero_summary_anchor
+
+        def encode_v7_factual_state(
+            action_summary: Optional[torch.Tensor],
+        ) -> torch.Tensor:
+            if not cfg.factual_v7_early_action_conditioning:
+                return prior_state[:, : cfg.T]
+            if action_summary is None or tuple(action_summary.shape) != (
+                batch,
+                cfg.K,
+                cfg.state_hidden,
+            ):
+                raise ValueError(
+                    "early factual action summary must align to [B,K,D]"
+                )
+            # Exact V7 appends one physical-action token per future horizon to
+            # the observed state sequence before every encoder layer.  The V8
+            # trunk is factorized, so the equivalent shared-parameter form is
+            # to append the K centered command tokens to the spatial token set
+            # of every frame.  Spatial attention then lets every world patch
+            # read the command before the first block; the action tokens are
+            # removed again before the factual decoder.  This is materially
+            # different from adding a channel bias after the state trunk.
+            action_tokens = (
+                float(cfg.factual_v7_early_action_scale) * action_summary
+            )
+            factual_state = torch.cat(
+                (
+                    factual_state_seed[:, : cfg.T],
+                    action_tokens[:, None].expand(-1, cfg.T, -1, -1),
+                ),
+                dim=2,
+            )
+            for state_block in self.state_blocks:
+                factual_state = self._run(
+                    state_block,
+                    factual_state,
+                    enabled=cfg.activation_checkpointing,
+                )
+            return self.state_norm(factual_state[:, :, : cfg.P])
+
+        factual_observed_state = encode_v7_factual_state(centered_summary)
         factual_future = refine_factual(
             centered_encoded,
             factual_encoded_mask,
             centered_summary,
+            factual_observed_state,
             repeats=cfg.factual_dynamics_repeats,
             residual_scale=cfg.factual_action_residual_scale,
         )
@@ -4170,6 +4253,7 @@ class NativeWorldModel(nn.Module):
                 centered_encoded,
                 factual_encoded_mask,
                 centered_summary,
+                factual_observed_state,
                 repeats=render_repeats,
                 residual_scale=render_residual_scale,
             )
@@ -4197,10 +4281,14 @@ class NativeWorldModel(nn.Module):
             appearance_action_tokens = centered_encoded
             appearance_action_mask = factual_encoded_mask
         if compute_zero_action_control:
+            zero_factual_observed_state = encode_v7_factual_state(
+                zero_centered_summary
+            )
             zero_action_future = refine_factual(
                 zero_centered_encoded,
                 zero_encoded_mask,
                 zero_centered_summary,
+                zero_factual_observed_state,
                 repeats=cfg.factual_dynamics_repeats,
                 residual_scale=cfg.factual_action_residual_scale,
             )

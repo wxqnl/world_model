@@ -1297,6 +1297,8 @@ def _tiny_original_v7_rgb_config() -> NativeWorldModelConfig:
         dynamics_layers=2,
         factual_dynamics_repeats=1,
         factual_action_residual_scale=1.0,
+        factual_v7_early_action_conditioning=True,
+        factual_v7_early_action_scale=1.0,
         rgb_hidden=32,
         rgb_size=32,
         rgb_context_enabled=True,
@@ -1369,6 +1371,110 @@ def test_original_v7_rgb_future_action_changes_rgb_not_policy_or_action_free() -
     )
     assert not torch.allclose(factual["pred_tokens"], zero["pred_tokens"])
     assert not torch.allclose(factual["rgb"], zero["rgb"])
+
+
+def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    torch.manual_seed(213)
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
+    batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
+    block_inputs: list[torch.Tensor] = []
+    decoder_memories: list[torch.Tensor] = []
+
+    def record(_module, inputs) -> None:
+        block_inputs.append(inputs[0].detach().clone())
+
+    def record_decoder(_module, inputs) -> None:
+        decoder_memories.append(inputs[1].detach().clone())
+
+    handle = model.state_blocks[0].register_forward_pre_hook(record)
+    decoder_handle = model.dynamics_blocks[0].register_forward_pre_hook(
+        record_decoder
+    )
+    try:
+        factual = model(**batch)
+        zero_batch = dict(batch)
+        zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
+            batch["future_factual_fine_action_values"]
+        )
+        zero_batch["future_factual_coarse_action_values"] = torch.zeros_like(
+            batch["future_factual_coarse_action_values"]
+        )
+        zero = model(**zero_batch)
+    finally:
+        handle.remove()
+        decoder_handle.remove()
+
+    # Each forward has an action-free policy pass followed by the factual pass.
+    # The factual pass exposes K additional physical-action tokens before the
+    # first state block, matching the original V7 encoder conditioning point.
+    assert len(block_inputs) == 4
+    torch.testing.assert_close(block_inputs[0], block_inputs[2], rtol=0, atol=0)
+    assert block_inputs[0].shape[2] == cfg.P
+    assert block_inputs[0].shape[1] == cfg.T + cfg.K
+    assert block_inputs[1].shape[1] == cfg.T
+    assert block_inputs[3].shape[1] == cfg.T
+    assert block_inputs[1].shape[2] == cfg.P + cfg.K
+    assert block_inputs[3].shape[2] == cfg.P + cfg.K
+    assert not torch.allclose(
+        block_inputs[1][:, :, cfg.P :],
+        torch.zeros_like(block_inputs[1][:, :, cfg.P :]),
+    )
+    torch.testing.assert_close(
+        block_inputs[3][:, :, cfg.P :],
+        torch.zeros_like(block_inputs[3][:, :, cfg.P :]),
+        rtol=0,
+        atol=0,
+    )
+    assert len(decoder_memories) == 2
+    observed_memory = slice(1, 1 + cfg.T * cfg.P)
+    assert not torch.allclose(
+        decoder_memories[0][:, observed_memory],
+        decoder_memories[1][:, observed_memory],
+    )
+    torch.testing.assert_close(
+        factual["policy_action"], zero["policy_action"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        factual["action_free_pred_tokens"],
+        zero["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast is required")
+def test_original_v7_early_factual_path_checkpoint_backward_is_finite() -> None:
+    cfg = replace(_tiny_original_v7_rgb_config(), activation_checkpointing=True)
+    torch.manual_seed(215)
+    model = NativeWorldModel(cfg).cuda().train()
+    batch = {
+        name: value.cuda() if isinstance(value, torch.Tensor) else value
+        for name, value in _batch(cfg).items()
+    }
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size, device="cuda"
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool, device="cuda"
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = model(**batch, compute_zero_action_control=True)
+        loss = (
+            output["pred_tokens"].float().square().mean()
+            + output["zero_action_pred_tokens"].float().square().mean()
+            + output["rgb"].float().square().mean()
+        )
+    loss.backward()
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+    gradient = model.factual_action.fine_value.weight.grad
+    assert gradient is not None
+    assert gradient.abs().sum() > 0
 
 
 def test_original_v7_rgb_rejects_competing_appearance_or_alignment_lanes() -> None:
