@@ -2292,19 +2292,22 @@ def test_dual_path_inference_uses_predicted_appearance_without_future_targets() 
         model(**batch, appearance_teacher_ratio=0.5)
 
 
-def test_dual_path_1b_and_5b_profiles_are_materializable() -> None:
+def test_5b_v8_core_and_legacy_filename_are_the_same_safe_contract() -> None:
     root = Path(__file__).resolve().parents[1]
     counts = {}
-    for name in ("native_1b_dual_path.yaml", "native_5b_dual_path.yaml"):
+    for name in ("native_5b_v8_core.yaml", "native_5b_dual_path.yaml"):
         profile = yaml.safe_load((root / "configs/model" / name).read_text())
         with torch.device("meta"):
             model = build_world_model(profile)
         counts[name] = sum(parameter.numel() for parameter in model.parameters())
-        assert model.cfg.appearance_enabled is True
-        assert model.cfg.appearance_P == 256
+        assert model.cfg.appearance_enabled is False
+        assert model.cfg.rgb_original_v7_context is True
+        assert model.cfg.rgb_v7_high_frequency_refiner is True
+        assert model.cfg.factual_v7_early_action_conditioning is True
+        assert model.cfg.factual_action_residual_scale == 1.0
         assert counts[name] == profile["expected_parameter_count"]
-    assert 1_000_000_000 < counts["native_1b_dual_path.yaml"] < 2_000_000_000
-    assert counts["native_5b_dual_path.yaml"] > 5_000_000_000
+    assert counts["native_5b_v8_core.yaml"] == counts["native_5b_dual_path.yaml"]
+    assert counts["native_5b_v8_core.yaml"] > 5_000_000_000
 
 
 def test_v7_aligned_rgb_profile_is_isolated_and_materializable() -> None:

@@ -1,25 +1,26 @@
 # WM3D 5B 训练流程
 
-WM3D 5B 使用 `configs/model/native_5b_dual_path.yaml`，参数量为 `5,323,627,059`。
+WM3D V8 5B 使用 `configs/model/native_5b_v8_core.yaml`，参数量为 `5,440,933,496`。
 默认训练规模为 8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做
 8-way FSDP2 分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，
 不做梯度累积，global batch 为 256。
 
-该 profile 使用正式 dual-path RGB：P144 融合 geometry 主干继续负责 3D、动作和动力学，
-逐视角 P256 appearance latent 保留高频纹理，RGB decoder 同时接受两者。decoder hidden
-为 1536，每个上采样层含 2 个 residual blocks，并监督未来全部 16 帧。RGB 目标使用
-`configs/objective/stage0_native_dual_path.yaml`，同时启用 appearance MSE/cosine、L1、
-Charbonnier、spatial gradient 和冻结的 VGG LPIPS；不依赖 Wan。默认 site 文件已经填好
-model、encoder 和 objective，拉取代码后无需手工调整。训练只解码数据中实际有 RGB
-监督的相机，decoder 与 LPIPS 都按小块执行 activation checkpoint，因此不能为了省显存
-把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
+该 profile 与 1B 使用同一份 V8 语义：future physical action 在 state encoder 之前进入独立
+factual pass，并在两层独立 factual decoder 的 query/memory 中再次注入；policy/action-free
+trunk 不读取 future candidate。P144 factual future state 是运动与低频画面的唯一所有者，原始
+V7 ContextResidualPixelDecoder 直接消费它。额外的高频 refiner 只有受限的晚期细节作用，
+不使用绝对 future P256、P256 自回归、teacher forcing、copy-last 或 flow/RAFT 路线。
+decoder hidden 为 1536，并监督未来全部 16 帧。RGB 目标使用
+`configs/objective/stage0_v8_core.yaml`，复用已冻结的 V7 RGB/motion objective，不增加相互竞争的
+appearance teacher loss。默认 site 文件已经填好 model、encoder 和 objective，拉取代码后无需
+手工调整。训练只解码数据中实际有 RGB 监督的相机，decoder 与 LPIPS 都按小块执行 activation
+checkpoint，因此不能为了省显存把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
 [原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
 
-1B/5B 还共用 `factual_dynamics_repeats=2`：单个 factual-only dynamics block 共享权重
-执行两次，增强动作条件深度，但不增加参数，也不把 future action 写回 policy lane。
-两种规模也共用可导的 zero-future-action token 对照：真实动作与零动作分支复用同一个
-action-free trunk，并以相对排序梯度学习动作差异。训练期 RGB 保持原质量目标，动作因果
-响应只在 `appearance_teacher_ratio=0` 的验证中比较，避免 teacher future latent 污染对照。
+1B/5B 共用可导的 zero-future-action token 对照：真实动作与零动作分支复用同一个
+action-free trunk，并以相对排序梯度学习动作差异。zero anchor 数值严格为零且 stop-gradient，
+但共享 encoder 的 factual/zero 两支都能反传。训练和验证的 appearance teacher ratio 始终为零，
+因为 V8 Core 已彻底移除 absolute-P256 teacher 通路。
 
 1B 实测通过的 grouped-action 向量化实现由 1B/5B 共用，不改变动作时间语义、输出或梯度；
 5B 不需要单独维护另一份慢速实现。三套 H200 runtime 还将冻结感知网络的输入按 8 张图一组
@@ -43,12 +44,8 @@ episode visual cache、LRU 或 sidecar。完整 episode cache 与 `streaming_raw
 和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
 
 三套 runtime 都显式使用 validation micro batch 1、RGB decode chunk 2、RGB perceptual
-chunk 8，并从
-`appearance_teacher_start_ratio=1.0` 线性切换到
-`appearance_teacher_end_ratio=0.0`。`canary1k` 在前 750 step 完成切换，
-`validation100k` 与 `formal600k` 在前 10,000 step 完成切换。这样 decoder 先学习
-真值 appearance latent 到 RGB 的稳定重建，再进入完全由模型预测 latent 驱动的训练；
-appearance dynamics 在整个过程中持续接受 MSE 与 cosine 监督。
+chunk 8，并将 appearance teacher start/end ratio 都固定为 0。任何出现 absolute-P256、
+teacher forcing 或 appearance AR loss 的 runtime 都不属于本 V8 5B 合同，`doctor` 会在训练前拒绝。
 
 默认 global batch 为 256，因此 1K、100K 和 600K 分别对应约 25.6 万、2,560 万和
 1.536 亿个全局采样位置。
@@ -168,11 +165,11 @@ INCLUDE_AGIBOT_BETA=YES
 | OXE | 新增除 DROID 外的 55 个 source | 约 97.3 h 原始记录；约 264.6 万个 cache 帧 | 约 6–7 TB |
 | **默认组合合计** | **63 个训练 source，不含 AgiBotWorld Beta** | **约 3,227 h 原始记录** | **约 290 TB** |
 
-cache 估算按正式的三视角 P144 geometry + P256 appearance 表征、最高约 10 Hz 保留观测
+cache 估算按正式的三视角 P144 geometry 与 RGB/depth/point/camera 监督、最高约 10 Hz 保留观测
 计算。OXE 中许多数据是 20 Hz 或 50 Hz，因此会按真实时间戳降到最高约 10 Hz；动作和
 状态仍保留原始时间戳，不做固定频率插值。实际大小以 `plan` 对现场数据的输出为准。
 
-完整 dual-path cache 明显大于旧 geometry-only cache。把原始下载、临时文件、日志和
+完整 observation/geometry cache 明显大于只保存索引的 direct_raw 路径。把原始下载、临时文件、日志和
 checkpoint 一并计算后，完整 cache 方案建议准备约 **320–350 TB 总磁盘**。默认站点因此使用
 `direct_raw`，视觉 latent 不落盘；只有明确接受旧 LRU 状态机或现场确认容量充足时，才显式
 切到 `streaming_raw` 或 `episode_cache`。
@@ -225,8 +222,9 @@ archive、schema、adapter、inventory 命令整理。OXE 数据已经是 LeRobo
 ./run_wm3d.sh 5b plan "$SITE"
 ```
 
-输出应显示 `native_5b_dual_path`、64 个 rank，以及与所选配置一致的数据 source 数量，并且不再
-出现 `data_profile=WAITING`。同时确认 runtime 封存的模型参数量是 `5,323,627,059`、
+输出应显示 `native_5b_v8_exact_v7_factual_high_frequency_refiner`、64 个 rank，以及与所选配置一致的
+数据 source 数量，并且不再出现 `data_profile=WAITING`。同时确认 runtime 封存的模型参数量是
+`5,440,933,496`、
 模型 schema 是 `wm3d_native_world_model_v2`，RGB future indices 为 `0..15`；任一项不同都
 不要启动 64 卡训练。
 
@@ -298,7 +296,7 @@ worker 可重入。任务中断后用完全相同的 worker count 重跑，已�
 
 `direct_raw` 复用 task bank、episode/window metadata 和 grouped normalization，但不创建或
 读取 episode visual payload。每个 rank 只随机访问当前 `T+K` observation ordinal，在线一次
-生成 P144 geometry、逐视角 P256 layer-4 appearance 以及 depth/point/camera 监督。Frozen
+生成 P144 geometry 以及 RGB/depth/point/camera 监督，不提取 absolute future P256。Frozen
 teacher 不进入 optimizer、FSDP 或 checkpoint；推理时仍由 WM3D 自己的 heads 输出 RGB、
 depth、point、camera、action 和 state。
 
@@ -313,7 +311,7 @@ DIRECT_PREFETCH_WINDOWS=8
 DIRECT_VIDEO_INDEX_CACHE_ASSETS=128
 DIRECT_ENCODE_CHUNK_ROWS=32
 DIRECT_MINIMUM_CHUNK_ROWS=4
-DIRECT_APPEARANCE_FEATURE_LAYER=4
+DIRECT_APPEARANCE_FEATURE_LAYER=-1
 ```
 
 准备和启动命令：
@@ -381,7 +379,7 @@ steps 减半，但不是 8 倍墙钟加速。当前 `formal600k` 没有减少 st
 | 100K | 6–9 天 |
 | 600K 正式训练 | 40–55 天，通常按约 45 天安排，资源窗口预留 55 天 |
 
-`streaming_raw` 去掉的是约 290 TB 的完整 dual-path 视觉 cache，原始数据仍需保留。当前上游规模下，
+`streaming_raw` 去掉的是约 290 TB 的完整 observation/geometry 视觉 cache，原始数据仍需保留。当前上游规模下，
 默认 OXE 组合的原始数据预计约 15–20 TB。总磁盘按下面的项目规划：
 
 | 项目 | 预计空间 | 使用阶段 |

@@ -1,7 +1,7 @@
 # WM3D direct_raw：无视觉 latent cache 的正式训练路径
 
 `direct_raw` 是 1B 和 5B 共用的正式数据路径。它保留 WM3D 的原生 3D
-目标和双通路 RGB 结构，但不再创建或读取 episode 级 VGGT latent cache、
+目标和 V8 Core RGB 结构，但不再创建或读取 episode 级 VGGT latent cache、
 streaming LRU 或 sidecar。
 
 ## 数据流
@@ -11,8 +11,7 @@ streaming LRU 或 sidecar。
 1. 从已经封存的 episode/window 元数据取出同一个 `T+K` observation ordinal；
 2. 对每个真实相机只随机访问这些 RGB 帧；
 3. 在 rank 内用 frozen VGGT 编码这一窗口；
-4. P64 geometry token 进入 3D 主干，逐视角 P256 layer-4 appearance token
-   进入 RGB 通路；
+4. P64 geometry token 进入 factual 3D/运动主干并直接驱动原始 V7 RGB decoder；
 5. 正常运行 WM3D 的 RGB、depth、point、camera、action 和 state loss。
 
 视频层先使用 Decord 随机访问；遇到 Decord 不支持的 AV1 等视频时，自动使用
@@ -34,7 +33,7 @@ PyAV 从前一个 keyframe seek 到最后一个目标帧。两种路径都按视
 - frozen VGGT encoder；
 - 训练期 VGGT depth/point/camera teacher heads，用于产生不变的监督目标；
 - WM3D 自己的 RGB/depth/point/camera/action/state 输出 heads；
-- P64 geometry 主干和逐视角 P256 appearance 通路。
+- P64 factual geometry/运动主干、原始 V7 RGB decoder 与受限晚期高频 refiner。
 
 因此，direct 并不会让模型失去 depth、point 或 camera 输出。推理时不需要运行
 VGGT 的 teacher decoder heads；最终输出仍由 WM3D 自己的 heads 产生。
@@ -75,8 +74,8 @@ Canary 通过后，用新的 site 文件执行 `formal100k`。不要复用 canar
 ./run_wm3d.sh 5b train /data/wm3d/control/direct_5b_canary.env
 ```
 
-5B 使用同一实现，只把 geometry grid 改为模型 profile 的 P144；appearance 仍是
-逐视角 P256 layer 4。不存在单独的 5B cache 实现。
+5B 使用同一实现，只把 geometry grid 改为模型 profile 的 P144。5B 同样不提取或训练
+absolute future P256；不存在单独的 5B cache 实现。
 
 ## 关键参数
 
@@ -90,7 +89,8 @@ Canary 通过后，用新的 site 文件执行 `formal100k`。不要复用 canar
   避免嵌套线程争抢 CPU 和视频盘。
 - `DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1`：只在内存中保留近期完成 resize 的
   uint8 相机行；相邻 window 重用后立即按字节 LRU 淘汰，不写视觉 latent。
-- `DIRECT_APPEARANCE_FEATURE_LAYER=4`：清晰 RGB 路径使用浅层逐视角特征。
+- `DIRECT_APPEARANCE_FEATURE_LAYER=-1`：V8 Core 禁用 absolute-P256 appearance 提取；
+  清晰度由 factual P64 驱动的受限高频 refiner 学习。
 
 ## 稳定性边界
 

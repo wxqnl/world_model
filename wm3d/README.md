@@ -8,13 +8,12 @@ profile。
 ```mermaid
 flowchart LR
   O["多视角观测 + 真实时间戳"] --> G["融合 geometry tokens"]
-  O --> V["逐视角 P256 appearance"]
   G --> C["Native 3D core"]
-  A["source-native 已执行动作"] --> C
+  A["source-native 已执行动作"] --> F["独立 factual future pass"]
+  C --> F
   S["current state + embodiment"] --> H["统一 action policy"]
-  C --> W["未来 depth / point / pose"]
-  C --> R["原生 RGB decoder"]
-  V --> R
+  F --> W["未来 depth / point / pose"]
+  F --> R["V7 motion decoder + bounded detail refiner"]
   C --> H
   W --> P["Stage1 action-blind planner"]
 ```
@@ -25,9 +24,10 @@ flowchart LR
 - dynamics 使用真实执行过的 source-native fine command；policy 与 factual dynamics
   state 分离，避免未来动作泄漏。
 - grouped action/current-state ABI 表达单臂、双臂、底盘、腰部、头部和可变维度。
-- 3D 主干使用融合后的 geometry tokens；RGB 额外保留逐视角 P256 appearance latent，
-  并由 3D future state 约束。RGB、depth、point、pose 都是显式监督和显式输出，
-  不存在 VLA/Wan action 或视频生成旁路。
+- 3D 主干使用融合后的 geometry tokens；future physical action 在 state encoder 前进入独立
+  factual pass，并在 factual decoder 再次注入。RGB 由 factual future state 直接驱动原始 V7
+  motion decoder，受限高频 refiner 只补晚期细节，不使用 absolute future P256、copy-last 或
+  future target。RGB、depth、point、pose 都是显式监督和显式输出。
 - Stage0 是联合世界动力学与 action policy 预训练；Stage1 冻结 Stage0，用真实 simulator
   candidates 和 native 3D future evidence 学习候选排序。
 - DDP/FSDP2 共用训练入口；DCP 支持完整编号 checkpoint、独立进程 exact resume 和受控
@@ -97,14 +97,15 @@ ABI。旧 residual 只能由 `legacy-residual-import` 审计并转换，不能�
 
 5B 集群流程默认使用完整 OXE collection，并保留 DROID、Bridge、RoboCasa365 和
 AgiBotWorld2026。AgiBotWorld Beta 默认关闭，可在生成 5B 数据模板前显式启用。具体命令见
-[WM3D 5B 训练流程](docs/WM3D_5B_SCALING.md)。
+[WM3D 5B 训练流程](docs/WM3D_5B_SCALING.md)。第一次启动当前 V8 5B 前还应核对
+[V8 5B 训练交接](docs/WM3D_V8_5B_HANDOFF.md)。
 
 单机 8×H100 的 1B 新训练可使用全 OXE 按需缓存路径：保留 DROID、Bridge 和三类
 RoboCasa，加入去重后的 55 个 OXE source，不使用旧 PCA token cache。数据容量、1K canary、
 100K 正式训练与结果检查见
 [WM3D 1B 全 OXE 按需缓存训练](docs/WM3D_1B_STREAMING.md)。
-默认站点配置已经选择 P64 geometry + 逐视角 P256 appearance 的 dual-path 模型；
-无需操作者再手工替换 RGB 配置。
+默认站点配置已经选择 V8 Core：P64 factual future state 驱动原始 V7 RGB motion decoder，
+高频 refiner 只补受限细节；无需操作者再手工替换 RGB 配置。
 
 ## 真实小样本验收
 

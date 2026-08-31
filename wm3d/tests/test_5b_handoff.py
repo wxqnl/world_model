@@ -17,69 +17,72 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize(
-    "profile,total_steps,checkpoint_steps,checkpoint_interval,teacher_decay_steps",
+    "profile,total_steps,checkpoint_steps,checkpoint_interval",
     [
-        ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000, 750),
-        ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000, 10_000),
+        ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000),
+        ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000),
         (
             "h200_64_fsdp2.yaml",
             600_000,
             [1_000, 5_000, 20_000],
             20_000,
-            10_000,
         ),
     ],
 )
-def test_5b_presets_match_dual_path_5b_and_64_h200(
+def test_5b_presets_match_v8_core_5b_and_64_h200(
     profile: str,
     total_steps: int,
     checkpoint_steps: list[int],
     checkpoint_interval: int,
-    teacher_decay_steps: int,
 ) -> None:
     model = yaml.safe_load(
-        (ROOT / "configs/model/native_5b_dual_path.yaml").read_text()
+        (ROOT / "configs/model/native_5b_v8_core.yaml").read_text()
     )
     objective = yaml.safe_load(
-        (ROOT / "configs/objective/stage0_native_dual_path.yaml").read_text()
+        (ROOT / "configs/objective/stage0_v8_core.yaml").read_text()
     )
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_656_230_792
+    assert model["expected_parameter_count"] == 5_440_933_496
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
-    assert model["model"]["appearance_P"] == 256
-    assert model["model"]["appearance_autoregressive_steps"] == 2
+    assert model["model"]["appearance_enabled"] is False
     assert model["model"]["rgb_hidden"] == 1536
-    assert model["model"]["rgb_res_blocks"] == 2
+    assert model["model"]["rgb_res_blocks"] == 1
     assert model["model"]["rgb_decode_chunk_size"] == 2
     assert model["model"]["rgb_decode_indices"] == list(range(16))
     assert model["model"]["dynamics_layers"] == 2
     assert model["model"]["factual_dynamics_repeats"] == 1
-    assert model["model"]["factual_action_residual_scale"] == 0.3
+    assert model["model"]["factual_action_residual_scale"] == 1.0
+    assert model["model"]["factual_v7_early_action_conditioning"] is True
+    assert model["model"]["factual_v7_early_action_scale"] == 1.0
     assert "render_factual_dynamics_repeats" not in model["model"]
     assert "render_factual_action_residual_scale" not in model["model"]
-    assert model["model"]["appearance_action_residual_scale"] == 0.3
+    assert model["model"]["appearance_action_residual_scale"] == 0.0
     assert model["model"]["rgb_context_enabled"] is True
+    assert model["model"]["rgb_original_v7_context"] is True
+    assert model["model"]["rgb_v7_high_frequency_refiner"] is True
+    assert model["model"]["rgb_v7_high_frequency_scale"] == 0.0625
     assert model["model"]["rgb_context_residual_scale"] == 0.75
     assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
-    assert model["model"]["rgb_context_appearance_delta_scale"] == 1.0
-    assert objective["objective"]["rgb_l1"] == 0.5
-    assert objective["objective"]["rgb_charbonnier"] == 1.0
+    assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
+    assert objective["objective"]["rgb_l1"] == 1.2
+    assert objective["objective"]["rgb_charbonnier"] == 0.0
     assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
     assert objective["objective"]["action_counterfactual_token_advantage"] == 1.0
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
-    assert objective["objective"]["rgb_perceptual"] == 0.1
+    assert objective["objective"]["rgb_perceptual"] == 0.55
+    assert objective["objective"]["rgb_gradient"] == 0.08
     assert objective["objective"]["rgb_motion_l1"] == 1.0
     assert objective["objective"]["rgb_motion_bce"] == 0.03
     assert objective["objective"]["rgb_motion_dice"] == 0.03
     assert objective["objective"]["appearance_l1"] == 0.0
-    assert objective["objective"]["appearance_teacher_l1"] == 1.0
-    assert objective["objective"]["appearance_autoregressive_l1"] == 1.0
-    assert objective["objective"]["appearance_motion_l1"] == 0.5
+    assert objective["objective"]["appearance_teacher_l1"] == 0.0
+    assert objective["objective"]["appearance_autoregressive_l1"] == 0.0
+    assert objective["objective"]["appearance_motion_l1"] == 0.0
     assert objective["objective"]["appearance_mse"] == 0.0
     assert objective["objective"]["appearance_cosine"] == 0.0
     assert objective["objective"]["appearance_motion_mse"] == 0.0
@@ -97,10 +100,11 @@ def test_5b_presets_match_dual_path_5b_and_64_h200(
     assert runtime["train"]["checkpoint_interval"] == checkpoint_interval
     assert runtime["train"]["rgb_decode_chunk_size"] == 2
     assert runtime["train"]["rgb_perceptual_chunk_size"] == 8
-    assert runtime["train"]["appearance_teacher_start_ratio"] == 1.0
+    assert runtime["train"]["appearance_teacher_start_ratio"] == 0.0
     assert runtime["train"]["appearance_teacher_end_ratio"] == 0.0
-    assert runtime["train"]["appearance_validation_three_way"] is True
-    assert runtime["train"]["appearance_teacher_decay_steps"] == teacher_decay_steps
+    assert runtime["train"]["appearance_validation_three_way"] is False
+    assert runtime["train"]["appearance_teacher_decay_steps"] == 1
+    assert runtime["train"]["appearance_teacher0_every_steps"] == 2
 
 
 def test_5b_site_init_is_no_clobber(tmp_path: Path) -> None:
@@ -262,7 +266,7 @@ def test_5b_lock_passes_exact_license_confirmation() -> None:
     assert "--confirm-licenses YES_I_HAVE_ACCEPTED_THE_UPSTREAM_LICENSES" in wrapper
 
 
-def test_5b_site_defaults_to_oxe_and_direct_p144_p256() -> None:
+def test_5b_site_defaults_to_oxe_and_direct_v8_p144() -> None:
     site = (ROOT / "configs/cluster/h200_5b.env.example").read_text()
     assert "NNODES=8" in site
     assert "GPUS_PER_NODE=8" in site
@@ -280,14 +284,12 @@ def test_5b_site_defaults_to_oxe_and_direct_p144_p256() -> None:
     assert "DIRECT_VIDEO_INDEX_CACHE_ASSETS=128" in site
     assert "DIRECT_ENCODE_CHUNK_ROWS=32" in site
     assert "DIRECT_MINIMUM_CHUNK_ROWS=4" in site
-    assert "DIRECT_APPEARANCE_FEATURE_LAYER=4" in site
+    assert "DIRECT_APPEARANCE_FEATURE_LAYER=-1" in site
     assert "STREAMING_LRU_ROOT=" not in site
     assert "STREAMING_LRU_GIB_PER_RANK=" not in site
-    assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
-    assert (
-        "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
-    )
-    assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_v8_core.yaml" in site
+    assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144.yaml" in site
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_core.yaml" in site
     assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
     assert "DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe.template.yaml" in site
 
@@ -297,10 +299,8 @@ def test_5b_direct_template_has_optimized_runtime_defaults() -> None:
     assert "WM3D_DATA_MODE=direct_raw" in site
     assert "DIRECT_DECODE_WORKERS=1" in site
     assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
-    assert "MODEL_PROFILE=configs/model/native_5b_dual_path.yaml" in site
-    assert (
-        "ENCODER_CONTRACT=configs/encoder/vggt_native_p144_appearance_p256.yaml" in site
-    )
+    assert "MODEL_PROFILE=configs/model/native_5b_v8_core.yaml" in site
+    assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144.yaml" in site
 
 
 def _oxe_info(action_dim: int, state_dim: int, views: int = 1) -> dict:

@@ -46,10 +46,11 @@ train:
   checkpoint_steps: [100, 500]
   rgb_decode_chunk_size: 2
   rgb_perceptual_chunk_size: 8
-  appearance_teacher_start_ratio: 1.0
+  appearance_teacher_start_ratio: 0.0
   appearance_teacher_end_ratio: 0.0
-  appearance_teacher_decay_steps: 750
-  appearance_validation_three_way: true
+  appearance_teacher_decay_steps: 1
+  appearance_teacher0_every_steps: 2
+  appearance_validation_three_way: false
 optimizer:
   name: adamw
   peak_lr: 0.00012

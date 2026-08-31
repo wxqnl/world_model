@@ -86,6 +86,80 @@ require_file() {
   [[ -f "${value}" && ! -L "${value}" ]] || die "${label} 不存在、不是普通文件或是符号链接：${value}"
 }
 
+validate_5b_v8_contract() {
+  [[ "${SCALE}" == 5b ]] || return 0
+  "${PYTHON_BIN}" - "${MODEL_PROFILE}" "${ENCODER_CONTRACT}" "${OBJECTIVE_PROFILE}" <<'PY'
+from pathlib import Path
+import sys
+
+import torch
+import yaml
+
+from wm3d.models.model_factory import build_world_model, validate_model_profile
+
+model = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+encoder = yaml.safe_load(Path(sys.argv[2]).read_text(encoding="utf-8"))
+objective = yaml.safe_load(Path(sys.argv[3]).read_text(encoding="utf-8"))
+validate_model_profile(model)
+cfg = model["model"]
+required = {
+    "T": 24,
+    "P": 144,
+    "K": 16,
+    "policy_task_modulation": True,
+    "policy_calibration_conditioning": True,
+    "dynamics_layers": 2,
+    "factual_dynamics_repeats": 1,
+    "factual_action_residual_scale": 1.0,
+    "factual_v7_early_action_conditioning": True,
+    "factual_v7_early_action_scale": 1.0,
+    "appearance_enabled": False,
+    "rgb_context_enabled": True,
+    "rgb_original_v7_context": True,
+    "rgb_v7_high_frequency_refiner": True,
+    "rgb_v7_high_frequency_scale": 0.0625,
+    "rgb_context_appearance_delta_scale": 0.0,
+}
+wrong = {
+    key: (cfg.get(key), expected)
+    for key, expected in required.items()
+    if cfg.get(key) != expected
+}
+if wrong:
+    raise SystemExit(f"5B V8 model contract mismatch: {wrong}")
+if encoder.get("token_grid") != 12 or encoder.get("target_rgb_size") != 384:
+    raise SystemExit("5B V8 encoder must be P144/384px")
+if "appearance_token_grid" in encoder or "appearance_feature_layer" in encoder:
+    raise SystemExit("5B V8 production encoder must not extract absolute P256")
+weights = objective.get("objective", {})
+required_weights = {
+    "rgb_l1": 1.2,
+    "rgb_perceptual": 0.55,
+    "rgb_gradient": 0.08,
+    "rgb_charbonnier": 0.0,
+    "rgb_motion_l1": 1.0,
+    "appearance_l1": 0.0,
+    "appearance_teacher_l1": 0.0,
+    "appearance_autoregressive_l1": 0.0,
+    "action_counterfactual_token_advantage": 1.0,
+    "action_counterfactual_token_margin": 0.005,
+}
+wrong_weights = {
+    key: (weights.get(key), expected)
+    for key, expected in required_weights.items()
+    if weights.get(key) != expected
+}
+if wrong_weights:
+    raise SystemExit(f"5B V8 objective mismatch: {wrong_weights}")
+with torch.device("meta"):
+    built = build_world_model(model)
+print(
+    "5B V8 contract passed: "
+    f"parameters={sum(parameter.numel() for parameter in built.parameters()):,}"
+)
+PY
+}
+
 validate_preset() {
   if [[ "${SCALE}" == 1b ]]; then
     case "$1" in
@@ -165,7 +239,7 @@ load_site() {
   DIRECT_VIDEO_INDEX_CACHE_ASSETS=${DIRECT_VIDEO_INDEX_CACHE_ASSETS:-128}
   DIRECT_ENCODE_CHUNK_ROWS=${DIRECT_ENCODE_CHUNK_ROWS:-32}
   DIRECT_MINIMUM_CHUNK_ROWS=${DIRECT_MINIMUM_CHUNK_ROWS:-4}
-  DIRECT_APPEARANCE_FEATURE_LAYER=${DIRECT_APPEARANCE_FEATURE_LAYER:-4}
+  DIRECT_APPEARANCE_FEATURE_LAYER=${DIRECT_APPEARANCE_FEATURE_LAYER:--1}
   DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=${DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK:-1}
   [[ "${DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK}" =~ ^[0-9]+$ ]] ||     die "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK 必须是非负整数"
   WM3D_DIRECT_PREPARED_ROW_CACHE_BYTES_PER_RANK=$((
@@ -311,6 +385,7 @@ case "${action}" in
     token_mode=$(stat -c '%a' "${HF_TOKEN_FILE}")
     (( (8#${token_mode} & 8#077) == 0 )) || die "HF token 禁止 group/world 权限；推荐 chmod 600"
     [[ -x "${PYTHON_BIN}" ]] || die "Python 环境不存在：${PYTHON_BIN}；先运行 ENV_DIR=... ./run_wm3d.sh env"
+    validate_5b_v8_contract
     "${PYTHON_BIN}" -m pip check
     "${PYTHON_BIN}" - "${MODEL_PROFILE}" "${RUNTIME_PROFILE}" <<'PY'
 from pathlib import Path
@@ -537,6 +612,7 @@ EOF
   runtime)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     require_file "environment receipt" "${ENV_DIR}/environment_receipt.json"
+    validate_5b_v8_contract
     mkdir -p "${CONTROL_ROOT}" "${RUN_ROOT}"
     common=(runtime --model "${MODEL_PROFILE}" --data "${DATA_PROFILE}" \
       --runtime "${RUNTIME_PROFILE}" --objective "${OBJECTIVE_PROFILE}" \
