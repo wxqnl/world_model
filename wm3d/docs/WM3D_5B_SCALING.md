@@ -1,192 +1,96 @@
-# WM3D 5B 训练流程
+# WM3D V8 5B 训练交付手册
 
-WM3D V8 5B 使用 `configs/model/native_5b_v8_core.yaml`，参数量为 `5,440,933,496`。
-默认训练规模为 8 个节点、每节点 8 张 H200，共 64 张 GPU。模型在每个节点内做
-8-way FSDP2 分片，8 个节点组成 data-parallel replicas。每张卡的 micro batch 为 4，
-不做梯度累积，global batch 为 256。
+本文只描述当前正式方案。训练操作员按顺序执行，不修改模型结构、数据模式、loss、batch、
+动作语义或 runtime profile。
 
-该 profile 与 1B 使用同一份 V8 语义：future physical action 在 state encoder 之前进入独立
-factual pass，并在两层独立 factual decoder 的 query/memory 中再次注入；policy/action-free
-trunk 不读取 future candidate。P144 factual future state 是运动与低频画面的唯一所有者，原始
-V7 ContextResidualPixelDecoder 直接消费它。额外的高频 refiner 只有受限的晚期细节作用，
-不使用绝对 future P256、P256 自回归、teacher forcing、copy-last 或 flow/RAFT 路线。
-decoder hidden 为 1536，并监督未来全部 16 帧。RGB 目标使用
-`configs/objective/stage0_v8_core.yaml`，复用已冻结的 V7 RGB/motion objective，不增加相互竞争的
-appearance teacher loss。默认 site 文件已经填好 model、encoder 和 objective，拉取代码后无需
-手工调整。训练只解码数据中实际有 RGB 监督的相机，decoder 与 LPIPS 都按小块执行 activation
-checkpoint，因此不能为了省显存把 `rgb_decode_indices` 改回旧的 4 帧。完整结构见
-[原生 RGB 解码器](WM3D_NATIVE_RGB.md)。
+## 1. 固定训练合同
 
-1B/5B 共用可导的 zero-future-action token 对照：真实动作与零动作分支复用同一个
-action-free trunk，并以相对排序梯度学习动作差异。zero anchor 数值严格为零且 stop-gradient，
-但共享 encoder 的 factual/zero 两支都能反传。训练和验证的 appearance teacher ratio 始终为零，
-因为 V8 Core 已彻底移除 absolute-P256 teacher 通路。
+- GitHub 分支：`v8`
+- 模型：`configs/model/native_5b_v8_core.yaml`
+- 参数量：`5,440,933,496`
+- 视觉 encoder：`configs/encoder/vggt_native_p144.yaml`
+- objective：`configs/objective/stage0_v8_core.yaml`
+- 数据访问：`direct_raw`
+- 集群：8 个节点，每节点 8 张 H200，共 64 张 GPU
+- 分布式：节点内 8-way FSDP2，节点间 data parallel
+- micro batch：每卡 4
+- global batch：256
+- canary：1,000 steps
+- 正式训练：600,000 steps，必须 fresh step 0 启动
 
-1B 实测通过的 grouped-action 向量化实现由 1B/5B 共用，不改变动作时间语义、输出或梯度；
-5B 不需要单独维护另一份慢速实现。三套 H200 runtime 还将冻结感知网络的输入按 8 张图一组
-计算，减少小 kernel 与 Python 调度开销，同时保留 RGB decoder 的显存安全分块。
+V8 的 future physical action 在 state encoder 前进入独立 factual pass，并再次进入两层独立
+factual decoder。P144 factual future state 负责运动和低频 RGB；原始 V7
+`ContextResidualPixelDecoder` 负责 RGB 主输出；受限高频 refiner 只补充晚期细节。
+policy/action-free trunk 不读取 future candidate。当前合同不使用 absolute future P256、
+P256 自回归、teacher forcing、copy-last、flow 或 RAFT。
 
-direct_raw 的批量解码加速同样由 1B/5B 共用：一个 micro batch 内属于同一 task/episode 的
-window 先合并，按有序唯一 observation 行只做一次视频解码和 resize，再严格重建原来的每个
-window。lookahead 在当前 batch 被消费后才补入 future，避免尚未释放的 future 占满有界队列；
-每 rank 默认只开一个 prefetch worker，避免并发重复解码重叠帧和随机读取竞争。这些改动只减少
-重复的数据准备，不改变采样顺序、输入张量、VGGT 输出、模型、loss、optimizer 或 checkpoint
-合同。
+以下文件由 site 自动指定，不要手工换成旧配置：
 
-整个流程按数据下载、数据整理、数据访问准备、1K 集群验证和正式训练依次进行。当前默认
-`direct_raw` 只解码 sealed `T+K` window，并在每个 rank 内在线运行 frozen VGGT；不生成
-episode visual cache、LRU 或 sidecar。完整 episode cache 与 `streaming_raw` 仅保留为显式
-兼容选项。命令会自动记录和校验中间产物，使用者只需要指定数据目录、数据许可、模型目录
-和集群地址。
-
-## 1. 训练预设
-
-| preset | optimizer steps | 用途 |
-|---|---:|---|
-| `canary1k` | 1,000 | 验证 64 卡通信、训练、保存、恢复和评测 |
-| `validation100k` | 100,000 | 可选的中程训练，不是正式训练前置条件 |
-| `formal600k` | 600,000 | 正式训练 |
-
-三套预设使用同一个 5B 模型、data profile 和数据访问方式。它们各自生成独立的 runtime
-和 checkpoint，不能把不同 preset 的 checkpoint 混在一起恢复。
-
-三套 runtime 都显式使用 validation micro batch 1、RGB decode chunk 2、RGB perceptual
-chunk 8，并将 appearance teacher start/end ratio 都固定为 0。任何出现 absolute-P256、
-teacher forcing 或 appearance AR loss 的 runtime 都不属于本 V8 5B 合同，`doctor` 会在训练前拒绝。
-
-默认 global batch 为 256，因此 1K、100K 和 600K 分别对应约 25.6 万、2,560 万和
-1.536 亿个全局采样位置。
-
-## 2. 服务器与存储
-
-默认集群配置：
-
-- 8 个 8×H200 SXM 节点，节点内 NVLink；
-- 400 Gb/s InfiniBand；
-- Linux x86_64、Python 3.10、CUDA 12.8；
-- 所有节点都能访问代码、原始数据、cache 和训练输出；底层可以是共享存储，也可以是各节点
-  独立存储并由站点配置映射；
-- 数据盘应能持续供给训练和 cache 构建所需的读写吞吐；
-- 按第 4.1 节的总量规划磁盘，下载前用 `df -h` 确认剩余容量。
-
-克隆项目：
-
-```bash
-git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
-cd world_model/wm3d
+```text
+configs/model/native_5b_v8_core.yaml
+configs/encoder/vggt_native_p144.yaml
+configs/encoder/task_qwen3_vl_embedding_2b.yaml
+configs/objective/stage0_v8_core.yaml
+configs/runtime/h200_64_fsdp2_canary1k.yaml
+configs/runtime/h200_64_fsdp2.yaml
 ```
 
-创建 1K 验证站点配置和 Python 环境：
+## 2. 启动前准备
+
+要求登录节点能访问 GitHub、Python package index 和 Hugging Face。计算节点可以离线，但必须
+共享 `/data/wm3d`、模型目录、原始数据和训练输出。集群必须具备 400 Gb/s InfiniBand，节点内
+8 张 H200 必须组成正常的 NVLink clique。
+
+数据负责人需要提前把已审计的数据控制包完整放到：
+
+```text
+/data/wm3d/control
+```
+
+其中必须包含 source lock、上游 file-list receipt、正式 data profile、adapter audit receipt、
+source inventory 和 manifest。训练操作员不修改 adapter，也不自行解释 action/state 字段。
+只有原始数据、没有正式 data profile 时不能启动训练。
+
+固定模型资产路径：
+
+```text
+/data/models/vggt/a288dd0f14786c93483e45524328726ab7b1b4ce
+/data/models/huggingface/facebook-VGGT-1B/860abec7937da0a4c03c41d3c269c366e82abdf9
+/data/models/huggingface/Qwen3-VL-Embedding-2B/9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
+```
+
+## 3. 拉取代码并创建环境
+
+在共享登录节点执行：
 
 ```bash
+cd /data
+git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
+cd /data/world_model/wm3d
+
 SITE=/data/wm3d/control/5b_canary1k.env
 ./run_wm3d.sh 5b init canary1k "$SITE" direct_raw
-vim "$SITE"
-./run_wm3d.sh 5b env "$SITE"
-./run_wm3d.sh 5b data-template "$SITE"
-./run_wm3d.sh 5b doctor "$SITE"
-./run_wm3d.sh 5b plan "$SITE"
+sed -i 's/^ACCEPT_DATA_LICENSES=NO$/ACCEPT_DATA_LICENSES=YES/' "$SITE"
+sed -i 's/REQUIRED_MASTER_ADDR/127.0.0.1/' "$SITE"
 ```
 
-`init` 的最后一个参数明确选择数据访问方式，可选 `direct_raw`、`streaming_raw` 或
-`episode_cache`；省略时仍默认 `direct_raw`。选择会直接写入 site 文件，后续
-`canary1k`、`validation100k` 和 `formal600k` 使用完全相同的入口。
-
-站点文件至少需要修改：
+site 已固定为以下设置，不要打开文件改成其他路径或配置：
 
 ```bash
 WORK_ROOT=/data/wm3d
 HF_TOKEN_FILE=/data/secrets/huggingface_token
 ACCEPT_DATA_LICENSES=YES
+INCLUDE_AGIBOT_2026=YES
 INCLUDE_AGIBOT_BETA=NO
-MASTER_ADDR=TRAIN_NODE_0
-WM3D_VGGT_SOURCE_ROOT=/data/models/vggt
-WM3D_VGGT_MODEL_SNAPSHOT=/data/models/facebook-VGGT-1B
-QWEN3_VL_EMBEDDING_PATH=/data/models/Qwen3-VL-Embedding-2B
+WM3D_VGGT_SOURCE_ROOT=/data/models/vggt/a288dd0f14786c93483e45524328726ab7b1b4ce
+WM3D_VGGT_MODEL_SNAPSHOT=/data/models/huggingface/facebook-VGGT-1B/860abec7937da0a4c03c41d3c269c366e82abdf9
+QWEN3_VL_EMBEDDING_PATH=/data/models/huggingface/Qwen3-VL-Embedding-2B/9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
 ```
 
-默认值已经设置为 `NNODES=8`、`GPUS_PER_NODE=8`，不需要再改 world size。
+site 中的 `127.0.0.1` 只供登录节点执行本地检查。第 6、7 节启动训练时会用 Slurm 分配到的
+第一台训练节点覆盖它。
 
-## 3. 数据准备
-
-### 3.1 默认数据组合
-
-默认 `DATA_FAMILY=public_robot_oxe`。项目保留 DROID、Bridge、RoboCasa365 和
-AgiBotWorld2026，并加入完整的
-[LeRobot Open X-Embodiment collection](https://huggingface.co/collections/lerobot/open-x-embodiment-68de658d8b544a43be4c6687)。
-AgiBotWorld Beta 默认关闭。
-
-| 数据源 | 公开仓库 | 默认状态 | 规划时长 | `$RAW_ROOT/` 下的目录 |
-|---|---|---|---:|---|
-| DROID | [`lerobot/droid_1.0.1`](https://huggingface.co/datasets/lerobot/droid_1.0.1) | 使用 | 约 350 h | `droid` |
-| Bridge V2 | [`ember-lab-berkeley/bridge_v2`](https://huggingface.co/datasets/ember-lab-berkeley/bridge_v2) | 使用 | 约 100 h | `bridge` |
-| RoboCasa365 Atomic | [`ember-lab-berkeley/robocasa365-pretrain-atomic`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-atomic) | 使用 | 约 21 h | `atomic` |
-| RoboCasa365 Composite | [`ember-lab-berkeley/robocasa365-pretrain-composite`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-composite) | 使用 | 约 383 h | `composite` |
-| RoboCasa365 MG | [`ember-lab-berkeley/robocasa365-pretrain-mg`](https://huggingface.co/datasets/ember-lab-berkeley/robocasa365-pretrain-mg) | 使用 | 约 1,615 h | `mg` |
-| AgiBotWorld2026 真机数据 | [`agibot-world/AgiBotWorld2026`](https://huggingface.co/datasets/agibot-world/AgiBotWorld2026) | 使用 | 约 661 h | `agibot_world_2026` |
-| OXE | [LeRobot OXE collection](https://huggingface.co/collections/lerobot/open-x-embodiment-68de658d8b544a43be4c6687) | 使用，DROID 去重 | 当前约 97.3 h | `oxe/<dataset>` |
-| AgiBotWorld Beta | [`agibot-world/AgiBotWorld-Beta`](https://huggingface.co/datasets/agibot-world/AgiBotWorld-Beta) | 可选，默认关闭 | 约 2,976.4 h | `agibot_beta` |
-
-当前官方清单包含 56 套 OXE 数据，其中 DROID 已作为主数据使用，因此默认新增 55 个 OXE
-source。默认组合共 63 个训练 source，规划时长约 3,227 小时。官方 collection 发生变化时，
-source 数量以 `data-template` 生成结果为准。
-
-AgiBotWorld2026 只使用 Imitation Learning、Rich Interaction 和 Reinforcement Learning
-三类真机数据，不使用其 Simulation 部分。表中的时长用于容量规划；最终训练量以整理后的
-episode、frame 和 window 数量为准。
-
-### 3.2 生成默认数据模板
-
-site 文件默认配置为：
-
-```bash
-DATA_FAMILY=public_robot_oxe
-INCLUDE_AGIBOT_BETA=NO
-WM3D_DATA_MODE=direct_raw
-```
-
-运行：
-
-```bash
-./run_wm3d.sh 5b data-template "$SITE"
-```
-
-该命令读取官方 OXE collection 和每个数据集的 `meta/info.json`，生成 source template、data
-template 和 adapter 候选。DROID 自动去重。现有主数据权重保持不变；每个新增 OXE 数据集
-作为普通 source 加入，权重为 1。OXE 不再拥有固定的整体采样比例。
-
-如需加入 AgiBotWorld Beta，在第一次生成模板前设置：
-
-```bash
-INCLUDE_AGIBOT_BETA=YES
-```
-
-启用后，生成器同时加入 Beta 和官方 Alpha converter。已经生成的模板不会被不同配置覆盖；
-更改该选项时应使用新的 site 和 `CONTROL_ROOT`。
-
-当前默认组合的规模和 cache 预算如下：
-
-| 组成 | 数据变化 | 数据规模 | 预计 episode cache |
-|---|---|---:|---:|
-| 保留的主数据 | DROID、Bridge、RoboCasa、AgiBotWorld2026 | 约 3,130 h | 约 280–290 TB |
-| OXE | 新增除 DROID 外的 55 个 source | 约 97.3 h 原始记录；约 264.6 万个 cache 帧 | 约 6–7 TB |
-| **默认组合合计** | **63 个训练 source，不含 AgiBotWorld Beta** | **约 3,227 h 原始记录** | **约 290 TB** |
-
-cache 估算按正式的三视角 P144 geometry 与 RGB/depth/point/camera 监督、最高约 10 Hz 保留观测
-计算。OXE 中许多数据是 20 Hz 或 50 Hz，因此会按真实时间戳降到最高约 10 Hz；动作和
-状态仍保留原始时间戳，不做固定频率插值。实际大小以 `plan` 对现场数据的输出为准。
-
-完整 observation/geometry cache 明显大于只保存索引的 direct_raw 路径。把原始下载、临时文件、日志和
-checkpoint 一并计算后，完整 cache 方案建议准备约 **320–350 TB 总磁盘**。默认站点因此使用
-`direct_raw`，视觉 latent 不落盘；只有明确接受旧 LRU 状态机或现场确认容量充足时，才显式
-切到 `streaming_raw` 或 `episode_cache`。
-
-生成模板后照常执行 `lock`、`download`、schema audit、adapter audit 和 inventory。某个数据集
-的动作或状态维度超过 WM3D 容量时，生成步骤会停止并报告数据集名称。
-
-### 3.3 下载
-
-先准备 Hugging Face token：
+安全保存 Hugging Face token：
 
 ```bash
 install -d -m 700 /data/secrets
@@ -197,311 +101,119 @@ unset HF_TOKEN
 chmod 600 /data/secrets/huggingface_token
 ```
 
-下载命令：
+创建并封存环境：
 
 ```bash
+cd /data/world_model/wm3d
+./run_wm3d.sh 5b env "$SITE"
+```
+
+完成标志：
+
+```text
+/data/wm3d/envs/wm3d-cu128/environment_receipt.json
+```
+
+再次执行同一条 `env` 命令应输出 `verified-skip`。不要在训练期间升级 package。
+
+## 4. 验证并复用现有数据
+
+AgiBotWorld2026 必须保持官方目录：
+
+```text
+/data/wm3d/raw/agibot_world_2026/ImitationLearning
+/data/wm3d/raw/agibot_world_2026/RichInteraction
+/data/wm3d/raw/agibot_world_2026/ReinforcementLearning
+```
+
+先做只读检查：
+
+```bash
+cd /data/world_model/wm3d
+SITE=/data/wm3d/control/5b_canary1k.env
+source "$SITE"
+./run_wm3d.sh agibot-existing-check \
+  --snapshot-root "$RAW_ROOT/agibot_world_2026"
+```
+
+输出必须包含 `"passed": true`，三个 prefix 都必须有非零 archive 数量。该检查不解压、不改写
+数据，也不会哈希整个多 TB 数据。
+
+随后固定所有数据版本并验证已有文件：
+
+```bash
+cd /data/world_model/wm3d
+SITE=/data/wm3d/control/5b_canary1k.env
+./run_wm3d.sh 5b data-template "$SITE"
 ./run_wm3d.sh 5b lock "$SITE"
 ./run_wm3d.sh 5b download "$SITE"
 ```
 
-`lock` 自动固定所有数据版本，`download` 支持断点续传。确认下载是否完成：
+`download` 会复用现有文件，只补缺失内容，并生成训练所需的 download receipt。不要绕过
+`lock` 或手工伪造 receipt。
+
+确认数据控制包和 download receipt 都存在：
 
 ```bash
+SITE=/data/wm3d/control/5b_canary1k.env
 source "$SITE"
-find "$RAW_ROOT/receipts" -name '*.json' -type f | wc -l
-du -sh "$RAW_ROOT"/*
-df -h "$RAW_ROOT"
-```
-
-### 3.4 数据整理
-
-RoboCasa 和 AgiBotWorld 2026 先按 [WM3D 从零数据流程](WM3D_FROM_ZERO.md) 中的
-archive、schema、adapter、inventory 命令整理。OXE 数据已经是 LeRobot 格式；生成命令会为
-每套数据保留其官方相机键、action/state 维度和原始时间戳，并生成 opaque controller adapter
-候选。负责人仍需按同一数据流程完成 schema、adapter audit、inventory 和 data-profile，不能
-把候选文件直接当成已审计 adapter。当前默认配置应包含 63 个训练 source；启用 Beta 后为
-64 个。source 数量随官方 OXE collection 调整，每个 source 都必须有非空 episode 数量。
-
-完成后运行：
-
-```bash
+test -f "$SOURCE_LOCK"
+test -f "$DATA_PROFILE"
+test -f "$RAW_ROOT/receipts/agibot_world_2026.json"
 ./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b plan "$SITE"
 ```
 
-输出应显示 `native_5b_v8_exact_v7_factual_high_frequency_refiner`、64 个 rank，以及与所选配置一致的
-数据 source 数量，并且不再出现 `data_profile=WAITING`。同时确认 runtime 封存的模型参数量是
-`5,440,933,496`、
-模型 schema 是 `wm3d_native_world_model_v2`，RGB future indices 为 `0..15`；任一项不同都
-不要启动 64 卡训练。
-
-## 4. 数据访问路径
-
-以下完整 cache 流程只在显式选择 `episode_cache` 时运行；默认 `direct_raw` 直接进入 4.1 节。
-完整 cache 按 64 张 GPU 展开：每张 GPU 一个长驻 worker，
-每个 worker 使用 4 个视频解码线程、`batch_frames=16` 的 VGGT 前向和 2 个写盘线程。
-worker 会流水执行“准备下一个 episode、GPU 编码当前 episode、写盘上一个 episode”，避免
-解码和落盘期间 GPU 空转。
-
-先构建任务：
-
-```bash
-./run_wm3d.sh 5b task-bank "$SITE"
-./run_wm3d.sh 5b cache-plan "$SITE"
-```
-
-用 Slurm 在 64 张卡上启动 cache：
-
-```bash
-export SITE=/data/wm3d/control/5b_canary1k.env
-srun --nodes=8 --ntasks=64 --ntasks-per-node=8 --gpus-per-task=1 \
-  --cpus-per-task=8 --cpu-bind=cores \
-  --export=ALL,SITE bash -lc '
-  ./run_wm3d.sh 5b cache-worker "$SITE" \
-    "$SLURM_PROCID" 64 inherited
-'
-```
-
-站点文件中的默认性能参数为：
-
-```bash
-CACHE_WORKER_COUNT=64
-CACHE_BATCH_FRAMES=16
-CACHE_DECODE_WORKERS=4
-CACHE_WRITER_THREADS=2
-```
-
-H200 显存足够时保持这组默认值。只有出现单卡 OOM 时，才把 `CACHE_BATCH_FRAMES` 降为 12
-或 8；不要先减少 worker 数量。写入吃不满时，先检查存储带宽、挂载方式和小文件性能，再
-考虑增加写线程，避免在慢盘上盲目堆线程。
-
-运行期间查看：
-
-```bash
-watch -n 2 nvidia-smi
-iostat -xz 2
-./run_wm3d.sh 5b status "$SITE"
-```
-
-正常表现是 64 张 GPU 都有一个 cache 进程，warm-up 后 GPU 周期性处于高利用率，worker
-持续输出 `prepare_seconds`、`encode_seconds`、`write_seconds`、`tasks_per_second`，且
-`failed` 始终为 0。若 `prepare_seconds` 明显高于编码时间，检查 CPU 绑定和视频盘读取；若
-`write_seconds` 持续堆积，检查 cache 文件系统带宽。
-
-worker 可重入。任务中断后用完全相同的 worker count 重跑，已经完成的 episode 会自动跳过。
-全部 worker 退出后执行：
-
-```bash
-./run_wm3d.sh 5b cache-seal "$SITE"
-./run_wm3d.sh 5b window "$SITE"
-./run_wm3d.sh 5b normalization "$SITE"
-./run_wm3d.sh 5b runtime "$SITE"
-./run_wm3d.sh 5b status "$SITE"
-```
-
-### 4.1 direct_raw：无视觉 latent cache 的正式默认
-
-`direct_raw` 复用 task bank、episode/window metadata 和 grouped normalization，但不创建或
-读取 episode visual payload。每个 rank 只随机访问当前 `T+K` observation ordinal，在线一次
-生成 P144 geometry 以及 RGB/depth/point/camera 监督，不提取 absolute future P256。Frozen
-teacher 不进入 optimizer、FSDP 或 checkpoint；推理时仍由 WM3D 自己的 heads 输出 RGB、
-depth、point、camera、action 和 state。
-
-site 默认已经写入：
-
-```bash
-WM3D_DATA_MODE=direct_raw
-DIRECT_INPUT_RGB_SIZE=518
-DIRECT_DECODE_WORKERS=1
-DIRECT_PREFETCH_WORKERS=1
-DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1
-DIRECT_PREFETCH_WINDOWS=8
-DIRECT_VIDEO_INDEX_CACHE_ASSETS=128
-DIRECT_ENCODE_CHUNK_ROWS=32
-DIRECT_MINIMUM_CHUNK_ROWS=4
-DIRECT_APPEARANCE_FEATURE_LAYER=-1
-```
-
-准备和启动命令：
-
-```bash
-./run_wm3d.sh 5b task-bank "$SITE"
-./run_wm3d.sh 5b cache-plan "$SITE"
-./run_wm3d.sh 5b streaming-prepare "$SITE"
-./run_wm3d.sh 5b runtime "$SITE"
-./run_wm3d.sh 5b preflight "$SITE"
-```
-
-`cache-plan` 与 `streaming-prepare` 是沿用的命令名；前者生成原始 episode 任务清单，后者只
-生成轻量 metadata、窗口和 normalization，二者都不执行 VGGT visual cache。训练日志中的
-`direct_raw.decode_seconds` 和 `direct_vggt.encode_seconds` 分别表示视频窗口解码与在线
-frozen VGGT 成本。相邻 window 的预处理 RGB 行由每 rank 1 GiB 内存 LRU 重用，同一
-micro batch 的重复 observation 只进入一次 VGGT，然后恢复固定输出形状。operator report
-同时给出 `coalesced_requested_rows`、`coalesced_unique_rows`、`decode_calls` 和
-`prefetch_capacity_skips`；前两项用于计算去重比例，正常稳态下 capacity skips 应保持为 0。
-`direct_raw.prefetch_pending` 和两级 LRU 都有固定上限，内存不会随 step 或 episode
-长度增长。完整实现和验证证据见 [direct_raw 正式路径](WM3D_DIRECT_RAW.md)。
-
-Direct 去掉的是 cache 发布、收养、淘汰、重复编码和 sidecar/训练竞态；它仍支付在线 VGGT
-计算，因此实际排期必须由 64 卡 canary 的热态中位秒/step 外推，不能套用完整热 cache 的
-吞吐估计。
-
-### 4.2 legacy streaming_raw：按需 episode LRU
-
-只有在需要恢复旧运行合同时才显式使用 `streaming_raw`。这个模式不会在每一步重复处理
-原始视频。它先生成全量的轻量 metadata 和窗口索引，训练第一次访问某个 episode 时才解码
-视频并运行冻结的 VGGT，然后把生成的标准 episode cache 放进有容量上限的 LRU。后续窗口直接读取
-这份缓存；达到容量上限后，LRU 只淘汰最久未使用的 episode。
-
-若选择该兼容模式，仍使用默认数据组合并启用 `streaming_raw`。DROID、Bridge、RoboCasa、
-AgiBotWorld 2026 和 OXE 都参与训练，按需缓存只改变数据访问方式。
-
-两种数据访问方式使用相同的 data profile、采样权重、模型输入和训练目标。下表是 64×H200、
-默认 OXE 组合的容量与排期预算。`300K 等样本预算`与旧 global batch 128 下的 600K
-拥有相同的 7,680 万个全局采样位置；当前正式预设仍训练 600K steps，共 1.536 亿个采样位置。
-
-| 数据访问方式 | 建议总磁盘 | 相对训练吞吐 | 300K 等样本预算 | 600K 正式训练 | 选择条件 |
-|---|---:|---:|---:|---:|---|
-| `episode_cache` | 约 320–350 TB | 1.0 | 约 2–4 天 | 约 5–7 天 | 磁盘充足，优先训练吞吐 |
-| `streaming_raw` | 约 35–45 TB | 约 0.75–0.9 | 约 4–6 天 | 约 8–12 天 | 只有几十 TB，接受一定速度损失 |
-
-吞吐按完整 cache 为 `1.0`。LRU 命中后的读取速度约为完整 cache 的 `0.95–1.0`；长期平均还要
-计入 episode 第一次解码和 VGGT 编码，因此约为 `0.75–0.9`。换算成训练耗时，按需缓存通常是
-完整 cache 的 `1.1–1.35` 倍。短 episode 较多、原始视频盘较慢或 LRU 频繁淘汰时，差距会扩大。
-
-micro batch 从 1 调到 4、梯度累积从 2 调到 1 后，每个 rank 每个 optimizer step 的有效
-样本数从 2 增加到 4，global batch 从 128 增加到 256。这使固定样本预算所需的 optimizer
-steps 减半，但不是 8 倍墙钟加速。当前 `formal600k` 没有减少 steps，而是把训练样本预算
-翻倍，因此 600K 排期不能直接除以 2 或 8。
-
-这些时间是排期估算，不代替 64 卡 canary。64 卡实际跑完前 100–500 steps 后，用日志中的
-单步中位时间更新正式排期：
+`doctor` 必须报告：
 
 ```text
-预计天数 = 剩余 steps × 单步中位秒数 ÷ 86400 × 1.08
+model=native_5b_v8_exact_v7_factual_high_frequency_refiner
+parameters=5,440,933,496
+world_size=64
+data mode=direct_raw
 ```
 
-按需缓存的排期参考：
+出现 `data_profile=WAITING`、旧 P256/teacher 配置或参数量不一致时停止，不要启动 GPU 作业。
 
-| 训练预设 | 预计用时 |
-|---|---:|
-| 1K canary | 2–3 小时 |
-| 100K | 6–9 天 |
-| 600K 正式训练 | 40–55 天，通常按约 45 天安排，资源窗口预留 55 天 |
+## 5. 生成训练 metadata 和 runtime
 
-`streaming_raw` 去掉的是约 290 TB 的完整 observation/geometry 视觉 cache，原始数据仍需保留。当前上游规模下，
-默认 OXE 组合的原始数据预计约 15–20 TB。总磁盘按下面的项目规划：
-
-| 项目 | 预计空间 | 使用阶段 |
-|---|---:|---|
-| 原始数据和物化后的训练数据 | 15–20 TB | 全程保留 |
-| 下载、转换临时文件 | 峰值额外 5–10 TB | 数据确认后清理 |
-| metadata、task bank、日志和临时输出 | 预留 1–2 TB | 全程 |
-| 10 个完整 5B checkpoint | 约 1 TB | 训练期间 |
-| 有容量上限的 episode LRU | 建议预留 2–4 TB | 训练期间，可按可用空间调整 |
-| **建议总磁盘** | **约 35–45 TB** | 覆盖准备阶段峰值并保留运行余量 |
-
-因此实际规划按 **40 TB 左右** 准备最稳妥，不要按清理临时文件后的理论最低值采购。LRU
-建议从总量 2–4 TB 起步；磁盘更紧时可以缩小，代价是 episode 淘汰增加、吞吐下降。LRU
-可以放在共享存储或节点本地存储，优先选择现场速度最快且容量稳定的路径。程序会按主机名和
-global rank 自动隔离缓存目录。
-
-在 site 文件中设置：
+依次执行：
 
 ```bash
-WM3D_DATA_MODE=streaming_raw
-STREAMING_METADATA_ROOT=/data/wm3d/streaming_metadata/native_p144
-STREAMING_LRU_ROOT=/data/wm3d/streaming_lru
-STREAMING_LRU_GIB_PER_RANK=64
-STREAMING_METADATA_WORKERS=32
-STREAMING_ENCODE_BATCH_FRAMES=16
-STREAMING_DECODE_WORKERS=4
-```
-
-以上路径和容量是起始建议，不是存储架构要求。`STREAMING_METADATA_ROOT` 保存时间戳、动作、
-状态、任务向量和窗口索引，不保存 VGGT 视觉 token、depth、point 或 RGB pack。
-`STREAMING_LRU_GIB_PER_RANK` 可按总磁盘空间调整；`STREAMING_METADATA_WORKERS=32` 用于并行
-扫描 episode，存储和 CPU 还有余量时可以提高到 64。
-
-下载、adapter audit、inventory 和 data profile 与完整 cache 模式相同。完成这些步骤后执行：
-
-```bash
+cd /data/world_model/wm3d
+SITE=/data/wm3d/control/5b_canary1k.env
 ./run_wm3d.sh 5b task-bank "$SITE"
 ./run_wm3d.sh 5b cache-plan "$SITE"
 ./run_wm3d.sh 5b streaming-prepare "$SITE"
 ./run_wm3d.sh 5b runtime "$SITE"
+./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b status "$SITE"
 ```
 
-`cache-plan` 在这里仅生成 episode 任务清单，不会生成视觉 cache。这个模式不运行
-`cache-worker`、`cache-seal`、`window` 和 `normalization`；`streaming-prepare` 一次性生成
-轻量 metadata、窗口和归一化统计。采样器按 episode 连续取窗口，减少冷缓存切换。
+这些命令只生成 task bank、episode/window metadata、normalization 和 sealed runtime。
+`direct_raw` 不生成 episode visual cache，训练时按 sealed window 在线解码并运行 frozen VGGT。
 
-之后的 64 卡启动方式与完整 cache 模式相同。先使用第 5 节定义的 `run_5b` 函数，然后按
-独立进程执行：
+## 6. 运行 64 卡 1K canary
 
-```bash
-run_5b preflight
-run_5b train 100
-
-run_5b preflight
-run_5b resume 100 500
-
-run_5b preflight
-run_5b eval 500
-./run_wm3d.sh 5b verify "$SITE" 500
-```
-
-第一次训练进程会产生冷缓存。恢复进程继续使用已有 LRU 时应当看到缓存命中。更换节点或
-缓存路径不会影响 checkpoint 正确性，但未命中的 episode 需要重新生成。
-
-训练日志中会增加 `streaming_raw` 字段：
-
-- `generated_episodes`：本进程从原始数据生成的 episode 数；
-- `cache_hits`：命中 LRU 的次数；
-- `evicted_episodes`：因容量上限被删除的 episode 数；
-- `prepare_seconds`、`encode_seconds`：累计解码准备和 VGGT 编码时间；
-- `resident_bytes`、`resident_episodes`：当前 LRU 占用。
-
-正常运行应满足：
-
-- 冷启动时 `generated_episodes` 增加，`prepare_seconds` 和 `encode_seconds` 为有限值；
-- 进入同一 episode 的后续窗口后，`cache_hits` 持续增加，准备和编码时间不再重复增加；
-- `resident_bytes` 不超过每 rank 的容量上限；
-- `evicted_episodes` 不应每个 step 都快速增加，否则应扩大 LRU 或检查采样是否保持 episode 连续；
-- checkpoint、独立进程恢复和离线评测与完整 cache 模式使用相同的通过标准。
-
-性能调优顺序是缓存盘吞吐、LRU 容量、CPU/视频读取带宽、解码线程和 VGGT batch。默认每 GPU
-使用 4 个解码线程、`batch_frames=16`。`prepare_seconds` 长期高于 `encode_seconds` 时，先增加
-CPU 和原始视频盘带宽；VGGT OOM 时把 `STREAMING_ENCODE_BATCH_FRAMES` 调到 12 或 8。
-冷缓存阶段 GPU 利用率会随视频准备产生波动，LRU 命中后的训练阶段应恢复稳定。
-
-## 5. 1K 集群验证
-
-1K canary 使用与正式训练相同的 64 卡拓扑，验证通信、5B 参数分片、前向、反向、梯度、
-checkpoint、独立进程恢复和离线评测。
+先申请 8 个完整 H200 节点。进入 Slurm allocation 后执行：
 
 ```bash
-SITE=/data/wm3d/control/5b_canary1k.env
-./run_wm3d.sh 5b init canary1k "$SITE" direct_raw
-vim "$SITE"
-./run_wm3d.sh 5b doctor "$SITE"
-./run_wm3d.sh 5b runtime "$SITE"
-```
-
-多节点启动函数：
-
-```bash
+export CODE_ROOT=/data/world_model/wm3d
+export SITE=/data/wm3d/control/5b_canary1k.env
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 
 run_5b () {
+  operation=$1
+  shift
   srun --nodes=8 --ntasks=8 --ntasks-per-node=1 \
-    --export=ALL,SITE,MASTER_ADDR bash -lc \
-    "./run_wm3d.sh 5b $1 \"$SITE\" ${2:-} ${3:-}"
+    --kill-on-bad-exit=1 \
+    --export=ALL,CODE_ROOT,SITE,MASTER_ADDR \
+    bash -lc 'cd "$CODE_ROOT" && exec ./run_wm3d.sh 5b "$@"' \
+    _ "$operation" "$SITE" "$@"
 }
 ```
 
-按三个独立进程完成 canary：
+按以下顺序运行，不能合并成一个长进程：
 
 ```bash
 run_5b preflight
@@ -515,72 +227,75 @@ run_5b resume 500 1000
 
 run_5b preflight
 run_5b eval 1000
+
+cd "$CODE_ROOT"
 ./run_wm3d.sh 5b verify "$SITE" 1000
 ```
 
-`verify` 通过后可以开始 600K 正式训练。不要跳过独立进程 resume，因为它能发现只在恢复时
-出现的模型、optimizer、sampler 或分布式状态问题。
+通过条件：
 
-## 6. 正式训练
+- 64 个 rank 全部存在，GPU 型号、HBM、ECC、NVLink 和 IB preflight 全部通过；
+- loss、grad norm 和所有梯度所有权指标有限；
+- factual decoder、RGB decoder、action head 和 policy 都有非零梯度；
+- future action 对 policy/action-free 输出的逐元素差异为 0；
+- step100、step500、step1000 都有完整 COMMITTED checkpoint；
+- 每个 checkpoint 都有 64 份分片状态，独立进程 resume 成功；
+- step1000 eval 和 `verify` 通过。
 
-1K 通过后创建 600K site。需要观察中程曲线时可以另建 100K site，但它不是正式训练的
-前置条件。两者复用 data profile 和已选择的数据访问方式；`direct_raw` 复用 metadata 并保持
-无视觉 cache，`episode_cache` 复用完整 cache，`streaming_raw` 复用 metadata 和有容量上限的 LRU。每个 preset
-仍从自己的 step 0 开始训练。
+任一条件失败都不要启动正式训练。
+
+## 7. Fresh 启动正式 600K
+
+1K canary 通过后，从 canary site 复制固定站点设置，只修改 preset：
 
 ```bash
-./run_wm3d.sh 5b init validation100k /data/wm3d/control/5b_validation100k.env
-./run_wm3d.sh 5b init formal600k /data/wm3d/control/5b_formal600k.env
-```
+export CODE_ROOT=/data/world_model/wm3d
+export CANARY_SITE=/data/wm3d/control/5b_canary1k.env
+export SITE=/data/wm3d/control/5b_formal600k.env
 
-100K：
+install -m 600 "$CANARY_SITE" "$SITE"
+sed -i 's/^WM3D_5B_PRESET=canary1k$/WM3D_5B_PRESET=formal600k/' "$SITE"
 
-```bash
-SITE=/data/wm3d/control/5b_validation100k.env
+cd "$CODE_ROOT"
+./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b runtime "$SITE"
-run_5b preflight
-run_5b train 1000
-run_5b preflight
-run_5b resume 1000 100000
-run_5b preflight
-run_5b eval 100000
-./run_wm3d.sh 5b verify "$SITE" 100000
 ```
 
-600K：
+重新进入正式训练的 8 节点 Slurm allocation，定义与第 6 节相同的 `run_5b` 函数，然后执行：
 
 ```bash
-SITE=/data/wm3d/control/5b_formal600k.env
-./run_wm3d.sh 5b runtime "$SITE"
 run_5b preflight
-run_5b train 1000
-run_5b preflight
-run_5b resume 1000 5000
-run_5b preflight
-run_5b resume 5000 20000
-run_5b preflight
-run_5b resume 20000 600000
-run_5b preflight
-run_5b eval 600000
-./run_wm3d.sh 5b verify "$SITE" 600000
+run_5b train
 ```
 
-## 7. 常见问题
+正式训练必须从自己的 step 0 开始。不要从 1K canary、旧 V8、旧 5B 或任何 1B checkpoint
+初始化。
 
-| 现象 | 处理 |
-|---|---|
-| `data_profile=WAITING` | 数据尚未完成 schema、inventory 和 profile 物化 |
-| 下载 401/403 | 先在上游页面接受许可，再检查 token 文件 |
-| cache 中 GPU 经常为 0% | 检查是否启动了 64 个 worker、CPU 绑定、原始视频盘吞吐和 batch size |
-| cache 写盘积压 | 检查存储带宽、挂载方式和小文件性能 |
-| cache OOM | 先将 `CACHE_BATCH_FRAMES` 从 16 降到 12 或 8 |
-| streaming 冷缓存反复生成 | 提高 LRU 容量；恢复时尽量复用原缓存路径和 rank 布局 |
-| streaming 中 GPU 长时间空闲 | 检查原始视频盘、CPU 绑定和 `STREAMING_DECODE_WORKERS`；再观察 `prepare_seconds` |
-| 训练 OOM | 先检查 8-way FSDP2、BF16、activation checkpoint 和 64 卡 topology；确认无误后将 micro batch 从 4 降为 2，并同步把 global batch 改为 128 |
-| GPU busy、ECC、NVLink、IB 失败 | 更换节点或修复资源后重新运行 preflight |
-| 恢复失败 | 只从完整编号 checkpoint 恢复，并重新运行 preflight |
-| eval coverage 为 0 | 检查验证集和对应 action/视觉 supervision 是否真实存在 |
+查看状态：
 
-模型与分布式原理见 [WM3D 统一训练与扩展](WM3D_SCALING.md)，数据底层命令见
-[WM3D 从零数据流程](WM3D_FROM_ZERO.md)，Stage1 见
-[WM3D Stage1](WM3D_STAGE1_UNIFIED.md)。
+```bash
+cd /data/world_model/wm3d
+./run_wm3d.sh 5b status /data/wm3d/control/5b_formal600k.env
+```
+
+训练中断后只从本正式 run 最新的完整 COMMITTED checkpoint 恢复：
+
+```bash
+run_5b preflight
+run_5b resume 完整checkpoint的step号
+```
+
+## 8. 必须停止的情况
+
+出现以下任一情况，停止作业并保留日志和 checkpoint：
+
+- 任一 rank 丢失或 NCCL/IB/NVLink 报错；
+- loss、梯度或模型输出出现 NaN/Inf；
+- GPU ECC 非零；
+- 20 分钟内日志、CPU 和 GPU 都没有进展；
+- 数据、runtime、normalization 或 environment receipt 不一致；
+- checkpoint 没有 COMMITTED 标记或分片数量不足；
+- future action 进入 policy/action-free trunk；
+- RGB 输出单色塌缩，或 factual action 路径没有梯度。
+
+不要通过改模型、改 loss、减少 RGB horizon、切换数据模式或跳过 preflight 来绕过错误。
