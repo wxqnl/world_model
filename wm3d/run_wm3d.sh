@@ -14,6 +14,7 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
   ./run_wm3d.sh env
   ./run_wm3d.sh lock-resolve <resolve_source_lock.py 参数...>
   ./run_wm3d.sh download <download_sources.py 参数...>
+  ./run_wm3d.sh agibot-existing-check --snapshot-root <已下载的 AgiBotWorld2026 目录>
   ./run_wm3d.sh archive-collection <materialize_archive_collection.py 参数...>
   ./run_wm3d.sh external-convert <run_external_converter.py 参数...>
   ./run_wm3d.sh beta-task-list <list_agibot_beta_tasks.py 参数...>
@@ -133,6 +134,7 @@ case "${command}" in
     ;;
   lock-resolve) exec "${PYTHON_BIN}" scripts/data/resolve_source_lock.py "$@" ;;
   download) exec "${PYTHON_BIN}" scripts/data/download_sources.py "$@" ;;
+  agibot-existing-check) exec "${PYTHON_BIN}" scripts/data/check_existing_agibot2026.py "$@" ;;
   archive-collection) exec "${PYTHON_BIN}" scripts/data/materialize_archive_collection.py "$@" ;;
   external-convert) exec "${PYTHON_BIN}" scripts/data/run_external_converter.py "$@" ;;
   beta-task-list) exec "${PYTHON_BIN}" scripts/data/list_agibot_beta_tasks.py "$@" ;;

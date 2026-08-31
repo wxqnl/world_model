@@ -45,6 +45,26 @@ SITE=/data/wm3d/control/5b_v8_canary1k.env
 absolute-P256/teacher 路线、参数量不匹配、factual action 顺序不对或 appearance teacher ratio
 非零，就会在大作业前失败。
 
+### 复用已经下载的 AgiBotWorld2026
+
+如果原始数据已经由 Hugging Face 下载到本地，不要重新搬运或重新下载。令
+`RAW_ROOT` 的下一层正好是 `agibot_world_2026/`，其中保留官方三个目录：
+`ImitationLearning/`、`RichInteraction/`、`ReinforcementLearning/`。先做快速只读检查：
+
+```bash
+./run_wm3d.sh agibot-existing-check \
+  --snapshot-root "$RAW_ROOT/agibot_world_2026"
+```
+
+该命令只枚举 archive，并对每个前缀抽查一个 archive 的 LeRobot `meta/info.json`、parquet 与
+视频/图像结构；不解压、不改写、不哈希整个多 TB 数据。之后仍需执行 `lock` 和 `download`：
+把 site 的 `RAW_ROOT` 指向上述父目录，`download` 会按冻结 revision/file list 校验已有文件并只补
+真正缺失的文件，然后生成后续 archive materialization 所需的 receipt。不要绕过 receipt，也不要
+把已经解压但来源不明的目录直接写进正式 data profile。
+
+当前 1B 训练默认 `INCLUDE_AGIBOT_2026=NO`，不代表 5B 不支持它；5B site 默认是 `YES`。
+如同事明确不想使用该数据，必须在生成 data template 之前设为 `NO`，不能只把目录留空。
+
 64 卡启动方式见 `docs/WM3D_5B_SCALING.md`。先完成同拓扑 1K canary，至少覆盖真实前向、
 反向、梯度所有权、编号 checkpoint、独立进程 exact resume 和固定评测；通过后再用新 site
 从 step 0 启动正式训练，不能把 canary checkpoint 当正式初始化。

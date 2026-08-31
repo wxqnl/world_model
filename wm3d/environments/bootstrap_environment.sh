@@ -46,6 +46,66 @@ PY
   "${PYTHON_BIN}" -m pip install \
     --index-url "${PYPI_INDEX_URL}" \
     --requirement "${ROOT}/environments/requirements.lock"
+
+  # PyPI's decord 0.6.0 Linux payload is Python-version agnostic (the Python
+  # package loads libdecord.so through ctypes), but some mirrors serve a wheel
+  # whose internal WHEEL tag is incorrectly left at cp36.  pip can install and
+  # import it on Python 3.10, then `pip check` rejects the stale internal tag.
+  # Normalize only this known payload, update RECORD, and prove the installed
+  # library imports before sealing the environment receipt.
+  "${PYTHON_BIN}" - <<'PY'
+import base64
+import csv
+import hashlib
+import io
+from pathlib import Path
+import platform
+import sys
+
+import decord
+
+if sys.version_info[:2] != (3, 10):
+    raise RuntimeError("decord wheel normalization is sealed for Python 3.10")
+if platform.system() != "Linux" or platform.machine() != "x86_64":
+    raise RuntimeError("decord wheel normalization requires Linux x86_64")
+site_root = Path(decord.__file__).resolve().parent.parent
+dist_roots = sorted(site_root.glob("decord-0.6.0.dist-info"))
+if len(dist_roots) != 1:
+    raise RuntimeError(f"expected one decord 0.6.0 dist-info, found {dist_roots}")
+dist_root = dist_roots[0]
+wheel = dist_root / "WHEEL"
+record = dist_root / "RECORD"
+payload = wheel.read_text(encoding="utf-8")
+stale = "Tag: cp36-cp36m-manylinux2010_x86_64"
+correct = "Tag: cp310-cp310-manylinux2010_x86_64"
+if stale in payload:
+    payload = payload.replace(stale, correct)
+    temporary_wheel = wheel.with_name(f".{wheel.name}.tmp")
+    temporary_wheel.write_text(payload, encoding="utf-8")
+    temporary_wheel.replace(wheel)
+elif correct not in payload:
+    raise RuntimeError(f"unexpected decord wheel tag in {wheel}: {payload!r}")
+
+rows = list(csv.reader(io.StringIO(record.read_text(encoding="utf-8"))))
+wheel_relative = wheel.relative_to(site_root).as_posix()
+wheel_bytes = wheel.read_bytes()
+digest = base64.urlsafe_b64encode(hashlib.sha256(wheel_bytes).digest()).rstrip(b"=")
+matched = 0
+for row in rows:
+    if row and row[0] == wheel_relative:
+        row[1] = f"sha256={digest.decode()}"
+        row[2] = str(len(wheel_bytes))
+        matched += 1
+if matched != 1:
+    raise RuntimeError(f"decord RECORD does not uniquely contain {wheel_relative}")
+temporary = record.with_name(f".{record.name}.tmp")
+with temporary.open("w", encoding="utf-8", newline="") as handle:
+    csv.writer(handle, lineterminator="\n").writerows(rows)
+temporary.replace(record)
+if decord.__version__ != "0.6.0":
+    raise RuntimeError(f"unexpected decord version {decord.__version__}")
+decord.cpu(0)
+PY
 fi
 
 # 无论首次建环境还是复用封存环境，都必须先做离线依赖一致性检查。
