@@ -1,0 +1,76 @@
+_base_: wm3d_v7_stage0_mixed_oxe20_rc80_30k_node43.yaml
+
+# Formal V7 S0 run: start from random initialization, train native RGB /
+# geometry on the complete audited data mixture, and leave causal action
+# specialization to S1.
+data:
+  compact_index: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_full_v1/index.jsonl
+  action_stats: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_full_v1/action_stats_train.npz
+  rgb_sidecar_indices:
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_atomic_rgb_anchor_v1/index.jsonl
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_composite_rgb_anchor_v1/index.jsonl
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_mg_rgb_anchor_v1/index.jsonl
+  robocasa_partitions:
+    - atomic
+    - composite
+    - mg
+  oxe_source_name: oxe_visual
+  oxe:
+    manifest: /data/Minko/world_model/wm3d_v7/manifests/oxe_node43_rgb_geom_representation_v1.jsonl
+    include_datasets:
+      - bridge
+      - droid
+      - fractal20220817_data
+      - jaco_play
+      - kuka
+      - taco_play
+    allowed_action_kinds:
+      - delta_xyz+rpy+gripper
+      - droid_action_7d
+    allowed_fps:
+      - 5
+    action_stats: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_full_v1/action_stats_train.npz
+    trusted_manifest_fast_init: true
+    trusted_manifest_sha256: f0005c63127f8fa8ce909ead3b79d7e56e851d0a8d0f5f9a37f3de898a902671
+    require_action_contract: false
+    action_contract_evidence_path: null
+    default_action_frame_offset: 0
+
+train:
+  strict_v6_native_warm_start: false
+  stage_transition: null
+  batch_size_per_gpu: 4
+  gradient_accumulation_steps: 2
+  num_workers: 4
+  prefetch_factor: 2
+  max_steps: 100000
+  ckpt_every_steps: 5000
+  keep_last_checkpoints: 6
+  warmup_steps: 500
+  max_val_batches: 16
+  abort_on_nonfinite: true
+  oxe_representation_only: true
+  oxe_representation_trainable_prefixes:
+    - pixel.
+    - context_pixel.
+  mixed_batch_sampler:
+    enabled: true
+    seed: 1707
+    expected_oxe_fraction: 0.20
+    # 50K micro-batches = 25K optimizer updates at accumulation=2.
+    # Four epochs therefore reach the requested 100K optimizer updates.
+    num_batches_per_epoch: 50000
+    val_num_batches_per_epoch: 50
+    # Global mix: OXE 20%; atomic/composite/MG 16%/32%/32%.
+    # Equivalently, RoboCasa is 80%, with its internal mix 20%/40%/40%.
+    source_cycle_counts_exact:
+      oxe_visual: 5
+      robocasa_atomic: 4
+      robocasa_composite: 8
+      robocasa_mg: 8
+
+lr_schedule:
+  warmup_steps: 500
+
+out:
+  root: /data/Minko/world_model/wm3d_v7/results/wm3d_v7_stage0_full_oxe20_rc80_bs4_acc2_100k_node41

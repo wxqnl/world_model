@@ -1,0 +1,128 @@
+_base_: wm3d_v7_1b_native_common.yaml
+
+model:
+  enable_pixel: true
+  enable_context_pixel: true
+  context_pixel_hidden: 1024
+  context_pixel_action_dim: 7
+  context_pixel_task_dim: 2048
+  context_pixel_residual_scale: 0.75
+  context_pixel_use_action: true
+  context_pixel_use_task: true
+  context_pixel_predict_motion: true
+  context_pixel_motion_blend_gain: 0.5
+
+data:
+  dataset_type: v7_mixed
+  compact_index: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_bootstrap_v1/index.jsonl
+  require_task_emb: true
+  require_action_stats: true
+  action_stats: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_bootstrap_v1/action_stats_train.npz
+  rgb_sidecar_indices:
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_atomic_rgb_anchor_v1/index.jsonl
+    - /data/Minko/world_model/wm3d_v7/manifests/rgb_sidecar/robocasa365_composite_rgb_anchor_v1/index.jsonl
+  require_rgb_sidecar: true
+  robocasa_partitions:
+    - atomic
+    - composite
+  oxe_source_name: oxe_bridge
+  T: 16
+  k: 8
+  stride: 2
+  seed: 1707
+  view_dropout: 0.20
+  node_sharded_window_cache: false
+  oxe:
+    manifest: /data/Minko/world_model/wm3d_v6/manifests/oxe_droid20k_depthplus_world_v1.jsonl
+    include_datasets:
+      - bridge
+    allowed_action_kinds:
+      - delta_xyz+rpy+gripper
+    allowed_fps:
+      - 5
+    cache_root: /data/Minko/datasets/cache/wm3d_v5_stage0_sharded
+    tokens_subdir: vggt_pooled
+    # Use the model-wide V7 pose normalization. The selected Bridge cohort has
+    # V7-matched physical scale; incompatible DROID/TACO/etc. are excluded.
+    action_stats: /data/Minko/world_model/wm3d_v7/manifests/robocasa365_stage0_bootstrap_v1/action_stats_train.npz
+    # The promoted V6 evidence proves offset=-2 for Bridge. The current V7
+    # generic loader expects a newer bundle schema, so bind the immutable V6
+    # evidence by digest and apply the already-supported explicit offset.
+    require_action_contract: false
+    default_action_frame_offset: -2
+    action_contract_evidence_path: /0604-10T-test/wm3d_v6/results/wm3d_v6_stage1_rgb_world_refine_preflight_20260711/action_contract/formal_snapshot_contract_20260711/action_frame_contract.json
+    action_contract_evidence_sha256: bea17c1215ecedc22934e78532322cd36244389d86a9dfc4aeb527d0cab1ee9c
+    require_task_emb: true
+    load_task_text: false
+    load_rgb: true
+    load_geom: true
+    load_state_tgt: true
+    load_geom_extra: true
+    require_geom_extra: true
+    window_geom_subdir: vggt_window_geom_p64_T16_k8_s4_hw64_full_v1
+    use_window_tokens: true
+    window_geom_shard_index: /data/Minko/datasets/cache/wm3d_v5_stage0_sharded/vggt_window_geom_p64_T16_k8_s4_hw64_full_v1_shards/index.tsv
+    window_geom_shard_root: /data/Minko/datasets/cache/wm3d_v5_stage0_sharded/vggt_window_geom_p64_T16_k8_s4_hw64_full_v1_shards
+    trust_window_geom_cache: true
+    allow_pseudo_progress_targets: false
+    T: 16
+    k: 8
+    stride: 4
+    split:
+      mode: episode
+      val_frac: 0.03
+      seed: 909
+    max_windows_per_episode: 0
+
+train:
+  strict_v6_native_warm_start: true
+  stage_transition:
+    required_resume_path: /data/Minko/world_model/wm3d_v7/init/wm3d_v6_stage0_best.pt
+    require_reset_optim: true
+    load_mode: v6_native
+  batch_size_per_gpu: 2
+  num_workers: 4
+  prefetch_factor: 3
+  max_steps: 30000
+  ckpt_every_steps: 5000
+  keep_last_checkpoints: 6
+  warmup_steps: 2000
+  max_val_batches: 32
+  enable_pixel_loss: true
+  weighted_sampler:
+    enabled: false
+  mixed_batch_sampler:
+    enabled: true
+    seed: 1707
+    expected_oxe_fraction: 0.20
+    num_batches_per_epoch: 30000
+    val_num_batches_per_epoch: 64
+    # Overall: OXE:Robocasa = 5:(4+16) = 2:8.
+    # Inside RoboCasa: atomic:composite = 4:16 = 2:8.
+    source_cycle_counts:
+      oxe_bridge: 5
+      robocasa_atomic: 4
+      robocasa_composite: 16
+
+loss:
+  rgb_l1: 1.2
+  rgb_lpips: 0.55
+  rgb_motion_l1: 1.0
+  rgb_edge: 0.08
+  rgb_motion_bce: 0.03
+  rgb_motion_dice: 0.03
+  rgb_motion_pos_weight: 2.0
+  rgb_motion_threshold: 0.03
+  rgb_motion_gain: 3.0
+
+optimizer:
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+
+lr_schedule:
+  peak_lr: 1.0e-5
+  min_lr: 1.0e-6
+  warmup_steps: 2000
+
+out:
+  root: /data/Minko/world_model/wm3d_v7/results/wm3d_v7_stage0_mixed_oxe20_rc80_30k_node43

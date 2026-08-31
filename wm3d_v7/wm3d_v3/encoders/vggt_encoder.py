@@ -3,12 +3,10 @@
 The training code expects VGGT tokens pooled to either 8x8 (64 tokens) or
 16x16 (256 tokens), plus optional full-resolution 224x224 depth maps.
 """
-
 from __future__ import annotations
 
 import inspect
 import math
-import os
 import sys
 from pathlib import Path
 
@@ -18,12 +16,7 @@ import torch.nn.functional as F
 
 
 def _ensure_local_vggt_on_path() -> Path:
-    root = Path(
-        os.environ.get(
-            "WM3D_VGGT_SOURCE_ROOT",
-            "/data/world_model_workspace/world_model/vggt",
-        )
-    ).resolve(strict=True)
+    root = Path("/data/world_model_workspace/world_model/vggt").resolve(strict=True)
     for name, module in tuple(sys.modules.items()):
         if name != "vggt" and not name.startswith("vggt."):
             continue
@@ -37,9 +30,6 @@ def _ensure_local_vggt_on_path() -> Path:
                 f"preloaded VGGT module is outside the registered source tree: "
                 f"{name}={module_path}"
             ) from exc
-    # The source tree is part of the sealed asset bundle.  Importing it must
-    # never add __pycache__ files and invalidate the exact file-set receipt.
-    sys.dont_write_bytecode = True
     sys.path[:] = [entry for entry in sys.path if entry != str(root)]
     sys.path.insert(0, str(root))
     return root
@@ -72,17 +62,13 @@ class VGGTEncoder(torch.nn.Module):
             ) from exc
         if model_revision is None:
             raise ValueError("model_revision is required for VGGTEncoder")
-        bundled_snapshot = os.environ.get("WM3D_VGGT_MODEL_SNAPSHOT")
-        if bundled_snapshot:
-            snapshot_path = Path(bundled_snapshot).resolve(strict=True)
-        else:
-            snapshot_path = Path(
-                snapshot_download(
-                    repo_id=model_name,
-                    revision=model_revision,
-                    local_files_only=local_files_only,
-                )
-            ).resolve(strict=True)
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=model_name,
+                revision=model_revision,
+                local_files_only=local_files_only,
+            )
+        ).resolve(strict=True)
         if snapshot_path.name != str(model_revision):
             raise RuntimeError(
                 f"VGGT snapshot revision mismatch: {snapshot_path.name} != {model_revision}"
@@ -101,18 +87,12 @@ class VGGTEncoder(torch.nn.Module):
         self.vggt_source_file = str(source_file)
         self.local_files_only = bool(local_files_only)
         if dtype is None:
-            major = (
-                torch.cuda.get_device_capability(self.device)[0]
-                if self.device.type == "cuda"
-                else 0
-            )
+            major = torch.cuda.get_device_capability(self.device)[0] if self.device.type == "cuda" else 0
             dtype = torch.bfloat16 if major >= 8 else torch.float16
         self.dtype = dtype
-        self.model = (
-            VGGT.from_pretrained(str(snapshot_path), local_files_only=True)
-            .to(self.device)
-            .eval()
-        )
+        self.model = VGGT.from_pretrained(
+            str(snapshot_path), local_files_only=True
+        ).to(self.device).eval()
 
     @torch.inference_mode()
     def forward(self, images: torch.Tensor) -> dict[str, Any]:
@@ -129,9 +109,7 @@ class VGGTEncoder(torch.nn.Module):
         if images.ndim == 4:
             images = images.unsqueeze(0)
         images = images.to(self.device, non_blocking=True)
-        with torch.amp.autocast(
-            "cuda", dtype=self.dtype, enabled=self.device.type == "cuda"
-        ):
+        with torch.amp.autocast("cuda", dtype=self.dtype, enabled=self.device.type == "cuda"):
             aggregated_tokens, patch_start_idx = self.model.aggregator(images)
 
         tokens = aggregated_tokens[-1]
@@ -141,20 +119,14 @@ class VGGTEncoder(torch.nn.Module):
         out: dict[str, Any] = {"pooled": pooled}
         missing: list[str] = []
 
-        need_depth_head = (
-            self.return_depth or self.return_depth_conf or self.return_geom_extra
-        )
+        need_depth_head = self.return_depth or self.return_depth_conf or self.return_geom_extra
         if need_depth_head:
             depth_head = getattr(self.model, "depth_head", None)
             if depth_head is None:
                 missing.append("depth_head")
             else:
                 with torch.amp.autocast("cuda", enabled=False):
-                    depth, depth_conf = depth_head(
-                        aggregated_tokens,
-                        images=images,
-                        patch_start_idx=patch_start_idx,
-                    )
+                    depth, depth_conf = depth_head(aggregated_tokens, images=images, patch_start_idx=patch_start_idx)
                 if self.return_depth:
                     out["depth"] = depth.squeeze(-1).to(torch.float16)
                 if self.return_depth_conf or self.return_geom_extra:
@@ -166,18 +138,14 @@ class VGGTEncoder(torch.nn.Module):
                 missing.append("camera_head")
             else:
                 with torch.amp.autocast("cuda", enabled=False):
-                    out["pose_enc"] = camera_head(aggregated_tokens)[-1].to(
-                        torch.float16
-                    )
+                    out["pose_enc"] = camera_head(aggregated_tokens)[-1].to(torch.float16)
             point_head = getattr(self.model, "point_head", None)
             if point_head is None:
                 missing.append("point_head")
             else:
                 with torch.amp.autocast("cuda", enabled=False):
                     world_points, world_points_conf = point_head(
-                        aggregated_tokens,
-                        images=images,
-                        patch_start_idx=patch_start_idx,
+                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx
                     )
                 out["world_points"] = world_points.to(torch.float16)
                 out["world_points_conf"] = world_points_conf.to(torch.float16)
