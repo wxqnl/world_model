@@ -172,6 +172,9 @@ def test_5b_init_selects_data_mode(tmp_path: Path, data_mode: str, detail: str) 
     assert plan.returncode == 0, plan.stderr
     assert f"data mode:  {data_mode}" in plan.stdout
     assert detail in plan.stdout
+    if data_mode == "direct_raw":
+        assert "batch-coalesced decode" in plan.stdout
+        assert "prefetch workers=1" in plan.stdout
 
 
 @pytest.mark.parametrize(
@@ -279,6 +282,7 @@ def test_5b_site_defaults_to_oxe_and_direct_v8_p144() -> None:
     assert "WM3D_DATA_MODE=direct_raw" in site
     assert "DIRECT_INPUT_RGB_SIZE=518" in site
     assert "DIRECT_DECODE_WORKERS=1" in site
+    assert "DIRECT_PREFETCH_WORKERS=1" in site
     assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
     assert "DIRECT_PREFETCH_WINDOWS=8" in site
     assert "DIRECT_VIDEO_INDEX_CACHE_ASSETS=128" in site
@@ -298,9 +302,42 @@ def test_5b_direct_template_has_optimized_runtime_defaults() -> None:
     site = (ROOT / "configs/cluster/h200_5b_direct.env.example").read_text()
     assert "WM3D_DATA_MODE=direct_raw" in site
     assert "DIRECT_DECODE_WORKERS=1" in site
+    assert "DIRECT_PREFETCH_WORKERS=1" in site
     assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
     assert "MODEL_PROFILE=configs/model/native_5b_v8_core.yaml" in site
     assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144.yaml" in site
+
+
+def test_5b_rejects_more_prefetch_workers_than_windows(tmp_path: Path) -> None:
+    site = tmp_path / "site.env"
+    init = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/cluster/wm3d_5b.sh"),
+            "init",
+            "canary1k",
+            str(site),
+            "direct_raw",
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert init.returncode == 0, init.stderr
+    payload = site.read_text().replace(
+        "DIRECT_PREFETCH_WORKERS=1", "DIRECT_PREFETCH_WORKERS=9"
+    )
+    site.write_text(payload)
+    plan = subprocess.run(
+        ["bash", str(ROOT / "scripts/cluster/wm3d_5b.sh"), "plan", str(site)],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert plan.returncode == 2
+    assert "DIRECT_PREFETCH_WORKERS 不能超过 DIRECT_PREFETCH_WINDOWS" in plan.stderr
 
 
 def _oxe_info(action_dim: int, state_dim: int, views: int = 1) -> dict:
@@ -433,6 +470,16 @@ def test_5b_report_accepts_complete_synthetic_run(tmp_path: Path) -> None:
         "seconds_per_log_interval": 2.0,
         "total": 4.0,
         "token_mse": 2.0,
+        "direct_raw": {
+            "coalesced_batches": 4,
+            "coalesced_requested_rows": 64,
+            "coalesced_unique_rows": 20,
+            "decode_calls": 5,
+            "prefetch_workers": 1,
+            "prefetch_pending": 4,
+            "prefetch_capacity_skips": 0,
+            "prepared_row_cache_bytes": 1_073_741_824,
+        },
     }
     (run / "train_metrics.jsonl").write_text(json.dumps(metrics) + "\n")
     ownership = {
@@ -514,6 +561,8 @@ def test_5b_report_accepts_complete_synthetic_run(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "checkpoint: PASS" in result.stdout
     assert "eval: PASS" in result.stdout
+    assert "direct raw: coalesced=4" in result.stdout
+    assert "capacity_skips=0" in result.stdout
     assert "WM3D 5B pipeline: INCOMPLETE" in result.stdout
 
 

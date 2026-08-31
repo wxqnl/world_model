@@ -146,8 +146,8 @@ def _checkpoint_summary(path: Path, failures: list[str]) -> dict[str, Any]:
         expected = set(files) | {"MANIFEST.json", "COMMITTED.json"}
         if actual != expected:
             raise ReportError(
-                f"checkpoint file set mismatch: missing={sorted(expected-actual)} "
-                f"extra={sorted(actual-expected)}"
+                f"checkpoint file set mismatch: missing={sorted(expected - actual)} "
+                f"extra={sorted(actual - expected)}"
             )
         for relative, evidence in files.items():
             payload = path / relative
@@ -203,16 +203,30 @@ def _training_summary(
     loss_keys = sorted(
         key
         for key, value in last.items()
-        if key not in {"step", "lr", "source_id", "grad_norm", "seconds_per_log_interval", "gradient_ownership"}
+        if key
+        not in {
+            "step",
+            "lr",
+            "source_id",
+            "grad_norm",
+            "seconds_per_log_interval",
+            "gradient_ownership",
+        }
         and isinstance(value, (int, float))
         and not isinstance(value, bool)
     )
     losses = {key: float(last[key]) for key in loss_keys}
     first_total = next(
-        (float(row["total"]) for row in train_rows if isinstance(row.get("total"), (int, float))),
+        (
+            float(row["total"])
+            for row in train_rows
+            if isinstance(row.get("total"), (int, float))
+        ),
         None,
     )
-    last_total = float(last["total"]) if isinstance(last.get("total"), (int, float)) else None
+    last_total = (
+        float(last["total"]) if isinstance(last.get("total"), (int, float)) else None
+    )
     loss_change = (
         None
         if first_total is None or last_total is None or first_total == 0.0
@@ -225,13 +239,47 @@ def _training_summary(
         delta = int(last["step"]) - int(previous["step"])
         if seconds > 0 and delta > 0:
             throughput = delta * int(runtime["train"]["global_batch_size"]) / seconds
+    direct_raw = None
+    direct_metrics = last.get("direct_raw")
+    if isinstance(direct_metrics, dict):
+
+        def counter(name: str) -> int | None:
+            value = direct_metrics.get(name)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and float(value) >= 0
+            ):
+                return int(value)
+            return None
+
+        requested = counter("coalesced_requested_rows")
+        unique = counter("coalesced_unique_rows")
+        coalescing_ratio = (
+            (requested - unique) / requested
+            if requested is not None
+            and unique is not None
+            and requested > 0
+            and unique <= requested
+            else None
+        )
+        direct_raw = {
+            "coalesced_batches": counter("coalesced_batches"),
+            "coalesced_requested_rows": requested,
+            "coalesced_unique_rows": unique,
+            "coalescing_ratio": coalescing_ratio,
+            "decode_calls": counter("decode_calls"),
+            "prefetch_workers": counter("prefetch_workers"),
+            "prefetch_pending": counter("prefetch_pending"),
+            "prefetch_capacity_skips": counter("prefetch_capacity_skips"),
+            "prepared_row_cache_bytes": counter("prepared_row_cache_bytes"),
+        }
     ownership_path = run_root / "gradient_ownership.json"
     ownership = None
     if ownership_path.is_file() and not ownership_path.is_symlink():
         ownership = _json(ownership_path)
-        ownership_schema_ok = (
-            ownership.get("schema") == "wm3d_v8_gradient_ownership_v2"
-        )
+        ownership_schema_ok = ownership.get("schema") == "wm3d_v8_gradient_ownership_v2"
         if not ownership_schema_ok:
             failures.append("gradient ownership schema mismatch")
         owners = ownership.get("owners")
@@ -240,11 +288,16 @@ def _training_summary(
             for name, value in (owners.items() if isinstance(owners, dict) else ())
             if isinstance(value, dict) and value.get("required") is True
         }
-        ownership_passed = ownership_schema_ok and bool(ownership.get("passed")) and bool(required) and all(
-            value.get("passed") is True
-            and int(value.get("nonzero_elements", 0)) > 0
-            and int(value.get("nonfinite_elements", -1)) == 0
-            for value in required.values()
+        ownership_passed = (
+            ownership_schema_ok
+            and bool(ownership.get("passed"))
+            and bool(required)
+            and all(
+                value.get("passed") is True
+                and int(value.get("nonzero_elements", 0)) > 0
+                and int(value.get("nonfinite_elements", -1)) == 0
+                for value in required.values()
+            )
         )
         if not ownership_passed:
             failures.append("required gradient ownership did not pass")
@@ -271,6 +324,7 @@ def _training_summary(
             "relative_total_loss_change": loss_change,
             "global_samples_per_second": throughput,
             "latest_validation": validation_rows[-1] if validation_rows else None,
+            "direct_raw": direct_raw,
             "gradient_ownership": ownership,
         }
     )
@@ -425,11 +479,16 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
     if args.expected_step is not None:
         latest = int(report["training"].get("latest_step", -1))
         if latest < args.expected_step:
-            failures.append(f"training step {latest} is below expected {args.expected_step}")
+            failures.append(
+                f"training step {latest} is below expected {args.expected_step}"
+            )
 
     if args.checkpoint is not None:
         report["checkpoint"] = _checkpoint_summary(args.checkpoint, failures)
-        if args.expected_step is not None and report["checkpoint"].get("step") != args.expected_step:
+        if (
+            args.expected_step is not None
+            and report["checkpoint"].get("step") != args.expected_step
+        ):
             failures.append("checkpoint step differs from expected step")
 
     if args.eval is not None:
@@ -476,8 +535,13 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
             ):
                 failures.append("eval receipt belongs to another checkpoint")
                 passed = False
-            if args.expected_step is not None and receipt.get("checkpoint_step") != args.expected_step:
-                failures.append("eval receipt checkpoint step differs from expected step")
+            if (
+                args.expected_step is not None
+                and receipt.get("checkpoint_step") != args.expected_step
+            ):
+                failures.append(
+                    "eval receipt checkpoint step differs from expected step"
+                )
                 passed = False
             report["evaluation"] = {
                 "passed": passed,
@@ -504,7 +568,9 @@ def build_report(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
         and not failures
         and not pending
     )
-    report["status"] = "PASS" if acceptance_complete else ("FAIL" if failures else "INCOMPLETE")
+    report["status"] = (
+        "PASS" if acceptance_complete else ("FAIL" if failures else "INCOMPLETE")
+    )
     return report, failures
 
 
@@ -515,9 +581,13 @@ def _human(report: Mapping[str, Any]) -> str:
     if profile:
         lines.append(f"  data: {profile['name']} ({profile['sources']} sources)")
     if data.get("episodes"):
-        lines.append(f"  cache: {data['episodes']['count']:,} episodes, seal={'PASS' if data['episodes']['passed'] else 'FAIL'}")
+        lines.append(
+            f"  cache: {data['episodes']['count']:,} episodes, seal={'PASS' if data['episodes']['passed'] else 'FAIL'}"
+        )
     if data.get("windows"):
-        lines.append(f"  windows: {data['windows']['count']:,}, seal={'PASS' if data['windows']['passed'] else 'FAIL'}")
+        lines.append(
+            f"  windows: {data['windows']['count']:,}, seal={'PASS' if data['windows']['passed'] else 'FAIL'}"
+        )
     runtime = report.get("runtime")
     if runtime:
         lines.append(
@@ -531,7 +601,24 @@ def _human(report: Mapping[str, Any]) -> str:
             f"grad_norm={training.get('gradient_norm')}"
         )
         if training.get("global_samples_per_second") is not None:
-            lines.append(f"  throughput: {training['global_samples_per_second']:.2f} samples/s")
+            lines.append(
+                f"  throughput: {training['global_samples_per_second']:.2f} samples/s"
+            )
+        direct_raw = training.get("direct_raw")
+        if direct_raw:
+            requested = direct_raw.get("coalesced_requested_rows")
+            unique = direct_raw.get("coalesced_unique_rows")
+            ratio = direct_raw.get("coalescing_ratio")
+            ratio_text = (
+                f", reduction={100.0 * ratio:.1f}%"
+                if isinstance(ratio, (int, float))
+                else ""
+            )
+            lines.append(
+                f"  direct raw: coalesced={direct_raw.get('coalesced_batches')}, "
+                f"rows={unique}/{requested}{ratio_text}, "
+                f"capacity_skips={direct_raw.get('prefetch_capacity_skips')}"
+            )
         ownership = training.get("gradient_ownership") or {}
         lines.append(
             f"  gradients: {'PASS' if ownership.get('passed') else 'FAIL'} "
@@ -553,7 +640,9 @@ def _human(report: Mapping[str, Any]) -> str:
         lines.append(f"  ! {failure}")
     for item in report.get("pending", []):
         lines.append(f"  - pending: {item}")
-    lines.append("  Note: PASS proves pipeline integrity and finite supervision, not model capability.")
+    lines.append(
+        "  Note: PASS proves pipeline integrity and finite supervision, not model capability."
+    )
     return "\n".join(lines)
 
 
@@ -561,7 +650,9 @@ def _write_output(path: Path, report: Mapping[str, Any]) -> None:
     path = path.absolute()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
