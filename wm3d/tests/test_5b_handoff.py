@@ -57,6 +57,9 @@ def test_5b_presets_match_v8_core_5b_and_64_h200(
     assert model["model"]["factual_action_residual_scale"] == 1.0
     assert model["model"]["factual_v7_early_action_conditioning"] is True
     assert model["model"]["factual_v7_early_action_scale"] == 1.0
+    assert model["model"]["factual_v7_bridge_layers_state"] == [
+        3, 6, 9, 12, 15, 18, 21, 24, 27, 31
+    ]
     assert "render_factual_dynamics_repeats" not in model["model"]
     assert "render_factual_action_residual_scale" not in model["model"]
     assert model["model"]["appearance_action_residual_scale"] == 0.0
@@ -74,8 +77,8 @@ def test_5b_presets_match_v8_core_5b_and_64_h200(
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
-    assert objective["objective"]["context_pixel_action_rank_weight"] == 2.0
-    assert objective["objective"]["context_pixel_action_separation_weight"] == 0.5
+    assert objective["objective"]["context_pixel_action_rank_weight"] == 0.0
+    assert objective["objective"]["context_pixel_action_separation_weight"] == 0.0
     assert objective["objective"]["context_pixel_action_rank_start_step"] == 30000
     assert objective["objective"]["context_pixel_action_rank_ramp_steps"] == 10000
     assert objective["objective"]["context_pixel_action_rank_every"] == 8
