@@ -25,6 +25,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS
+from wm3d.training.native_objective import compose_axis_angle_sequence
 
 
 NATIVE_WORLD_MODEL_SCHEMA = "wm3d_native_world_model_v2"
@@ -2365,6 +2366,171 @@ class _ZeroProjection(nn.Conv2d):
             nn.init.zeros_(self.bias)
 
 
+class OriginalV7RGBActionAdapter(nn.Module):
+    """Recover the exact seven-dimensional command consumed by V7 RGB.
+
+    V8 retains source-rate, masked, normalized and grouped action tensors. The
+    original V7 renderer consumed one per-horizon
+    [dx,dy,dz,rx,ry,rz,close01] command, not a pooled hidden representation.
+    This parameter-free adapter composes the unique canonical arm group into
+    that proven ABI. Other groups remain available to factual P64 and policy.
+    """
+
+    _EXPECTED_SEMANTICS = (
+        ACTION_SEMANTIC_IDS["delta_position_m"],
+        ACTION_SEMANTIC_IDS["delta_position_m"],
+        ACTION_SEMANTIC_IDS["delta_position_m"],
+        ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+        ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+        ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+        ACTION_SEMANTIC_IDS["absolute_gripper_close01"],
+    )
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
+
+    @staticmethod
+    def _select_future_group(
+        value: torch.Tensor, group_index: torch.Tensor
+    ) -> torch.Tensor:
+        shape = list(value.shape)
+        index = group_index.view(shape[0], 1, 1, *([1] * (value.ndim - 3)))
+        expand = list(shape)
+        expand[2] = 1
+        return value.gather(2, index.expand(expand)).squeeze(2)
+
+    @staticmethod
+    def _select_static_group(
+        value: torch.Tensor, group_index: torch.Tensor
+    ) -> torch.Tensor:
+        shape = list(value.shape)
+        index = group_index.view(shape[0], 1, *([1] * (value.ndim - 2)))
+        expand = list(shape)
+        expand[1] = 1
+        return value.gather(1, index.expand(expand)).squeeze(1)
+
+    def forward(
+        self,
+        *,
+        fine_values: torch.Tensor,
+        fine_dim_mask: torch.Tensor,
+        fine_sample_mask: torch.Tensor,
+        coarse_values: torch.Tensor,
+        coarse_dim_mask: torch.Tensor,
+        action_semantic_ids: torch.Tensor,
+        group_mask: torch.Tensor,
+        normalization_offset: torch.Tensor,
+        normalization_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        cfg = self.cfg
+        batch = fine_values.shape[0]
+        if tuple(fine_values.shape[1:3]) != (cfg.K, cfg.max_action_groups):
+            raise ValueError("V7 RGB fine action must align to [B,K,G,S,A]")
+        if fine_values.shape != fine_dim_mask.shape:
+            raise ValueError("V7 RGB fine action values/mask must match")
+        if fine_sample_mask.shape != fine_values.shape[:-1]:
+            raise ValueError("V7 RGB fine sample mask must align")
+        if tuple(coarse_values.shape[1:]) != (
+            cfg.K,
+            cfg.max_action_groups,
+            cfg.max_action_dim,
+        ) or coarse_dim_mask.shape != coarse_values.shape:
+            raise ValueError("V7 RGB coarse action must align to [B,K,G,A]")
+        if tuple(action_semantic_ids.shape) != (
+            batch,
+            cfg.max_action_groups,
+            cfg.max_action_dim,
+        ):
+            raise ValueError("V7 RGB action semantics must align to [B,G,A]")
+        if tuple(group_mask.shape) != (batch, cfg.max_action_groups):
+            raise ValueError("V7 RGB group mask must align to [B,G]")
+        if (
+            normalization_offset.shape != action_semantic_ids.shape
+            or normalization_scale.shape != action_semantic_ids.shape
+            or bool((normalization_scale <= 0).any())
+        ):
+            raise ValueError("V7 RGB action normalization is invalid")
+
+        expected = torch.as_tensor(
+            self._EXPECTED_SEMANTICS,
+            dtype=action_semantic_ids.dtype,
+            device=action_semantic_ids.device,
+        )
+        canonical_group = (
+            action_semantic_ids[..., :7].eq(expected).all(dim=-1) & group_mask
+        )
+        if not bool(canonical_group.sum(dim=1).eq(1).all()):
+            raise ValueError(
+                "original V7 RGB requires exactly one canonical seven-dimensional arm group"
+            )
+        group_index = canonical_group.to(dtype=torch.long).argmax(dim=1)
+        fine = self._select_future_group(fine_values, group_index)
+        fine_mask = self._select_future_group(fine_dim_mask, group_index)
+        sample_mask = self._select_future_group(fine_sample_mask, group_index)
+        coarse = self._select_future_group(coarse_values, group_index)
+        coarse_mask = self._select_future_group(coarse_dim_mask, group_index)
+        offset = self._select_static_group(normalization_offset, group_index)
+        scale = self._select_static_group(normalization_scale, group_index)
+
+        fine_valid = fine_mask[..., :7] & sample_mask[..., None]
+        fine_present = fine_valid.any(dim=(-1, -2))
+        coarse_present = coarse_mask[..., :7].any(dim=-1)
+        if bool((fine_present & coarse_present).any()):
+            raise ValueError("one V7 RGB horizon cannot mix fine and coarse arm actions")
+        if not bool((fine_present | coarse_present).all()):
+            raise ValueError("every V7 RGB horizon requires a real arm command")
+
+        translation = (
+            fine[..., :3] * fine_valid[..., :3].to(dtype=fine.dtype)
+        ).sum(dim=2)
+        physical_rotation = torch.where(
+            fine_valid[..., 3:6],
+            fine[..., 3:6] * scale[:, None, None, 3:6]
+            + offset[:, None, None, 3:6],
+            torch.zeros_like(fine[..., 3:6]),
+        )
+        zero_rotation = torch.where(
+            fine_valid[..., 3:6],
+            offset[:, None, None, 3:6].expand_as(fine[..., 3:6]),
+            torch.zeros_like(fine[..., 3:6]),
+        )
+        rotation_valid = fine_valid[..., 3:6].any(dim=-1)
+        rotation, rotation_present = compose_axis_angle_sequence(
+            physical_rotation, rotation_valid, left_multiply=True
+        )
+        zero_rotation, zero_rotation_present = compose_axis_angle_sequence(
+            zero_rotation, rotation_valid, left_multiply=True
+        )
+        if not torch.equal(rotation_present, zero_rotation_present):
+            raise RuntimeError("V7 RGB factual/zero rotation masks differ")
+        rotation = (rotation - zero_rotation) / scale[:, None, 3:6]
+        rotation = rotation * rotation_present[..., None].to(rotation.dtype)
+
+        substeps = fine.shape[2]
+        substep_index = torch.arange(
+            substeps, device=fine.device, dtype=torch.long
+        ).view(1, 1, substeps)
+        grip_valid = fine_valid[..., 6]
+        last_index = torch.where(grip_valid, substep_index, -1).amax(dim=2)
+        grip = fine[..., 6].gather(2, last_index.clamp_min(0).unsqueeze(2))
+        grip = grip.squeeze(2)
+        grip = torch.where(last_index >= 0, grip, torch.zeros_like(grip))
+        fine_action = torch.cat(
+            (translation, rotation, (grip > 0.5).to(dtype=fine.dtype)[..., None]),
+            dim=-1,
+        )
+
+        coarse_action = coarse[..., :7].clone()
+        coarse_action[..., 6] = (coarse_action[..., 6] > 0.5).to(
+            dtype=coarse_action.dtype
+        )
+        action = torch.where(fine_present[..., None], fine_action, coarse_action)
+        if tuple(action.shape) != (batch, cfg.K, 7):
+            raise RuntimeError("V7 RGB action adapter produced an invalid shape")
+        return action
+
+
 class NativeV7BoundedHighFrequencyRefiner(nn.Module):
     """Tiny factual-P64 detail head with a fixed zero-DC output contract."""
 
@@ -2467,9 +2633,8 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
     The spatial path and output parameterization match the decoder used by the
     original V7 60K checkpoint: a full-resolution observed RGB pyramid, P64
     factual tokens interpolated into the 16x16 bottleneck, direct RGB plus a
-    bounded residual, and learned blend/motion maps.  V8 keeps its generalized
-    grouped-action ABI by projecting the centered factual action summary rather
-    than hard-coding a seven-dimensional robot action.
+    bounded residual, and learned blend/motion maps. Its renderer input remains
+    the exact canonical seven-dimensional physical action used by V7.
     """
 
     def __init__(self, cfg: NativeWorldModelConfig):
@@ -2495,7 +2660,7 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
             _RGBConvBlock(hidden, hidden),
         )
         self.action_proj = nn.Sequential(
-            nn.Linear(cfg.state_hidden, hidden),
+            nn.Linear(7, hidden),
             nn.SiLU(inplace=True),
             nn.Linear(hidden, hidden),
         )
@@ -2591,10 +2756,10 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
         if self.cfg.rgb_context_action_scale > 0.0:
             if factual_action_summary is None or factual_action_summary.shape != (
                 tokens.shape[0],
-                self.cfg.state_hidden,
+                7,
             ):
                 raise ValueError(
-                    "centered factual action summary must align to original V7 RGB slots"
+                    "canonical physical action must align to original V7 RGB slots"
                 )
         elif factual_action_summary is not None:
             raise ValueError("RGB action was supplied while its scale is zero")
@@ -3231,8 +3396,17 @@ class NativeRGBDecoder(nn.Module):
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.view_embed = nn.Parameter(torch.empty(cfg.num_views, cfg.rgb_hidden, 1, 1))
-        nn.init.normal_(self.view_embed, std=0.02)
+        if cfg.rgb_original_v7_context:
+            self.register_buffer(
+                "view_embed",
+                torch.zeros(cfg.num_views, cfg.rgb_hidden, 1, 1),
+                persistent=False,
+            )
+        else:
+            self.view_embed = nn.Parameter(
+                torch.empty(cfg.num_views, cfg.rgb_hidden, 1, 1)
+            )
+            nn.init.normal_(self.view_embed, std=0.02)
         image_decoder: nn.Module
         if cfg.rgb_original_v7_context:
             image_decoder = NativeOriginalV7ContextRGBImageDecoder(cfg)
@@ -3245,7 +3419,8 @@ class NativeRGBDecoder(nn.Module):
         self.image_decoder = image_decoder
 
     def reset_parameters(self) -> None:
-        nn.init.normal_(self.view_embed, std=0.02)
+        if isinstance(self.view_embed, nn.Parameter):
+            nn.init.normal_(self.view_embed, std=0.02)
 
     def forward(
         self,
@@ -3404,11 +3579,10 @@ class NativeRGBDecoder(nn.Module):
         view_ids = view_ids.view(1, 1, views).expand(batch, frames, -1).reshape(-1)
         expanded_action: Optional[torch.Tensor] = None
         if self.cfg.rgb_context_action_scale > 0.0:
-            expected_action = (
-                batch,
-                self.cfg.K,
-                self.cfg.state_hidden,
+            action_dim = (
+                7 if self.cfg.rgb_original_v7_context else self.cfg.state_hidden
             )
+            expected_action = (batch, self.cfg.K, action_dim)
             if (
                 factual_action_summary is None
                 or tuple(factual_action_summary.shape) != expected_action
@@ -3418,7 +3592,7 @@ class NativeRGBDecoder(nn.Module):
             expanded_action = (
                 selected_action[:, :, None]
                 .expand(-1, -1, views, -1)
-                .reshape(batch * frames * views, self.cfg.state_hidden)
+                .reshape(batch * frames * views, action_dim)
             )
         elif factual_action_summary is not None:
             raise ValueError(
@@ -3739,6 +3913,11 @@ class NativeWorldModel(nn.Module):
         self.action_head = UnifiedActionHead(cfg)
         self.geometry_head = NativeGeometryHead(cfg)
         self.rgb_head = NativeRGBDecoder(cfg)
+        self.original_v7_rgb_action: Optional[OriginalV7RGBActionAdapter] = (
+            OriginalV7RGBActionAdapter(cfg)
+            if cfg.rgb_original_v7_context and cfg.rgb_context_action_scale > 0.0
+            else None
+        )
 
         self._action_steps = [
             (cfg.action_layers * (index + 1) // cfg.state_layers)
@@ -4261,16 +4440,28 @@ class NativeWorldModel(nn.Module):
             action_free_future if cfg.rgb_render_action_free_prior else render_future
         )
         zero_action_pred_tokens: Optional[torch.Tensor] = None
-        centered_action_summary: Optional[torch.Tensor] = None
-        if cfg.rgb_context_action_scale > 0.0:
-            assert centered_summary is not None
-            # The RGB renderer needs the physical command itself, not the
-            # encoder's action-independent mask/time/semantic/group mixture.
-            centered_action_summary = centered_summary
         rgb_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
-            assert centered_action_summary is not None
-            rgb_action_summary = centered_action_summary
+            if cfg.rgb_original_v7_context:
+                if self.original_v7_rgb_action is None:
+                    raise RuntimeError(
+                        "original V7 RGB action adapter is unavailable"
+                    )
+                rgb_action_summary = self.original_v7_rgb_action(
+                    fine_values=future_factual_fine_action_values,
+                    fine_dim_mask=future_factual_fine_action_mask,
+                    fine_sample_mask=future_factual_fine_sample_mask,
+                    coarse_values=future_factual_coarse_action_values,
+                    coarse_dim_mask=future_factual_coarse_action_mask,
+                    action_semantic_ids=action_semantic_ids,
+                    group_mask=action_group_mask,
+                    normalization_offset=action_normalization_offset,
+                    normalization_scale=action_normalization_scale,
+                )
+            else:
+                if centered_summary is None:
+                    raise RuntimeError("centered RGB action summary is unavailable")
+                rgb_action_summary = centered_summary
         appearance_action_tokens: Optional[torch.Tensor] = None
         appearance_action_mask: Optional[torch.Tensor] = None
         if cfg.appearance_action_residual_scale > 0.0:

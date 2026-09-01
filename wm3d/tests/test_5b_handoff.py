@@ -44,7 +44,7 @@ def test_5b_presets_match_v8_core_5b_and_64_h200(
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_440_933_496
+    assert model["expected_parameter_count"] == 5_437_007_480
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_enabled"] is False

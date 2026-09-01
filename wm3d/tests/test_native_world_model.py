@@ -20,6 +20,7 @@ from wm3d.models.native_world_model import (
     NativeRGBImageDecoder,
     NativeWorldModel,
     NativeWorldModelConfig,
+    OriginalV7RGBActionAdapter,
     OriginalV7FactualDecoderLayer,
     _warp_rgb_feature_with_pixel_flow,
 )
@@ -1311,11 +1312,30 @@ def _tiny_original_v7_rgb_config() -> NativeWorldModelConfig:
     )
 
 
+def _original_v7_batch(cfg: NativeWorldModelConfig) -> dict[str, torch.Tensor]:
+    batch = _batch(cfg)
+    batch["action_semantic_ids"][:, 0, 6] = ACTION_SEMANTIC_IDS[
+        "absolute_gripper_close01"
+    ]
+    return batch
+
+
+def test_original_v7_rgb_keeps_the_exact_renderer_abi() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    model = NativeWorldModel(cfg)
+    decoder = model.rgb_head.image_decoder
+    assert isinstance(model.original_v7_rgb_action, OriginalV7RGBActionAdapter)
+    assert isinstance(decoder, NativeOriginalV7ContextRGBImageDecoder)
+    assert decoder.action_proj[0].in_features == 7
+    assert not isinstance(model.rgb_head.view_embed, torch.nn.Parameter)
+    assert model.rgb_head.view_embed.count_nonzero() == 0
+
+
 def test_original_v7_rgb_uses_p64_context_action_and_task_gradients() -> None:
     cfg = _tiny_original_v7_rgb_config()
     torch.manual_seed(211)
     model = NativeWorldModel(cfg).train()
-    batch = _batch(cfg)
+    batch = _original_v7_batch(cfg)
     batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
 
@@ -1347,7 +1367,7 @@ def test_original_v7_rgb_future_action_changes_rgb_not_policy_or_action_free() -
     cfg = _tiny_original_v7_rgb_config()
     torch.manual_seed(212)
     model = NativeWorldModel(cfg).eval()
-    batch = _batch(cfg)
+    batch = _original_v7_batch(cfg)
     batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     factual = model(**batch)
@@ -1377,7 +1397,7 @@ def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:
     cfg = _tiny_original_v7_rgb_config()
     torch.manual_seed(213)
     model = NativeWorldModel(cfg).eval()
-    batch = _batch(cfg)
+    batch = _original_v7_batch(cfg)
     batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     block_inputs: list[torch.Tensor] = []
@@ -1452,7 +1472,7 @@ def test_original_v7_early_factual_path_checkpoint_backward_is_finite() -> None:
     model = NativeWorldModel(cfg).cuda().train()
     batch = {
         name: value.cuda() if isinstance(value, torch.Tensor) else value
-        for name, value in _batch(cfg).items()
+        for name, value in _original_v7_batch(cfg).items()
     }
     batch["context_rgb"] = torch.rand(
         2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size, device="cuda"
@@ -1514,7 +1534,7 @@ def test_v7_high_frequency_refiner_starts_exactly_at_v7_rgb() -> None:
     slots = 2
     tokens = torch.randn(slots, base_cfg.P, base_cfg.token_dim)
     view_embedding = torch.randn(slots, base_cfg.rgb_hidden, 1, 1)
-    action = torch.randn(slots, base_cfg.state_hidden)
+    action = torch.randn(slots, 7)
     task = torch.randn(slots, base_cfg.task_dim)
     context_rgb = torch.rand(slots, 3, base_cfg.rgb_size, base_cfg.rgb_size)
     context_indices = torch.arange(slots, dtype=torch.long)
@@ -1625,7 +1645,7 @@ def test_existing_rgb_objective_opens_v7_high_frequency_refiner() -> None:
     cfg = _tiny_original_v7_high_frequency_config()
     torch.manual_seed(214)
     model = NativeWorldModel(cfg).train()
-    batch = _batch(cfg)
+    batch = _original_v7_batch(cfg)
     batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     output = model(**batch)
