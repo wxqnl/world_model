@@ -4,7 +4,11 @@ from copy import deepcopy
 
 import pytest
 
-from tests.test_native_world_model import _batch, _tiny_config
+from tests.test_native_world_model import (
+    _batch,
+    _tiny_config,
+    _tiny_original_v7_rgb_config,
+)
 from wm3d.models.native_world_model import NativeWorldModel
 from wm3d.training.gradient_ownership import (
     GRADIENT_OWNERSHIP_SCHEMA,
@@ -43,6 +47,23 @@ def test_owner_table_covers_each_trainable_parameter_exactly_once() -> None:
     assert "policy_action_inputs" in owners
     assert "auxiliary_inputs" in owners
     assert "auxiliary_inputs" not in required_gradient_owner_names(model)
+
+
+def test_exact_v7_factual_modules_have_one_gradient_owner() -> None:
+    model = NativeWorldModel(_tiny_original_v7_rgb_config())
+    owners = _owner_parameters(model)
+    owned = [
+        id(parameter)
+        for parameters in owners.values()
+        for parameter in parameters
+    ]
+    expected = [
+        id(parameter)
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    assert len(owned) == len(set(owned))
+    assert set(owned) == set(expected)
 
 
 def test_real_receipt_has_complete_finite_owner_evidence() -> None:

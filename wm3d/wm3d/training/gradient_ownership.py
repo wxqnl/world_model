@@ -44,17 +44,29 @@ def _required_owner_modules(
         policy_modules.append(model.policy_spatial_task_modulation)
     if model.policy_calibration is not None:
         policy_modules.append(model.policy_calibration)
+    factual_modules: list[nn.Module] = [
+        model.factual_action,
+        model.dynamics_blocks,
+        model.factual_token_output,
+    ]
+    for module in (
+        model.factual_v7_query_action,
+        model.factual_v7_stream_action,
+        model.factual_v7_action_memory,
+        model.factual_v7_state_to_action,
+        model.factual_v7_group_query_norm,
+        model.factual_v7_group_action_norm,
+        model.factual_v7_group_query_cross,
+    ):
+        if module is not None:
+            factual_modules.append(module)
     owners: dict[str, tuple[nn.Module, ...]] = {
         "native_state_trunk": (
             model.view_fuser,
             model.state_blocks,
             model.token_output,
         ),
-        "factual_dynamics": (
-            model.factual_action,
-            model.dynamics_blocks,
-            model.factual_token_output,
-        ),
+        "factual_dynamics": tuple(factual_modules),
         "policy_action_trunk": tuple(policy_modules),
         "state_action_bridges": (model.bridges,),
         "current_state_proprio": (model.current_state,),
