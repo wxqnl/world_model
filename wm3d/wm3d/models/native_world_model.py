@@ -735,7 +735,26 @@ class FactorizedStateBlock(nn.Module):
         self.ff_norm = RMSNorm(dim)
         self.ff = SwiGLU(dim, cfg.state_ff_mult, cfg.dropout)
 
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        value: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if value.ndim == 3:
+            if token_mask is None or tuple(token_mask.shape) != tuple(value.shape[:2]):
+                raise ValueError("full state sequence mask must be [B,L]")
+            value = value * token_mask[..., None].to(dtype=value.dtype)
+            value = value + self.spatial(
+                self.spatial_norm(value),
+                allowed_mask=token_mask[:, None, None, :],
+            )
+            value = value * token_mask[..., None].to(dtype=value.dtype)
+            value = value + self.ff(self.ff_norm(value))
+            return value * token_mask[..., None].to(dtype=value.dtype)
+        if value.ndim != 4:
+            raise ValueError("state block expects [B,F,P,D] or [B,L,D]")
+        if token_mask is not None:
+            raise ValueError("factorized state execution does not take a token mask")
         batch, frames, patches, dim = value.shape
         spatial = value.reshape(batch * frames, patches, dim)
         spatial = spatial + self.spatial(self.spatial_norm(spatial))
@@ -889,12 +908,15 @@ class CanonicalV7ActionTokenEncoder(nn.Module):
         nn.init.normal_(self.horizon_pos, std=0.02)
 
     def forward(self, action_cond: torch.Tensor) -> torch.Tensor:
-        if action_cond.ndim != 3 or tuple(action_cond.shape[1:]) != (
-            self.horizon,
-            7,
-        ):
-            raise ValueError("canonical V7 action must be [B,K,7]")
-        return self.proj(action_cond) + self.horizon_pos
+        if action_cond.ndim == 3:
+            if tuple(action_cond.shape[1:]) != (self.horizon, 7):
+                raise ValueError("canonical V7 action must be [B,K,7]")
+            return self.proj(action_cond) + self.horizon_pos
+        if action_cond.ndim == 4:
+            if action_cond.shape[1] != self.horizon or action_cond.shape[-1] != 7:
+                raise ValueError("grouped canonical V7 action must be [B,K,G,7]")
+            return self.proj(action_cond) + self.horizon_pos[:, :, None]
+        raise ValueError("canonical V7 action must be [B,K,7] or [B,K,G,7]")
 
 
 class CurrentStateEncoder(nn.Module):
@@ -1122,6 +1144,19 @@ class ActionBlock(nn.Module):
         task_condition: torch.Tensor,
         task_token_mask: torch.Tensor,
     ) -> torch.Tensor:
+        if value.ndim == 3:
+            if tuple(token_mask.shape) != tuple(value.shape[:2]):
+                raise ValueError("full action sequence mask must be [B,L]")
+            value = value * token_mask[..., None].to(dtype=value.dtype)
+            value = value + self.attn(
+                self.attn_norm(value),
+                allowed_mask=token_mask[:, None, None, :],
+            )
+            value = value * token_mask[..., None].to(dtype=value.dtype)
+            value = value + self.ff(self.ff_norm(value))
+            return value * token_mask[..., None].to(dtype=value.dtype)
+        if value.ndim != 4:
+            raise ValueError("action block expects [B,S,G,D] or [B,L,D]")
         batch, steps, groups, dim = value.shape
         if tuple(action_times.shape) != (batch, steps, groups):
             raise ValueError("action_times must align with [B,S,G] action tokens")
@@ -1209,20 +1244,29 @@ class StateActionBridge(nn.Module):
         # direction of robot/object motion.  The existing projection weights
         # are reused, so this branch adds no bridge parameters.
         if state.ndim == 3 and action.ndim == 3:
+            if tuple(state.shape[:2]) != tuple(action.shape[:2]):
+                raise ValueError("full-token bridge streams must share token length")
             if tuple(action_mask.shape) != tuple(action.shape[:2]):
                 raise ValueError("full-token action mask must be [B,L]")
+            state_normalized = self.state_norm(state)
+            action_normalized = self.action_norm(action)
             action_update = self.action_reads_state(
-                self.action_norm(action), self.state_norm(state)
+                action_normalized,
+                state_normalized,
+                allowed_mask=action_mask[:, None, None, :],
+            )
+            state_update = self.state_reads_action(
+                state_normalized,
+                action_normalized,
+                allowed_mask=action_mask[:, None, None, :],
+            )
+            state = (state + state_update) * action_mask[..., None].to(
+                dtype=state.dtype
             )
             action = (action + action_update) * action_mask[..., None].to(
                 dtype=action.dtype
             )
-            state_update = self.state_reads_action(
-                self.state_norm(state),
-                self.action_norm(action),
-                allowed_mask=action_mask[:, None, None, :],
-            )
-            return state + state_update, action
+            return state, action
         if state.ndim != 4 or action.ndim != 4:
             raise ValueError("bridge inputs must both be factorized or full-token")
         batch, state_steps, patches, _ = state.shape
@@ -2499,7 +2543,8 @@ class OriginalV7RGBActionAdapter(nn.Module):
         group_mask: torch.Tensor,
         normalization_offset: torch.Tensor,
         normalization_scale: torch.Tensor,
-    ) -> torch.Tensor:
+        return_grouped: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         batch = fine_values.shape[0]
         if tuple(fine_values.shape[1:3]) != (cfg.K, cfg.max_action_groups):
@@ -2610,13 +2655,17 @@ class OriginalV7RGBActionAdapter(nn.Module):
         grouped_action = torch.where(
             fine_present[..., None], fine_action, coarse_action
         )
-        # V7's decoder/RGB ABI has one Kx7 query skip. Multi-arm identity is
-        # preserved by the full grouped KxG ActionStream and decoder memory;
-        # this auxiliary skip is the explicit mean of all canonical arm
-        # commands rather than silently choosing one group.
-        weight = canonical_group[:, None, :, None].to(dtype=grouped_action.dtype)
-        action = (grouped_action * weight).sum(dim=2)
-        action = action / weight.sum(dim=2).clamp_min(1.0)
+        grouped_action = grouped_action * canonical_group[:, None, :, None].to(
+            dtype=grouped_action.dtype
+        )
+        if return_grouped:
+            return grouped_action, canonical_group
+        if not bool(canonical_group.sum(dim=1).eq(1).all()):
+            raise ValueError(
+                "a direct V7 Kx7 action skip requires exactly one canonical arm group"
+            )
+        group_index = canonical_group.to(dtype=torch.long).argmax(dim=1)
+        action = self._select_future_group(grouped_action, group_index)
         if tuple(action.shape) != (batch, cfg.K, 7):
             raise RuntimeError("V7 RGB action adapter produced an invalid shape")
         return action
@@ -3956,8 +4005,38 @@ class NativeWorldModel(nn.Module):
             if cfg.factual_v7_early_action_conditioning
             else None
         )
+        self.factual_v7_stream_action: Optional[CanonicalV7ActionTokenEncoder] = (
+            CanonicalV7ActionTokenEncoder(cfg.action_hidden, cfg.K)
+            if cfg.factual_v7_early_action_conditioning
+            else None
+        )
         self.factual_v7_action_memory: Optional[nn.Linear] = (
             nn.Linear(cfg.action_hidden, cfg.state_hidden, bias=True)
+            if cfg.factual_v7_early_action_conditioning
+            else None
+        )
+        self.factual_v7_state_to_action: Optional[nn.Linear] = (
+            nn.Linear(cfg.state_hidden, cfg.action_hidden, bias=True)
+            if cfg.factual_v7_early_action_conditioning
+            else None
+        )
+        self.factual_v7_group_query_norm: Optional[RMSNorm] = (
+            RMSNorm(cfg.state_hidden)
+            if cfg.factual_v7_early_action_conditioning
+            else None
+        )
+        self.factual_v7_group_action_norm: Optional[RMSNorm] = (
+            RMSNorm(cfg.action_hidden)
+            if cfg.factual_v7_early_action_conditioning
+            else None
+        )
+        self.factual_v7_group_query_cross: Optional[CrossAttention] = (
+            CrossAttention(
+                cfg.state_hidden,
+                cfg.action_hidden,
+                cfg.state_heads,
+                cfg.dropout,
+            )
             if cfg.factual_v7_early_action_conditioning
             else None
         )
@@ -4218,11 +4297,14 @@ class NativeWorldModel(nn.Module):
         state = (
             state + self.state_space + self.state_time(relative_world_time)[:, :, None]
         )
+        # V7 factual streams carry task as one explicit sequence token. Keep a
+        # task-free observed P64 seed for those streams while leaving the
+        # action-free policy calculation below byte-for-byte unchanged.
+        factual_state_seed = self._encode_aux(
+            state, aux_values, aux_mask, aux_type_ids
+        )
         state = state + self.task_state(task_embedding)[:, None, None]
         state = self._encode_aux(state, aux_values, aux_mask, aux_type_ids)
-        # The factual path starts before policy/history bridges so candidate
-        # action changes cannot alter the already-computed policy prior.
-        factual_state_seed = state
 
         history, history_valid = self.history_action(
             fine_values=history_fine_action_values,
@@ -4502,12 +4584,15 @@ class NativeWorldModel(nn.Module):
             zero_centered_summary = zero_summary - zero_summary_anchor
 
         canonical_action_cond: Optional[torch.Tensor] = None
+        canonical_grouped_action: Optional[torch.Tensor] = None
+        canonical_group_mask: Optional[torch.Tensor] = None
+        canonical_single_group: Optional[torch.Tensor] = None
         if cfg.factual_v7_early_action_conditioning or (
             cfg.rgb_original_v7_context and cfg.rgb_context_action_scale > 0.0
         ):
             if self.original_v7_rgb_action is None:
                 raise RuntimeError("canonical V7 physical action adapter is unavailable")
-            canonical_action_cond = self.original_v7_rgb_action(
+            canonical_grouped_action, canonical_group_mask = self.original_v7_rgb_action(
                 fine_values=future_factual_fine_action_values,
                 fine_dim_mask=future_factual_fine_action_mask,
                 fine_sample_mask=future_factual_fine_sample_mask,
@@ -4517,6 +4602,23 @@ class NativeWorldModel(nn.Module):
                 group_mask=action_group_mask,
                 normalization_offset=action_normalization_offset,
                 normalization_scale=action_normalization_scale,
+                return_grouped=True,
+            )
+            canonical_single_group = canonical_group_mask.sum(dim=1).eq(1)
+            canonical_group_index = canonical_group_mask.to(dtype=torch.long).argmax(
+                dim=1
+            )
+            selected_action = OriginalV7RGBActionAdapter._select_future_group(
+                canonical_grouped_action, canonical_group_index
+            )
+            # The original V7 direct query/RGB skip is exact only for one arm
+            # owner. Multi-group samples stay fully conditioned through the
+            # factual streams below; a raw group mean would cancel commands
+            # from different physical owners, so the direct skip is disabled.
+            canonical_action_cond = torch.where(
+                canonical_single_group[:, None, None],
+                selected_action,
+                torch.zeros_like(selected_action),
             )
 
         def encode_factual_action_stream(
@@ -4536,162 +4638,238 @@ class NativeWorldModel(nn.Module):
                 embodiment_ids=embodiment_ids,
             )
 
-        def run_v7_factorized_factual(
+        def run_v7_fullsequence_factual(
             physical_action: torch.Tensor,
             physical_action_mask: torch.Tensor,
             canonical_action: torch.Tensor,
+            grouped_canonical_action: torch.Tensor,
+            canonical_groups: torch.Tensor,
+            single_group: torch.Tensor,
             *,
             repeats: int,
             residual_scale: float,
         ) -> torch.Tensor:
-            """Scale-safe V7 causal topology over the shared V8 trunks.
+            """Run the exact V7 dual full-sequence factual topology.
 
-            Physical action exists exactly once as [B,K,G,A]. Before block
-            zero and at every factual V7 bridge, each observed P64 patch and
-            every valid action token exchange query-specific information via
-            full softmax cross-attention. State/action blocks themselves keep
-            their production factorization, avoiding O((T*P)^2) execution.
+            Both streams contain ``task + observed TP + future KG`` from
+            block zero onward.  State/action blocks are shared with the
+            policy pass but run non-causally over these explicit sequences;
+            every configured bridge is applied once and synchronously.  This
+            adds no duplicate trunk and never exposes the future candidate to
+            the already-computed policy/action-free result.
             """
 
-            if tuple(physical_action.shape) != (
+            expected_action = (
                 batch,
                 cfg.K,
                 cfg.max_action_groups,
                 cfg.action_hidden,
-            ):
+            )
+            if tuple(physical_action.shape) != expected_action:
                 raise ValueError("factual ActionStream must be [B,K,G,A]")
-            if tuple(physical_action_mask.shape) != tuple(physical_action.shape[:3]):
+            if tuple(physical_action_mask.shape) != expected_action[:3]:
                 raise ValueError("factual action mask must be [B,K,G]")
             if tuple(canonical_action.shape) != (batch, cfg.K, 7):
                 raise ValueError("canonical factual action must be [B,K,7]")
-            if self.factual_v7_query_action is None:
-                raise RuntimeError("V7 factual query action encoder is unavailable")
-            if self.factual_v7_action_memory is None:
-                raise RuntimeError("V7 factual action memory projection is unavailable")
+            if tuple(grouped_canonical_action.shape) != (
+                batch,
+                cfg.K,
+                cfg.max_action_groups,
+                7,
+            ):
+                raise ValueError("grouped canonical action must be [B,K,G,7]")
+            if tuple(canonical_groups.shape) != (
+                batch,
+                cfg.max_action_groups,
+            ):
+                raise ValueError("canonical group mask must be [B,G]")
+            if tuple(single_group.shape) != (batch,):
+                raise ValueError("single-group selector must be [B]")
+            required = (
+                self.factual_v7_query_action,
+                self.factual_v7_stream_action,
+                self.factual_v7_action_memory,
+                self.factual_v7_state_to_action,
+                self.factual_v7_group_query_norm,
+                self.factual_v7_group_action_norm,
+                self.factual_v7_group_query_cross,
+            )
+            if any(module is None for module in required):
+                raise RuntimeError("full-sequence V7 factual modules are unavailable")
+            assert self.factual_v7_query_action is not None
+            assert self.factual_v7_stream_action is not None
+            assert self.factual_v7_action_memory is not None
+            assert self.factual_v7_state_to_action is not None
+            assert self.factual_v7_group_query_norm is not None
+            assert self.factual_v7_group_action_norm is not None
+            assert self.factual_v7_group_query_cross is not None
 
-            factual_state = factual_state_seed[:, : cfg.T]
+            observed_state = factual_state_seed[:, : cfg.T]
+            observed_state_flat = observed_state.reshape(
+                batch, cfg.T * cfg.P, cfg.state_hidden
+            )
             factual_action_times = relative_world_time[:, cfg.T :, None].expand(
                 -1, -1, cfg.max_action_groups
             )
-            factual_action = (
-                float(cfg.factual_v7_early_action_scale) * physical_action
-                + self.action_time(
+            # Keep group/semantic/embodiment identity in the token.  Centering
+            # the entire token would erase group identity; only the canonical
+            # physical values are centered upstream by the adapter.
+            factual_action = physical_action + self.action_time(
                 factual_action_times
-                )
             )
-            factual_action = factual_action + action_task[:, None, None]
             factual_action = factual_action * physical_action_mask[..., None].to(
                 dtype=factual_action.dtype
             )
-            factual_task_mask = physical_action_mask
-
-            def full_bridge(
-                bridge: nn.Module,
-                state_value: torch.Tensor,
-                action_value: torch.Tensor,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                state_flat = state_value.reshape(
-                    batch, cfg.T * cfg.P, cfg.state_hidden
-                )
-                action_flat = action_value.reshape(
-                    batch,
-                    cfg.K * cfg.max_action_groups,
-                    cfg.action_hidden,
-                )
-                action_valid = physical_action_mask.reshape(
-                    batch, cfg.K * cfg.max_action_groups
-                )
-                state_flat, action_flat = self._run(
-                    bridge,
-                    state_flat,
-                    action_flat,
-                    action_valid,
-                    enabled=cfg.activation_checkpointing,
-                )
-                return (
-                    state_flat.view(batch, cfg.T, cfg.P, cfg.state_hidden),
-                    action_flat.view(
-                        batch,
-                        cfg.K,
-                        cfg.max_action_groups,
-                        cfg.action_hidden,
-                    ),
-                )
-
-            # Bridge zero is deliberately shared here and at its configured
-            # V7 layer. This exposes the complete observed P64 grid before the
-            # first ActionStream block without adding another bridge module.
-            factual_state, factual_action = full_bridge(
-                self.bridges[0], factual_state, factual_action
+            grouped_state_action = self.factual_v7_query_action(
+                grouped_canonical_action
             )
-            factual_action_index = 0
-            for factual_state_index, state_block in enumerate(self.state_blocks):
-                factual_state = self._run(
-                    state_block,
-                    factual_state,
-                    enabled=cfg.activation_checkpointing,
-                )
-                for _ in range(self._action_steps[factual_state_index]):
-                    factual_action = self._run(
-                        self.action_blocks[factual_action_index],
-                        factual_action,
-                        factual_action_times,
-                        physical_action_mask,
-                        action_task,
-                        factual_task_mask,
-                        enabled=cfg.activation_checkpointing,
-                    )
-                    factual_action_index += 1
-                factual_bridge_index = self._factual_bridge_by_state_layer.get(
-                    factual_state_index
-                )
-                if factual_bridge_index is not None:
-                    factual_state, factual_action = full_bridge(
-                        self.bridges[factual_bridge_index],
-                        factual_state,
-                        factual_action,
-                    )
-            while factual_action_index < len(self.action_blocks):
-                factual_action = self._run(
-                    self.action_blocks[factual_action_index],
-                    factual_action,
-                    factual_action_times,
-                    physical_action_mask,
-                    action_task,
-                    factual_task_mask,
-                    enabled=cfg.activation_checkpointing,
-                )
-                factual_action_index += 1
-
-            factual_state = self.state_norm(factual_state)
-            factual_action = self.action_norm(factual_action)
-            factual_action = factual_action * physical_action_mask[..., None].to(
-                dtype=factual_action.dtype
+            grouped_stream_action = self.factual_v7_stream_action(
+                grouped_canonical_action
             )
-            transformed_action_memory = self.factual_v7_action_memory(
-                factual_action
+            exact_group = (
+                single_group[:, None, None, None]
+                & canonical_groups[:, None, :, None]
             )
-            state_memory = factual_state.reshape(
-                batch, cfg.T * cfg.P, cfg.state_hidden
+            state_action = torch.where(
+                exact_group,
+                grouped_state_action,
+                self.factual_v7_action_memory(factual_action),
+            ).reshape(batch, cfg.K * cfg.max_action_groups, cfg.state_hidden)
+            action_observed = self.factual_v7_state_to_action(
+                observed_state_flat
             )
-            action_memory = transformed_action_memory.reshape(
-                batch, cfg.K * cfg.max_action_groups, cfg.state_hidden
+            action_future = torch.where(
+                exact_group,
+                grouped_stream_action,
+                factual_action,
+            ).reshape(
+                batch, cfg.K * cfg.max_action_groups, cfg.action_hidden
             )
-            action_memory_valid = physical_action_mask.reshape(
+            state_sequence = torch.cat(
+                (task_memory, observed_state_flat, state_action), dim=1
+            )
+            action_sequence = torch.cat(
+                (action_task[:, None], action_observed, action_future), dim=1
+            )
+            action_valid = physical_action_mask.reshape(
                 batch, cfg.K * cfg.max_action_groups
             )
-            memory = torch.cat((task_memory, state_memory, action_memory), dim=1)
-            memory_valid = torch.cat(
-                (decoder_prefix_valid, action_memory_valid), dim=1
+            sequence_valid = torch.cat(
+                (
+                    torch.ones(
+                        batch,
+                        1 + cfg.T * cfg.P,
+                        dtype=torch.bool,
+                        device=physical_action.device,
+                    ),
+                    action_valid,
+                ),
+                dim=1,
             )
-            expected_memory = 1 + cfg.T * cfg.P + cfg.K * cfg.max_action_groups
-            if memory.shape[1] != expected_memory:
-                raise RuntimeError("factual decoder memory lost state/action tokens")
+            expected_length = 1 + cfg.T * cfg.P + cfg.K * cfg.max_action_groups
+            if state_sequence.shape[1] != expected_length:
+                raise RuntimeError("state factual stream lost full TP/KG topology")
+            if action_sequence.shape[1] != expected_length:
+                raise RuntimeError("action factual stream lost full TP/KG topology")
+            state_sequence = state_sequence * sequence_valid[..., None].to(
+                dtype=state_sequence.dtype
+            )
+            action_sequence = action_sequence * sequence_valid[..., None].to(
+                dtype=action_sequence.dtype
+            )
 
-            query_action = self.factual_v7_query_action(canonical_action)
+            dummy_times = torch.zeros(
+                batch,
+                expected_length,
+                dtype=relative_world_time.dtype,
+                device=relative_world_time.device,
+            )
+            dummy_task_mask = torch.zeros_like(sequence_valid)
+            action_index = 0
+            bridge_calls = 0
+            for state_index, state_block in enumerate(self.state_blocks):
+                state_sequence = self._run(
+                    state_block,
+                    state_sequence,
+                    sequence_valid,
+                    enabled=cfg.activation_checkpointing,
+                )
+                for _ in range(self._action_steps[state_index]):
+                    action_sequence = self._run(
+                        self.action_blocks[action_index],
+                        action_sequence,
+                        dummy_times,
+                        sequence_valid,
+                        action_task,
+                        dummy_task_mask,
+                        enabled=cfg.activation_checkpointing,
+                    )
+                    action_index += 1
+                bridge_index = self._factual_bridge_by_state_layer.get(state_index)
+                if bridge_index is not None:
+                    state_sequence, action_sequence = self._run(
+                        self.bridges[bridge_index],
+                        state_sequence,
+                        action_sequence,
+                        sequence_valid,
+                        enabled=cfg.activation_checkpointing,
+                    )
+                    bridge_calls += 1
+            while action_index < len(self.action_blocks):
+                action_sequence = self._run(
+                    self.action_blocks[action_index],
+                    action_sequence,
+                    dummy_times,
+                    sequence_valid,
+                    action_task,
+                    dummy_task_mask,
+                    enabled=cfg.activation_checkpointing,
+                )
+                action_index += 1
+            if bridge_calls != len(self._factual_bridge_by_state_layer):
+                raise RuntimeError("factual V7 bridge schedule was not applied once")
+
+            state_sequence = self.state_norm(state_sequence)
+            action_sequence = self.action_norm(action_sequence)
+            state_sequence = state_sequence * sequence_valid[..., None].to(
+                dtype=state_sequence.dtype
+            )
+            action_sequence = action_sequence * sequence_valid[..., None].to(
+                dtype=action_sequence.dtype
+            )
+            # Exact V7 decoder memory is the complete post-block StateStream.
+            # It already contains transformed KG tokens; concatenating the
+            # ActionStream here would duplicate the candidate.
+            memory = state_sequence
+            memory_valid = sequence_valid
+
+            exact_query_update = self.factual_v7_query_action(canonical_action)
+            post_group_action = action_sequence[:, 1 + cfg.T * cfg.P :].reshape(
+                batch * cfg.K,
+                cfg.max_action_groups,
+                cfg.action_hidden,
+            )
+            query_by_horizon = self.factual_v7_group_query_norm(
+                factual_query
+            ).reshape(batch * cfg.K, cfg.P, cfg.state_hidden)
+            group_valid = physical_action_mask.reshape(
+                batch * cfg.K, cfg.max_action_groups
+            )
+            safe_group_valid = group_valid.clone()
+            safe_group_valid[:, 0] |= ~safe_group_valid.any(dim=1)
+            grouped_query_update = self.factual_v7_group_query_cross(
+                query_by_horizon,
+                self.factual_v7_group_action_norm(post_group_action),
+                allowed_mask=safe_group_valid[:, None, None, :],
+            ).reshape(batch, cfg.K, cfg.P, cfg.state_hidden)
+            query_update = torch.where(
+                single_group[:, None, None, None],
+                exact_query_update[:, :, None, :],
+                grouped_query_update,
+            )
             refined = factual_query
             if residual_scale > 0.0:
-                refined = refined + residual_scale * query_action[:, :, None, :]
+                refined = refined + residual_scale * query_update
             for _ in range(repeats):
                 for dynamics_block in self.dynamics_blocks:
                     refined = self._run(
@@ -4749,6 +4927,10 @@ class NativeWorldModel(nn.Module):
         if cfg.factual_v7_early_action_conditioning:
             if canonical_action_cond is None:
                 raise RuntimeError("canonical V7 action is unavailable")
+            if canonical_single_group is None:
+                raise RuntimeError("canonical V7 group ownership is unavailable")
+            if canonical_grouped_action is None or canonical_group_mask is None:
+                raise RuntimeError("grouped canonical V7 action is unavailable")
             factual_action_stream, factual_action_stream_mask = (
                 encode_factual_action_stream(
                     future_factual_fine_action_values,
@@ -4765,15 +4947,13 @@ class NativeWorldModel(nn.Module):
                 factual_action_stream_mask, zero_action_stream_mask
             ):
                 raise RuntimeError("factual ActionStream masks must match")
-            zero_action_stream_anchor = zero_action_stream.detach()
-            factual_action_stream = (
-                factual_action_stream - zero_action_stream_anchor
-            )
-            zero_action_stream = zero_action_stream - zero_action_stream_anchor
-            factual_future = run_v7_factorized_factual(
+            factual_future = run_v7_fullsequence_factual(
                 factual_action_stream,
                 factual_action_stream_mask,
                 canonical_action_cond,
+                canonical_grouped_action,
+                canonical_group_mask,
+                canonical_single_group,
                 repeats=cfg.factual_dynamics_repeats,
                 residual_scale=cfg.factual_action_residual_scale,
             )
@@ -4807,10 +4987,16 @@ class NativeWorldModel(nn.Module):
             assert factual_action_stream is not None
             assert factual_action_stream_mask is not None
             assert canonical_action_cond is not None
-            render_future = run_v7_factorized_factual(
+            assert canonical_grouped_action is not None
+            assert canonical_group_mask is not None
+            assert canonical_single_group is not None
+            render_future = run_v7_fullsequence_factual(
                 factual_action_stream,
                 factual_action_stream_mask,
                 canonical_action_cond,
+                canonical_grouped_action,
+                canonical_group_mask,
+                canonical_single_group,
                 repeats=render_repeats,
                 residual_scale=render_residual_scale,
             )
@@ -4851,7 +5037,10 @@ class NativeWorldModel(nn.Module):
             if cfg.factual_v7_early_action_conditioning:
                 assert zero_action_stream is not None
                 assert zero_action_stream_mask is not None
-                zero_action_future = run_v7_factorized_factual(
+                assert canonical_grouped_action is not None
+                assert canonical_group_mask is not None
+                assert canonical_single_group is not None
+                zero_action_future = run_v7_fullsequence_factual(
                     zero_action_stream,
                     zero_action_stream_mask,
                     torch.zeros(
@@ -4861,6 +5050,9 @@ class NativeWorldModel(nn.Module):
                         dtype=zero_action_stream.dtype,
                         device=zero_action_stream.device,
                     ),
+                    torch.zeros_like(canonical_grouped_action),
+                    canonical_group_mask,
+                    canonical_single_group,
                     repeats=cfg.factual_dynamics_repeats,
                     residual_scale=cfg.factual_action_residual_scale,
                 )

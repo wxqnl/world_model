@@ -1437,6 +1437,8 @@ def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:
     batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     block_inputs: list[torch.Tensor] = []
+    action_block_inputs: list[torch.Tensor] = []
+    factual_bridge_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
     decoder_memories: list[torch.Tensor] = []
 
     def record(_module, inputs) -> None:
@@ -1445,7 +1447,20 @@ def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:
     def record_decoder(_module, inputs) -> None:
         decoder_memories.append(inputs[1].detach().clone())
 
+    def record_action(_module, inputs) -> None:
+        action_block_inputs.append(inputs[0].detach().clone())
+
+    def record_bridge(_module, inputs) -> None:
+        if inputs[0].ndim == 3:
+            factual_bridge_inputs.append(
+                (inputs[0].detach().clone(), inputs[1].detach().clone())
+            )
+
     handle = model.state_blocks[0].register_forward_pre_hook(record)
+    action_handle = model.action_blocks[0].register_forward_pre_hook(record_action)
+    bridge_handles = [
+        bridge.register_forward_pre_hook(record_bridge) for bridge in model.bridges
+    ]
     decoder_handle = model.dynamics_blocks[0].register_forward_pre_hook(
         record_decoder
     )
@@ -1461,27 +1476,41 @@ def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:
         zero = model(**zero_batch)
     finally:
         handle.remove()
+        action_handle.remove()
+        for bridge_handle in bridge_handles:
+            bridge_handle.remove()
         decoder_handle.remove()
 
-    # Each forward has an action-free policy pass followed by the factual pass.
-    # Physical action is not copied into T separate patch sets.  One KxG lane
-    # first exchanges full-token cross-attention with every observed patch,
-    # then the existing factorized state block receives the unchanged [T,P]
-    # topology.
+    # Each forward has an unchanged factorized policy pass followed by an
+    # exact V7 factual pass. Both factual streams contain task + full observed
+    # TP + one (not T-copied) KG candidate lane from block zero onward.
     assert len(block_inputs) == 4
     torch.testing.assert_close(block_inputs[0], block_inputs[2], rtol=0, atol=0)
     assert block_inputs[0].shape[2] == cfg.P
     assert block_inputs[0].shape[1] == cfg.T + cfg.K
-    assert block_inputs[1].shape[1] == cfg.T
-    assert block_inputs[3].shape[1] == cfg.T
-    assert block_inputs[1].shape[2] == cfg.P
-    assert block_inputs[3].shape[2] == cfg.P
+    expected_memory = 1 + cfg.T * cfg.P + cfg.K * cfg.max_action_groups
+    assert block_inputs[1].shape == (
+        2,
+        expected_memory,
+        cfg.state_hidden,
+    )
+    assert block_inputs[3].shape == block_inputs[1].shape
     assert not torch.allclose(
         block_inputs[1],
         block_inputs[3],
     )
+    assert len(action_block_inputs) == 4
+    assert action_block_inputs[0].ndim == 4
+    assert action_block_inputs[1].shape == (
+        2,
+        expected_memory,
+        cfg.action_hidden,
+    )
+    assert action_block_inputs[3].shape == action_block_inputs[1].shape
+    assert len(factual_bridge_inputs) == 2 * len(model.bridges)
+    assert all(state.shape[1] == expected_memory for state, _ in factual_bridge_inputs)
+    assert all(action.shape[1] == expected_memory for _, action in factual_bridge_inputs)
     assert len(decoder_memories) == 2
-    expected_memory = 1 + cfg.T * cfg.P + cfg.K * cfg.max_action_groups
     assert decoder_memories[0].shape[1] == expected_memory
     observed_memory = slice(1, 1 + cfg.T * cfg.P)
     action_memory = slice(1 + cfg.T * cfg.P, expected_memory)
@@ -1508,11 +1537,10 @@ def test_factual_full_cross_bridge_keeps_patch_updates_nonuniform() -> None:
     cfg = _tiny_original_v7_rgb_config()
     torch.manual_seed(214)
     bridge = StateActionBridge(cfg).eval()
-    state = torch.randn(2, cfg.T * cfg.P, cfg.state_hidden)
-    action = torch.randn(
-        2, cfg.K * cfg.max_action_groups, cfg.action_hidden
-    )
-    action_mask = torch.ones(action.shape[:2], dtype=torch.bool)
+    length = 1 + cfg.T * cfg.P + cfg.K * cfg.max_action_groups
+    state = torch.randn(2, length, cfg.state_hidden)
+    action = torch.randn(2, length, cfg.action_hidden)
+    action_mask = torch.ones(2, length, dtype=torch.bool)
     state_out, action_out = bridge(state, action, action_mask)
     state_delta = state_out - state
     action_delta = action_out - action
@@ -1571,7 +1599,7 @@ def test_canonical_v7_adapter_keeps_multi_group_factual_contract() -> None:
     offset = torch.zeros_like(coarse[:, 0])
     scale = torch.ones_like(offset)
 
-    action = adapter(
+    grouped_action, canonical_group = adapter(
         fine_values=fine,
         fine_dim_mask=fine_mask,
         fine_sample_mask=fine_sample_mask,
@@ -1581,9 +1609,54 @@ def test_canonical_v7_adapter_keeps_multi_group_factual_contract() -> None:
         group_mask=group_mask,
         normalization_offset=offset,
         normalization_scale=scale,
+        return_grouped=True,
     )
-    expected = ((first + second) / 2.0).view(1, 1, 7).expand(1, cfg.K, 7)
-    torch.testing.assert_close(action, expected)
+    assert canonical_group.all()
+    torch.testing.assert_close(
+        grouped_action[:, :, 0], first.view(1, 1, 7).expand(1, cfg.K, 7)
+    )
+    torch.testing.assert_close(
+        grouped_action[:, :, 1], second.view(1, 1, 7).expand(1, cfg.K, 7)
+    )
+    with pytest.raises(ValueError, match="exactly one canonical arm group"):
+        adapter(
+            fine_values=fine,
+            fine_dim_mask=fine_mask,
+            fine_sample_mask=fine_sample_mask,
+            coarse_values=coarse,
+            coarse_dim_mask=coarse_mask,
+            action_semantic_ids=semantic_ids,
+            group_mask=group_mask,
+            normalization_offset=offset,
+            normalization_scale=scale,
+        )
+
+
+def test_multi_group_factual_query_uses_group_aware_post_block_action() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    torch.manual_seed(217)
+    model = NativeWorldModel(cfg).train()
+    batch = _original_v7_batch(cfg)
+    batch["action_semantic_ids"][:, 1, 6] = ACTION_SEMANTIC_IDS[
+        "absolute_gripper_close01"
+    ]
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    output = model(**batch)
+    output["pred_tokens"][0].float().square().mean().backward()
+    assert model.factual_v7_group_query_cross is not None
+    gradients = [
+        parameter.grad
+        for parameter in model.factual_v7_group_query_cross.parameters()
+        if parameter.grad is not None
+    ]
+    assert gradients
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert sum(gradient.abs().sum() for gradient in gradients) > 0
 
 
 def test_factual_p64_local_action_direction_is_signed_not_pooled_away() -> None:
@@ -1666,7 +1739,9 @@ def test_original_v7_early_factual_path_checkpoint_backward_is_finite() -> None:
     required_prefixes = [
         "history_action.",
         "factual_v7_query_action.",
+        "factual_v7_stream_action.",
         "factual_v7_action_memory.",
+        "factual_v7_state_to_action.",
         "rgb_head.image_decoder.",
     ]
     required_prefixes.extend(
