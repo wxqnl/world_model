@@ -206,6 +206,41 @@ def test_one_core_handles_bimanual_nonuniform_state_and_action_times() -> None:
     assert torch.all((output["policy_action"][output["policy_gripper_mask"]] <= 1))
 
 
+def test_policy_only_needs_no_future_candidate_and_is_future_invariant() -> None:
+    cfg = replace(
+        _tiny_config(),
+        factual_v7_early_action_conditioning=True,
+        factual_v7_early_action_scale=1.0,
+        factual_v7_bridge_layers_state=(0,),
+    )
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    batch["future_factual_fine_action_mask"].zero_()
+    batch["future_factual_fine_sample_mask"].zero_()
+    batch["future_factual_coarse_action_mask"].zero_()
+
+    with torch.no_grad():
+        baseline = model(**batch, policy_only=True)
+        changed = dict(batch)
+        changed["future_factual_fine_action_values"] = torch.randn_like(
+            batch["future_factual_fine_action_values"]
+        ) * 1.0e4
+        changed["future_factual_coarse_action_values"] = torch.randn_like(
+            batch["future_factual_coarse_action_values"]
+        ) * 1.0e4
+        perturbed = model(**changed, policy_only=True)
+
+    assert "pred_tokens" not in baseline
+    assert "rgb" not in baseline
+    for key in (
+        "policy_latent",
+        "policy_action_raw",
+        "policy_action",
+        "policy_action_mask",
+    ):
+        torch.testing.assert_close(baseline[key], perturbed[key], rtol=0.0, atol=0.0)
+
+
 def test_rgb_decoder_uses_native_tokens_and_skips_unsupervised_views() -> None:
     cfg = _tiny_config()
     model = NativeWorldModel(cfg).train()

@@ -123,6 +123,7 @@ def test_libero_policy_inputs_are_exact_k8_h1_panda_contract() -> None:
         state_scale,
     ).model_kwargs()
 
+    assert packed["policy_only"] is True
     assert packed["embodiment_ids"].item() == PANDA_ROBOCASA_LIBERO_EMBODIMENT_ID
     assert packed["action_group_ids"][0, 0].item() == PANDA_ROBOCASA_LIBERO_ARM_GROUP_ID
     assert packed["action_group_mask"].sum().item() == 1

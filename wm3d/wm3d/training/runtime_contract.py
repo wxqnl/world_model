@@ -61,6 +61,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "factual_action_residual_scale",
     "factual_v7_early_action_conditioning",
     "factual_v7_early_action_scale",
+    "factual_v7_bridge_layers_state",
     "render_factual_dynamics_repeats",
     "render_factual_action_residual_scale",
     "rgb_context_enabled",

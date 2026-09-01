@@ -414,6 +414,7 @@ def test_streaming_data_contract_ignores_model_only_conditioning_scales() -> Non
         {
             "factual_dynamics_repeats": 3,
             "factual_action_residual_scale": 0.2,
+            "factual_v7_bridge_layers_state": [3, 6, 9, 12, 15, 17],
             "render_factual_dynamics_repeats": 1,
             "render_factual_action_residual_scale": 0.0,
             "appearance_action_residual_scale": 0.5,

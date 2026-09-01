@@ -4173,6 +4173,7 @@ class NativeWorldModel(nn.Module):
         target_appearance_mask: Optional[torch.Tensor] = None,
         appearance_teacher_ratio: float | torch.Tensor = 0.0,
         compute_zero_action_control: bool = False,
+        policy_only: bool = False,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         expected_world = (cfg.T, cfg.num_views, cfg.P, cfg.token_dim)
@@ -4347,6 +4348,31 @@ class NativeWorldModel(nn.Module):
         )
         policy_query = self.action_norm(policy_query)
         policy_query = policy_query * query_token_mask[..., None].to(policy_query.dtype)
+
+        # Deployment does not know a future factual candidate: the policy is
+        # the component that proposes it.  Keep that boundary explicit instead
+        # of fabricating a future command or running the world/RGB branch with
+        # an empty action mask.  Training retains the full forward by default.
+        if policy_only:
+            if compute_zero_action_control:
+                raise ValueError(
+                    "policy_only cannot request zero-action world control"
+                )
+            policy_output: dict[str, torch.Tensor] = {
+                "policy_latent": policy_query.transpose(1, 2),
+                "world_times_s": world_times_s,
+                "policy_query_dt": policy_query_dt,
+            }
+            policy_output.update(
+                self.action_head(
+                    policy_query,
+                    action_semantic_ids,
+                    policy_query_mask,
+                    action_normalization_offset,
+                    action_normalization_scale,
+                )
+            )
+            return policy_output
 
         action_free_future = prior_state[:, cfg.T :]
         # This is the V7 decoder query, not the action-free future prediction.

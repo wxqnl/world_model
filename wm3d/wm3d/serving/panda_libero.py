@@ -42,8 +42,10 @@ class PandaLiberoPolicyInputs:
 
     tensors: Mapping[str, torch.Tensor]
 
-    def model_kwargs(self) -> dict[str, torch.Tensor]:
-        return dict(self.tensors)
+    def model_kwargs(self) -> dict[str, object]:
+        result: dict[str, object] = dict(self.tensors)
+        result["policy_only"] = True
+        return result
 
 
 def _finite_vector(value: object, *, name: str, minimum: int) -> np.ndarray:
