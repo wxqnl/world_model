@@ -2,7 +2,7 @@ schema: wm3d_v8_model_profile_v1
 name: native_5b_v8_exact_v7_factual_high_frequency_refiner
 architecture: native_world_model
 # Sealed after constructing this exact profile on meta and real FSDP2 shards.
-expected_parameter_count: 5437007480
+expected_parameter_count: 5448870520
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -32,6 +32,9 @@ model:
   policy_task_modulation: true
   policy_calibration_conditioning: true
   bridge_layers_state: [2, 5, 8, 11, 14, 17, 20, 23, 26, 29]
+  # Scale the V7 cadence while retaining a final post-block bridge.  This is
+  # factual-only and does not alter the production policy prior.
+  factual_v7_bridge_layers_state: [3, 6, 9, 12, 15, 18, 21, 24, 27, 31]
   bridge_heads: 16
   # Exact V7 factual decoder semantics, scaled only by the 5B hidden width.
   dynamics_layers: 2

@@ -22,6 +22,7 @@ from wm3d.models.native_world_model import (
     NativeWorldModelConfig,
     OriginalV7RGBActionAdapter,
     OriginalV7FactualDecoderLayer,
+    StateActionBridge,
     _warp_rgb_feature_with_pixel_flow,
 )
 from wm3d.models.model_factory import build_world_model
@@ -1428,31 +1429,34 @@ def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:
         decoder_handle.remove()
 
     # Each forward has an action-free policy pass followed by the factual pass.
-    # The factual pass exposes K additional physical-action tokens before the
-    # first state block, matching the original V7 encoder conditioning point.
+    # Physical action is not copied into T separate patch sets.  One KxG lane
+    # first exchanges full-token cross-attention with every observed patch,
+    # then the existing factorized state block receives the unchanged [T,P]
+    # topology.
     assert len(block_inputs) == 4
     torch.testing.assert_close(block_inputs[0], block_inputs[2], rtol=0, atol=0)
     assert block_inputs[0].shape[2] == cfg.P
     assert block_inputs[0].shape[1] == cfg.T + cfg.K
     assert block_inputs[1].shape[1] == cfg.T
     assert block_inputs[3].shape[1] == cfg.T
-    assert block_inputs[1].shape[2] == cfg.P + cfg.K
-    assert block_inputs[3].shape[2] == cfg.P + cfg.K
+    assert block_inputs[1].shape[2] == cfg.P
+    assert block_inputs[3].shape[2] == cfg.P
     assert not torch.allclose(
-        block_inputs[1][:, :, cfg.P :],
-        torch.zeros_like(block_inputs[1][:, :, cfg.P :]),
-    )
-    torch.testing.assert_close(
-        block_inputs[3][:, :, cfg.P :],
-        torch.zeros_like(block_inputs[3][:, :, cfg.P :]),
-        rtol=0,
-        atol=0,
+        block_inputs[1],
+        block_inputs[3],
     )
     assert len(decoder_memories) == 2
+    expected_memory = 1 + cfg.T * cfg.P + cfg.K * cfg.max_action_groups
+    assert decoder_memories[0].shape[1] == expected_memory
     observed_memory = slice(1, 1 + cfg.T * cfg.P)
+    action_memory = slice(1 + cfg.T * cfg.P, expected_memory)
     assert not torch.allclose(
         decoder_memories[0][:, observed_memory],
         decoder_memories[1][:, observed_memory],
+    )
+    assert not torch.allclose(
+        decoder_memories[0][:, action_memory],
+        decoder_memories[1][:, action_memory],
     )
     torch.testing.assert_close(
         factual["policy_action"], zero["policy_action"], rtol=0, atol=0
@@ -1460,6 +1464,137 @@ def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:
     torch.testing.assert_close(
         factual["action_free_pred_tokens"],
         zero["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_factual_full_cross_bridge_keeps_patch_updates_nonuniform() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    torch.manual_seed(214)
+    bridge = StateActionBridge(cfg).eval()
+    state = torch.randn(2, cfg.T * cfg.P, cfg.state_hidden)
+    action = torch.randn(
+        2, cfg.K * cfg.max_action_groups, cfg.action_hidden
+    )
+    action_mask = torch.ones(action.shape[:2], dtype=torch.bool)
+    state_out, action_out = bridge(state, action, action_mask)
+    state_delta = state_out - state
+    action_delta = action_out - action
+
+    assert state_out.shape == state.shape
+    assert action_out.shape == action.shape
+    # Every patch queries the same KxG command set with its own feature.  A
+    # pooled/broadcast bridge would make this variance exactly zero.
+    assert state_delta.var(dim=1).mean() > 0
+    assert action_delta.var(dim=1).mean() > 0
+
+    shuffled = action.roll(1, dims=0)
+    shuffled_state, _ = bridge(state, shuffled, action_mask)
+    assert not torch.allclose(state_out, shuffled_state)
+
+
+def test_canonical_v7_adapter_keeps_multi_group_factual_contract() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    adapter = OriginalV7RGBActionAdapter(cfg)
+    batch = 1
+    fine = torch.zeros(
+        batch,
+        cfg.K,
+        cfg.max_action_groups,
+        cfg.max_action_substeps,
+        cfg.max_action_dim,
+    )
+    fine_mask = torch.zeros_like(fine, dtype=torch.bool)
+    fine_sample_mask = torch.zeros(fine.shape[:-1], dtype=torch.bool)
+    coarse = torch.zeros(
+        batch, cfg.K, cfg.max_action_groups, cfg.max_action_dim
+    )
+    coarse_mask = torch.zeros_like(coarse, dtype=torch.bool)
+    first = torch.tensor([0.2, 0.0, 0.0, 0.1, 0.0, 0.0, 1.0])
+    second = torch.tensor([0.0, 0.4, 0.0, 0.0, 0.2, 0.0, 0.0])
+    coarse[:, :, 0, :7] = first
+    coarse[:, :, 1, :7] = second
+    coarse_mask[..., :7] = True
+    semantics = torch.tensor(
+        [
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["absolute_gripper_close01"],
+        ],
+        dtype=torch.long,
+    )
+    semantic_ids = torch.zeros(
+        batch, cfg.max_action_groups, cfg.max_action_dim, dtype=torch.long
+    )
+    semantic_ids[..., :7] = semantics
+    group_mask = torch.ones(batch, cfg.max_action_groups, dtype=torch.bool)
+    offset = torch.zeros_like(coarse[:, 0])
+    scale = torch.ones_like(offset)
+
+    action = adapter(
+        fine_values=fine,
+        fine_dim_mask=fine_mask,
+        fine_sample_mask=fine_sample_mask,
+        coarse_values=coarse,
+        coarse_dim_mask=coarse_mask,
+        action_semantic_ids=semantic_ids,
+        group_mask=group_mask,
+        normalization_offset=offset,
+        normalization_scale=scale,
+    )
+    expected = ((first + second) / 2.0).view(1, 1, 7).expand(1, cfg.K, 7)
+    torch.testing.assert_close(action, expected)
+
+
+def test_factual_p64_local_action_direction_is_signed_not_pooled_away() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    torch.manual_seed(216)
+    model = NativeWorldModel(cfg).eval()
+    base = _original_v7_batch(cfg)
+    base["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    base["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    zero_values = torch.zeros_like(base["future_factual_fine_action_values"])
+
+    def predict(signed_delta: float) -> dict[str, torch.Tensor]:
+        value = zero_values.clone()
+        value[..., 0] = signed_delta
+        batch = dict(base)
+        batch["future_factual_fine_action_values"] = value
+        batch["future_factual_coarse_action_values"] = torch.zeros_like(
+            base["future_factual_coarse_action_values"]
+        )
+        with torch.no_grad():
+            return model(**batch)
+
+    zero = predict(0.0)
+    positive = predict(1.0e-3)
+    negative = predict(-1.0e-3)
+    positive_delta = (positive["pred_tokens"] - zero["pred_tokens"]).flatten(1)
+    negative_delta = (negative["pred_tokens"] - zero["pred_tokens"]).flatten(1)
+    assert positive_delta.norm(dim=1).min() > 0
+    assert negative_delta.norm(dim=1).min() > 0
+    direction = torch.nn.functional.cosine_similarity(
+        positive_delta, negative_delta, dim=1
+    )
+    # Opposite physical translations must induce opposite local P64
+    # derivatives. A pooled constant/action-independent path would have zero
+    # response or the same sign.
+    assert direction.max() < -0.5
+    torch.testing.assert_close(
+        positive["policy_action"], negative["policy_action"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        positive["action_free_pred_tokens"],
+        negative["action_free_pred_tokens"],
         rtol=0,
         atol=0,
     )
@@ -1492,9 +1627,34 @@ def test_original_v7_early_factual_path_checkpoint_backward_is_finite() -> None:
         parameter.grad is None or torch.isfinite(parameter.grad).all()
         for parameter in model.parameters()
     )
-    gradient = model.factual_action.fine_value.weight.grad
-    assert gradient is not None
-    assert gradient.abs().sum() > 0
+    named = dict(model.named_parameters())
+    required_prefixes = [
+        "history_action.",
+        "factual_v7_query_action.",
+        "factual_v7_action_memory.",
+        "rgb_head.image_decoder.",
+    ]
+    required_prefixes.extend(
+        f"state_blocks.{index}." for index in range(cfg.state_layers)
+    )
+    required_prefixes.extend(
+        f"action_blocks.{index}." for index in range(cfg.action_layers)
+    )
+    required_prefixes.extend(
+        f"bridges.{index}." for index in range(len(cfg.bridge_layers_state))
+    )
+    required_prefixes.extend(
+        f"dynamics_blocks.{index}." for index in range(cfg.dynamics_layers)
+    )
+    for prefix in required_prefixes:
+        gradients = [
+            parameter.grad
+            for name, parameter in named.items()
+            if name.startswith(prefix) and parameter.grad is not None
+        ]
+        assert gradients, prefix
+        assert all(torch.isfinite(gradient).all() for gradient in gradients), prefix
+        assert sum(gradient.abs().sum() for gradient in gradients) > 0, prefix
 
 
 def test_original_v7_rgb_rejects_competing_appearance_or_alignment_lanes() -> None:

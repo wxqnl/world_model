@@ -568,7 +568,7 @@ def main() -> None:
         loss.backward()
         if step == 1:
             gradient_norms = {
-                "factual_action_encoder": _first_gradient_norm(model.factual_action),
+                "factual_action_encoder": _first_gradient_norm(model.history_action),
                 "early_factual_state_block": _first_gradient_norm(
                     model.state_blocks[0]
                 ),
