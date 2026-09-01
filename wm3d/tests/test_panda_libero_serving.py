@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS
+from wm3d.models.native_world_model import NativeWorldModel, NativeWorldModelConfig
 from wm3d.serving.panda_libero import (
     PANDA_LIBERO_HISTORY_WORLD_INTERVALS,
     PANDA_LIBERO_POLICY_HISTORY,
@@ -124,6 +125,7 @@ def test_libero_policy_inputs_are_exact_k8_h1_panda_contract() -> None:
     ).model_kwargs()
 
     assert packed["policy_only"] is True
+    assert "composition_operator_ids" not in packed
     assert packed["embodiment_ids"].item() == PANDA_ROBOCASA_LIBERO_EMBODIMENT_ID
     assert packed["action_group_ids"][0, 0].item() == PANDA_ROBOCASA_LIBERO_ARM_GROUP_ID
     assert packed["action_group_mask"].sum().item() == 1
@@ -157,6 +159,95 @@ def test_libero_policy_inputs_are_exact_k8_h1_panda_contract() -> None:
         packed["state_normalization_scale"][0, 0, :10],
         torch.from_numpy(state_scale),
     )
+
+
+def test_panda_packer_runs_full_policy_model_and_action_consumer() -> None:
+    cfg = NativeWorldModelConfig(
+        T=4,
+        P=4,
+        K=8,
+        token_dim=16,
+        task_dim=12,
+        num_views=2,
+        state_hidden=32,
+        state_layers=2,
+        state_heads=4,
+        state_ff_mult=2.0,
+        action_hidden=24,
+        action_layers=2,
+        action_heads=4,
+        action_ff_mult=2.0,
+        bridge_layers_state=(1,),
+        factual_v7_bridge_layers_state=(0,),
+        bridge_heads=4,
+        dynamics_layers=1,
+        factual_v7_early_action_conditioning=True,
+        factual_v7_early_action_scale=1.0,
+        view_hidden=16,
+        view_heads=4,
+        view_ff_mult=2.0,
+        max_action_groups=8,
+        max_action_dim=16,
+        max_state_dim=32,
+        max_action_substeps=4,
+        max_policy_queries=8,
+        max_group_id=16,
+        max_embodiments=8,
+        max_action_semantic_id=16,
+        max_state_semantic_id=16,
+        time_fourier_dim=8,
+        max_aux_tokens=2,
+        aux_dim=8,
+        max_aux_type_id=8,
+        rgb_hidden=16,
+        rgb_res_blocks=1,
+        rgb_decode_chunk_size=1,
+        rgb_size=16,
+        rgb_decode_indices=tuple(range(8)),
+        geom_hidden=16,
+        activation_checkpointing=False,
+    )
+    packed = panda_libero_policy_inputs(
+        np.zeros(10, dtype=np.float32),
+        np.zeros((PANDA_LIBERO_POLICY_HISTORY, 7), dtype=np.float32),
+        np.zeros(7, dtype=np.float32),
+        np.ones(7, dtype=np.float32),
+        np.zeros(10, dtype=np.float32),
+        np.ones(10, dtype=np.float32),
+        context_steps=cfg.T,
+        world_horizon=cfg.K,
+        max_groups=cfg.max_action_groups,
+        max_action_dim=cfg.max_action_dim,
+        max_state_dim=cfg.max_state_dim,
+        max_substeps=cfg.max_action_substeps,
+        max_policy_queries=cfg.max_policy_queries,
+    )
+    kwargs = packed.model_kwargs()
+    kwargs.update(
+        {
+            "world_tokens": torch.randn(
+                1, cfg.T, cfg.num_views, cfg.P, cfg.token_dim
+            ),
+            "view_mask": torch.ones(1, cfg.T, cfg.num_views, dtype=torch.bool),
+            "world_times_s": torch.arange(
+                cfg.T + cfg.K, dtype=torch.float32
+            )[None],
+            "task_embedding": torch.randn(1, cfg.task_dim),
+        }
+    )
+
+    with torch.no_grad():
+        output = NativeWorldModel(cfg).eval()(**kwargs)
+    chunk = panda_action_chunk_from_model_output(
+        output,
+        packed.tensors["action_semantic_ids"],
+        packed.tensors["action_group_ids"],
+        packed.tensors["action_group_mask"],
+        packed.tensors["embodiment_ids"],
+    )
+
+    assert chunk.canonical_close01.shape == (PANDA_LIBERO_POLICY_HORIZON, 7)
+    assert chunk.libero_signed.shape == (PANDA_LIBERO_POLICY_HORIZON, 7)
 
 
 def test_libero_policy_inputs_reject_nonidentity_gripper_normalization() -> None:

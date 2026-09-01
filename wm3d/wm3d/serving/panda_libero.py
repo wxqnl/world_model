@@ -43,7 +43,13 @@ class PandaLiberoPolicyInputs:
     tensors: Mapping[str, torch.Tensor]
 
     def model_kwargs(self) -> dict[str, object]:
-        result: dict[str, object] = dict(self.tensors)
+        # Composition operators supervise physical trajectory construction;
+        # they are not an input to NativeWorldModel.forward.
+        result: dict[str, object] = {
+            name: value
+            for name, value in self.tensors.items()
+            if name != "composition_operator_ids"
+        }
         result["policy_only"] = True
         return result
 
