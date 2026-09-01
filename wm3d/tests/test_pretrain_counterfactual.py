@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from wm3d.training import pretrain
+from wm3d.training.native_objective import NativeObjectiveConfig
 
 
 def _objective(*, token: bool, rgb: bool) -> SimpleNamespace:
@@ -135,3 +137,171 @@ def test_token_only_counterfactual_needs_one_model_forward(monkeypatch) -> None:
     assert controls == [True]
     assert output["zero_action_pred_tokens"].requires_grad
     assert "zero_action_rgb" not in output
+
+
+def test_original_v7_rgb_action_schedule_matches_sparse_ramp() -> None:
+    objective = NativeObjectiveConfig(
+        context_pixel_action_rank_weight=2.0,
+        context_pixel_action_separation_weight=0.5,
+        context_pixel_action_rank_start_step=30_000,
+        context_pixel_action_rank_ramp_steps=10_000,
+        context_pixel_action_rank_every=8,
+        context_pixel_action_rank_batch_size=1,
+    )
+    assert pretrain._scheduled_context_pixel_action_weights(
+        objective, step=29_999
+    ) == (0.0, 0.0)
+    assert pretrain._scheduled_context_pixel_action_weights(
+        objective, step=30_000
+    ) == (0.0, 0.0)
+    assert pretrain._scheduled_context_pixel_action_weights(
+        objective, step=30_001
+    ) == (0.0, 0.0)
+    rank, separation = pretrain._scheduled_context_pixel_action_weights(
+        objective, step=30_008
+    )
+    assert rank == pytest.approx(0.0016)
+    assert separation == pytest.approx(0.0004)
+    assert pretrain._scheduled_context_pixel_action_weights(
+        objective, step=35_000
+    ) == pytest.approx((1.0, 0.25))
+    assert pretrain._scheduled_context_pixel_action_weights(
+        objective, step=40_000
+    ) == pytest.approx((2.0, 0.5))
+    assert pretrain._scheduled_context_pixel_action_weights(
+        objective, step=0, diagnostic_force=True
+    ) == (2.0, 0.5)
+
+
+def test_shuffled_rgb_action_forward_is_differentiable_and_subsampled(
+    monkeypatch,
+) -> None:
+    batch_size = 3
+    fine = torch.arange(
+        batch_size * 2 * 1 * 1 * 2, dtype=torch.float32
+    ).reshape(batch_size, 2, 1, 1, 2).requires_grad_()
+    coarse = torch.arange(
+        batch_size * 2 * 1 * 2, dtype=torch.float32
+    ).reshape(batch_size, 2, 1, 2).requires_grad_()
+    batch = {
+        "future_factual_fine_action_values": fine,
+        "future_factual_fine_action_mask": torch.ones_like(fine, dtype=torch.bool),
+        "future_factual_fine_action_dt": torch.ones(batch_size, 2, 1, 1),
+        "future_factual_fine_sample_mask": torch.ones(
+            batch_size, 2, 1, 1, dtype=torch.bool
+        ),
+        "future_factual_coarse_action_values": coarse,
+        "future_factual_coarse_action_mask": torch.ones_like(
+            coarse, dtype=torch.bool
+        ),
+        "action_group_ids": torch.ones(batch_size, 1, dtype=torch.long),
+        "action_group_mask": torch.ones(batch_size, 1, dtype=torch.bool),
+        "action_semantic_ids": torch.ones(batch_size, 1, 2, dtype=torch.long),
+        "embodiment_ids": torch.ones(batch_size, dtype=torch.long),
+        "action_normalization_offset": torch.zeros(batch_size, 1, 2),
+        "action_normalization_scale": torch.ones(batch_size, 1, 2),
+    }
+    calls: list[int] = []
+
+    def fake_forward(
+        _model,
+        value,
+        *,
+        appearance_teacher_ratio,
+        compute_zero_action_control=False,
+    ):
+        del appearance_teacher_ratio, compute_zero_action_control
+        signal = value["future_factual_fine_action_values"].mean(
+            dim=(1, 2, 3, 4)
+        )
+        calls.append(int(signal.shape[0]))
+        return {
+            "pred_tokens": signal[:, None, None],
+            "rgb": signal[:, None, None, None, None, None].expand(
+                -1, 1, 1, 3, 2, 2
+            ),
+        }
+
+    monkeypatch.setattr(pretrain, "_forward", fake_forward)
+    objective = NativeObjectiveConfig(
+        context_pixel_action_rank_weight=2.0,
+        context_pixel_action_separation_weight=0.5,
+        context_pixel_action_rank_batch_size=1,
+        context_pixel_action_negative_min_distance=0.0,
+    )
+    output = pretrain._forward_with_action_counterfactual(
+        object(),
+        batch,
+        appearance_teacher_ratio=0.0,
+        objective=objective,
+        step=0,
+        diagnostic_force_context_pixel_action=True,
+    )
+    assert calls == [3, 1]
+    assert output["shuffled_action_indices"].numel() == 1
+    assert output["shuffled_action_valid"].item() is True
+    assert output["shuffled_action_rgb"].requires_grad
+    output["shuffled_action_rgb"].sum().backward()
+    assert fine.grad is not None
+    assert torch.isfinite(fine.grad).all()
+    assert fine.grad.abs().sum() > 0
+
+
+def test_invalid_shuffled_rgb_action_still_executes_fixed_shape_forward(
+    monkeypatch,
+) -> None:
+    batch_size = 2
+    fine = torch.zeros(batch_size, 1, 1, 1, 1)
+    coarse = torch.zeros(batch_size, 1, 1, 1)
+    batch = {
+        "future_factual_fine_action_values": fine,
+        "future_factual_fine_action_mask": torch.ones_like(fine, dtype=torch.bool),
+        "future_factual_fine_action_dt": torch.ones(batch_size, 1, 1, 1),
+        "future_factual_fine_sample_mask": torch.ones(
+            batch_size, 1, 1, 1, dtype=torch.bool
+        ),
+        "future_factual_coarse_action_values": coarse,
+        "future_factual_coarse_action_mask": torch.ones_like(
+            coarse, dtype=torch.bool
+        ),
+        "action_group_ids": torch.ones(batch_size, 1, dtype=torch.long),
+        "action_group_mask": torch.ones(batch_size, 1, dtype=torch.bool),
+        "action_semantic_ids": torch.ones(batch_size, 1, 1, dtype=torch.long),
+        "embodiment_ids": torch.ones(batch_size, dtype=torch.long),
+        "action_normalization_offset": torch.zeros(batch_size, 1, 1),
+        "action_normalization_scale": torch.ones(batch_size, 1, 1),
+    }
+    calls: list[int] = []
+
+    def fake_forward(
+        _model,
+        value,
+        *,
+        appearance_teacher_ratio,
+        compute_zero_action_control=False,
+    ):
+        del appearance_teacher_ratio, compute_zero_action_control
+        size = int(value["future_factual_fine_action_values"].shape[0])
+        calls.append(size)
+        return {
+            "pred_tokens": torch.zeros(size, 1, 1),
+            "rgb": torch.zeros(size, 1, 1, 3, 2, 2),
+        }
+
+    monkeypatch.setattr(pretrain, "_forward", fake_forward)
+    output = pretrain._forward_with_action_counterfactual(
+        object(),
+        batch,
+        appearance_teacher_ratio=0.0,
+        objective=NativeObjectiveConfig(
+            context_pixel_action_rank_weight=2.0,
+            context_pixel_action_separation_weight=0.5,
+            context_pixel_action_rank_batch_size=1,
+            context_pixel_action_negative_min_distance=0.05,
+        ),
+        step=0,
+        diagnostic_force_context_pixel_action=True,
+    )
+    assert calls == [2, 1]
+    assert output["shuffled_action_valid"].item() is False
+    assert output["shuffled_action_valid_fraction"].item() == 0.0

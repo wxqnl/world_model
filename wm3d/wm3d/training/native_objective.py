@@ -54,6 +54,21 @@ class NativeObjectiveConfig:
     action_counterfactual_token_margin: float = 0.0
     action_counterfactual_rgb_advantage: float = 0.0
     action_counterfactual_rgb_margin: float = 0.0
+    # Original V7 actionbridge RGB curriculum.  This is deliberately separate
+    # from the zero-action telemetry above: the historical 60K model learned
+    # from a differentiable shuffled-action forward with both ranking and
+    # output-separation terms.
+    context_pixel_action_rank_weight: float = 0.0
+    context_pixel_action_separation_weight: float = 0.0
+    context_pixel_action_rank_start_step: int = 0
+    context_pixel_action_rank_ramp_steps: int = 0
+    context_pixel_action_rank_every: int = 1
+    context_pixel_action_rank_batch_size: int = 0
+    context_pixel_action_rank_margin: float = 0.003
+    context_pixel_action_separation_margin: float = 0.006
+    context_pixel_action_motion_threshold: float = 0.03
+    context_pixel_action_motion_gain: float = 4.0
+    context_pixel_action_negative_min_distance: float = 0.05
     epsilon: float = 1.0e-6
     rgb_charbonnier_epsilon: float = 1.0e-3
     huber_delta: float = 0.05
@@ -72,6 +87,30 @@ class NativeObjectiveConfig:
         if self.rgb_disocclusion_pos_weight <= 0.0:
             raise NativeObjectiveError(
                 "rgb_disocclusion_pos_weight must be positive"
+            )
+        if self.context_pixel_action_rank_every <= 0:
+            raise NativeObjectiveError(
+                "context_pixel_action_rank_every must be positive"
+            )
+        if self.context_pixel_action_rank_batch_size < 0:
+            raise NativeObjectiveError(
+                "context_pixel_action_rank_batch_size cannot be negative"
+            )
+        if (
+            max(
+                self.context_pixel_action_rank_weight,
+                self.context_pixel_action_separation_weight,
+            )
+            > 0.0
+            and self.context_pixel_action_rank_batch_size != 1
+        ):
+            raise NativeObjectiveError(
+                "the distributed V7 RGB action curriculum requires "
+                "context_pixel_action_rank_batch_size=1"
+            )
+        if self.context_pixel_action_motion_threshold <= 0.0:
+            raise NativeObjectiveError(
+                "context_pixel_action_motion_threshold must be positive"
             )
         if self.action_velocity != 0.0:
             raise NativeObjectiveError(
@@ -1077,6 +1116,22 @@ def compute_native_objective(
     action_counterfactual_rgb_gain = zero
     action_counterfactual_rgb_advantage = zero
     action_counterfactual_rgb_response_rms = zero
+    context_pixel_action_rank = zero
+    context_pixel_action_separation = zero
+    context_pixel_action_acc = zero
+    context_pixel_action_gap = zero
+    context_pixel_action_rgb_gap = zero
+    context_pixel_action_response_rms = zero
+    context_pixel_action_negative_distance = zero
+    context_pixel_action_valid_fraction = output.get(
+        "shuffled_action_valid_fraction", zero
+    )
+    context_pixel_action_rank_weight = output.get(
+        "context_pixel_action_rank_weight", zero
+    )
+    context_pixel_action_separation_weight = output.get(
+        "context_pixel_action_separation_weight", zero
+    )
     if "target_rgb" in batch and output["rgb"].numel():
         target_rgb = batch["target_rgb"]
         rgb_mask = batch.get(
@@ -1366,6 +1421,101 @@ def compute_native_objective(
             rgb_mask,
             epsilon=epsilon,
         )
+        if "shuffled_action_rgb" in output:
+            if "context_rgb" not in batch:
+                raise NativeObjectiveError(
+                    "RGB action ranking requires context_rgb"
+                )
+            indices = output.get("shuffled_action_indices")
+            if indices is None or indices.ndim != 1:
+                raise NativeObjectiveError(
+                    "shuffled_action_indices must be a one-dimensional tensor"
+                )
+            indices = indices.to(device=target_rgb.device, dtype=torch.long)
+            selected_valid = output.get("shuffled_action_valid")
+            if selected_valid is None or tuple(selected_valid.shape) != tuple(
+                indices.shape
+            ):
+                raise NativeObjectiveError(
+                    "shuffled_action_valid must align to shuffled_action_indices"
+                )
+            selected_valid = selected_valid.to(
+                device=target_rgb.device, dtype=torch.bool
+            )
+            factual_rgb = output["rgb"].index_select(0, indices).float()
+            wrong_rgb = output["shuffled_action_rgb"].float()
+            selected_target = target_rgb.index_select(0, indices).float()
+            selected_rgb_mask = rgb_mask.index_select(0, indices).bool()
+            selected_context = batch["context_rgb"].index_select(
+                0, indices
+            ).float()
+            selected_context_mask = batch.get(
+                "context_rgb_mask",
+                torch.ones(
+                    target_rgb.shape[0],
+                    target_rgb.shape[2],
+                    dtype=torch.bool,
+                    device=target_rgb.device,
+                ),
+            ).index_select(0, indices).bool()
+            if wrong_rgb.shape != factual_rgb.shape:
+                raise NativeObjectiveError(
+                    "shuffled-action and factual RGB shapes differ"
+                )
+            valid = (
+                selected_rgb_mask
+                & selected_context_mask[:, None, :, None, None, None]
+            )
+            motion = (
+                selected_target - selected_context[:, None]
+            ).abs().mean(dim=3, keepdim=True)
+            motion_weight = 1.0 + config.context_pixel_action_motion_gain * (
+                motion > config.context_pixel_action_motion_threshold
+            ).to(dtype=factual_rgb.dtype)
+
+            def action_weighted_l1(
+                prediction: torch.Tensor, target: torch.Tensor
+            ) -> torch.Tensor:
+                error = (prediction.float() - target.float()).abs()
+                weight = (
+                    motion_weight.to(device=error.device, dtype=error.dtype)
+                    * valid.to(device=error.device, dtype=error.dtype)
+                ).expand_as(error)
+                return (error * weight).flatten(1).sum(dim=1) / weight.flatten(
+                    1
+                ).sum(dim=1).clamp_min(epsilon)
+
+            factual_error = action_weighted_l1(factual_rgb, selected_target)
+            wrong_error = action_weighted_l1(wrong_rgb, selected_target)
+            gap = wrong_error - factual_error
+            separation = action_weighted_l1(wrong_rgb, factual_rgb.detach())
+            selected_valid_float = selected_valid.to(dtype=gap.dtype)
+
+            def valid_sample_mean(value: torch.Tensor) -> torch.Tensor:
+                return (
+                    value * selected_valid_float
+                ).sum() / selected_valid_float.sum().clamp_min(1.0)
+
+            context_pixel_action_rank = valid_sample_mean(
+                torch.relu(config.context_pixel_action_rank_margin - gap)
+            )
+            context_pixel_action_separation = valid_sample_mean(
+                torch.relu(
+                    config.context_pixel_action_separation_margin - separation
+                )
+            )
+            context_pixel_action_acc = valid_sample_mean((gap > 0).float())
+            context_pixel_action_gap = valid_sample_mean(gap)
+            context_pixel_action_rgb_gap = valid_sample_mean(separation)
+            response_per_sample = (
+                (wrong_rgb - factual_rgb.detach()).square().flatten(1).mean(dim=1).sqrt()
+            )
+            context_pixel_action_response_rms = valid_sample_mean(
+                response_per_sample
+            )
+            context_pixel_action_negative_distance = valid_sample_mean(
+                output.get("shuffled_action_distance", zero).float()
+            )
         if config.action_counterfactual_rgb_advantage > 0.0:
             if "zero_action_rgb" not in output:
                 raise NativeObjectiveError(
@@ -1590,6 +1740,22 @@ def compute_native_objective(
         "action_counterfactual_rgb_response_rms": (
             action_counterfactual_rgb_response_rms
         ),
+        "context_pixel_action_rank": context_pixel_action_rank,
+        "context_pixel_action_separation": context_pixel_action_separation,
+        "context_pixel_action_acc": context_pixel_action_acc,
+        "context_pixel_action_gap": context_pixel_action_gap,
+        "context_pixel_action_rgb_gap": context_pixel_action_rgb_gap,
+        "context_pixel_action_response_rms": context_pixel_action_response_rms,
+        "context_pixel_action_negative_distance": (
+            context_pixel_action_negative_distance
+        ),
+        "context_pixel_action_valid_fraction": (
+            context_pixel_action_valid_fraction
+        ),
+        "context_pixel_action_rank_weight": context_pixel_action_rank_weight,
+        "context_pixel_action_separation_weight": (
+            context_pixel_action_separation_weight
+        ),
         "depth_log": depth_log,
         "point": point,
         "camera_pose": camera_pose,
@@ -1673,6 +1839,9 @@ def compute_native_objective(
         * action_counterfactual_token_advantage
         + config.action_counterfactual_rgb_advantage
         * action_counterfactual_rgb_advantage
+        + context_pixel_action_rank_weight * context_pixel_action_rank
+        + context_pixel_action_separation_weight
+        * context_pixel_action_separation
     )
     if not bool(torch.isfinite(total)):
         raise FloatingPointError("WM3D native objective is non-finite")

@@ -193,6 +193,108 @@ def test_rgb_motion_objective_separates_static_and_changed_pixels() -> None:
     assert motion_logit.grad is not None and motion_logit.grad.abs().sum() > 0
 
 
+@pytest.mark.parametrize("selected_valid", [True, False])
+def test_original_v7_rgb_action_rank_trains_factual_and_wrong_graphs(
+    selected_valid: bool,
+) -> None:
+    batch_size = 2
+    factual = torch.full(
+        (batch_size, 1, 1, 3, 2, 2), 0.8, requires_grad=True
+    )
+    wrong = torch.full((1, 1, 1, 3, 2, 2), 0.2, requires_grad=True)
+    policy = torch.zeros(batch_size, 1, 1, 1)
+    output = {
+        "pred_tokens": torch.zeros(batch_size, 1, 1, 2),
+        "rgb": factual,
+        "shuffled_action_rgb": wrong,
+        "shuffled_action_indices": torch.tensor([1]),
+        "shuffled_action_valid": torch.tensor([selected_valid]),
+        "shuffled_action_valid_fraction": torch.tensor(
+            1.0 if selected_valid else 0.0
+        ),
+        "shuffled_action_distance": torch.tensor([0.5]),
+        "context_pixel_action_rank_weight": torch.tensor(2.0),
+        "context_pixel_action_separation_weight": torch.tensor(0.5),
+        "policy_action_raw": policy,
+        "policy_action_normalized": policy,
+        "policy_action": policy,
+        "policy_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "policy_gripper_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_binary_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_query_dt": torch.tensor([[[0.5]], [[0.5]]]),
+    }
+    batch = {
+        "target_tokens": torch.zeros(batch_size, 1, 1, 2),
+        "target_rgb": torch.ones(batch_size, 1, 1, 3, 2, 2),
+        "target_rgb_mask": torch.ones(
+            batch_size, 1, 1, 1, 1, 1, dtype=torch.bool
+        ),
+        "context_rgb": torch.zeros(batch_size, 1, 3, 2, 2),
+        "context_rgb_mask": torch.ones(batch_size, 1, dtype=torch.bool),
+        "target_fine_action": torch.zeros_like(policy),
+        "target_fine_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "future_world_boundaries_dt": torch.tensor(
+            [[0.0, 1.0], [0.0, 1.0]]
+        ),
+        "composition_operator_ids": torch.tensor(
+            [
+                [[COMPOSITION_OPERATOR_IDS["last"]]],
+                [[COMPOSITION_OPERATOR_IDS["last"]]],
+            ]
+        ),
+        "target_coarse_action_normalized": torch.zeros(
+            batch_size, 1, 1, 1
+        ),
+        "target_coarse_action_mask": torch.ones(
+            batch_size, 1, 1, 1, dtype=torch.bool
+        ),
+        "action_normalization_offset": torch.zeros(batch_size, 1, 1),
+        "action_normalization_scale": torch.ones(batch_size, 1, 1),
+    }
+    losses = compute_native_objective(
+        output=output,
+        batch=batch,
+        config=NativeObjectiveConfig(
+            token_mse=0.0,
+            token_cosine=0.0,
+            rgb_l1=0.0,
+            rgb_charbonnier=0.0,
+            rgb_gradient=0.0,
+            depth_log=0.0,
+            point=0.0,
+            camera_pose=0.0,
+            action_fine=0.0,
+            action_coarse=0.0,
+            context_pixel_action_rank_weight=2.0,
+            context_pixel_action_separation_weight=0.5,
+            context_pixel_action_rank_batch_size=1,
+            context_pixel_action_rank_margin=1.0,
+            context_pixel_action_separation_margin=1.0,
+        ),
+    )
+    expected = 1.0 if selected_valid else 0.0
+    assert losses["context_pixel_action_gap"].item() == pytest.approx(0.6 * expected)
+    assert losses["context_pixel_action_rgb_gap"].item() == pytest.approx(
+        0.6 * expected
+    )
+    assert losses["context_pixel_action_rank"].item() == pytest.approx(
+        0.4 * expected
+    )
+    assert losses["context_pixel_action_separation"].item() == pytest.approx(
+        0.4 * expected
+    )
+    assert losses["context_pixel_action_valid_fraction"].item() == expected
+    losses["total"].backward()
+    assert factual.grad is not None
+    assert wrong.grad is not None
+    if selected_valid:
+        assert factual.grad.abs().sum() > 0
+        assert wrong.grad.abs().sum() > 0
+    else:
+        assert factual.grad.count_nonzero() == 0
+        assert wrong.grad.count_nonzero() == 0
+
+
 def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None:
     rgb = torch.zeros(1, 1, 1, 3, 4, 4)
     flow = torch.zeros(1, 1, 1, 2, 4, 4, requires_grad=True)

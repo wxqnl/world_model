@@ -74,6 +74,17 @@ def test_5b_presets_match_v8_core_5b_and_64_h200(
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
+    assert objective["objective"]["context_pixel_action_rank_weight"] == 2.0
+    assert objective["objective"]["context_pixel_action_separation_weight"] == 0.5
+    assert objective["objective"]["context_pixel_action_rank_start_step"] == 30000
+    assert objective["objective"]["context_pixel_action_rank_ramp_steps"] == 10000
+    assert objective["objective"]["context_pixel_action_rank_every"] == 8
+    assert objective["objective"]["context_pixel_action_rank_batch_size"] == 1
+    assert objective["objective"]["context_pixel_action_rank_margin"] == 0.003
+    assert objective["objective"]["context_pixel_action_separation_margin"] == 0.006
+    assert objective["objective"]["context_pixel_action_motion_threshold"] == 0.03
+    assert objective["objective"]["context_pixel_action_motion_gain"] == 4.0
+    assert objective["objective"]["context_pixel_action_negative_min_distance"] == 0.05
     assert objective["objective"]["rgb_perceptual"] == 0.55
     assert objective["objective"]["rgb_gradient"] == 0.08
     assert objective["objective"]["rgb_motion_l1"] == 1.0

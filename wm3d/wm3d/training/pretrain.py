@@ -566,7 +566,167 @@ def _action_counterfactual_enabled(objective: Any) -> bool:
     return bool(
         objective.action_counterfactual_token_advantage > 0.0
         or objective.action_counterfactual_rgb_advantage > 0.0
+        or getattr(objective, "context_pixel_action_rank_weight", 0.0) > 0.0
+        or getattr(objective, "context_pixel_action_separation_weight", 0.0) > 0.0
     )
+
+
+def _scheduled_context_pixel_action_weights(
+    objective: Any,
+    *,
+    step: int | None,
+    diagnostic_force: bool = False,
+) -> tuple[float, float]:
+    """Resolve the sparse V7 RGB actionbridge schedule.
+
+    Validation and ordinary offline evaluation pass ``step=None`` and never
+    pay for the second differentiable RGB forward.  A diagnostic probe may
+    force the fully-ramped objective without changing the formal schedule.
+    """
+
+    rank = float(getattr(objective, "context_pixel_action_rank_weight", 0.0))
+    separation = float(
+        getattr(objective, "context_pixel_action_separation_weight", 0.0)
+    )
+    if max(rank, separation) <= 0.0:
+        return 0.0, 0.0
+    if diagnostic_force:
+        return rank, separation
+    if step is None:
+        return 0.0, 0.0
+    start = int(objective.context_pixel_action_rank_start_step)
+    ramp = int(objective.context_pixel_action_rank_ramp_steps)
+    every = int(objective.context_pixel_action_rank_every)
+    if step < start or step % every != 0:
+        return 0.0, 0.0
+    factor = 1.0 if ramp == 0 else min(1.0, max(0.0, (step - start) / ramp))
+    return rank * factor, separation * factor
+
+
+def _context_pixel_action_derangement(
+    batch: Mapping[str, torch.Tensor],
+    *,
+    step: int,
+    minimum_distance: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the best deterministic non-self cyclic action permutation."""
+
+    fine = batch["future_factual_fine_action_values"]
+    coarse = batch["future_factual_coarse_action_values"]
+    fine_mask = batch["future_factual_fine_action_mask"].to(dtype=fine.dtype)
+    coarse_mask = batch["future_factual_coarse_action_mask"].to(dtype=coarse.dtype)
+    batch_size = int(fine.shape[0])
+    identity = torch.arange(batch_size, device=fine.device)
+    if batch_size < 2:
+        return (
+            identity,
+            torch.zeros(batch_size, device=fine.device, dtype=torch.bool),
+            fine.new_zeros((batch_size,), dtype=torch.float32),
+        )
+    flat = torch.cat(
+        (
+            fine.float().flatten(1),
+            coarse.float().flatten(1),
+        ),
+        dim=1,
+    )
+    flat_mask = torch.cat(
+        (fine_mask.bool().flatten(1), coarse_mask.bool().flatten(1)), dim=1
+    )
+
+    def compatible_layout(permutation: torch.Tensor) -> torch.Tensor:
+        compatible = torch.ones(
+            batch_size, device=fine.device, dtype=torch.bool
+        )
+        for name in (
+            "action_group_ids",
+            "action_group_mask",
+            "action_semantic_ids",
+            "embodiment_ids",
+            "action_normalization_offset",
+            "action_normalization_scale",
+        ):
+            value = batch[name]
+            paired = value.index_select(0, permutation.to(device=value.device))
+            equal = (value == paired).reshape(batch_size, -1).all(dim=1)
+            compatible &= equal.to(device=compatible.device)
+        return compatible
+    best: tuple[tuple[int, float], torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    for offset in range(batch_size - 1):
+        shift = 1 + ((step + offset) % (batch_size - 1))
+        permutation = torch.roll(identity, shifts=shift, dims=0)
+        paired_flat = flat.index_select(0, permutation)
+        paired_mask = flat_mask.index_select(0, permutation)
+        active = flat_mask | paired_mask
+        difference = (
+            flat * flat_mask.to(dtype=flat.dtype)
+            - paired_flat * paired_mask.to(dtype=flat.dtype)
+        )
+        distance = (
+            (difference.square() * active.to(dtype=difference.dtype)).sum(dim=1)
+            / active.sum(dim=1).clamp_min(1).to(dtype=difference.dtype)
+        ).sqrt()
+        valid = (
+            (distance >= float(minimum_distance))
+            & compatible_layout(permutation)
+            & active.any(dim=1)
+        )
+        score = (
+            int(valid.sum().item()),
+            float(distance[valid].mean().item()) if bool(valid.any()) else -1.0,
+        )
+        if best is None or score > best[0]:
+            best = (score, permutation, valid, distance)
+    assert best is not None
+    _score, permutation, valid, distance = best
+    if bool((permutation == identity).any()):
+        raise PretrainError("action counterfactual produced a self-match")
+    return permutation, valid, distance
+
+
+def _batch_index_select(
+    value: Any,
+    indices: torch.Tensor,
+    *,
+    batch_size: int,
+) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim > 0 and int(value.shape[0]) == batch_size:
+            return value.index_select(0, indices.to(device=value.device))
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: _batch_index_select(item, indices, batch_size=batch_size)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _batch_index_select(item, indices, batch_size=batch_size)
+            for item in value
+        )
+    if isinstance(value, list):
+        return [
+            _batch_index_select(item, indices, batch_size=batch_size)
+            for item in value
+        ]
+    return value
+
+
+def _shuffled_future_factual_action(
+    batch: Mapping[str, torch.Tensor], permutation: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    shuffled = dict(batch)
+    for name in (
+        "future_factual_fine_action_values",
+        "future_factual_fine_action_mask",
+        "future_factual_fine_action_dt",
+        "future_factual_fine_sample_mask",
+        "future_factual_coarse_action_values",
+        "future_factual_coarse_action_mask",
+    ):
+        value = batch[name]
+        shuffled[name] = value.index_select(0, permutation.to(device=value.device))
+    return shuffled
 
 
 def _zero_future_factual_action(
@@ -589,6 +749,8 @@ def _forward_with_action_counterfactual(
     *,
     appearance_teacher_ratio: float,
     objective: Any,
+    step: int | None = None,
+    diagnostic_force_context_pixel_action: bool = False,
 ) -> Mapping[str, torch.Tensor]:
     output = dict(
         _forward(
@@ -613,6 +775,67 @@ def _forward_with_action_counterfactual(
                 appearance_teacher_ratio=appearance_teacher_ratio,
             )
         output["zero_action_rgb"] = zero_output["rgb"].detach()
+    rank_weight, separation_weight = _scheduled_context_pixel_action_weights(
+        objective,
+        step=step,
+        diagnostic_force=diagnostic_force_context_pixel_action,
+    )
+    if max(rank_weight, separation_weight) > 0.0:
+        if step is None and not diagnostic_force_context_pixel_action:
+            raise PretrainError("active RGB action curriculum requires a global step")
+        schedule_step = 0 if step is None else int(step)
+        permutation, valid, distance = _context_pixel_action_derangement(
+            batch,
+            step=schedule_step,
+            minimum_distance=float(
+                objective.context_pixel_action_negative_min_distance
+            ),
+        )
+        valid_indices = torch.nonzero(valid, as_tuple=False).flatten()
+        if valid_indices.numel() > 0:
+            start = (
+                schedule_step // int(objective.context_pixel_action_rank_every)
+            ) % int(valid_indices.numel())
+            selected_indices = torch.roll(valid_indices, shifts=-start)[:1]
+            selected_valid = torch.ones(
+                1, device=valid.device, dtype=torch.bool
+            )
+        else:
+            # Every FSDP rank must execute the same number and shape of model
+            # forwards.  An invalid deterministic dummy keeps collectives
+            # aligned while the objective masks its contribution to exact 0.
+            selected_indices = torch.tensor(
+                [schedule_step % int(permutation.numel())],
+                device=permutation.device,
+                dtype=torch.long,
+            )
+            selected_valid = torch.zeros(
+                1, device=valid.device, dtype=torch.bool
+            )
+        shuffled = _shuffled_future_factual_action(batch, permutation)
+        selected_wrong = _batch_index_select(
+            shuffled,
+            selected_indices,
+            batch_size=int(permutation.numel()),
+        )
+        wrong_output = _forward(
+            model,
+            selected_wrong,
+            appearance_teacher_ratio=appearance_teacher_ratio,
+        )
+        output["shuffled_action_rgb"] = wrong_output["rgb"]
+        output["shuffled_action_indices"] = selected_indices
+        output["shuffled_action_valid"] = selected_valid
+        output["shuffled_action_valid_fraction"] = valid.float().mean()
+        output["shuffled_action_distance"] = distance.index_select(
+            0, selected_indices
+        )
+        output["context_pixel_action_rank_weight"] = output["rgb"].new_tensor(
+            rank_weight
+        )
+        output["context_pixel_action_separation_weight"] = output[
+            "rgb"
+        ].new_tensor(separation_weight)
     return output
 
 
@@ -1535,6 +1758,7 @@ def main() -> None:
                                     step, runtime
                                 ),
                                 objective=objective,
+                                step=step,
                             ),
                             batch=batch,
                             config=objective,

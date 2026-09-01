@@ -145,6 +145,17 @@ required_weights = {
     "appearance_autoregressive_l1": 0.0,
     "action_counterfactual_token_advantage": 1.0,
     "action_counterfactual_token_margin": 0.005,
+    "context_pixel_action_rank_weight": 2.0,
+    "context_pixel_action_separation_weight": 0.5,
+    "context_pixel_action_rank_start_step": 30000,
+    "context_pixel_action_rank_ramp_steps": 10000,
+    "context_pixel_action_rank_every": 8,
+    "context_pixel_action_rank_batch_size": 1,
+    "context_pixel_action_rank_margin": 0.003,
+    "context_pixel_action_separation_margin": 0.006,
+    "context_pixel_action_motion_threshold": 0.03,
+    "context_pixel_action_motion_gain": 4.0,
+    "context_pixel_action_negative_min_distance": 0.05,
 }
 wrong_weights = {
     key: (weights.get(key), expected)
