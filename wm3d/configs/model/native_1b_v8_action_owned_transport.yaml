@@ -37,7 +37,10 @@ model:
   bridge_heads: 16
   # Kept positive for the common config schema; action-owned execution uses
   # the shared StateStream blocks and allocates no legacy factual decoder.
-  dynamics_layers: 1
+  # Retained at the sealed-data ABI value. The action-owned path does not
+  # allocate the legacy dynamics decoder, so this is metadata-compatible and
+  # has no effect on parameters or execution.
+  dynamics_layers: 2
   factual_dynamics_repeats: 1
   # Add the centered source-normalized action effect to its future state slot
   # before state block zero, matching the verified V7/OXE ordering.
