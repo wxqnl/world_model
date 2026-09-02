@@ -20,7 +20,7 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL_PROFILE = ROOT / "configs/model/native_5b_v8_core.yaml"
+MODEL_PROFILE = ROOT / "configs/model/native_5b_v8_action_owned_transport.yaml"
 VGGT_PROFILE = ROOT / "configs/encoder/vggt_native_p144.yaml"
 TASK_PROFILE = ROOT / "configs/encoder/task_qwen3_vl_embedding_2b.yaml"
 SITE_TEMPLATE = ROOT / "configs/cluster/h200_5b_direct.env.example"

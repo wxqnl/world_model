@@ -440,6 +440,14 @@ class NativeWorldModelConfig:
                     "action-owned RGB transport requires unit factual action injection"
                 )
             if (
+                self.factual_v7_early_action_conditioning
+                or self.factual_v7_early_action_scale != 0.0
+                or self.factual_v7_bridge_layers_state
+            ):
+                raise ValueError(
+                    "action-owned RGB transport forbids legacy V7 factual action conditioning"
+                )
+            if (
                 self.render_factual_dynamics_repeats is not None
                 or self.render_factual_action_residual_scale is not None
             ):

@@ -7,8 +7,9 @@
 ## 1. 当前训练合同
 
 - GitHub 分支：`v8`
-- 模型配置：`configs/model/native_5b_v8_core.yaml`
-- 参数量：`5,440,933,496`
+- 模型配置：`configs/model/native_5b_v8_action_owned_transport.yaml`
+- objective：`configs/objective/stage0_v8_action_owned_transport.yaml`
+- 参数量：`5,087,822,644`
 - 数据模式：`direct_raw`
 - 集群：8 个节点，每节点 8 张 H200
 - micro batch：每卡 4
@@ -16,10 +17,13 @@
 - canary：1,000 steps
 - 正式训练：600,000 steps，从正式 run 的 step 0 开始
 
-V8 使用独立 factual pass 学习 future physical action。原始 V7
-`ContextResidualPixelDecoder` 负责运动和低频 RGB；高频 refiner 只补充受限细节。
-future candidate 不进入 policy/action-free trunk。当前正式配置不使用 absolute future P256、
-P256 自回归、copy-last、flow 或 RAFT。
+V8 使用 source-normalized、group-preserving 的 factual action conditioner 学习未来状态。
+factual P144 是唯一运动所有者，并预测 renderer 实际应用的 backward flow；最后观测 RGB
+只能通过该 flow 传输到未来帧，motion head 不会衰减它。高频 refiner 只补充有界高通细节，
+不能改变低频位置或运动。future candidate 不进入 policy/action-free trunk。
+
+当前正式配置不使用 absolute future P256、P256 自回归、teacher forcing、unwarped copy 或
+full-frequency redraw。RAFT 只在训练时生成 backward-flow 监督 target，不属于模型或 serving。
 
 ## 2. 只填写模型和数据目录
 

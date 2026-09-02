@@ -29,22 +29,22 @@ ROOT = Path(__file__).resolve().parents[1]
         ),
     ],
 )
-def test_5b_presets_match_v8_core_5b_and_64_h200(
+def test_5b_presets_match_action_owned_5b_and_64_h200(
     profile: str,
     total_steps: int,
     checkpoint_steps: list[int],
     checkpoint_interval: int,
 ) -> None:
     model = yaml.safe_load(
-        (ROOT / "configs/model/native_5b_v8_core.yaml").read_text()
+        (ROOT / "configs/model/native_5b_v8_action_owned_transport.yaml").read_text()
     )
     objective = yaml.safe_load(
-        (ROOT / "configs/objective/stage0_v8_core.yaml").read_text()
+        (ROOT / "configs/objective/stage0_v8_action_owned_transport.yaml").read_text()
     )
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_487_202_937
+    assert model["expected_parameter_count"] == 5_087_822_644
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_enabled"] is False
@@ -55,25 +55,27 @@ def test_5b_presets_match_v8_core_5b_and_64_h200(
     assert model["model"]["dynamics_layers"] == 2
     assert model["model"]["factual_dynamics_repeats"] == 1
     assert model["model"]["factual_action_residual_scale"] == 1.0
-    assert model["model"]["factual_v7_early_action_conditioning"] is True
-    assert model["model"]["factual_v7_early_action_scale"] == 1.0
-    assert model["model"]["factual_v7_bridge_layers_state"] == [
-        3, 6, 9, 12, 15, 18, 21, 24, 27, 31
-    ]
+    assert model["model"]["factual_v7_early_action_conditioning"] is False
+    assert model["model"]["factual_v7_early_action_scale"] == 0.0
+    assert model["model"]["factual_v7_bridge_layers_state"] == []
     assert "render_factual_dynamics_repeats" not in model["model"]
     assert "render_factual_action_residual_scale" not in model["model"]
     assert model["model"]["appearance_action_residual_scale"] == 0.0
     assert model["model"]["rgb_context_enabled"] is True
-    assert model["model"]["rgb_original_v7_context"] is True
+    assert model["model"]["rgb_original_v7_context"] is False
+    assert model["model"]["rgb_action_owned_transport"] is True
     assert model["model"]["rgb_v7_high_frequency_refiner"] is True
     assert model["model"]["rgb_v7_high_frequency_scale"] == 0.0625
     assert model["model"]["rgb_context_residual_scale"] == 0.75
-    assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
+    assert model["model"]["rgb_context_motion_blend_gain"] == 0.0
     assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
     assert objective["objective"]["rgb_l1"] == 1.2
     assert objective["objective"]["rgb_charbonnier"] == 0.0
     assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
     assert objective["objective"]["action_counterfactual_token_advantage"] == 1.0
+    assert objective["objective"]["rgb_flow_teacher"] == 0.20
+    assert objective["objective"]["rgb_disocclusion_bce"] == 0.0
+    assert objective["objective"]["rgb_disocclusion_dice"] == 0.0
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
@@ -305,9 +307,9 @@ def test_5b_site_defaults_to_oxe_and_direct_v8_p144() -> None:
     assert "DIRECT_APPEARANCE_FEATURE_LAYER=-1" in site
     assert "STREAMING_LRU_ROOT=" not in site
     assert "STREAMING_LRU_GIB_PER_RANK=" not in site
-    assert "MODEL_PROFILE=configs/model/native_5b_v8_core.yaml" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_v8_action_owned_transport.yaml" in site
     assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144.yaml" in site
-    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_core.yaml" in site
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_action_owned_transport.yaml" in site
     assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
     assert "DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe.template.yaml" in site
 
@@ -318,7 +320,7 @@ def test_5b_direct_template_has_optimized_runtime_defaults() -> None:
     assert "DIRECT_DECODE_WORKERS=1" in site
     assert "DIRECT_PREFETCH_WORKERS=1" in site
     assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
-    assert "MODEL_PROFILE=configs/model/native_5b_v8_core.yaml" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_v8_action_owned_transport.yaml" in site
     assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144.yaml" in site
 
 

@@ -5,20 +5,21 @@ dual-path/P256 变体。
 
 ## 冻结合同
 
-- 模型配置：`configs/model/native_5b_v8_core.yaml`
-- 兼容入口：`configs/model/native_5b_dual_path.yaml`，内容必须与上述安全配置等价；新任务不要再选它
-- 参数量：`5,440,933,496`
+- 唯一模型配置：`configs/model/native_5b_v8_action_owned_transport.yaml`
+- 参数量：`5,087,822,644`
 - encoder：`configs/encoder/vggt_native_p144.yaml`
-- objective：`configs/objective/stage0_v8_core.yaml`
+- objective：`configs/objective/stage0_v8_action_owned_transport.yaml`
 - runtime：先用 `configs/runtime/h200_64_fsdp2_canary1k.yaml`
 - 时空合同：`T=24`、P144、`K=16`，RGB 监督全部 K16
 
-future physical action 在 state encoder 之前进入独立 factual pass，并在两层独立 factual
-decoder 的 query/memory 中再次注入。policy/action-free trunk 不读取 future candidate。
-P144 factual future state 是运动与低频 RGB 的唯一所有者；原始 V7
-`ContextResidualPixelDecoder` 直接消费该状态。高频 refiner 仅做有界晚期细节，不读取
-absolute future P256、copy-last 或 future target。V8 5B 禁用 P256 AR、appearance teacher
-forcing、RAFT/flow 和旧 renderer-only action 通路。
+future physical action 经过 source normalization 后，在 factual StateStream 的 block 0 之前按
+horizon 因果注入，并由 group-preserving conditioner 持续作用于 P144 future state。
+policy/action-free trunk 不读取 future candidate。P144 factual future state 是唯一运动所有者，
+直接预测 renderer 实际使用的 backward flow；最后观测 RGB 只能通过该 flow 被传输到未来帧。
+motion head 只作辅助监督，不门控 flow，也不存在 unwarped copy 或 full-frequency redraw。
+高频 refiner 只补充有界高通细节。训练期 RAFT 仅产生同一 backward-flow 字段的监督 target，
+不进入模型、optimizer 或 serving。absolute future P256、P256 AR/teacher forcing、独立
+appearance lane 和旧 renderer-only action 通路均禁用。
 
 ## 新鲜启动
 
@@ -42,7 +43,7 @@ SITE=/data/wm3d/control/5b_v8_canary1k.env
 ```
 
 `doctor` 与 `runtime` 会执行 5B V8 语义门禁。只要 model/encoder/objective 仍指向旧
-absolute-P256/teacher 路线、参数量不匹配、factual action 顺序不对或 appearance teacher ratio
+V7-context/P256 路线、参数量不匹配、factual action 顺序不对或 appearance teacher ratio
 非零，就会在大作业前失败。
 
 ### 复用已经下载的 AgiBotWorld2026
@@ -71,12 +72,14 @@ absolute-P256/teacher 路线、参数量不匹配、factual action 顺序不对�
 
 ## 启动前核对
 
-- runtime 中模型名为 `native_5b_v8_exact_v7_factual_high_frequency_refiner`
-- 封存参数量为 `5,440,933,496`
+- runtime 中模型名为 `native_5b_v8_action_owned_rgb_transport`
+- 封存参数量为 `5,087,822,644`
 - appearance teacher start/end ratio 都为 0
 - encoder 没有 P256 appearance feature
+- objective 的 `rgb_flow_teacher` 为 `0.20`，且 disocclusion loss 为 0
+- renderer 使用未被 motion gate 衰减的 factual backward flow
 - future action 对 policy/action-free 输出逐元素无影响
-- factual decoder、RGB decoder、action head 和 policy 都有有限非零梯度
+- factual conditioner、RGB transport、action head 和 policy 都有有限非零梯度
 - 所有 rank 使用同一份 runtime/data seal/normalization 和训练-serving action/state calibration
 
 这里的 1K 只验证 5B 实现、分布式状态和学习方向；真实 VLA 能力仍要由独立 action regression

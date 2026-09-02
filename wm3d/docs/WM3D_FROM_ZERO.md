@@ -240,20 +240,20 @@ TASK_BANK_SHA=$(sha256sum "$WORK/task_bank/index.jsonl" | awk '{print $1}')
   --episode-index-fragment-root "$CACHE/episode_index_fragments" \
   --output-index "$CACHE/episode_index.jsonl" --output-seal "$CACHE/episode_seal.json"
 
-MODEL_PROFILE=configs/model/native_5b_v8_core.yaml
+MODEL_PROFILE=configs/model/native_5b_v8_action_owned_transport.yaml
 ./run_wm3d.sh window \
   --episode-index "$CACHE/episode_index.jsonl" --episode-seal "$CACHE/episode_seal.json" \
   --cache-root "$CACHE" --data-profile "$WORK/public_robot_6106h.yaml" \
-  --model-profile "$MODEL_PROFILE" --output-index "$WORK/windows/native_5b_v8_core.jsonl" \
-  --output-seal "$WORK/windows/native_5b_v8_core.seal.json"
+  --model-profile "$MODEL_PROFILE" --output-index "$WORK/windows/native_5b_v8_action_owned_transport.jsonl" \
+  --output-seal "$WORK/windows/native_5b_v8_action_owned_transport.seal.json"
 
-WINDOW_SHA=$(sha256sum "$WORK/windows/native_5b_v8_core.jsonl" | awk '{print $1}')
+WINDOW_SHA=$(sha256sum "$WORK/windows/native_5b_v8_action_owned_transport.jsonl" | awk '{print $1}')
 ./run_wm3d.sh normalization \
   --data-profile "$WORK/public_robot_6106h.yaml" \
   --model-profile "$MODEL_PROFILE" \
-  --window-index "$WORK/windows/native_5b_v8_core.jsonl" \
+  --window-index "$WORK/windows/native_5b_v8_action_owned_transport.jsonl" \
   --window-index-sha256 "$WINDOW_SHA" --cache-root "$CACHE" \
-  --output "$WORK/windows/native_5b_v8_core.grouped_normalization.json"
+  --output "$WORK/windows/native_5b_v8_action_owned_transport.grouped_normalization.json"
 ```
 
 昂贵 episode cache 绑定 raw manifest row、adapter、视觉 encoder、task encoder/bank 和 representation SHA，不绑定 T/K、训练步数或 1B/5B profile。view token 为 int8 per-vector + scale，depth/point 为 fp16，RGB 为 JPEG pack。改成 `native_1b` 只需重建便宜 window index。
@@ -266,19 +266,19 @@ grouped normalization 只读 train split 的真实 window，按 embodiment/group
 RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_canary1k.yaml
 ./run_wm3d.sh runtime \
   --model "$MODEL_PROFILE" --data "$WORK/public_robot_6106h.yaml" \
-  --runtime "$RUNTIME_PROFILE" --objective configs/objective/stage0_v8_core.yaml \
+  --runtime "$RUNTIME_PROFILE" --objective configs/objective/stage0_v8_action_owned_transport.yaml \
   --cache-root "$CACHE" --episode-cache-index "$CACHE/episode_index.jsonl" \
   --episode-cache-seal "$CACHE/episode_seal.json" \
-  --cache-index "$WORK/windows/native_5b_v8_core.jsonl" --cache-seal "$WORK/windows/native_5b_v8_core.seal.json" \
-  --grouped-normalization "$WORK/windows/native_5b_v8_core.grouped_normalization.json" \
+  --cache-index "$WORK/windows/native_5b_v8_action_owned_transport.jsonl" --cache-seal "$WORK/windows/native_5b_v8_action_owned_transport.seal.json" \
+  --grouped-normalization "$WORK/windows/native_5b_v8_action_owned_transport.grouped_normalization.json" \
   --environment-lock .venv/environment_receipt.json \
-  --run-name wm3d_native_5b_v8_core --run-lineage public_robot_6106h_native_5b_v8_core_v1 \
-  --output-root "$RUNS/wm3d_native_5b_v8_core" \
-  --output "$RUNS/wm3d_native_5b_v8_core/runtime.yaml"
+  --run-name wm3d_native_5b_v8_action_owned_transport --run-lineage public_robot_6106h_native_5b_v8_action_owned_transport_v1 \
+  --output-root "$RUNS/wm3d_native_5b_v8_action_owned_transport" \
+  --output "$RUNS/wm3d_native_5b_v8_action_owned_transport/runtime.yaml"
 ./run_wm3d.sh preflight \
   --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
   --master_addr="$MASTER_ADDR" --master_port="$PREFLIGHT_MASTER_PORT" -- \
-  --runtime "$RUNS/wm3d_native_5b_v8_core/runtime.yaml"
+  --runtime "$RUNS/wm3d_native_5b_v8_action_owned_transport/runtime.yaml"
 ```
 
 正式大作业前，用相同链路配 `native_1b + smoke_2gpu_fsdp2` 跑真实两卡 canary：0→编号 checkpoint，退出进程，再从该目录 exact resume；随后运行统一 offline eval。训练/eval 的 torchrun 命令见根 README。checkpoint authority 只能是原子提交的 `step_XXXXXXXX/`。

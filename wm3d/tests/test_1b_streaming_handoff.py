@@ -31,20 +31,24 @@ def _oxe_info(action_dim: int = 7, state_dim: int = 7) -> dict:
     }
 
 
-def test_1b_streaming_presets_use_dual_path_1b_and_saturating_batch() -> None:
+def test_1b_streaming_presets_use_action_owned_1b_and_saturating_batch() -> None:
     model = yaml.safe_load(
-        (ROOT / "configs/model/native_1b_dual_path.yaml").read_text()
+        (ROOT / "configs/model/native_1b_v8_action_owned_transport.yaml").read_text()
     )
     validate_model_profile(model)
-    assert model["expected_parameter_count"] == 1_526_840_720
+    assert model["expected_parameter_count"] == 1_192_794_292
     assert model["model"]["P"] == 64
     assert model["model"]["appearance_P"] == 256
-    assert model["model"]["appearance_autoregressive_steps"] == 2
+    assert model["model"]["appearance_enabled"] is False
+    assert model["model"]["rgb_action_owned_transport"] is True
+    assert model["model"]["factual_v7_early_action_conditioning"] is False
+    assert model["model"]["factual_v7_early_action_scale"] == 0.0
+    assert model["model"]["factual_v7_bridge_layers_state"] == []
     assert model["model"]["rgb_decode_indices"] == list(range(8))
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75
-    assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
-    assert model["model"]["rgb_context_appearance_delta_scale"] == 1.0
+    assert model["model"]["rgb_context_motion_blend_gain"] == 0.0
+    assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
 
     expected = {
         "h100_8_fsdp2_streaming_canary1k.yaml": 1_000,
@@ -80,12 +84,13 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
     assert init.returncode == 0, init.stderr
     payload = site.read_text()
     assert "WM3D_1B_PRESET=formal100k" in payload
-    assert "MODEL_PROFILE=configs/model/native_1b_dual_path.yaml" in payload
+    assert "MODEL_PROFILE=configs/model/native_1b_v8_action_owned_transport.yaml" in payload
     assert (
-        "ENCODER_CONTRACT=configs/encoder/vggt_native_p64_appearance_p256.yaml"
+        "ENCODER_CONTRACT=configs/encoder/vggt_native_p64.yaml"
         in payload
     )
-    assert "OBJECTIVE_PROFILE=configs/objective/stage0_native_dual_path.yaml" in payload
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_action_owned_transport.yaml" in payload
+    assert "DIRECT_APPEARANCE_FEATURE_LAYER=-1" in payload
     assert "WM3D_DATA_MODE=direct_raw" in payload
     assert "MINIMUM_RAW_FILESYSTEM_BYTES=0" in payload
     assert "DIRECT_PREFETCH_WINDOWS=16" in payload
@@ -146,8 +151,8 @@ def test_1b_oxe_mix_is_60_sources_without_agibot_or_pca() -> None:
     )
     representation = _representation_from_profiles(
         base=base_data["cache_representation"],
-        model_path=ROOT / "configs/model/native_1b_dual_path.yaml",
-        encoder_path=ROOT / "configs/encoder/vggt_native_p64_appearance_p256.yaml",
+        model_path=ROOT / "configs/model/native_1b_v8_action_owned_transport.yaml",
+        encoder_path=ROOT / "configs/encoder/vggt_native_p64.yaml",
     )
     repos = ("lerobot/droid_1.0.1",) + tuple(
         f"lerobot/fixture_{index:02d}" for index in range(55)
@@ -176,8 +181,8 @@ def test_1b_oxe_mix_is_60_sources_without_agibot_or_pca() -> None:
     assert generated_data["notes"]["agibot_world_2026_enabled"] is False
     assert generated_data["notes"]["agibot_beta_enabled"] is False
     assert generated_data["cache_representation"]["spatial_tokens"] == 64
-    assert generated_data["cache_representation"]["appearance_token_grid"] == 16
-    assert generated_data["cache_representation"]["appearance_feature_layer"] == 4
+    assert "appearance_token_grid" not in generated_data["cache_representation"]
+    assert "appearance_feature_layer" not in generated_data["cache_representation"]
     assert generated_data["cache_representation"]["token_dim"] == 2048
     assert generated_data["cache_representation"]["rgb_size"] == 256
     assert "pca" not in json.dumps(generated_data["cache_representation"]).lower()

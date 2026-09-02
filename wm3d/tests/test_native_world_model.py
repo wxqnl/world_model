@@ -1527,10 +1527,75 @@ def test_original_v7_rgb_future_action_changes_rgb_not_policy_or_action_free() -
 def _tiny_action_owned_transport_config() -> NativeWorldModelConfig:
     return replace(
         _tiny_original_v7_rgb_config(),
+        dynamics_layers=1,
+        factual_v7_bridge_layers_state=(),
+        factual_v7_early_action_conditioning=False,
+        factual_v7_early_action_scale=0.0,
         rgb_original_v7_context=False,
         rgb_action_owned_transport=True,
         rgb_context_motion_blend_gain=0.0,
     )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "factual_v7_early_action_conditioning": True,
+            "factual_v7_early_action_scale": 1.0,
+        },
+        {"factual_v7_early_action_scale": 1.0},
+        {"factual_v7_bridge_layers_state": (1,)},
+    ],
+)
+def test_action_owned_transport_rejects_legacy_factual_configuration(
+    updates: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="factual|legacy V7"):
+        NativeWorldModel(replace(_tiny_action_owned_transport_config(), **updates))
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "expected_parameters", "expected_p", "expected_k"),
+    [
+        (
+            "native_1b_v8_action_owned_transport.yaml",
+            1_192_794_292,
+            64,
+            8,
+        ),
+        (
+            "native_5b_v8_action_owned_transport.yaml",
+            5_087_822_644,
+            144,
+            16,
+        ),
+    ],
+)
+def test_action_owned_transport_release_profiles_are_sealed(
+    profile_name: str,
+    expected_parameters: int,
+    expected_p: int,
+    expected_k: int,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    profile = yaml.safe_load((root / "configs/model" / profile_name).read_text())
+    with torch.device("meta"):
+        model = build_world_model(profile)
+    assert profile["expected_parameter_count"] == expected_parameters
+    assert sum(parameter.numel() for parameter in model.parameters()) == expected_parameters
+    assert model.cfg.P == expected_p
+    assert model.cfg.K == expected_k
+    assert model.cfg.rgb_action_owned_transport is True
+    assert model.cfg.rgb_original_v7_context is False
+    assert model.cfg.factual_v7_early_action_conditioning is False
+    assert model.cfg.factual_v7_early_action_scale == 0.0
+    assert model.cfg.factual_v7_bridge_layers_state == ()
+    assert model.factual_action is not None
+    assert model.factual_action.condition_on_normalization is True
+    assert model.factual_state_action_cross is not None
+    assert model.factual_v7_query_action is None
+    assert len(model.dynamics_blocks) == 0
 
 
 def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:

@@ -86,6 +86,7 @@ model:
   rgb_v7_high_frequency_scale: 0.0625
   rgb_context_alignment_enabled: false
   rgb_render_action_free_prior: false
+  rgb_context_residual_scale: 0.75
   rgb_context_motion_blend_gain: 0.0
   rgb_context_action_scale: 1.0
   rgb_context_appearance_delta_scale: 0.0
