@@ -15,11 +15,13 @@ from wm3d.training.runtime_contract import (
     validate_runtime_profile,
 )
 from wm3d.training.pretrain import (
+    _clear_rgb_decoder_gradients_during_warmup,
     _collate_and_trim,
     _learning_rate,
     _training_objective_for_step,
 )
 from wm3d.training.native_objective import NativeObjectiveConfig
+from wm3d.training.distributed_runtime import initialize_adamw_state
 from wm3d.data.step_sampler import ExactSourceSchedule
 
 
@@ -128,6 +130,38 @@ def test_rgb_decoder_warmup_preserves_non_rgb_objectives() -> None:
     invalid["train"]["checkpoint_steps"] = [5]
     with pytest.raises(RuntimeContractError, match="follow the RGB decoder warmup"):
         validate_runtime_profile(invalid)
+
+
+def test_rgb_decoder_warmup_prevents_adamw_decay_and_step_aging() -> None:
+    runtime = copy.deepcopy(_load("h100_8_fsdp2.yaml"))
+    runtime["train"]["rgb_decoder_warmup_steps"] = 5
+    runtime["train"]["checkpoint_steps"] = [6]
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rgb_head = torch.nn.Linear(3, 2, bias=False)
+
+    model = Model()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.1, weight_decay=0.1
+    )
+    initialize_adamw_state(optimizer)
+    parameter = model.rgb_head.weight
+    before = parameter.detach().clone()
+    parameter.grad = torch.zeros_like(parameter)
+
+    _clear_rgb_decoder_gradients_during_warmup(model, 4, runtime)
+    optimizer.step()
+
+    torch.testing.assert_close(parameter, before, rtol=0.0, atol=0.0)
+    assert optimizer.state[parameter]["step"].item() == 0.0
+
+    parameter.grad = torch.zeros_like(parameter)
+    _clear_rgb_decoder_gradients_during_warmup(model, 5, runtime)
+    optimizer.step()
+    assert not torch.equal(parameter, before)
+    assert optimizer.state[parameter]["step"].item() == 1.0
 
 
 def test_v7_aligned_rgb_warmstart_is_explicit_and_model_only() -> None:

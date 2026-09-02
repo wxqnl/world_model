@@ -443,6 +443,25 @@ def _training_objective_for_step(
     )
 
 
+def _clear_rgb_decoder_gradients_during_warmup(
+    model: NativeWorldModel,
+    step: int,
+    runtime: Mapping[str, Any],
+) -> None:
+    """Keep RGB-only parameters bitwise frozen during dynamics bootstrap.
+
+    Multiplying an RGB loss by zero still creates zero-valued gradients. AdamW
+    would then apply weight decay and advance bias-correction state. Clearing
+    those gradients is therefore required for a real optimizer freeze.
+    """
+
+    warmup_steps = int(runtime["train"].get("rgb_decoder_warmup_steps", 0))
+    if step >= warmup_steps:
+        return
+    for parameter in model.rgb_head.parameters():
+        parameter.grad = None
+
+
 def _batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
     return {
         name: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
@@ -1817,6 +1836,9 @@ def main() -> None:
                         + value.detach() / accumulation
                     )
             completed = step + 1
+            _clear_rgb_decoder_gradients_during_warmup(
+                native_model, step, runtime
+            )
             ownership_audited_this_step = False
             # Audit before clipping/zeroing.  Fresh runs must prove all owners
             # on the first step where every sealed objective owner is active;
