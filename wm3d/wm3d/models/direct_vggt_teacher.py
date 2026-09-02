@@ -328,16 +328,14 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             or view_mask.shape != tokens.shape[:3]
         ):
             raise ValueError("direct future geometry shapes are inconsistent")
-        weight = (
-            confidence.float().clamp_min(0.0)
-            * view_mask[..., None].float()
-        )
-        denominator = weight.sum(dim=2)
-        target = (
-            (tokens.float() * weight[..., None]).sum(dim=2)
-            / denominator.clamp_min(1.0e-12)[..., None]
-        )
-        return target.to(torch.bfloat16), denominator > 0
+        # P64 is an image-coordinate state. Patch ``p`` from two cameras does
+        # not describe the same ray, so averaging equal patch indices across
+        # views destroys the spatial coordinate needed by the V7 renderer.
+        # Preserve the sealed ``head`` slot (view 0) as the anchor target;
+        # auxiliary views remain available to the observed-state fuser.
+        anchor_confidence = confidence[:, :, 0].float().clamp_min(0.0)
+        anchor_valid = view_mask[:, :, 0, None] & (anchor_confidence > 0)
+        return tokens[:, :, 0].to(torch.bfloat16), anchor_valid
 
     def materialize(
         self, batch: Mapping[str, Any]
@@ -377,6 +375,12 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         context_rgb = context_rgb_source.gather(1, context_rgb_gather).squeeze(1)
         context_rgb = context_rgb.float().div_(255.0)
         context_rgb = context_rgb * context_rgb_mask[..., None, None, None]
+        # Original V7 predicts RGB only in the anchor camera coordinate. Keep
+        # auxiliary images for world-state encoding, but never ask one anchor
+        # P64 state to render several incompatible camera frames.
+        anchor_context_rgb_mask = torch.zeros_like(context_rgb_mask)
+        anchor_context_rgb_mask[:, 0] = context_rgb_mask[:, 0]
+        context_rgb_mask = anchor_context_rgb_mask
         target_tokens, target_token_mask = self._fuse_future_tokens(
             future_tokens,
             future_confidence,
@@ -410,9 +414,12 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         future_rgb = encoded["rgb"][:, future].index_select(
             1, rgb_indices
         )
-        future_rgb_mask = future_view_mask.index_select(
-            1, rgb_indices
-        ) & context_rgb_mask[:, None]
+        selected_future_view_mask = future_view_mask.index_select(1, rgb_indices)
+        future_rgb_mask = torch.zeros_like(selected_future_view_mask)
+        future_rgb_mask[:, :, 0] = (
+            selected_future_view_mask[:, :, 0]
+            & context_rgb_mask[:, None, 0]
+        )
         result = dict(batch)
         result.pop("direct_rgb_uint8", None)
         result.pop("direct_view_mask", None)

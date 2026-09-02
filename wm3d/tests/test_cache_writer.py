@@ -34,12 +34,49 @@ from wm3d.data.manifest_contract import (
     load_cache_episode_index,
     sha256_file,
 )
-from wm3d.data.unified_cache_dataset import UnifiedCacheDataset
+from wm3d.data.unified_cache_dataset import (
+    UnifiedCacheDataset,
+    _fuse_target_tokens,
+)
 from wm3d.data.window_index import plan_window_index
 
 
 def _clock() -> np.ndarray:
     return np.arange(20, dtype=np.float64) * 0.1
+
+
+def test_cached_future_target_preserves_head_coordinate() -> None:
+    head = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)
+    auxiliary = head.add(1000.0)
+    view_tokens = torch.stack((head, auxiliary), dim=1)
+    confidence = torch.ones(1, 2, 4)
+    view_mask = torch.ones(1, 2, dtype=torch.bool)
+    world_mask = torch.ones(1, 4, dtype=torch.bool)
+
+    target, mask = _fuse_target_tokens(
+        view_tokens,
+        confidence,
+        view_mask,
+        world_mask,
+        source_grid=2,
+        target_grid=2,
+    )
+
+    torch.testing.assert_close(target.float(), head.to(torch.bfloat16).float())
+    assert bool(mask.all())
+
+    changed = view_tokens.clone()
+    changed[:, 1].mul_(17.0)
+    changed_target, changed_mask = _fuse_target_tokens(
+        changed,
+        confidence,
+        view_mask,
+        world_mask,
+        source_grid=2,
+        target_grid=2,
+    )
+    torch.testing.assert_close(changed_target, target)
+    torch.testing.assert_close(changed_mask, mask)
 
 
 def _task(supervision: str = "fine_command"):
@@ -363,6 +400,8 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
     assert loaded["world_tokens"].shape == (2, 2, 4, 16)
     assert loaded["target_tokens"].shape == (2, 4, 16)
     assert loaded["target_rgb"].shape == (2, 2, 3, 16, 16)
+    assert bool(loaded["target_rgb_mask"][:, 0].all())
+    assert not bool(loaded["target_rgb_mask"][:, 1:].any())
     assert loaded["action_group_mask"].tolist() == [True, True]
     assert loaded["current_state_mask"].all()
     assert loaded["policy_query_mask"].any(dim=-1).tolist() == [True, True]

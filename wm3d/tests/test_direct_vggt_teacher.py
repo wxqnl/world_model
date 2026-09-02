@@ -182,9 +182,24 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
     assert result["target_camera_pose"].shape == (2, 2, 3, 9)
     assert result["context_rgb"].shape == (2, 3, 3, 8, 8)
     assert result["context_rgb_mask"].shape == (2, 3)
-    assert bool(result["context_rgb_mask"].all())
+    torch.testing.assert_close(
+        result["context_rgb_mask"],
+        torch.tensor([[True, False, False], [True, False, False]]),
+    )
     assert result["target_rgb"].shape == (2, 2, 3, 3, 8, 8)
     assert result["target_rgb_mask"].shape == (2, 2, 3, 1, 1, 1)
+    assert bool(result["target_rgb_mask"][:, :, 0].all())
+    assert not bool(result["target_rgb_mask"][:, :, 1:].any())
+    expected_anchor_identity = (
+        batch["direct_rgb_uint8"][:, 2:, 0]
+        .float()
+        .div(255.0)
+        .mean(dim=(2, 3, 4))
+    )
+    torch.testing.assert_close(
+        result["target_tokens"][:, :, 0, 0].float(),
+        expected_anchor_identity.to(torch.bfloat16).float(),
+    )
     expected_context = F.interpolate(
         batch["direct_rgb_uint8"][:, 1].reshape(6, 3, 56, 56).float().div(255.0),
         size=(8, 8),
@@ -241,7 +256,7 @@ def test_direct_teacher_uses_latest_available_context_per_view() -> None:
     batch["direct_view_mask"][1, :2, 1] = False
     result = _adapter(_FakeNativeVGGT()).materialize(batch)
 
-    assert bool(result["context_rgb_mask"][0, 2])
+    assert not bool(result["context_rgb_mask"][0, 2])
     assert not bool(result["context_rgb_mask"][1, 1])
     assert not bool(result["target_rgb_mask"][1, :, 1].any())
     expected_fallback = F.interpolate(

@@ -311,10 +311,12 @@ def _fuse_target_tokens(
         view_tokens.shape[2],
     ):
         raise CacheDataError("future view/world masks disagree with tokens")
-    weight = confidence.float().clamp_min(0) * view_mask[..., None].float()
-    weight = weight * world_mask[:, None].float()
-    numerator = (view_tokens.float() * weight[..., None]).sum(dim=1)
-    denominator = weight.sum(dim=1)
+    # Equal patch indices from wrist and head cameras are different rays.
+    # Preserve the sealed head/anchor coordinate instead of averaging views.
+    weight = confidence[:, 0].float().clamp_min(0)
+    weight = weight * view_mask[:, 0, None].float() * world_mask.float()
+    numerator = view_tokens[:, 0].float() * weight[..., None]
+    denominator = weight
     channels = view_tokens.shape[-1]
     numerator_grid = numerator.reshape(-1, source_grid, source_grid, channels)
     numerator_grid = numerator_grid.permute(0, 3, 1, 2)
@@ -618,7 +620,10 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
                 antialias=True,
             ).reshape(*leading, 3, self.rgb_size, self.rgb_size)
         target_rgb = target_rgb.div_(255.0)
-        rgb_view_mask = frame["view_mask"].index_select(0, rgb_rows).bool()
+        rgb_view_mask = (
+            frame["view_mask"].index_select(0, rgb_rows).bool().clone()
+        )
+        rgb_view_mask[:, 1:] = False
 
         embodiment = self.data_profile.embodiments[entry.embodiment]
         robot_values, prepared_robot = self.robot.read(

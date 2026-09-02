@@ -1,7 +1,7 @@
 """Fast real-data learnability gate for the factual-action RGB path.
 
 The probe deliberately keeps the production implementation and physical
-action ABI, but reduces width, depth, view count and RGB resolution. One real
+action ABI, but reduces width, depth and RGB resolution. One real
 K8 high-motion window is expanded into eight K1 examples that share exactly
 the same observation, task and future timestamp. Their physical action is
 therefore the only input that can explain the eight different future targets.
@@ -181,8 +181,8 @@ def prepare_same_context_action_batch(
         "aux_type_ids",
     )
     batch = {name: _repeat(raw[name], horizons) for name in model_inputs}
-    batch["world_tokens"] = _repeat(raw["world_tokens"][:, :, :1], horizons)
-    batch["view_mask"] = _repeat(raw["view_mask"][:, :, :1], horizons)
+    batch["world_tokens"] = _repeat(raw["world_tokens"], horizons)
+    batch["view_mask"] = _repeat(raw["view_mask"], horizons)
     context_times = raw["world_times_s"][:, :16]
     # Every expanded example sees the same future timestamp. Time and context
     # cannot identify the target; only the physical action can.
@@ -205,11 +205,11 @@ def prepare_same_context_action_batch(
         batch[name] = _future_slices(raw[name], horizons)
 
     batch["context_rgb"] = _repeat(
-        _resize_rgb(raw["context_rgb"][:, :1], rgb_size), horizons
+        _resize_rgb(raw["context_rgb"], rgb_size), horizons
     )
-    batch["context_rgb_mask"] = _repeat(
-        raw["context_rgb_mask"][:, :1], horizons
-    )
+    anchor_context_mask = torch.zeros_like(raw["context_rgb_mask"])
+    anchor_context_mask[:, 0] = raw["context_rgb_mask"][:, 0]
+    batch["context_rgb_mask"] = _repeat(anchor_context_mask, horizons)
     batch["target_tokens"] = _future_slices(raw["target_tokens"], horizons)
     batch["target_token_mask"] = _future_slices(
         raw["target_token_mask"], horizons
@@ -234,17 +234,17 @@ def prepare_same_context_action_batch(
         (boundaries[0, 0].expand(horizons), boundaries[0, 1 : horizons + 1]),
         dim=1,
     )
-    target_rgb = raw["target_rgb"][0, :horizons, :1].unsqueeze(1)
+    target_rgb = raw["target_rgb"][0, :horizons].unsqueeze(1)
     batch["target_rgb"] = _resize_rgb(target_rgb, rgb_size)
-    batch["target_rgb_mask"] = (
-        raw["target_rgb_mask"][0, :horizons, :1].unsqueeze(1).clone()
-    )
+    target_rgb_mask = raw["target_rgb_mask"][0, :horizons].unsqueeze(1).clone()
+    target_rgb_mask[:, :, 1:] = False
+    batch["target_rgb_mask"] = target_rgb_mask
     batch["rgb_frame_indices"] = torch.zeros(horizons, 1, dtype=torch.long)
     return batch
 
 
 def build_micro_model(
-    runtime: Mapping[str, object], *, rgb_size: int
+    runtime: Mapping[str, object], *, rgb_size: int, num_views: int
 ) -> NativeWorldModel:
     profile = dict(runtime["model_profile"])
     profile.pop("expected_parameter_count", None)
@@ -253,7 +253,7 @@ def build_micro_model(
     model.update(
         {
             "K": 1,
-            "num_views": 1,
+            "num_views": num_views,
             "state_hidden": 128,
             "state_layers": 2,
             "state_heads": 8,
@@ -528,7 +528,11 @@ def main() -> None:
         state_normalization=args.state_normalization,
     )
     batch = _batch_to_device(cpu_batch, device)
-    model = build_micro_model(runtime, rgb_size=args.rgb_size).to(device)
+    model = build_micro_model(
+        runtime,
+        rgb_size=args.rgb_size,
+        num_views=int(cpu_batch["world_tokens"].shape[2]),
+    ).to(device)
     objective = probe_objective()
     perceptual = build_rgb_perceptual_model(objective, device=device)
     optimizer = torch.optim.AdamW(
@@ -567,8 +571,15 @@ def main() -> None:
             raise RuntimeError("micro-probe loss became non-finite")
         loss.backward()
         if step == 1:
+            factual_action_module = (
+                model.factual_v7_query_action
+                if model.factual_v7_query_action is not None
+                else model.factual_action
+            )
             gradient_norms = {
-                "factual_action_encoder": _first_gradient_norm(model.history_action),
+                "factual_action_encoder": _first_gradient_norm(
+                    factual_action_module
+                ),
                 "early_factual_state_block": _first_gradient_norm(
                     model.state_blocks[0]
                 ),

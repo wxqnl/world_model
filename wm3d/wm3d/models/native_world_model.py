@@ -679,7 +679,13 @@ class ContinuousTimeEmbedding(nn.Module):
 
 
 class MultiViewTokenFuser(nn.Module):
-    """Fuse cameras only along the view axis at each time/patch coordinate."""
+    """Fuse auxiliary cameras into the head-camera coordinate.
+
+    View zero is the sealed ``head``/anchor view. Each anchor patch queries
+    every patch from every valid auxiliary view, matching the original V7
+    spatial contract. The output therefore remains an anchor-coordinate P64
+    grid instead of averaging unrelated rays with the same patch index.
+    """
 
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
@@ -690,14 +696,18 @@ class MultiViewTokenFuser(nn.Module):
         )
         nn.init.normal_(self.view_embed, std=0.02)
         self.attn_norm = RMSNorm(cfg.view_hidden)
-        self.attn = SelfAttention(cfg.view_hidden, cfg.view_heads, cfg.dropout)
+        self.cross = CrossAttention(
+            cfg.view_hidden, cfg.view_hidden, cfg.view_heads, cfg.dropout
+        )
         self.ff_norm = RMSNorm(cfg.view_hidden)
         self.ff = SwiGLU(cfg.view_hidden, cfg.view_ff_mult, cfg.dropout)
         self.gate = nn.Linear(cfg.view_hidden, 1, bias=False)
+        nn.init.zeros_(self.gate.weight)
         self.out_proj = nn.Linear(cfg.view_hidden, cfg.state_hidden, bias=False)
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.view_embed, std=0.02)
+        nn.init.zeros_(self.gate.weight)
 
     def forward(self, tokens: torch.Tensor, view_mask: torch.Tensor) -> torch.Tensor:
         batch, frames, views, patches, _ = tokens.shape
@@ -705,20 +715,44 @@ class MultiViewTokenFuser(nn.Module):
             raise ValueError(f"expected {self.num_views} views, got {views}")
         if tuple(view_mask.shape) != (batch, frames, views):
             raise ValueError("view_mask must be [B,T,V]")
-        if not bool(view_mask.any(dim=-1).all()):
-            raise ValueError("every context frame must contain at least one real view")
+        if not bool(view_mask[:, :, 0].all()):
+            raise ValueError("every context frame must contain the head anchor view")
         value = self.in_proj(tokens) + self.view_embed
-        value = value.permute(0, 1, 3, 2, 4).reshape(
-            batch * frames * patches, views, -1
-        )
-        valid = view_mask[:, :, None, :].expand(batch, frames, patches, views)
-        valid = valid.reshape(batch * frames * patches, views)
-        value = value + self.attn(
-            self.attn_norm(value), allowed_mask=valid[:, None, None, :]
-        )
-        value = value + self.ff(self.ff_norm(value))
-        logits = self.gate(value).squeeze(-1).masked_fill(~valid, float("-inf"))
-        fused = (value * logits.softmax(dim=-1)[..., None]).sum(dim=1)
+        anchor = value[:, :, 0].reshape(batch * frames, patches, -1)
+        if views == 1:
+            dependency = sum(
+                parameter.reshape(-1)[0] * 0.0
+                for module in (self.cross, self.ff)
+                for parameter in module.parameters()
+            )
+            fused = anchor + dependency.to(dtype=anchor.dtype)
+        else:
+            auxiliary = value[:, :, 1:].reshape(
+                batch * frames, (views - 1) * patches, -1
+            )
+            auxiliary_valid = (
+                view_mask[:, :, 1:, None]
+                .expand(batch, frames, views - 1, patches)
+                .reshape(batch * frames, (views - 1) * patches)
+            )
+            has_auxiliary = auxiliary_valid.any(dim=-1)
+            # SDPA cannot consume an all-masked key row. Supply one zero
+            # fallback key, then mask its residual back to exact zero.
+            safe_valid = auxiliary_valid.clone()
+            safe_auxiliary = auxiliary.clone()
+            missing = ~has_auxiliary
+            if bool(missing.any()):
+                safe_valid[missing, 0] = True
+                safe_auxiliary[missing, 0] = 0
+            residual = self.cross(
+                self.attn_norm(anchor),
+                self.attn_norm(safe_auxiliary),
+                allowed_mask=safe_valid[:, None, None, :],
+            )
+            residual = residual + self.ff(self.ff_norm(residual))
+            residual = residual * has_auxiliary[:, None, None].to(residual.dtype)
+            gate = torch.tanh(self.gate.weight.mean())
+            fused = anchor + gate * residual
         return self.out_proj(fused.view(batch, frames, patches, -1))
 
 

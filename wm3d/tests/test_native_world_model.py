@@ -19,6 +19,7 @@ from wm3d.models.native_world_model import (
     NativeV7BoundedHighFrequencyRefiner,
     NativeRGBImageDecoder,
     NativeWorldModel,
+    MultiViewTokenFuser,
     NativeWorldModelConfig,
     OriginalV7RGBActionAdapter,
     OriginalV7FactualDecoderLayer,
@@ -76,6 +77,33 @@ def _tiny_config() -> NativeWorldModelConfig:
         rgb_decode_indices=(0, 1),
         geom_hidden=16,
         activation_checkpointing=False,
+    )
+
+
+def test_multiview_fuser_preserves_anchor_and_uses_auxiliary_as_residual() -> None:
+    cfg = _tiny_config()
+    torch.manual_seed(5)
+    fuser = MultiViewTokenFuser(cfg).eval()
+    tokens = torch.randn(2, cfg.T, cfg.num_views, cfg.P, cfg.token_dim)
+    mask = torch.ones(2, cfg.T, cfg.num_views, dtype=torch.bool)
+
+    baseline = fuser(tokens, mask)
+    changed_auxiliary = tokens.clone()
+    changed_auxiliary[:, :, 1] += 3.0
+    torch.testing.assert_close(fuser(changed_auxiliary, mask), baseline)
+
+    with torch.no_grad():
+        fuser.gate.weight.fill_(1.0)
+    assert not torch.equal(
+        fuser(changed_auxiliary, mask),
+        fuser(tokens, mask),
+    )
+
+    mono_mask = mask.clone()
+    mono_mask[:, :, 1:] = False
+    torch.testing.assert_close(
+        fuser(changed_auxiliary, mono_mask),
+        fuser(tokens, mono_mask),
     )
 
 
