@@ -19,9 +19,9 @@ train:
   validation_micro_batch_size: 1
   gradient_accumulation: 1
   global_batch_size: 128
-  # Preserve the production 500-step LR warmup; this short qualification only
-  # checks causal direction, physical action semantics and gradient ownership.
-  total_steps: 101
+  # Preserve the production 500-step LR warmup in the sealed schedule; the
+  # qualification stops at step 100 through the explicit launch gate.
+  total_steps: 501
   seed: 3407
   validation_seed: 7340
   num_workers: 8
