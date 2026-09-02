@@ -45,10 +45,11 @@ def _required_owner_modules(
     if model.policy_calibration is not None:
         policy_modules.append(model.policy_calibration)
     factual_modules: list[nn.Module] = [
-        model.factual_action,
         model.dynamics_blocks,
         model.factual_token_output,
     ]
+    if model.factual_action is not None:
+        factual_modules.insert(0, model.factual_action)
     for module in (
         model.factual_v7_query_action,
         model.factual_v7_stream_action,

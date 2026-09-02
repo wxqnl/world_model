@@ -32,6 +32,7 @@ from wm3d.models.model_factory import validate_model_data_compatibility
 from wm3d.data.grouped_robot import ActionGroupSpec, EmbodimentSpec
 from wm3d.training.gradient_ownership import (
     GradientOwnershipError,
+    _owner_parameters,
     audit_gradient_ownership,
 )
 
@@ -1541,6 +1542,8 @@ def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:
     torch.manual_seed(812)
     model = NativeWorldModel(cfg).train()
     assert model.factual_action is None
+    owners = _owner_parameters(model)
+    assert owners["factual_dynamics"]
     decoder = model.rgb_head.image_decoder
     assert isinstance(decoder, NativeActionOwnedTransportRGBImageDecoder)
     assert not any(name.startswith("ctx") for name, _ in decoder.named_modules())
