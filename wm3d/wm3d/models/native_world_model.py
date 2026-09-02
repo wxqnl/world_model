@@ -718,7 +718,7 @@ class MultiViewTokenFuser(nn.Module):
             self.output_projection = nn.Linear(
                 cfg.view_hidden, cfg.state_hidden, bias=False
             )
-            self.residual_gate = nn.Parameter(torch.ones(()))
+            self.residual_gate = nn.Parameter(torch.ones(1))
             nn.init.zeros_(self.output_projection.weight)
         else:
             self.gate = nn.Linear(cfg.view_hidden, 1, bias=False)
