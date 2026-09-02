@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--direct-input-rgb-size", type=int, default=518)
     parser.add_argument("--direct-decode-workers", type=int, default=4)
     parser.add_argument("--direct-robot-cache-episodes", type=int, default=8)
-    parser.add_argument("--direct-prefetch-windows", type=int, default=8)
+    parser.add_argument("--direct-prefetch-windows", type=int, default=32)
     parser.add_argument("--direct-video-index-cache-assets", type=int, default=128)
     parser.add_argument("--direct-encode-chunk-rows", type=int, default=32)
     parser.add_argument("--direct-minimum-chunk-rows", type=int, default=4)
