@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 
+import pytest
 import torch
 
 from scripts.tools import audit_action_owned_transport_checkpoint as audit
@@ -169,10 +170,19 @@ def test_metrics_summary_reports_quality_response_and_strict_policy_isolation() 
     assert variants["normal"]["rgb_l1"] == 0.0
     assert variants["normal"]["p64_error_rms"] == 0.0
     assert variants["normal"]["flow_epe_pixels"] == 0.0
+    assert variants["normal"]["rgb_motion_fraction"] == 0.5
     assert summary["gains"]["rgb_l1_normal_vs_physical_noop"] > 0.0
     assert summary["gains"]["rgb_l1_normal_vs_distant_mismatch"] > 0.0
     assert summary["responses"]["physical_noop"]["rgb_response_rms"] > 0.0
     assert summary["all_policy_invariants_passed"] is True
+
+
+def test_metrics_exclude_views_without_valid_context_rgb() -> None:
+    batch = _metric_batch()
+    batch["context_rgb_mask"].zero_()
+
+    with pytest.raises(audit.AuditError, match="lacks RGB motion or static support"):
+        audit.variant_metrics(_output(batch, scale=1.0), batch, motion_threshold=0.03)
 
 
 def test_policy_invariant_detects_future_action_leak() -> None:

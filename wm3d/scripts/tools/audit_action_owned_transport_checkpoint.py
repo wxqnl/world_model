@@ -285,7 +285,10 @@ def variant_metrics(
     prediction_rgb = output["rgb"].float().clamp(0.0, 1.0)
     target_rgb = batch["target_rgb"].float().clamp(0.0, 1.0)
     context_rgb = batch["context_rgb"].float().clamp(0.0, 1.0)
-    rgb_valid = batch["target_rgb_mask"].bool()
+    rgb_valid = (
+        batch["target_rgb_mask"].bool()
+        & batch["context_rgb_mask"].bool()[:, None, :, None, None, None]
+    )
     if prediction_rgb.shape != target_rgb.shape:
         raise AuditError("predicted and target RGB tensors differ in shape")
     context = context_rgb[:, None].expand_as(target_rgb)
@@ -365,8 +368,7 @@ def variant_metrics(
         "flow_direction_cosine": _masked_cosine(
             flow_prediction, flow_target, flow_vector_valid
         ),
-        "rgb_motion_fraction": target_motion.float().sum()
-        / rgb_valid.float().sum().clamp_min(1.0),
+        "rgb_motion_fraction": _masked_mean(target_motion.float(), rgb_valid),
     }
     result = {name: float(value) for name, value in values.items()}
     if not all(math.isfinite(value) for value in result.values()):
