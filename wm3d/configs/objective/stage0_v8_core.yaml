@@ -38,11 +38,9 @@ objective:
   action_counterfactual_token_margin: 0.005
   action_counterfactual_rgb_advantage: 0.0
   action_counterfactual_rgb_margin: 0.002
-  # The verified V7 60K production profile did not train an additional
-  # wrong-action RGB objective. Keep the implementation available only for
-  # explicit diagnostics; factual P64 direction is validated independently.
-  context_pixel_action_rank_weight: 0.0
-  context_pixel_action_separation_weight: 0.0
+  # Match the verified V7 60K late sparse wrong-action RGB curriculum.
+  context_pixel_action_rank_weight: 2.0
+  context_pixel_action_separation_weight: 0.5
   context_pixel_action_rank_start_step: 30000
   context_pixel_action_rank_ramp_steps: 10000
   context_pixel_action_rank_every: 8

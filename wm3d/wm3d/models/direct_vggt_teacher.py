@@ -86,6 +86,15 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         self.rgb_resize_rows = 0
         self.oom_backoffs = 0
         self.effective_chunk_rows = int(config.encode_chunk_rows)
+        self.temporal_teacher_calls = 0
+        self.temporal_teacher_sequences = 0
+        self.temporal_teacher_seconds = 0.0
+        self.temporal_teacher_oom_backoffs = 0
+        self.effective_temporal_teacher_samples = max(
+            1,
+            int(config.encode_chunk_rows) * int(config.encoder.max_views)
+            // (int(config.context_frames) + int(config.future_frames)),
+        )
 
     def train(self, mode: bool = True) -> "DirectVGGTTeacherAdapter":
         super().train(mode)
@@ -316,6 +325,83 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             for name, value in outputs.items()
         }
 
+    def _encode_temporal_future_teacher(
+        self,
+        images_u8: torch.Tensor,
+        view_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build V7-style temporal P64 labels without contaminating input."""
+
+        batch, length, views, channels, _height, _width = images_u8.shape
+        expected_length = self.config.context_frames + self.config.future_frames
+        if (
+            length != expected_length
+            or channels != 3
+            or views != self.config.encoder.max_views
+            or tuple(view_mask.shape) != (batch, length, views)
+        ):
+            raise ValueError("temporal teacher input differs from direct RGB ABI")
+        context_end = int(self.config.context_frames)
+        # Match the original V7 cache's T+K temporal conditioning/order: the
+        # anchor camera's complete observed+future window is one VGGT sequence.
+        # Only future positions are returned as labels below. The causal model
+        # input continues to come from the independent per-timestamp encode.
+        sequence_images = images_u8[:, :, 0]
+        sequence_valid = view_mask[:, :, 0].bool()
+        if not bool(sequence_valid.all()):
+            raise ValueError(
+                "V7 temporal target requires the anchor camera at every "
+                "observed and future timestamp"
+            )
+
+        chunks: list[torch.Tensor] = []
+        start = 0
+        effective = min(
+            self.effective_temporal_teacher_samples, int(batch)
+        )
+        started = time.perf_counter()
+        while start < batch:
+            stop = min(batch, start + effective)
+            images = (
+                sequence_images[start:stop]
+                .to(self.device, non_blocking=True)
+                .float()
+                .div_(255.0)
+            )
+            try:
+                tokens = self.encoder.encode_temporal_teacher_tokens(images)
+            except torch.OutOfMemoryError:
+                del images
+                if effective <= 1:
+                    raise
+                effective = max(1, effective // 2)
+                self.temporal_teacher_oom_backoffs += 1
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                continue
+            chunks.append(tokens)
+            del images, tokens
+            start = stop
+            self.temporal_teacher_calls += 1
+        self.effective_temporal_teacher_samples = min(
+            self.effective_temporal_teacher_samples, effective
+        )
+        self.temporal_teacher_sequences += int(batch)
+        self.temporal_teacher_seconds += time.perf_counter() - started
+        temporal = torch.cat(chunks, dim=0)
+        expected = (
+            batch,
+            expected_length,
+            self.config.encoder.token_grid**2,
+            self.config.encoder.token_dim,
+        )
+        if tuple(temporal.shape) != expected:
+            raise RuntimeError(
+                "temporal future teacher shape changed to "
+                f"{tuple(temporal.shape)}; expected {expected}"
+            )
+        return temporal[:, context_end:]
+
     @staticmethod
     def _fuse_future_tokens(
         tokens: torch.Tensor,
@@ -344,6 +430,9 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
         view_mask = batch["direct_view_mask"].bool()
         frame_keys = batch.get("direct_frame_keys")
         encoded = self._encode(images, view_mask, frame_keys)
+        temporal_target_tokens = self._encode_temporal_future_teacher(
+            images, view_mask
+        )
         context = slice(0, self.config.context_frames)
         future = slice(self.config.context_frames, None)
         future_tokens = encoded["view_tokens"][:, future]
@@ -386,6 +475,11 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             future_confidence,
             future_view_mask,
         )
+        if tuple(temporal_target_tokens.shape) != tuple(target_tokens.shape):
+            raise RuntimeError(
+                "temporal P64 target does not match the anchor target ABI"
+            )
+        target_tokens = temporal_target_tokens
         real_patch = future_view_mask[..., None]
         geometry_valid = future_confidence > 0
         target_depth = encoded["depth"][:, future]
@@ -486,6 +580,15 @@ class DirectVGGTTeacherAdapter(torch.nn.Module):
             "rgb_resize_rows": self.rgb_resize_rows,
             "oom_backoffs": self.oom_backoffs,
             "effective_chunk_rows": self.effective_chunk_rows,
+            "temporal_teacher_calls": self.temporal_teacher_calls,
+            "temporal_teacher_sequences": self.temporal_teacher_sequences,
+            "temporal_teacher_seconds": self.temporal_teacher_seconds,
+            "temporal_teacher_oom_backoffs": (
+                self.temporal_teacher_oom_backoffs
+            ),
+            "effective_temporal_teacher_samples": (
+                self.effective_temporal_teacher_samples
+            ),
         }
 
 

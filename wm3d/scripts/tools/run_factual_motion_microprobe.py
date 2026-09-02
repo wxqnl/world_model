@@ -263,6 +263,7 @@ def build_micro_model(
             "action_heads": 8,
             "action_ff_mult": 2.0,
             "bridge_layers_state": [1],
+            "factual_v7_bridge_layers_state": [1],
             "bridge_heads": 8,
             "dynamics_layers": 2,
             "view_hidden": 64,

@@ -10,9 +10,16 @@ streaming LRU 或 sidecar。
 
 1. 从已经封存的 episode/window 元数据取出同一个 `T+K` observation ordinal；
 2. 对每个真实相机只随机访问这些 RGB 帧；
-3. 在 rank 内用 frozen VGGT 编码这一窗口；
-4. P64 geometry token 进入 factual 3D/运动主干并直接驱动原始 V7 RGB decoder；
-5. 正常运行 WM3D 的 RGB、depth、point、camera、action 和 state loss。
+3. 在 rank 内用 frozen VGGT 逐时刻编码 observation，产生严格因果的模型输入；
+4. 同一 frozen VGGT 另以 anchor camera 的完整 `T+K` 顺序构造 target-only P64
+   teacher，只截取未来 K 个位置作为监督标签；
+5. 因果 P64 observation 进入 factual 3D/运动主干并直接驱动原始 V7 RGB decoder；
+6. 正常运行 WM3D 的 RGB、depth、point、camera、action 和 state loss。
+
+`time_isolation: fold_time_into_batch` 只约束模型输入。Target-only teacher 复刻的是
+V7 cache 的 `T+K` 时序 conditioning/order，不是把未来图像送进模型：它的输出只写入
+`target_tokens`，不会进入 world/context、policy/action-free 或 serving。当前 direct 路径
+仍使用封存的 518 letterbox 输入，因此不宣称与旧 V7 224 resize token 逐元素相同。
 
 视频层先使用 Decord 随机访问；遇到 Decord 不支持的 AV1 等视频时，自动使用
 PyAV 从前一个 keyframe seek 到最后一个目标帧。两种路径都按视频的精确 PTS
@@ -115,6 +122,8 @@ direct adapter 没有可训练参数，不进入 optimizer 或 checkpoint。VGGT
 - 2480 帧 AV1 episode 只请求 24 行时，PyAV fallback 只从前一 keyframe 解码到目标帧，
   不会 materialize 整个 episode；
 - 真实 VGGT 输出 geometry、appearance、RGB、depth、point、camera 全部有限；
+- 真实 H100 上 target-only `T+K` P64 teacher 的 BF16 输出有限，按等价图像预算
+  批处理并在 OOM 时二分回退；
 - 两卡 1.327B FSDP2 已完成完整 objective、backward、optimizer、COMMITTED checkpoint
   与独立 exact-resume 读取；
 - 全量单元/合同回归覆盖 direct、旧 cache 兼容路径和 rank-invariant RGB decoder。

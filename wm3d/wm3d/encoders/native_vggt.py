@@ -213,6 +213,73 @@ class NativeVGGTEncoder(torch.nn.Module):
         return result
 
     @torch.inference_mode()
+    def encode_temporal_teacher_tokens(
+        self, images: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode one target-only temporal sequence with the V7 VGGT contract.
+
+        ``forward`` deliberately folds time into the batch dimension because
+        it produces the causal world-model input. The frozen training teacher
+        has a different role: its future P64 target must retain the temporal
+        correspondence that the original V7 cache obtained by presenting a
+        window to VGGT as one sequence. This method exposes only pooled P64
+        tokens and is never used to construct ``world_tokens``.
+
+        The caller supplies the anchor camera's complete observed+future
+        window, matching the original V7 cache. Only the future positions are
+        consumed as labels, so no future feature can enter the model input or
+        serving path.
+        """
+
+        if images.ndim != 5:
+            raise ValueError(
+                "temporal teacher images must be [B,S,3,H,W]"
+            )
+        batch, sequence, channels, height, width = images.shape
+        if batch <= 0 or sequence <= 1 or channels != 3:
+            raise ValueError("temporal teacher sequence shape is invalid")
+        if (height, width) != (
+            self.config.input_rgb_size,
+            self.config.input_rgb_size,
+        ):
+            raise ValueError(
+                "temporal teacher RGB size differs from the sealed encoder"
+            )
+        if not bool(torch.isfinite(images).all()):
+            raise ValueError("temporal teacher RGB contains NaN/Inf")
+        if float(images.min()) < 0 or float(images.max()) > 1:
+            raise ValueError("temporal teacher RGB must be normalized to [0,1]")
+
+        geometry_rows = torch.zeros(
+            batch, dtype=torch.bool, device=images.device
+        )
+        appearance_rows = torch.zeros_like(geometry_rows)
+        selective_forward = getattr(self.encoder, "forward_selective", None)
+        if callable(selective_forward):
+            encoded = selective_forward(
+                images,
+                geometry_batch_mask=geometry_rows,
+                appearance_batch_mask=appearance_rows,
+            )
+        else:
+            encoded = self.encoder(images)
+        tokens = encoded["pooled"]
+        expected = (
+            batch,
+            sequence,
+            self.config.token_grid**2,
+            self.config.token_dim,
+        )
+        if tuple(tokens.shape) != expected:
+            raise RuntimeError(
+                "temporal teacher token ABI drifted to "
+                f"{tuple(tokens.shape)}; expected {expected}"
+            )
+        if not bool(torch.isfinite(tokens).all()):
+            raise FloatingPointError("temporal teacher P64 contains NaN/Inf")
+        return tokens.to(torch.bfloat16)
+
+    @torch.inference_mode()
     def forward(
         self,
         images: torch.Tensor,

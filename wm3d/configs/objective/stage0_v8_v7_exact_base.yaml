@@ -36,12 +36,12 @@ objective:
   action_counterfactual_token_margin: 0.005
   action_counterfactual_rgb_advantage: 0.0
   action_counterfactual_rgb_margin: 0.002
-  # Verified V7 production leaves wrong-action RGB ranking disabled.
-  context_pixel_action_rank_weight: 0.0
-  context_pixel_action_separation_weight: 0.0
-  context_pixel_action_rank_start_step: 0
-  context_pixel_action_rank_ramp_steps: 0
-  context_pixel_action_rank_every: 1
+  # Original V7 60K activates a sparse wrong-action RGB curriculum late.
+  context_pixel_action_rank_weight: 2.0
+  context_pixel_action_separation_weight: 0.5
+  context_pixel_action_rank_start_step: 30000
+  context_pixel_action_rank_ramp_steps: 10000
+  context_pixel_action_rank_every: 8
   context_pixel_action_rank_batch_size: 1
   context_pixel_action_rank_margin: 0.003
   context_pixel_action_separation_margin: 0.006

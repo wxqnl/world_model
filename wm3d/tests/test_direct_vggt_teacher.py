@@ -24,6 +24,18 @@ class _FakeNativeVGGT(torch.nn.Module):
         self.include_appearance = include_appearance
         self.calls: list[int] = []
         self.role_masks: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self.temporal_teacher_inputs: list[torch.Tensor] = []
+
+    @torch.inference_mode()
+    def encode_temporal_teacher_tokens(
+        self, images: torch.Tensor
+    ) -> torch.Tensor:
+        self.temporal_teacher_inputs.append(images.detach().cpu().clone())
+        identity = images.mean(dim=(2, 3, 4))
+        contextual = identity + identity[:, :1]
+        return contextual[..., None, None].expand(
+            images.shape[0], images.shape[1], 4, 2048
+        ).to(torch.bfloat16)
 
     @torch.inference_mode()
     def forward(
@@ -196,9 +208,17 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
         .div(255.0)
         .mean(dim=(2, 3, 4))
     )
+    first_context_identity = (
+        batch["direct_rgb_uint8"][:, :1, 0]
+        .float()
+        .div(255.0)
+        .mean(dim=(2, 3, 4))
+    )
     torch.testing.assert_close(
         result["target_tokens"][:, :, 0, 0].float(),
-        expected_anchor_identity.to(torch.bfloat16).float(),
+        (expected_anchor_identity + first_context_identity)
+        .to(torch.bfloat16)
+        .float(),
     )
     expected_context = F.interpolate(
         batch["direct_rgb_uint8"][:, 1].reshape(6, 3, 56, 56).float().div(255.0),
@@ -211,6 +231,13 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
     assert not bool(result["target_depth_mask"][0, 0, 2].any())
     assert not bool(result["target_camera_pose_mask"][1, 1, 1])
     assert backend.calls == [3, 3, 2]
+    temporal_teacher_images = torch.cat(
+        backend.temporal_teacher_inputs, dim=0
+    )
+    torch.testing.assert_close(
+        temporal_teacher_images,
+        batch["direct_rgb_uint8"][:, :, 0].float().div(255.0),
+    )
     geometry_rows = torch.cat([entry[0] for entry in backend.role_masks], dim=1)
     appearance_rows = torch.cat([entry[1] for entry in backend.role_masks], dim=1)
     rgb_rows = torch.cat([entry[2] for entry in backend.role_masks], dim=1)
@@ -228,8 +255,40 @@ def test_direct_teacher_materializes_the_unchanged_world_model_abi() -> None:
     assert adapter.metrics["geometry_head_rows"] == 4
     assert adapter.metrics["appearance_pool_rows"] == 6
     assert adapter.metrics["rgb_resize_rows"] == 8
+    assert adapter.metrics["temporal_teacher_sequences"] == 2
+    assert adapter.metrics["temporal_teacher_calls"] == 1
+    assert adapter.metrics["effective_temporal_teacher_samples"] == 2
     assert all(not parameter.requires_grad for parameter in adapter.parameters())
     assert not torch.is_inference(result["world_tokens"])
+
+
+def test_temporal_teacher_future_cannot_change_world_input() -> None:
+    backend = _FakeNativeVGGT()
+    adapter = _adapter(backend)
+    first = _raw_batch()
+    second = {
+        name: value.clone() if isinstance(value, torch.Tensor) else value
+        for name, value in first.items()
+    }
+    second["direct_rgb_uint8"][:, 2:] = 255 - second[
+        "direct_rgb_uint8"
+    ][:, 2:]
+
+    first_result = adapter.materialize(first)
+    second_result = adapter.materialize(second)
+
+    for name in (
+        "world_tokens",
+        "view_mask",
+        "context_rgb",
+        "context_rgb_mask",
+        "appearance_context_tokens",
+        "appearance_context_mask",
+    ):
+        torch.testing.assert_close(first_result[name], second_result[name])
+    assert not torch.equal(
+        first_result["target_tokens"], second_result["target_tokens"]
+    )
 
 
 def test_direct_teacher_skips_appearance_when_the_model_disables_it() -> None:
