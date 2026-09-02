@@ -140,6 +140,11 @@ class NativeWorldModelConfig:
     # 60K context-residual U-Net.  The only V8 adaptation is the per-view
     # embedding and the grouped-action summary width at the bottleneck.
     rgb_original_v7_context: bool = False
+    # Action-owned RGB transport. The factual P64 state predicts dense motion,
+    # the changed-pixel support and a bounded correction. The observed image
+    # may reach a future frame only through that predicted transport; it is
+    # never exposed as an unwarped U-Net skip or an unconditional copy path.
+    rgb_action_owned_transport: bool = False
     # Optional V8 clarity head on top of the proven V7 renderer. It consumes
     # only factual P64 and the final 256x256 decoder feature; a fixed zero-DC
     # high-pass operator removes low frequency before the bounded correction
@@ -316,6 +321,12 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_context_enabled must be boolean")
         if not isinstance(self.rgb_original_v7_context, bool):
             raise ValueError("rgb_original_v7_context must be boolean")
+        if not isinstance(self.rgb_action_owned_transport, bool):
+            raise ValueError("rgb_action_owned_transport must be boolean")
+        if self.rgb_original_v7_context and self.rgb_action_owned_transport:
+            raise ValueError(
+                "original V7 RGB and action-owned transport are mutually exclusive"
+            )
         if not isinstance(self.rgb_v7_high_frequency_refiner, bool):
             raise ValueError("rgb_v7_high_frequency_refiner must be boolean")
         if self.rgb_v7_high_frequency_channels <= 0:
@@ -329,9 +340,11 @@ class NativeWorldModelConfig:
                 "rgb_v7_high_frequency_scale must be finite and lie in [0,0.125]"
             )
         if self.rgb_v7_high_frequency_refiner:
-            if not self.rgb_original_v7_context:
+            if not (
+                self.rgb_original_v7_context or self.rgb_action_owned_transport
+            ):
                 raise ValueError(
-                    "V7 high-frequency refinement requires original V7 RGB"
+                    "bounded high-frequency refinement requires a factual P64 RGB path"
                 )
             if self.rgb_v7_high_frequency_scale <= 0.0:
                 raise ValueError(
@@ -390,6 +403,55 @@ class NativeWorldModelConfig:
             ):
                 raise ValueError(
                     "original V7 RGB cannot split token and render dynamics"
+                )
+        if self.rgb_action_owned_transport:
+            if not self.rgb_context_enabled:
+                raise ValueError("action-owned RGB transport requires context RGB")
+            if self.rgb_context_alignment_enabled:
+                raise ValueError(
+                    "action-owned RGB transport already owns alignment"
+                )
+            if self.rgb_render_action_free_prior:
+                raise ValueError(
+                    "action-owned RGB transport requires the factual future state"
+                )
+            if self.appearance_enabled:
+                raise ValueError(
+                    "action-owned RGB transport has no independent appearance lane"
+                )
+            if self.rgb_context_action_scale <= 0.0:
+                raise ValueError(
+                    "action-owned RGB transport requires physical action conditioning"
+                )
+            if self.rgb_context_appearance_delta_scale != 0.0:
+                raise ValueError(
+                    "action-owned RGB transport forbids a second appearance correction"
+                )
+            if self.rgb_detail_residual_scale != 0.0:
+                raise ValueError(
+                    "action-owned RGB transport forbids a second direct detail lane"
+                )
+            if self.dynamics_layers != 2 or self.factual_dynamics_repeats != 1:
+                raise ValueError(
+                    "action-owned RGB transport requires the two-layer factual decoder"
+                )
+            if self.factual_action_residual_scale != 1.0:
+                raise ValueError(
+                    "action-owned RGB transport requires unit factual action injection"
+                )
+            if (
+                not self.factual_v7_early_action_conditioning
+                or self.factual_v7_early_action_scale != 1.0
+            ):
+                raise ValueError(
+                    "action-owned RGB transport requires action before the state trunk"
+                )
+            if (
+                self.render_factual_dynamics_repeats is not None
+                or self.render_factual_action_residual_scale is not None
+            ):
+                raise ValueError(
+                    "action-owned RGB transport cannot split token and render dynamics"
                 )
         if not isinstance(self.rgb_context_alignment_enabled, bool):
             raise ValueError("rgb_context_alignment_enabled must be boolean")
@@ -699,7 +761,9 @@ class MultiViewTokenFuser(nn.Module):
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.num_views = cfg.num_views
-        self.original_v7_anchor = cfg.rgb_original_v7_context
+        self.original_v7_anchor = (
+            cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport
+        )
         if self.original_v7_anchor:
             # Preserve the canonical V7 anchor path exactly: the head-camera
             # P64 token reaches the state stream without first being compressed
@@ -2864,6 +2928,261 @@ class NativeV7BoundedHighFrequencyRefiner(nn.Module):
         return correction.to(dtype=decoder_features.dtype)
 
 
+class _RGBTransportMotionHead(nn.Conv2d):
+    """Start near the empirical moving-pixel prior without closing gradients."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, -2.0)
+
+
+class _RGBTransportFlowHead(nn.Conv2d):
+    """Near-identity transport with a live gradient to the factual trunk."""
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.weight, std=1.0e-5)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
+    """Render future RGB with factual P64 as the only motion owner.
+
+    The observed image is an appearance carrier, not a future-state input.  It
+    reaches every output pixel only through a backward flow predicted from the
+    factual future state.  The separately supervised change mask gates only a
+    bounded redraw correction for changed or newly visible pixels; it cannot
+    select an unwarped copy of the current image.  Static identity is therefore
+    represented by zero flow, not by a copy-last bypass.
+    """
+
+    def __init__(self, cfg: NativeWorldModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.grid = isqrt(cfg.P)
+        hidden = cfg.rgb_hidden
+        self.decode_grid = min(16, cfg.rgb_size)
+        stages = (cfg.rgb_size // self.decode_grid).bit_length() - 1
+        channels = tuple(
+            [hidden]
+            + [max(32, hidden >> min(stage, 3)) for stage in range(1, stages + 1)]
+        )
+        final_channels = channels[-1]
+        # Predict transport on a smooth grid, then upsample the displacement
+        # in full-image pixel units. A dense unconstrained 256x256 field can
+        # lower RGB loss by stretching a rigid robot instead of moving it.
+        flow_limit = min(32, cfg.rgb_size)
+        self.flow_grid = self.decode_grid
+        while self.flow_grid * 2 <= flow_limit:
+            self.flow_grid *= 2
+        flow_stage = (self.flow_grid // self.decode_grid).bit_length() - 1
+        flow_channels = channels[flow_stage]
+
+        self.token_proj = nn.Sequential(
+            nn.Conv2d(cfg.token_dim, hidden, 1),
+            nn.GroupNorm(_rgb_norm_groups(hidden), hidden),
+            nn.SiLU(inplace=True),
+            _RGBConvBlock(hidden, hidden),
+        )
+        self.action_proj = nn.Sequential(
+            nn.Linear(7, hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden, hidden),
+        )
+        self.task_proj = nn.Sequential(
+            nn.LayerNorm(cfg.task_dim),
+            nn.Linear(cfg.task_dim, hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden, hidden),
+        )
+        self.ups = nn.ModuleList(
+            _RGBUpBlock(input_channels, output_channels)
+            for input_channels, output_channels in zip(channels, channels[1:])
+        )
+
+        self.flow_head = _RGBTransportFlowHead(flow_channels, 2, 3, padding=1)
+        self.residual_head = _RGBDetailHead(final_channels, 3, 3, padding=1)
+        self.motion_head = _RGBTransportMotionHead(
+            final_channels, 1, 3, padding=1
+        )
+        self.high_frequency_refiner: Optional[NativeV7BoundedHighFrequencyRefiner] = (
+            None
+        )
+        if cfg.rgb_v7_high_frequency_refiner:
+            self.high_frequency_refiner = NativeV7BoundedHighFrequencyRefiner(
+                cfg,
+                feature_channels=final_channels,
+            )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        view_embedding: torch.Tensor,
+        geometry_tokens: Optional[torch.Tensor],
+        appearance_context_tokens: Optional[torch.Tensor],
+        factual_action_summary: Optional[torch.Tensor],
+        task_embedding: torch.Tensor,
+        context_rgb: torch.Tensor,
+        context_indices: Optional[torch.Tensor] = None,
+        motion_tokens: Optional[torch.Tensor] = None,
+        appearance_detail_residual_tokens: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if tuple(tokens.shape[1:]) != (self.cfg.P, self.cfg.token_dim):
+            raise ValueError("transport RGB tokens must end in [P,token_dim]")
+        if tuple(view_embedding.shape) != (
+            tokens.shape[0],
+            self.cfg.rgb_hidden,
+            1,
+            1,
+        ):
+            raise ValueError("view embedding must align to transport RGB slots")
+        if any(
+            value is not None
+            for value in (
+                geometry_tokens,
+                appearance_context_tokens,
+                motion_tokens,
+                appearance_detail_residual_tokens,
+            )
+        ):
+            raise ValueError(
+                "action-owned transport has no geometry, appearance or second motion lane"
+            )
+        if tuple(context_rgb.shape[1:]) != (
+            3,
+            self.cfg.rgb_size,
+            self.cfg.rgb_size,
+        ):
+            raise ValueError("transport context RGB must be [N,3,rgb_size,rgb_size]")
+        if context_indices is None:
+            if context_rgb.shape[0] != tokens.shape[0]:
+                raise ValueError("transport context RGB must align to decoder slots")
+            context_indices = torch.arange(
+                tokens.shape[0], device=context_rgb.device, dtype=torch.long
+            )
+        elif (
+            tuple(context_indices.shape) != (tokens.shape[0],)
+            or context_indices.dtype != torch.long
+            or context_indices.device != context_rgb.device
+        ):
+            raise ValueError("transport context indices must be aligned int64")
+        if factual_action_summary is None or factual_action_summary.shape != (
+            tokens.shape[0],
+            7,
+        ):
+            raise ValueError("physical action must align to transport RGB slots")
+        if task_embedding.shape != (tokens.shape[0], self.cfg.task_dim):
+            raise ValueError("task embedding must align to transport RGB slots")
+
+        value = tokens.transpose(1, 2).reshape(
+            tokens.shape[0], self.cfg.token_dim, self.grid, self.grid
+        )
+        value = self.token_proj(value)
+        if value.shape[-2:] != (self.decode_grid, self.decode_grid):
+            value = F.interpolate(
+                value.float(),
+                size=(self.decode_grid, self.decode_grid),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=tokens.dtype)
+        value = value + view_embedding.to(dtype=value.dtype)
+        action = self.action_proj(factual_action_summary).to(dtype=value.dtype)
+        value = value + float(self.cfg.rgb_context_action_scale) * action[:, :, None, None]
+        task = self.task_proj(task_embedding).to(dtype=value.dtype)
+        value = value + task[:, :, None, None]
+
+        flow_value = (
+            value
+            if value.shape[-2:] == (self.flow_grid, self.flow_grid)
+            else None
+        )
+        for upsample in self.ups:
+            value = upsample(value)
+            if value.shape[-2:] == (self.flow_grid, self.flow_grid):
+                flow_value = value
+        if value.shape[-2:] != (self.cfg.rgb_size, self.cfg.rgb_size):
+            # Model profiles are not restricted to powers of two (the 5B
+            # profile renders 384x384).  Keep the learned tower on efficient
+            # power-of-two grids and resize its final feature map exactly once.
+            value = F.interpolate(
+                value.float(),
+                size=(self.cfg.rgb_size, self.cfg.rgb_size),
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=tokens.dtype)
+        if flow_value is None:
+            raise RuntimeError("transport decoder did not produce its smooth flow grid")
+
+        context_base = context_rgb.index_select(0, context_indices).to(
+            dtype=value.dtype
+        )
+        max_flow_pixels = 0.5 * float(self.cfg.rgb_size)
+        raw_flow_pixels = max_flow_pixels * torch.tanh(
+            self.flow_head(flow_value).float()
+        )
+        if raw_flow_pixels.shape[-2:] != (self.cfg.rgb_size, self.cfg.rgb_size):
+            raw_flow_pixels = F.interpolate(
+                raw_flow_pixels,
+                size=(self.cfg.rgb_size, self.cfg.rgb_size),
+                mode="bilinear",
+                align_corners=True,
+            )
+        motion_logit = self.motion_head(value)
+        motion = torch.sigmoid(motion_logit)
+        # The supervised change support is part of the transport itself: it
+        # converts static pixels to exact identity flow while preserving a
+        # continuous gradient for moving pixels.  This prevents the raw flow
+        # field from translating the background merely to reduce foreground
+        # error, without reintroducing a raw-context output blend.
+        flow_pixels = raw_flow_pixels * motion.float()
+        transported, warp_valid = _warp_rgb_feature_with_pixel_flow(
+            context_base,
+            flow_pixels,
+            image_height=self.cfg.rgb_size,
+            image_width=self.cfg.rgb_size,
+        )
+        residual = torch.tanh(self.residual_head(value).float()) * float(
+            self.cfg.rgb_context_residual_scale
+        )
+        # The transported image is the only appearance base. The supervised
+        # motion mask is also the only gate for the bounded redraw path. Warp
+        # validity remains diagnostic only: letting a model-controlled
+        # out-of-bounds sample open the residual would permit a degenerate
+        # full-frame redraw that bypasses transport.
+        warp_invalid = (~warp_valid).to(dtype=torch.float32)
+        correction_support = motion.float()
+        rgb = torch.clamp(
+            transported.float() + correction_support * residual,
+            0.0,
+            1.0,
+        ).to(dtype=value.dtype)
+        if self.high_frequency_refiner is not None:
+            rgb = torch.clamp(
+                rgb + self.high_frequency_refiner(tokens, value),
+                0.0,
+                1.0,
+            )
+        disocclusion_logit = torch.where(
+            warp_valid,
+            torch.full_like(warp_invalid, -8.0),
+            torch.full_like(warp_invalid, 8.0),
+        )
+        return (
+            rgb,
+            motion_logit,
+            motion,
+            flow_pixels,
+            disocclusion_logit.to(dtype=value.dtype),
+        )
+
+
 class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
     """Original V7 P64 + observed-RGB context-residual renderer.
 
@@ -3641,7 +3960,9 @@ class NativeRGBDecoder(nn.Module):
             )
             nn.init.normal_(self.view_embed, std=0.02)
         image_decoder: nn.Module
-        if cfg.rgb_original_v7_context:
+        if cfg.rgb_action_owned_transport:
+            image_decoder = NativeActionOwnedTransportRGBImageDecoder(cfg)
+        elif cfg.rgb_original_v7_context:
             image_decoder = NativeOriginalV7ContextRGBImageDecoder(cfg)
         elif cfg.rgb_context_enabled:
             image_decoder = NativeContextRGBImageDecoder(cfg)
@@ -3819,7 +4140,12 @@ class NativeRGBDecoder(nn.Module):
         expanded_action: Optional[torch.Tensor] = None
         if self.cfg.rgb_context_action_scale > 0.0:
             action_dim = (
-                7 if self.cfg.rgb_original_v7_context else self.cfg.state_hidden
+                7
+                if (
+                    self.cfg.rgb_original_v7_context
+                    or self.cfg.rgb_action_owned_transport
+                )
+                else self.cfg.state_hidden
             )
             expected_action = (batch, self.cfg.K, action_dim)
             if (
@@ -4098,7 +4424,15 @@ class NativeWorldModel(nn.Module):
         self.state_input_norm = RMSNorm(cfg.state_hidden)
 
         self.history_action = GroupedSignalEncoder(cfg.action_hidden, cfg)
-        self.factual_action = GroupedSignalEncoder(cfg.state_hidden, cfg)
+        # Action-owned transport always uses the full V7-style factual
+        # ActionStream below. Do not also allocate/run the older grouped
+        # summary encoder: its result is discarded by that branch and would
+        # otherwise leave millions of permanently gradient-free parameters.
+        self.factual_action: Optional[GroupedSignalEncoder] = (
+            None
+            if cfg.rgb_action_owned_transport
+            else GroupedSignalEncoder(cfg.state_hidden, cfg)
+        )
         self.factual_v7_query_action: Optional[CanonicalV7ActionTokenEncoder] = (
             CanonicalV7ActionTokenEncoder(cfg.state_hidden, cfg.K)
             if cfg.factual_v7_early_action_conditioning
@@ -4195,7 +4529,10 @@ class NativeWorldModel(nn.Module):
         self.original_v7_rgb_action: Optional[OriginalV7RGBActionAdapter] = (
             OriginalV7RGBActionAdapter(cfg)
             if cfg.factual_v7_early_action_conditioning
-            or (cfg.rgb_original_v7_context and cfg.rgb_context_action_scale > 0.0)
+            or (
+                (cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport)
+                and cfg.rgb_context_action_scale > 0.0
+            )
             else None
         )
 
@@ -4577,6 +4914,8 @@ class NativeWorldModel(nn.Module):
             fine_values: torch.Tensor,
             coarse_values: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+            if self.factual_action is None:
+                raise RuntimeError("grouped factual summary encoder is unavailable")
             encoded, encoded_mask = self.factual_action(
                 fine_values=fine_values,
                 fine_dim_mask=future_factual_fine_action_mask,
@@ -4649,45 +4988,44 @@ class NativeWorldModel(nn.Module):
                     )
             return refined
 
-        factual_encoded, factual_encoded_mask, factual_summary = encode_factual(
-            future_factual_fine_action_values,
-            future_factual_coarse_action_values,
-        )
-        # Center against the exact same masked encoding of the zero physical
-        # command. This removes time/semantic/group/embodiment constants from
-        # the dynamics signal while preserving every real grouped action token.
-        # The zero branch remains differentiable through the shared decoder and
-        # token head; no counterfactual output is detached.
-        zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
-            torch.zeros_like(future_factual_fine_action_values),
-            torch.zeros_like(future_factual_coarse_action_values),
-        )
-        if not torch.equal(factual_encoded_mask, zero_encoded_mask):
-            raise RuntimeError("factual and zero action masks must be identical")
-        # Stop-gradient applies only to the numerical centering anchor.  Both
-        # factual E(a) and zero E(0) remain live branches of the same encoder.
-        # Writing E(0)-E(0) without this anchor made the zero branch's encoder
-        # gradient identically cancel, despite the output tensor not being
-        # detached.  The straight-through form is numerically zero and still
-        # gives the symmetric zero branch its required gradient.
-        zero_encoded_anchor = zero_encoded.detach()
-        centered_encoded = factual_encoded - zero_encoded_anchor
-        zero_centered_encoded = zero_encoded - zero_encoded_anchor
+        factual_encoded: Optional[torch.Tensor] = None
+        factual_encoded_mask: Optional[torch.Tensor] = None
+        zero_encoded_mask: Optional[torch.Tensor] = None
+        centered_encoded: Optional[torch.Tensor] = None
+        zero_centered_encoded: Optional[torch.Tensor] = None
         centered_summary: Optional[torch.Tensor] = None
         zero_centered_summary: Optional[torch.Tensor] = None
-        if factual_summary is not None:
-            if zero_summary is None:
-                raise RuntimeError("zero action summary is unavailable")
-            zero_summary_anchor = zero_summary.detach()
-            centered_summary = factual_summary - zero_summary_anchor
-            zero_centered_summary = zero_summary - zero_summary_anchor
+        if self.factual_action is not None:
+            factual_encoded, factual_encoded_mask, factual_summary = encode_factual(
+                future_factual_fine_action_values,
+                future_factual_coarse_action_values,
+            )
+            # Center against the exact same masked encoding of the zero
+            # physical command. This removes time/semantic/group/embodiment
+            # constants while preserving every real grouped action token.
+            zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
+                torch.zeros_like(future_factual_fine_action_values),
+                torch.zeros_like(future_factual_coarse_action_values),
+            )
+            if not torch.equal(factual_encoded_mask, zero_encoded_mask):
+                raise RuntimeError("factual and zero action masks must be identical")
+            zero_encoded_anchor = zero_encoded.detach()
+            centered_encoded = factual_encoded - zero_encoded_anchor
+            zero_centered_encoded = zero_encoded - zero_encoded_anchor
+            if factual_summary is not None:
+                if zero_summary is None:
+                    raise RuntimeError("zero action summary is unavailable")
+                zero_summary_anchor = zero_summary.detach()
+                centered_summary = factual_summary - zero_summary_anchor
+                zero_centered_summary = zero_summary - zero_summary_anchor
 
         canonical_action_cond: Optional[torch.Tensor] = None
         canonical_grouped_action: Optional[torch.Tensor] = None
         canonical_group_mask: Optional[torch.Tensor] = None
         canonical_single_group: Optional[torch.Tensor] = None
         if cfg.factual_v7_early_action_conditioning or (
-            cfg.rgb_original_v7_context and cfg.rgb_context_action_scale > 0.0
+            (cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport)
+            and cfg.rgb_context_action_scale > 0.0
         ):
             if self.original_v7_rgb_action is None:
                 raise RuntimeError("canonical V7 physical action adapter is unavailable")
@@ -5058,6 +5396,8 @@ class NativeWorldModel(nn.Module):
             )
             factual_observed_state = None
         else:
+            if centered_encoded is None or factual_encoded_mask is None:
+                raise RuntimeError("centered factual action tokens are unavailable")
             factual_observed_state = encode_v7_factual_state(centered_summary)
             factual_future = refine_factual(
                 centered_encoded,
@@ -5101,6 +5441,8 @@ class NativeWorldModel(nn.Module):
             )
         else:
             assert factual_observed_state is not None
+            if centered_encoded is None or factual_encoded_mask is None:
+                raise RuntimeError("centered render action tokens are unavailable")
             render_future = refine_factual(
                 centered_encoded,
                 factual_encoded_mask,
@@ -5115,7 +5457,7 @@ class NativeWorldModel(nn.Module):
         zero_action_pred_tokens: Optional[torch.Tensor] = None
         rgb_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
-            if cfg.rgb_original_v7_context:
+            if cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport:
                 if canonical_action_cond is None:
                     raise RuntimeError("canonical V7 RGB action is unavailable")
                 rgb_action_summary = canonical_action_cond
@@ -5130,6 +5472,8 @@ class NativeWorldModel(nn.Module):
             # action-independent encoder component. The appearance lane can
             # then resolve physical direction per patch before its own
             # spatial/temporal reasoning, while a zero command stays exact 0.
+            if centered_encoded is None or factual_encoded_mask is None:
+                raise RuntimeError("centered appearance action tokens are unavailable")
             appearance_action_tokens = centered_encoded
             appearance_action_mask = factual_encoded_mask
         if compute_zero_action_control:
@@ -5156,6 +5500,8 @@ class NativeWorldModel(nn.Module):
                     residual_scale=cfg.factual_action_residual_scale,
                 )
             else:
+                if zero_centered_encoded is None or zero_encoded_mask is None:
+                    raise RuntimeError("centered zero-action tokens are unavailable")
                 zero_factual_observed_state = encode_v7_factual_state(
                     zero_centered_summary
                 )
@@ -5370,7 +5716,7 @@ class NativeWorldModel(nn.Module):
         if cfg.rgb_context_enabled:
             output["rgb_motion_logit"] = rgb_motion_logit
             output["rgb_blend"] = rgb_blend
-        if cfg.rgb_context_alignment_enabled:
+        if cfg.rgb_context_alignment_enabled or cfg.rgb_action_owned_transport:
             output["rgb_flow_pixels"] = rgb_flow_pixels
             output["rgb_disocclusion_logit"] = rgb_disocclusion_logit
         return output

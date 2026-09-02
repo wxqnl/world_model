@@ -14,6 +14,7 @@ from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS, STATE_SEMANTIC_IDS
 from wm3d.models.native_world_model import (
     ActionBlock,
     FutureSpatialDetailPredictor,
+    NativeActionOwnedTransportRGBImageDecoder,
     NativeContextRGBImageDecoder,
     NativeOriginalV7ContextRGBImageDecoder,
     NativeV7BoundedHighFrequencyRefiner,
@@ -1504,6 +1505,156 @@ def test_original_v7_rgb_future_action_changes_rgb_not_policy_or_action_free() -
     batch["context_rgb"] = torch.rand(2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size)
     batch["context_rgb_mask"] = torch.ones(2, cfg.num_views, dtype=torch.bool)
     factual = model(**batch)
+    zero_batch = dict(batch)
+    zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
+        batch["future_factual_fine_action_values"]
+    )
+    zero_batch["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+    zero = model(**zero_batch)
+
+    torch.testing.assert_close(
+        factual["action_free_pred_tokens"],
+        zero["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        factual["policy_action"], zero["policy_action"], rtol=0, atol=0
+    )
+    assert not torch.allclose(factual["pred_tokens"], zero["pred_tokens"])
+    assert not torch.allclose(factual["rgb"], zero["rgb"])
+
+
+def _tiny_action_owned_transport_config() -> NativeWorldModelConfig:
+    return replace(
+        _tiny_original_v7_rgb_config(),
+        rgb_original_v7_context=False,
+        rgb_action_owned_transport=True,
+        rgb_context_motion_blend_gain=0.0,
+    )
+
+
+def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(812)
+    model = NativeWorldModel(cfg).train()
+    assert model.factual_action is None
+    decoder = model.rgb_head.image_decoder
+    assert isinstance(decoder, NativeActionOwnedTransportRGBImageDecoder)
+    assert not any(name.startswith("ctx") for name, _ in decoder.named_modules())
+    assert decoder.action_proj[0].in_features == 7
+
+    batch = _original_v7_batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    output = model(**batch)
+    output["rgb"].float().mean().backward()
+    for parameter in (
+        decoder.token_proj[0].weight,
+        decoder.action_proj[0].weight,
+        decoder.task_proj[1].weight,
+        decoder.flow_head.weight,
+        decoder.residual_head.weight,
+        decoder.motion_head.weight,
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
+
+
+def test_action_owned_transport_motion_gate_cannot_restore_raw_context() -> None:
+    cfg = replace(
+        _tiny_action_owned_transport_config(),
+        rgb_v7_high_frequency_refiner=False,
+    )
+    decoder = NativeActionOwnedTransportRGBImageDecoder(cfg).eval()
+    with torch.no_grad():
+        decoder.flow_head.weight.zero_()
+        decoder.flow_head.bias.zero_()
+        decoder.flow_head.bias[0] = torch.atanh(
+            torch.tensor(4.0 / (0.5 * float(cfg.rgb_size)))
+        )
+        decoder.residual_head.weight.zero_()
+        residual_value = 0.05
+        decoder.residual_head.bias.fill_(
+            torch.atanh(
+                torch.tensor(residual_value / cfg.rgb_context_residual_scale)
+            )
+        )
+        decoder.motion_head.weight.zero_()
+        decoder.motion_head.bias.zero_()
+
+    horizontal = torch.linspace(0.0, 1.0, cfg.rgb_size).square().view(
+        1, 1, 1, cfg.rgb_size
+    )
+    context = horizontal.expand(1, 3, cfg.rgb_size, -1).contiguous()
+    rgb, _, motion, flow, _ = decoder(
+        torch.zeros(1, cfg.P, cfg.token_dim),
+        torch.zeros(1, cfg.rgb_hidden, 1, 1),
+        None,
+        None,
+        torch.zeros(1, 7),
+        torch.zeros(1, cfg.task_dim),
+        context,
+    )
+
+    torch.testing.assert_close(motion, torch.full_like(motion, 0.5))
+    assert float(flow[:, 0].mean()) > 1.9
+    expected, _ = _warp_rgb_feature_with_pixel_flow(
+        context,
+        flow,
+        image_height=cfg.rgb_size,
+        image_width=cfg.rgb_size,
+    )
+    # The output must be transport plus a residual gated only by the supervised
+    # motion support. Neither a raw-context blend nor model-controlled
+    # out-of-bounds flow may open a larger redraw path.
+    expected = torch.clamp(expected + 0.5 * residual_value, 0.0, 1.0)
+    torch.testing.assert_close(rgb, expected, rtol=0, atol=1.0e-6)
+    assert not torch.allclose(rgb, context, rtol=0, atol=1.0e-5)
+
+
+def test_action_owned_transport_supports_non_power_of_two_rgb_size() -> None:
+    cfg = replace(
+        _tiny_action_owned_transport_config(),
+        rgb_size=24,
+        rgb_v7_high_frequency_refiner=False,
+    )
+    decoder = NativeActionOwnedTransportRGBImageDecoder(cfg).eval()
+    rgb, motion_logit, _, flow, _ = decoder(
+        torch.zeros(1, cfg.P, cfg.token_dim),
+        torch.zeros(1, cfg.rgb_hidden, 1, 1),
+        None,
+        None,
+        torch.zeros(1, 7),
+        torch.zeros(1, cfg.task_dim),
+        torch.rand(1, 3, cfg.rgb_size, cfg.rgb_size),
+    )
+    assert rgb.shape == (1, 3, 24, 24)
+    assert motion_logit.shape == (1, 1, 24, 24)
+    assert flow.shape == (1, 2, 24, 24)
+
+
+def test_action_owned_transport_action_changes_rgb_not_policy_or_action_free() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(813)
+    model = NativeWorldModel(cfg).eval()
+    batch = _original_v7_batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    factual = model(**batch)
+    assert "rgb_flow_pixels" in factual
+    assert "rgb_disocclusion_logit" in factual
     zero_batch = dict(batch)
     zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
         batch["future_factual_fine_action_values"]
