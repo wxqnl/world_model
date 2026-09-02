@@ -678,6 +678,15 @@ class ContinuousTimeEmbedding(nn.Module):
         return self.proj(features)
 
 
+class _ZeroInitializedLinear(nn.Linear):
+    """Linear projection that remains zero after meta-shard materialization."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
 class MultiViewTokenFuser(nn.Module):
     """Fuse auxiliary cameras into the head-camera coordinate.
 
@@ -715,7 +724,7 @@ class MultiViewTokenFuser(nn.Module):
         self.ff_norm = RMSNorm(cfg.view_hidden)
         self.ff = SwiGLU(cfg.view_hidden, cfg.view_ff_mult, cfg.dropout)
         if self.original_v7_anchor:
-            self.output_projection = nn.Linear(
+            self.output_projection = _ZeroInitializedLinear(
                 cfg.view_hidden, cfg.state_hidden, bias=False
             )
             self.residual_gate = nn.Parameter(torch.ones(1))
