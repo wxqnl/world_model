@@ -1537,13 +1537,19 @@ def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:
     cfg = _tiny_action_owned_transport_config()
     torch.manual_seed(812)
     model = NativeWorldModel(cfg).train()
-    assert model.factual_action is None
+    assert model.factual_action is not None
+    assert model.original_v7_rgb_action is None
+    assert model.factual_decoder_queries is None
+    assert model.factual_decoder_space is None
+    assert model.factual_decoder_time is None
+    assert model.factual_task is None
+    assert len(model.dynamics_blocks) == 0
     owners = _owner_parameters(model)
     assert owners["factual_dynamics"]
     decoder = model.rgb_head.image_decoder
     assert isinstance(decoder, NativeActionOwnedTransportRGBImageDecoder)
     assert not any(name.startswith("ctx") for name, _ in decoder.named_modules())
-    assert decoder.action_proj[0].in_features == 7
+    assert decoder.action_proj[0].in_features == cfg.state_hidden
 
     batch = _original_v7_batch(cfg)
     batch["context_rgb"] = torch.rand(
@@ -1595,7 +1601,7 @@ def test_action_owned_transport_flow_is_not_attenuated_by_motion_gate() -> None:
         torch.zeros(1, cfg.rgb_hidden, 1, 1),
         None,
         None,
-        torch.zeros(1, 7),
+        torch.zeros(1, cfg.state_hidden),
         torch.zeros(1, cfg.task_dim),
         context,
     )
@@ -1606,7 +1612,7 @@ def test_action_owned_transport_flow_is_not_attenuated_by_motion_gate() -> None:
         torch.zeros(1, cfg.rgb_hidden, 1, 1),
         None,
         None,
-        torch.zeros(1, 7),
+        torch.zeros(1, cfg.state_hidden),
         torch.zeros(1, cfg.task_dim),
         context,
     )
@@ -1645,7 +1651,7 @@ def test_action_owned_transport_closed_motion_keeps_flow_gradient_and_identity()
         torch.zeros(1, cfg.rgb_hidden, 1, 1),
         None,
         None,
-        torch.randn(1, 7),
+        torch.randn(1, cfg.state_hidden),
         torch.randn(1, cfg.task_dim),
         context,
     )
@@ -1679,7 +1685,7 @@ def test_action_owned_transport_supports_non_power_of_two_rgb_size() -> None:
         torch.zeros(1, cfg.rgb_hidden, 1, 1),
         None,
         None,
-        torch.zeros(1, 7),
+        torch.zeros(1, cfg.state_hidden),
         torch.zeros(1, cfg.task_dim),
         torch.rand(1, 3, cfg.rgb_size, cfg.rgb_size),
     )
@@ -1722,6 +1728,275 @@ def test_action_owned_transport_action_changes_rgb_not_policy_or_action_free() -
     )
     assert not torch.allclose(factual["pred_tokens"], zero["pred_tokens"])
     assert not torch.allclose(factual["rgb"], zero["rgb"])
+
+
+def test_action_owned_transport_is_causal_across_future_horizons() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(814)
+    model = NativeWorldModel(cfg).eval()
+    batch = _original_v7_batch(cfg)
+    batch["context_rgb"] = torch.rand(
+        2, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        2, cfg.num_views, dtype=torch.bool
+    )
+    baseline = model(**batch)
+
+    changed_batch = dict(batch)
+    changed_fine = batch["future_factual_fine_action_values"].clone()
+    changed_fine[:, 1] += 4.0
+    changed_batch["future_factual_fine_action_values"] = changed_fine
+    changed = model(**changed_batch)
+
+    # A command at the final horizon cannot alter an earlier factual state or
+    # its anchor-to-horizon RGB transport.  It must still affect its own slot.
+    torch.testing.assert_close(
+        baseline["pred_tokens"][:, 0], changed["pred_tokens"][:, 0], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        baseline["rgb"][:, 0], changed["rgb"][:, 0], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        baseline["policy_action_raw"], changed["policy_action_raw"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        baseline["action_free_pred_tokens"],
+        changed["action_free_pred_tokens"],
+        rtol=0,
+        atol=0,
+    )
+    assert not torch.allclose(
+        baseline["pred_tokens"][:, 1], changed["pred_tokens"][:, 1]
+    )
+    assert not torch.allclose(baseline["rgb"][:, 1], changed["rgb"][:, 1])
+
+
+def _single_group_action_owned_batch(
+    cfg: NativeWorldModelConfig,
+) -> dict[str, torch.Tensor]:
+    batch = _original_v7_batch(cfg)
+    single = {
+        name: (
+            value[1:2].clone()
+            if isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == 2
+            else value
+        )
+        for name, value in batch.items()
+    }
+    single["context_rgb"] = torch.zeros(
+        1, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    single["context_rgb_mask"] = torch.ones(
+        1, cfg.num_views, dtype=torch.bool
+    )
+    return single
+
+
+def test_action_owned_factual_injection_preserves_command_magnitude() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(815)
+    model = NativeWorldModel(cfg).eval()
+    responses: list[float] = []
+    for magnitude in (0.25, 0.5, 1.0, 2.0):
+        batch = _single_group_action_owned_batch(cfg)
+        fine = torch.zeros_like(batch["future_factual_fine_action_values"])
+        fine[..., 0] = magnitude
+        batch["future_factual_fine_action_values"] = fine
+        batch["future_factual_coarse_action_values"] = torch.zeros_like(
+            batch["future_factual_coarse_action_values"]
+        )
+        block_inputs: list[torch.Tensor] = []
+
+        def record(_module, inputs) -> None:
+            block_inputs.append(inputs[0].detach().clone())
+
+        handle = model.state_blocks[0].register_forward_pre_hook(record)
+        try:
+            model(**batch)
+        finally:
+            handle.remove()
+        assert len(block_inputs) == 2
+        response = (
+            block_inputs[1][:, cfg.T :] - block_inputs[0][:, cfg.T :]
+        ).float().square().mean().sqrt()
+        responses.append(float(response))
+
+    # The removed action-context RMSNorm made this curve essentially flat.
+    # A larger physical command must now produce a materially larger pre-block
+    # factual update; exact linearity is not required because the encoder is
+    # deliberately nonlinear in value and timestamp.
+    assert responses == sorted(responses)
+    assert responses[-1] > 2.0 * responses[0]
+
+
+def test_grouped_factual_encoder_preserves_substep_count_and_calibration() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(816)
+    model = NativeWorldModel(cfg).eval()
+    assert model.factual_action is not None
+    batch = _single_group_action_owned_batch(cfg)
+    values = torch.zeros_like(batch["future_factual_fine_action_values"])
+    values[..., 0] = 0.2
+    dim_mask = torch.zeros_like(
+        batch["future_factual_fine_action_mask"], dtype=torch.bool
+    )
+    dim_mask[..., 0] = True
+    sample_mask = torch.ones_like(
+        batch["future_factual_fine_sample_mask"], dtype=torch.bool
+    )
+    dt = torch.zeros_like(batch["future_factual_fine_action_dt"])
+    common = {
+        "fine_values": values,
+        "fine_dt": dt,
+        "coarse_values": torch.zeros_like(
+            batch["future_factual_coarse_action_values"]
+        ),
+        "coarse_dim_mask": torch.zeros_like(
+            batch["future_factual_coarse_action_mask"], dtype=torch.bool
+        ),
+        "action_semantic_ids": batch["action_semantic_ids"],
+        "group_ids": batch["action_group_ids"],
+        "group_mask": batch["action_group_mask"],
+        "embodiment_ids": batch["embodiment_ids"],
+        "normalization_offset": batch["action_normalization_offset"],
+    }
+    one_sample = sample_mask.clone()
+    one_sample[..., 1:] = False
+    one_dim_mask = dim_mask & one_sample[..., None]
+    one, _ = model.factual_action(
+        **common,
+        fine_dim_mask=one_dim_mask,
+        fine_sample_mask=one_sample,
+        normalization_scale=batch["action_normalization_scale"],
+    )
+    repeated, _ = model.factual_action(
+        **common,
+        fine_dim_mask=dim_mask,
+        fine_sample_mask=sample_mask,
+        normalization_scale=batch["action_normalization_scale"],
+    )
+    assert not torch.allclose(one, repeated)
+
+    scaled, _ = model.factual_action(
+        **common,
+        fine_dim_mask=dim_mask,
+        fine_sample_mask=sample_mask,
+        normalization_scale=batch["action_normalization_scale"] * 2.0,
+    )
+    # Identical normalized coordinates can represent different controller
+    # magnitudes in two OXE source profiles.  The factual path must be able to
+    # distinguish those profiles without reading a source identifier.
+    assert not torch.allclose(repeated, scaled)
+
+
+def test_action_owned_conditioner_keeps_group_tokens_distinct() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(817)
+    model = NativeWorldModel(cfg).eval()
+    batch = _original_v7_batch(cfg)
+    batch = {
+        name: (
+            value[:1].clone()
+            if isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == 2
+            else value
+        )
+        for name, value in batch.items()
+    }
+    batch["context_rgb"] = torch.zeros(
+        1, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        1, cfg.num_views, dtype=torch.bool
+    )
+    fine = torch.zeros_like(batch["future_factual_fine_action_values"])
+    fine[:, :, 0, :, 0] = 0.75
+    fine[:, :, 1, :, 0] = -0.5
+    batch["future_factual_fine_action_values"] = fine
+    contexts: list[torch.Tensor] = []
+    assert model.factual_state_action_cross is not None
+
+    def record(_module, inputs) -> None:
+        contexts.append(inputs[1].detach().clone())
+
+    handle = model.factual_state_action_cross.register_forward_pre_hook(record)
+    try:
+        baseline = model(**batch)
+    finally:
+        handle.remove()
+    assert len(contexts) == 1
+    assert contexts[0].shape[1] == cfg.max_action_groups
+    assert not torch.allclose(contexts[0][:, 0], contexts[0][:, 1])
+
+    changed_batch = dict(batch)
+    changed_fine = fine.clone()
+    changed_fine[:, :, 1, :, 0] = 1.5
+    changed_batch["future_factual_fine_action_values"] = changed_fine
+    changed = model(**changed_batch)
+    assert not torch.allclose(baseline["pred_tokens"], changed["pred_tokens"])
+
+
+def test_action_owned_renderer_hint_is_local_not_hidden_cumulative() -> None:
+    cfg = replace(
+        _tiny_action_owned_transport_config(), rgb_decode_chunk_size=2
+    )
+    torch.manual_seed(818)
+    model = NativeWorldModel(cfg).eval()
+
+    class ConstantPerHorizonFactual(torch.nn.Module):
+        condition_on_normalization = True
+
+        def forward(self, *, fine_values, group_mask, **_kwargs):
+            scalar = fine_values[..., 0].mean(dim=3)
+            encoded = scalar[..., None].expand(
+                -1, -1, -1, cfg.state_hidden
+            )
+            valid = group_mask[:, None].expand(-1, cfg.K, -1)
+            return encoded * valid[..., None], valid
+
+    model.factual_action = ConstantPerHorizonFactual()
+    batch = _original_v7_batch(cfg)
+    batch = {
+        name: (
+            value[:1].clone()
+            if isinstance(value, torch.Tensor)
+            and value.ndim > 0
+            and value.shape[0] == 2
+            else value
+        )
+        for name, value in batch.items()
+    }
+    batch["context_rgb"] = torch.zeros(
+        1, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(
+        1, cfg.num_views, dtype=torch.bool
+    )
+    fine = torch.zeros_like(batch["future_factual_fine_action_values"])
+    fine[..., 0] = 1.0
+    batch["future_factual_fine_action_values"] = fine
+    batch["future_factual_coarse_action_values"] = torch.zeros_like(
+        batch["future_factual_coarse_action_values"]
+    )
+    decoder = model.rgb_head.image_decoder
+    captured: list[torch.Tensor] = []
+
+    def record(_module, inputs) -> None:
+        captured.append(inputs[0].detach().clone())
+
+    handle = decoder.action_proj[0].register_forward_pre_hook(record)
+    try:
+        model(**batch)
+    finally:
+        handle.remove()
+    assert captured
+    assert all(chunk.shape[0] == cfg.K for chunk in captured)
+    for chunk in captured:
+        torch.testing.assert_close(chunk[0], chunk[1], rtol=0, atol=0)
 
 
 def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:

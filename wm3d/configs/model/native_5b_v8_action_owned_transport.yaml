@@ -2,7 +2,7 @@ schema: wm3d_v8_model_profile_v1
 name: native_5b_v8_action_owned_rgb_transport
 architecture: native_world_model
 # Sealed after constructing this exact profile on meta and real FSDP2 shards.
-expected_parameter_count: 5315151668
+expected_parameter_count: 5087822644
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -32,18 +32,17 @@ model:
   policy_task_modulation: true
   policy_calibration_conditioning: true
   bridge_layers_state: [2, 5, 8, 11, 14, 17, 20, 23, 26, 29]
-  # Scale the V7 cadence while retaining a final post-block bridge.  This is
-  # factual-only and does not alter the production policy prior.
-  factual_v7_bridge_layers_state: [3, 6, 9, 12, 15, 18, 21, 24, 27, 31]
+  # Action-owned factual execution reuses the regular bridge schedule in its
+  # separate causal pass; the legacy full-sequence schedule is disabled.
+  factual_v7_bridge_layers_state: []
   bridge_heads: 16
-  # Exact V7 factual decoder semantics, scaled only by the 5B hidden width.
-  dynamics_layers: 2
+  # Kept positive for the common config schema; action-owned execution uses
+  # the shared StateStream blocks and allocates no legacy factual decoder.
+  dynamics_layers: 1
   factual_dynamics_repeats: 1
   factual_action_residual_scale: 1.0
-  # Future physical action owns the factual state before all state blocks.
-  # The action-free policy trunk remains a separate pass.
-  factual_v7_early_action_conditioning: true
-  factual_v7_early_action_scale: 1.0
+  factual_v7_early_action_conditioning: false
+  factual_v7_early_action_scale: 0.0
   appearance_action_residual_scale: 0.0
   view_hidden: 1024
   view_heads: 8

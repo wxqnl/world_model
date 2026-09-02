@@ -25,9 +25,10 @@ objective:
   rgb_motion_threshold: 0.03
   rgb_motion_gain: 3.0
 
-  # RAFT supplies a weak target for the same backward-flow field used by the
-  # renderer.  It is training-only supervision, not a second motion owner.
-  rgb_flow_teacher: 0.05
+  # RAFT supervises the same backward-flow field used by the renderer.  It is
+  # training-only supervision, not a second motion owner.  Keep enough vector
+  # signal after pixel-range normalization for the head to learn transport.
+  rgb_flow_teacher: 0.20
 
   # The current disocclusion value is a deterministic warp-validity metric,
   # not a learnable head.  Keep its losses disabled.

@@ -421,7 +421,7 @@ class NativeWorldModelConfig:
                 )
             if self.rgb_context_action_scale <= 0.0:
                 raise ValueError(
-                    "action-owned RGB transport requires physical action conditioning"
+                    "action-owned RGB transport requires normalized action conditioning"
                 )
             if self.rgb_context_appearance_delta_scale != 0.0:
                 raise ValueError(
@@ -431,20 +431,13 @@ class NativeWorldModelConfig:
                 raise ValueError(
                     "action-owned RGB transport forbids a second direct detail lane"
                 )
-            if self.dynamics_layers != 2 or self.factual_dynamics_repeats != 1:
+            if self.factual_dynamics_repeats != 1:
                 raise ValueError(
-                    "action-owned RGB transport requires the two-layer factual decoder"
+                    "action-owned RGB transport requires one causal factual StateStream pass"
                 )
             if self.factual_action_residual_scale != 1.0:
                 raise ValueError(
                     "action-owned RGB transport requires unit factual action injection"
-                )
-            if (
-                not self.factual_v7_early_action_conditioning
-                or self.factual_v7_early_action_scale != 1.0
-            ):
-                raise ValueError(
-                    "action-owned RGB transport requires action before the state trunk"
                 )
             if (
                 self.render_factual_dynamics_repeats is not None
@@ -919,11 +912,31 @@ class FactorizedStateBlock(nn.Module):
 class GroupedSignalEncoder(nn.Module):
     """Encode source-native fine commands and explicit coarse effects."""
 
-    def __init__(self, output_dim: int, cfg: NativeWorldModelConfig):
+    def __init__(
+        self,
+        output_dim: int,
+        cfg: NativeWorldModelConfig,
+        *,
+        condition_on_normalization: bool = False,
+    ):
         super().__init__()
         self.cfg = cfg
+        self.condition_on_normalization = bool(condition_on_normalization)
         self.fine_value = nn.Linear(cfg.max_action_dim * 2, output_dim, bias=False)
+        # Preserve the information V7 obtained by flattening every fixed-rate
+        # substep while still supporting V8's variable-rate windows.  Mean
+        # alone makes one repeated delta command indistinguishable from many.
+        self.fine_aggregate = (
+            nn.Linear(cfg.max_action_dim * 4, output_dim, bias=False)
+            if self.condition_on_normalization
+            else None
+        )
         self.coarse_value = nn.Linear(cfg.max_action_dim * 2, output_dim, bias=False)
+        self.normalization = (
+            nn.Linear(cfg.max_action_dim * 3, output_dim, bias=False)
+            if self.condition_on_normalization
+            else None
+        )
         self.time = ContinuousTimeEmbedding(output_dim, cfg)
         # The non-linearity is deliberately applied *after* joining each
         # command with its recorded timestamp.  An additive value/time
@@ -952,6 +965,8 @@ class GroupedSignalEncoder(nn.Module):
         group_ids: torch.Tensor,
         group_mask: torch.Tensor,
         embodiment_ids: torch.Tensor,
+        normalization_offset: Optional[torch.Tensor] = None,
+        normalization_scale: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         if fine_values.shape != fine_dim_mask.shape:
@@ -985,6 +1000,46 @@ class GroupedSignalEncoder(nn.Module):
         ):
             raise ValueError("action_semantic_ids must be [B,G,A]")
 
+        normalization_token: Optional[torch.Tensor] = None
+        if self.condition_on_normalization:
+            expected_normalization = (
+                batch,
+                cfg.max_action_groups,
+                cfg.max_action_dim,
+            )
+            if (
+                normalization_offset is None
+                or normalization_scale is None
+                or tuple(normalization_offset.shape) != expected_normalization
+                or tuple(normalization_scale.shape) != expected_normalization
+            ):
+                raise ValueError(
+                    "calibrated action encoding requires per-group offset/scale"
+                )
+            if not bool(torch.isfinite(normalization_offset).all()) or not bool(
+                torch.isfinite(normalization_scale).all()
+            ):
+                raise ValueError("action normalization contains non-finite values")
+            if bool((normalization_scale <= 0).any()):
+                raise ValueError("action normalization scale must be positive")
+            semantic_valid = action_semantic_ids.ne(0)
+            calibration = torch.cat(
+                (
+                    normalization_offset
+                    * semantic_valid.to(dtype=normalization_offset.dtype),
+                    normalization_scale.log()
+                    * semantic_valid.to(dtype=normalization_scale.dtype),
+                    semantic_valid.to(dtype=normalization_offset.dtype),
+                ),
+                dim=-1,
+            )
+            assert self.normalization is not None
+            normalization_token = self.normalization(calibration)
+        elif normalization_offset is not None or normalization_scale is not None:
+            raise ValueError(
+                "normalization statistics were supplied to an uncalibrated encoder"
+            )
+
         fine_pair = torch.cat(
             (
                 fine_values * fine_dim_mask.to(dtype=fine_values.dtype),
@@ -993,6 +1048,8 @@ class GroupedSignalEncoder(nn.Module):
             dim=-1,
         )
         fine_tokens = self.fine_value(fine_pair) + self.time(fine_dt)
+        if normalization_token is not None:
+            fine_tokens = fine_tokens + normalization_token[:, None, :, None]
         fine_tokens = fine_tokens + F.silu(
             self.fine_joint(self.fine_joint_norm(fine_tokens))
         )
@@ -1001,6 +1058,35 @@ class GroupedSignalEncoder(nn.Module):
         fine_summary = (fine_tokens * fine_weight).sum(dim=3)
         fine_count = fine_weight.sum(dim=3).clamp_min(1.0)
         fine_summary = fine_summary / fine_count
+        if self.fine_aggregate is not None:
+            fine_dim_valid = fine_dim_mask & fine_sample_mask[..., None]
+            fine_dim_weight = fine_dim_valid.to(dtype=fine_values.dtype)
+            per_dim_count = fine_dim_weight.sum(dim=3)
+            per_dim_sum = (fine_values * fine_dim_weight).sum(dim=3)
+            per_dim_mean = per_dim_sum / per_dim_count.clamp_min(1.0)
+            substep_index = torch.arange(substeps, device=fine_values.device).view(
+                1, 1, 1, substeps, 1
+            )
+            last_index = torch.where(
+                fine_dim_valid,
+                substep_index,
+                torch.full_like(substep_index, -1),
+            ).amax(dim=3)
+            gathered_last = fine_values.gather(
+                3,
+                last_index.clamp_min(0).unsqueeze(3).expand(-1, -1, -1, 1, -1),
+            ).squeeze(3)
+            per_dim_last = gathered_last * last_index.ge(0).to(gathered_last.dtype)
+            aggregate = torch.cat(
+                (
+                    per_dim_mean,
+                    per_dim_sum,
+                    per_dim_last,
+                    per_dim_count / float(substeps),
+                ),
+                dim=-1,
+            )
+            fine_summary = fine_summary + self.fine_aggregate(aggregate)
 
         coarse_pair = torch.cat(
             (
@@ -1010,6 +1096,8 @@ class GroupedSignalEncoder(nn.Module):
             dim=-1,
         )
         coarse_summary = self.coarse_value(coarse_pair)
+        if normalization_token is not None:
+            coarse_summary = coarse_summary + normalization_token[:, None]
         real_coarse = coarse_dim_mask.any(dim=-1)
         fine_present = real_fine.any(dim=3)
         source_count = fine_present.to(torch.int32) + real_coarse.to(torch.int32)
@@ -1386,6 +1474,8 @@ class StateActionBridge(nn.Module):
         state: torch.Tensor,
         action: torch.Tensor,
         action_mask: torch.Tensor,
+        *,
+        factual: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The factual V7 topology bridges complete token sequences in both
         # directions.  No patch mean or frame-wise broadcast is permitted:
@@ -1423,26 +1513,39 @@ class StateActionBridge(nn.Module):
         state_summary = state.mean(dim=2)
         action_flat = action.reshape(batch, action_steps * groups, -1)
         valid_flat = action_mask.reshape(batch, action_steps * groups)
+        # The factual pass follows the original V7 guard: its ActionStream may
+        # read only observed state.  Otherwise a late candidate command can
+        # travel future-state -> history-action -> earlier-future-state through
+        # the bridge and silently violate horizon causality.  The policy pass
+        # keeps its existing action-free behavior.
+        state_memory = (
+            state_summary[:, : self.history_steps] if factual else state_summary
+        )
         action_update = self.action_reads_state(
-            self.action_norm(action_flat), self.state_norm(state_summary)
+            self.action_norm(action_flat), self.state_norm(state_memory)
         )
         action_flat = (action_flat + action_update) * valid_flat[..., None].to(
             dtype=action_flat.dtype
         )
         action = action_flat.view(batch, action_steps, groups, -1)
-        # World prior may read already executed history, but learned future
-        # policy queries and current-state-conditioned query latents cannot
-        # write back into the action-free state branch.
-        history_action = action[:, : self.history_steps].reshape(
-            batch, self.history_steps * groups, -1
-        )
-        history_valid = action_mask[:, : self.history_steps].reshape(
-            batch, self.history_steps * groups
-        )
+        # In the action-free policy pass, learned future queries must not write
+        # back into the world prior.  In the separate factual pass, matching
+        # V7 means the state can read the complete candidate-free ActionStream;
+        # candidate information itself remains owned by StateStream.
+        if factual:
+            state_action = action_flat
+            state_action_valid = valid_flat
+        else:
+            state_action = action[:, : self.history_steps].reshape(
+                batch, self.history_steps * groups, -1
+            )
+            state_action_valid = action_mask[:, : self.history_steps].reshape(
+                batch, self.history_steps * groups
+            )
         state_update = self.state_reads_action(
             self.state_norm(state_summary),
-            self.action_norm(history_action),
-            allowed_mask=history_valid[:, None, None, :],
+            self.action_norm(state_action),
+            allowed_mask=state_action_valid[:, None, None, :],
         )
         state = state + state_update[:, :state_steps, None, :] / patches**0.5
         return state, action
@@ -3076,10 +3179,14 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
             nn.SiLU(inplace=True),
             _RGBConvBlock(hidden, hidden),
         )
+        # The transport head consumes the same source-normalized, masked,
+        # time-aware action effect as the factual world path.  Treating every
+        # OXE controller coordinate as metres/radians was both false for
+        # several sources and inconsistent with the proven V7/OXE recipe.
         self.action_proj = nn.Sequential(
-            nn.Linear(7, hidden),
+            nn.Linear(cfg.state_hidden, hidden, bias=False),
             nn.SiLU(inplace=True),
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden, hidden, bias=False),
         )
         self.task_proj = nn.Sequential(
             nn.LayerNorm(cfg.task_dim),
@@ -3165,9 +3272,11 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
             raise ValueError("transport context indices must be aligned int64")
         if factual_action_summary is None or factual_action_summary.shape != (
             tokens.shape[0],
-            7,
+            self.cfg.state_hidden,
         ):
-            raise ValueError("physical action must align to transport RGB slots")
+            raise ValueError(
+                "normalized cumulative action effect must align to transport RGB slots"
+            )
         if task_embedding.shape != (tokens.shape[0], self.cfg.task_dim):
             raise ValueError("task embedding must align to transport RGB slots")
 
@@ -4220,12 +4329,7 @@ class NativeRGBDecoder(nn.Module):
         expanded_action: Optional[torch.Tensor] = None
         if self.cfg.rgb_context_action_scale > 0.0:
             action_dim = (
-                7
-                if (
-                    self.cfg.rgb_original_v7_context
-                    or self.cfg.rgb_action_owned_transport
-                )
-                else self.cfg.state_hidden
+                7 if self.cfg.rgb_original_v7_context else self.cfg.state_hidden
             )
             expected_action = (batch, self.cfg.K, action_dim)
             if (
@@ -4476,16 +4580,25 @@ class NativeWorldModel(nn.Module):
         self.future_queries = nn.Parameter(
             torch.empty(1, cfg.K, cfg.P, cfg.state_hidden)
         )
-        # The factual V7 decoder owns its query and positional basis. Sharing
-        # the action-free future seed here would reintroduce the static-prior
-        # shortcut that this decoder is meant to avoid.
-        self.factual_decoder_queries = nn.Parameter(
-            torch.empty(1, cfg.K, cfg.P, cfg.state_hidden)
-        )
-        self.factual_decoder_space = nn.Parameter(
-            torch.empty(1, 1, cfg.P, cfg.state_hidden)
-        )
-        self.factual_decoder_time = ContinuousTimeEmbedding(cfg.state_hidden, cfg)
+        # Legacy factual-decoder profiles keep their independent query basis.
+        # Action-owned transport instead follows the verified V7/OXE order:
+        # normalized future commands condition the future StateStream before
+        # the first shared state block.  It therefore needs no second decoder
+        # or another learned future prior.
+        if cfg.rgb_action_owned_transport:
+            self.factual_decoder_queries = None
+            self.factual_decoder_space = None
+            self.factual_decoder_time = None
+        else:
+            self.factual_decoder_queries = nn.Parameter(
+                torch.empty(1, cfg.K, cfg.P, cfg.state_hidden)
+            )
+            self.factual_decoder_space = nn.Parameter(
+                torch.empty(1, 1, cfg.P, cfg.state_hidden)
+            )
+            self.factual_decoder_time = ContinuousTimeEmbedding(
+                cfg.state_hidden, cfg
+            )
         # Query identity comes from physical time, group/embodiment and current
         # state.  A shared seed avoids learning discrete 20Hz-style position
         # slots and makes the capacity ceiling parameter-count independent.
@@ -4497,50 +4610,74 @@ class NativeWorldModel(nn.Module):
             self.factual_decoder_space,
             self.policy_query_seed,
         ):
-            nn.init.normal_(parameter, std=0.02)
+            if parameter is not None:
+                nn.init.normal_(parameter, std=0.02)
         self.task_state = nn.Linear(cfg.task_dim, cfg.state_hidden, bias=False)
-        self.factual_task = nn.Linear(cfg.task_dim, cfg.state_hidden, bias=True)
+        self.factual_task: Optional[nn.Linear] = (
+            None
+            if cfg.rgb_action_owned_transport
+            else nn.Linear(cfg.task_dim, cfg.state_hidden, bias=True)
+        )
         self.task_action = nn.Linear(cfg.task_dim, cfg.action_hidden, bias=False)
         self.state_input_norm = RMSNorm(cfg.state_hidden)
 
         self.history_action = GroupedSignalEncoder(cfg.action_hidden, cfg)
-        # Action-owned transport always uses the full V7-style factual
-        # ActionStream below. Do not also allocate/run the older grouped
-        # summary encoder: its result is discarded by that branch and would
-        # otherwise leave millions of permanently gradient-free parameters.
         self.factual_action: Optional[GroupedSignalEncoder] = (
-            None
+            GroupedSignalEncoder(
+                cfg.state_hidden,
+                cfg,
+                condition_on_normalization=cfg.rgb_action_owned_transport,
+            )
+        )
+        self.factual_state_action_query_norm: Optional[RMSNorm] = (
+            RMSNorm(cfg.state_hidden) if cfg.rgb_action_owned_transport else None
+        )
+        # Do not normalize the centered action context here.  Its norm carries
+        # the physical command magnitude (after source calibration); an
+        # RMSNorm would make a 0.25x and 2x command nearly indistinguishable.
+        self.factual_state_action_context_norm: Optional[RMSNorm] = None
+        self.factual_state_action_cross: Optional[CrossAttention] = (
+            CrossAttention(
+                cfg.state_hidden,
+                cfg.state_hidden,
+                cfg.state_heads,
+                cfg.dropout,
+            )
             if cfg.rgb_action_owned_transport
-            else GroupedSignalEncoder(cfg.state_hidden, cfg)
+            else None
+        )
+        legacy_v7_factual = (
+            cfg.factual_v7_early_action_conditioning
+            and not cfg.rgb_action_owned_transport
         )
         self.factual_v7_query_action: Optional[CanonicalV7ActionTokenEncoder] = (
             CanonicalV7ActionTokenEncoder(cfg.state_hidden, cfg.K)
-            if cfg.factual_v7_early_action_conditioning
+            if legacy_v7_factual
             else None
         )
         self.factual_v7_stream_action: Optional[CanonicalV7ActionTokenEncoder] = (
             CanonicalV7ActionTokenEncoder(cfg.action_hidden, cfg.K)
-            if cfg.factual_v7_early_action_conditioning
+            if legacy_v7_factual
             else None
         )
         self.factual_v7_action_memory: Optional[nn.Linear] = (
             nn.Linear(cfg.action_hidden, cfg.state_hidden, bias=True)
-            if cfg.factual_v7_early_action_conditioning
+            if legacy_v7_factual
             else None
         )
         self.factual_v7_state_to_action: Optional[nn.Linear] = (
             nn.Linear(cfg.state_hidden, cfg.action_hidden, bias=True)
-            if cfg.factual_v7_early_action_conditioning
+            if legacy_v7_factual
             else None
         )
         self.factual_v7_group_query_norm: Optional[RMSNorm] = (
             RMSNorm(cfg.state_hidden)
-            if cfg.factual_v7_early_action_conditioning
+            if legacy_v7_factual
             else None
         )
         self.factual_v7_group_action_norm: Optional[RMSNorm] = (
             RMSNorm(cfg.action_hidden)
-            if cfg.factual_v7_early_action_conditioning
+            if legacy_v7_factual
             else None
         )
         self.factual_v7_group_query_cross: Optional[CrossAttention] = (
@@ -4550,7 +4687,7 @@ class NativeWorldModel(nn.Module):
                 cfg.state_heads,
                 cfg.dropout,
             )
-            if cfg.factual_v7_early_action_conditioning
+            if legacy_v7_factual
             else None
         )
         self.current_state = CurrentStateEncoder(cfg)
@@ -4584,7 +4721,12 @@ class NativeWorldModel(nn.Module):
             else None
         )
         self.dynamics_blocks = self._checkpoint_module_list(
-            (OriginalV7FactualDecoderLayer(cfg) for _ in range(cfg.dynamics_layers)),
+            (
+                OriginalV7FactualDecoderLayer(cfg)
+                for _ in (
+                    () if cfg.rgb_action_owned_transport else range(cfg.dynamics_layers)
+                )
+            ),
             enabled=cfg.activation_checkpointing,
         )
         self.state_norm = RMSNorm(cfg.state_hidden)
@@ -4608,10 +4750,12 @@ class NativeWorldModel(nn.Module):
         self.rgb_head = NativeRGBDecoder(cfg)
         self.original_v7_rgb_action: Optional[OriginalV7RGBActionAdapter] = (
             OriginalV7RGBActionAdapter(cfg)
-            if cfg.factual_v7_early_action_conditioning
-            or (
-                (cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport)
-                and cfg.rgb_context_action_scale > 0.0
+            if (
+                legacy_v7_factual
+                or (
+                    cfg.rgb_original_v7_context
+                    and cfg.rgb_context_action_scale > 0.0
+                )
             )
             else None
         )
@@ -4650,7 +4794,8 @@ class NativeWorldModel(nn.Module):
             self.factual_decoder_space,
             self.policy_query_seed,
         ):
-            nn.init.normal_(parameter, std=0.02)
+            if parameter is not None:
+                nn.init.normal_(parameter, std=0.02)
 
     @staticmethod
     def _checkpoint_module_list(
@@ -4677,13 +4822,18 @@ class NativeWorldModel(nn.Module):
         return nn.ModuleList(values)
 
     @staticmethod
-    def _run(module: nn.Module, *args: torch.Tensor, enabled: bool):
+    def _run(
+        module: nn.Module,
+        *args: torch.Tensor,
+        enabled: bool,
+        **kwargs: object,
+    ):
         # Activation checkpointing is installed structurally in __init__ so
         # this call enters the same wrapper under unwrapped, DDP, and FSDP2
         # execution.  ``enabled`` is retained at call sites as an explicit
         # architecture contract and to avoid two model-size-specific paths.
         del enabled
-        return module(*args)
+        return module(*args, **kwargs)
 
     def _validate_world_times(
         self, world_times_s: torch.Tensor, batch: int
@@ -4821,6 +4971,10 @@ class NativeWorldModel(nn.Module):
         )
         state = state + self.task_state(task_embedding)[:, None, None]
         state = self._encode_aux(state, aux_values, aux_mask, aux_type_ids)
+        # Preserve the exact pre-block input for the factual pass.  The policy
+        # pass below remains action-free; the same shared blocks are then run
+        # with only future StateStream slots conditioned by the candidate.
+        factual_state_input = state
 
         history, history_valid = self.history_action(
             fine_values=history_fine_action_values,
@@ -4888,6 +5042,7 @@ class NativeWorldModel(nn.Module):
             ),
             dim=1,
         )
+        factual_action_input = action
         action_index = 0
         for state_index, state_block in enumerate(self.state_blocks):
             state = self._run(state_block, state, enabled=cfg.activation_checkpointing)
@@ -4973,22 +5128,31 @@ class NativeWorldModel(nn.Module):
             return policy_output
 
         action_free_future = prior_state[:, cfg.T :]
-        # This is the V7 decoder query, not the action-free future prediction.
-        # Learned horizon/patch identity is combined with continuous physical
-        # time and spatial position.  Factual action is added below before the
-        # first decoder layer exactly once, as in V7.
-        factual_query = (
-            self.factual_decoder_queries.expand(batch, -1, -1, -1)
-            + self.factual_decoder_space
-            + self.factual_decoder_time(relative_world_time[:, cfg.T :])[:, :, None]
-        )
-        task_memory = self.state_norm(self.factual_task(task_embedding))[:, None]
-        decoder_prefix_valid = torch.ones(
-            batch,
-            1 + cfg.T * cfg.P,
-            dtype=torch.bool,
-            device=task_memory.device,
-        )
+        factual_query: Optional[torch.Tensor] = None
+        task_memory: Optional[torch.Tensor] = None
+        decoder_prefix_valid: Optional[torch.Tensor] = None
+        if not cfg.rgb_action_owned_transport:
+            if (
+                self.factual_decoder_queries is None
+                or self.factual_decoder_space is None
+                or self.factual_decoder_time is None
+                or self.factual_task is None
+            ):
+                raise RuntimeError("legacy factual decoder modules are unavailable")
+            factual_query = (
+                self.factual_decoder_queries.expand(batch, -1, -1, -1)
+                + self.factual_decoder_space
+                + self.factual_decoder_time(relative_world_time[:, cfg.T :])[
+                    :, :, None
+                ]
+            )
+            task_memory = self.state_norm(self.factual_task(task_embedding))[:, None]
+            decoder_prefix_valid = torch.ones(
+                batch,
+                1 + cfg.T * cfg.P,
+                dtype=torch.bool,
+                device=task_memory.device,
+            )
 
         def encode_factual(
             fine_values: torch.Tensor,
@@ -5007,6 +5171,16 @@ class NativeWorldModel(nn.Module):
                 group_ids=action_group_ids,
                 group_mask=action_group_mask,
                 embodiment_ids=embodiment_ids,
+                normalization_offset=(
+                    action_normalization_offset
+                    if self.factual_action.condition_on_normalization
+                    else None
+                ),
+                normalization_scale=(
+                    action_normalization_scale
+                    if self.factual_action.condition_on_normalization
+                    else None
+                ),
             )
             summary: Optional[torch.Tensor] = None
             if (
@@ -5036,6 +5210,94 @@ class NativeWorldModel(nn.Module):
                 raise ValueError("factual action memory must align to [B,K,G]")
             if tuple(encoded_mask.shape) != tuple(encoded.shape[:3]):
                 raise ValueError("factual action mask must align to action memory")
+            if cfg.rgb_action_owned_transport:
+                if repeats != 1:
+                    raise ValueError(
+                        "causal factual StateStream is executed exactly once"
+                    )
+                if (
+                    self.factual_state_action_query_norm is None
+                    or self.factual_state_action_cross is None
+                ):
+                    raise RuntimeError(
+                        "group-preserving factual state conditioner is unavailable"
+                    )
+
+                # Preserve each physical owner until it reaches every future
+                # patch.  This is the V7/OXE first-conditioning point, extended
+                # without averaging base/arm/mode owners into one token.  A
+                # one-group command reduces to V7's shared update; subsequent
+                # spatial/causal-temporal blocks localize and accumulate it.
+                future_seed = factual_state_input[:, cfg.T :]
+                grouped_action = encoded * encoded_mask[..., None].to(
+                    dtype=encoded.dtype
+                )
+                flat_grouped_action = grouped_action.reshape(
+                    batch * cfg.K,
+                    cfg.max_action_groups,
+                    cfg.state_hidden,
+                )
+                group_valid = encoded_mask.reshape(
+                    batch * cfg.K, cfg.max_action_groups
+                )
+                safe_group_valid = group_valid.clone()
+                safe_group_valid[:, 0] |= ~safe_group_valid.any(dim=1)
+                action_update = self.factual_state_action_cross(
+                    self.factual_state_action_query_norm(future_seed).reshape(
+                        batch * cfg.K, cfg.P, cfg.state_hidden
+                    ),
+                    flat_grouped_action,
+                    allowed_mask=safe_group_valid[:, None, None, :],
+                ).reshape(batch, cfg.K, cfg.P, cfg.state_hidden)
+                candidate_state = torch.cat(
+                    (
+                        factual_state_input[:, : cfg.T],
+                        future_seed + residual_scale * action_update,
+                    ),
+                    dim=1,
+                )
+                candidate_action = factual_action_input
+                candidate_action_index = 0
+                for state_index, state_block in enumerate(self.state_blocks):
+                    candidate_state = self._run(
+                        state_block,
+                        candidate_state,
+                        enabled=cfg.activation_checkpointing,
+                    )
+                    for _ in range(self._action_steps[state_index]):
+                        candidate_action = self._run(
+                            self.action_blocks[candidate_action_index],
+                            candidate_action,
+                            action_times,
+                            action_mask,
+                            action_task,
+                            task_token_mask,
+                            enabled=cfg.activation_checkpointing,
+                        )
+                        candidate_action_index += 1
+                    bridge_index = self._bridge_by_state_layer.get(state_index)
+                    if bridge_index is not None:
+                        candidate_state, candidate_action = self._run(
+                            self.bridges[bridge_index],
+                            candidate_state,
+                            candidate_action,
+                            action_mask,
+                            factual=True,
+                            enabled=cfg.activation_checkpointing,
+                        )
+                while candidate_action_index < len(self.action_blocks):
+                    candidate_action = self._run(
+                        self.action_blocks[candidate_action_index],
+                        candidate_action,
+                        action_times,
+                        action_mask,
+                        action_task,
+                        task_token_mask,
+                        enabled=cfg.activation_checkpointing,
+                    )
+                    candidate_action_index += 1
+                return self.state_norm(candidate_state)[:, cfg.T :]
+
             if tuple(observed_state.shape) != (
                 batch,
                 cfg.T,
@@ -5046,6 +5308,12 @@ class NativeWorldModel(nn.Module):
             observed_memory = observed_state.reshape(
                 batch, cfg.T * cfg.P, cfg.state_hidden
             )
+            if (
+                task_memory is None
+                or decoder_prefix_valid is None
+                or factual_query is None
+            ):
+                raise RuntimeError("legacy factual decoder inputs are unavailable")
             decoder_memory_prefix = torch.cat((task_memory, observed_memory), dim=1)
             action_memory = encoded.reshape(
                 batch, cfg.K * cfg.max_action_groups, cfg.state_hidden
@@ -5119,9 +5387,12 @@ class NativeWorldModel(nn.Module):
         canonical_grouped_action: Optional[torch.Tensor] = None
         canonical_group_mask: Optional[torch.Tensor] = None
         canonical_single_group: Optional[torch.Tensor] = None
-        if cfg.factual_v7_early_action_conditioning or (
-            (cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport)
-            and cfg.rgb_context_action_scale > 0.0
+        legacy_v7_factual = (
+            cfg.factual_v7_early_action_conditioning
+            and not cfg.rgb_action_owned_transport
+        )
+        if legacy_v7_factual or (
+            cfg.rgb_original_v7_context and cfg.rgb_context_action_scale > 0.0
         ):
             if self.original_v7_rgb_action is None:
                 raise RuntimeError("canonical V7 physical action adapter is unavailable")
@@ -5414,6 +5685,8 @@ class NativeWorldModel(nn.Module):
         def encode_v7_factual_state(
             action_summary: Optional[torch.Tensor],
         ) -> torch.Tensor:
+            if cfg.rgb_action_owned_transport:
+                return factual_state_input[:, : cfg.T]
             if not cfg.factual_v7_early_action_conditioning:
                 return prior_state[:, : cfg.T]
             if action_summary is None or tuple(action_summary.shape) != (
@@ -5454,7 +5727,7 @@ class NativeWorldModel(nn.Module):
         zero_action_stream: Optional[torch.Tensor] = None
         factual_action_stream_mask: Optional[torch.Tensor] = None
         zero_action_stream_mask: Optional[torch.Tensor] = None
-        if cfg.factual_v7_early_action_conditioning:
+        if legacy_v7_factual:
             if canonical_action_cond is None:
                 raise RuntimeError("canonical V7 action is unavailable")
             if canonical_single_group is None:
@@ -5515,7 +5788,7 @@ class NativeWorldModel(nn.Module):
             and render_residual_scale == cfg.factual_action_residual_scale
         ):
             render_future = factual_future
-        elif cfg.factual_v7_early_action_conditioning:
+        elif legacy_v7_factual:
             assert factual_action_stream is not None
             assert factual_action_stream_mask is not None
             assert canonical_action_cond is not None
@@ -5550,7 +5823,17 @@ class NativeWorldModel(nn.Module):
         zero_action_pred_tokens: Optional[torch.Tensor] = None
         rgb_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
-            if cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport:
+            if cfg.rgb_action_owned_transport:
+                if centered_summary is None:
+                    raise RuntimeError(
+                        "normalized factual RGB action effect is unavailable"
+                    )
+                # P64 is the causal anchor-to-horizon motion owner.  Keep this
+                # direct renderer hint local: summing a mixed learned latent
+                # would incorrectly accumulate absolute gripper/mode values
+                # and rotations.  Temporal composition happens in StateStream.
+                rgb_action_summary = centered_summary
+            elif cfg.rgb_original_v7_context:
                 if canonical_action_cond is None:
                     raise RuntimeError("canonical V7 RGB action is unavailable")
                 rgb_action_summary = canonical_action_cond
@@ -5570,7 +5853,7 @@ class NativeWorldModel(nn.Module):
             appearance_action_tokens = centered_encoded
             appearance_action_mask = factual_encoded_mask
         if compute_zero_action_control:
-            if cfg.factual_v7_early_action_conditioning:
+            if legacy_v7_factual:
                 assert zero_action_stream is not None
                 assert zero_action_stream_mask is not None
                 assert canonical_grouped_action is not None

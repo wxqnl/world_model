@@ -24,7 +24,7 @@ objective:
   rgb_motion_gain: 3.0
   # Direct supervision for the exact fields used by the renderer's warp and
   # redraw decision. The frozen target generator is training-only.
-  rgb_flow_teacher: 0.05
+  rgb_flow_teacher: 0.20
   rgb_disocclusion_bce: 0.2
   rgb_disocclusion_dice: 0.1
   rgb_disocclusion_pos_weight: 1.0

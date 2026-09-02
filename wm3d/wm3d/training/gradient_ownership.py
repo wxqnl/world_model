@@ -51,6 +51,13 @@ def _required_owner_modules(
     if model.factual_action is not None:
         factual_modules.insert(0, model.factual_action)
     for module in (
+        model.factual_state_action_query_norm,
+        model.factual_state_action_context_norm,
+        model.factual_state_action_cross,
+    ):
+        if module is not None:
+            factual_modules.append(module)
+    for module in (
         model.factual_v7_query_action,
         model.factual_v7_stream_action,
         model.factual_v7_action_memory,
@@ -85,7 +92,7 @@ def _required_owner_parameters(
 ) -> Mapping[str, tuple[nn.Parameter, ...]]:
     """Assign root parameters that are not owned by a child module."""
 
-    return {
+    owners: dict[str, tuple[nn.Parameter, ...]] = {
         "native_state_inputs": (
             model.state_space,
             model.future_queries,
@@ -93,12 +100,6 @@ def _required_owner_parameters(
             *tuple(model.task_state.parameters()),
             *tuple(model.state_input_norm.parameters()),
             *tuple(model.state_norm.parameters()),
-        ),
-        "factual_decoder_inputs": (
-            model.factual_decoder_queries,
-            model.factual_decoder_space,
-            *tuple(model.factual_decoder_time.parameters()),
-            *tuple(model.factual_task.parameters()),
         ),
         "policy_action_inputs": (
             model.policy_query_seed,
@@ -112,6 +113,19 @@ def _required_owner_parameters(
             *tuple(model.aux_type.parameters()),
         ),
     }
+    factual_inputs: list[nn.Parameter] = []
+    for parameter in (
+        model.factual_decoder_queries,
+        model.factual_decoder_space,
+    ):
+        if parameter is not None:
+            factual_inputs.append(parameter)
+    for module in (model.factual_decoder_time, model.factual_task):
+        if module is not None:
+            factual_inputs.extend(module.parameters())
+    if factual_inputs:
+        owners["factual_decoder_inputs"] = tuple(factual_inputs)
+    return owners
 
 
 def required_gradient_owner_names(model: NativeWorldModel) -> tuple[str, ...]:
