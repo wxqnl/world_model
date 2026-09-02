@@ -730,7 +730,7 @@ class MultiViewTokenFuser(nn.Module):
             self.residual_gate = nn.Parameter(torch.ones(1))
             nn.init.zeros_(self.output_projection.weight)
         else:
-            self.gate = nn.Linear(cfg.view_hidden, 1, bias=False)
+            self.gate = _ZeroInitializedLinear(cfg.view_hidden, 1, bias=False)
             nn.init.zeros_(self.gate.weight)
             self.out_proj = nn.Linear(
                 cfg.view_hidden, cfg.state_hidden, bias=False
@@ -1573,9 +1573,12 @@ class PerViewAppearanceDynamics(nn.Module):
             blocks = tuple(checkpoint_wrapper(block) for block in blocks)
         self.blocks = nn.ModuleList(blocks)
         self.norm = RMSNorm(cfg.appearance_hidden)
-        self.output = nn.Linear(cfg.appearance_hidden, cfg.token_dim, bias=False)
-        if cfg.appearance_flow_aligned_detail:
-            nn.init.zeros_(self.output.weight)
+        output_type = (
+            _ZeroInitializedLinear
+            if cfg.appearance_flow_aligned_detail
+            else nn.Linear
+        )
+        self.output = output_type(cfg.appearance_hidden, cfg.token_dim, bias=False)
 
     def reset_parameters(self) -> None:
         for parameter in (self.view_embed, self.patch_embed):
@@ -2501,6 +2504,15 @@ class _RGBDisocclusionHead(nn.Conv2d):
             nn.init.constant_(self.bias, -2.0)
 
 
+class _RGBMotionHead(nn.Conv2d):
+    """Preserve V7's initially closed motion gate under FSDP2 materialization."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+        if self.bias is not None:
+            nn.init.constant_(self.bias, -4.0)
+
+
 def _warp_rgb_feature_with_pixel_flow(
     source: torch.Tensor,
     flow_pixels: torch.Tensor,
@@ -2906,9 +2918,7 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
         self.up256 = _RGBUpBlock(channels_128, channels_256)
         self.fuse256 = _RGBConvBlock(channels_256 + channels_256, channels_256)
         self.head = nn.Conv2d(channels_256, 7, 3, padding=1)
-        self.motion_head = nn.Conv2d(channels_256, 1, 3, padding=1)
-        nn.init.zeros_(self.motion_head.weight)
-        nn.init.constant_(self.motion_head.bias, -4.0)
+        self.motion_head = _RGBMotionHead(channels_256, 1, 3, padding=1)
         self.high_frequency_refiner: Optional[NativeV7BoundedHighFrequencyRefiner] = (
             None
         )
@@ -3252,7 +3262,7 @@ class NativeContextRGBImageDecoder(nn.Module):
         # Preserve the V7 learned motion/blend path on the synthesis features.
         # The transport tower predicts only alignment and visibility; it must
         # not replace the renderer path that already produces moving RGB.
-        self.motion_head = nn.Conv2d(channels[-1], 1, 3, padding=1)
+        self.motion_head = _RGBMotionHead(channels[-1], 1, 3, padding=1)
         self.flow_head = (
             _RGBFlowHead(motion_output_channels, 2, 3, padding=1)
             if cfg.rgb_context_alignment_enabled
@@ -3263,8 +3273,6 @@ class NativeContextRGBImageDecoder(nn.Module):
             if cfg.rgb_context_alignment_enabled
             else None
         )
-        nn.init.zeros_(self.motion_head.weight)
-        nn.init.constant_(self.motion_head.bias, -4.0)
 
     def forward(
         self,
@@ -3646,6 +3654,12 @@ class NativeRGBDecoder(nn.Module):
     def reset_parameters(self) -> None:
         if isinstance(self.view_embed, nn.Parameter):
             nn.init.normal_(self.view_embed, std=0.02)
+        else:
+            # ``view_embed`` is a non-persistent buffer on the exact V7 RGB
+            # path. FSDP2 first allocates its meta storage with ``to_empty``;
+            # without writing it here, arbitrary allocator contents enter
+            # every RGB slot even though ordinary construction produced zero.
+            self.view_embed.zero_()
 
     def forward(
         self,
