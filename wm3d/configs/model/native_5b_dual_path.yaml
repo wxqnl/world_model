@@ -2,7 +2,7 @@ schema: wm3d_v8_model_profile_v1
 name: native_5b_v8_exact_v7_factual_high_frequency_refiner
 architecture: native_world_model
 # Sealed after constructing this exact profile on meta and real FSDP2 shards.
-expected_parameter_count: 5481958520
+expected_parameter_count: 5487202937
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -401,6 +402,45 @@ def _learning_rate(step: int, runtime: Mapping[str, Any]) -> float:
         return peak
     progress = min(1.0, (step - decay_start) / max(1, total - decay_start))
     return minimum + (peak - minimum) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+_RGB_OBJECTIVE_WEIGHTS = (
+    "rgb_l1",
+    "rgb_charbonnier",
+    "rgb_gradient",
+    "rgb_perceptual",
+    "rgb_motion_l1",
+    "rgb_motion_bce",
+    "rgb_motion_dice",
+    "rgb_flow_teacher",
+    "rgb_disocclusion_bce",
+    "rgb_disocclusion_dice",
+    "action_counterfactual_rgb_advantage",
+    "context_pixel_action_rank_weight",
+    "context_pixel_action_separation_weight",
+)
+
+
+def _training_objective_for_step(
+    step: int,
+    runtime: Mapping[str, Any],
+    objective: Any,
+) -> Any:
+    """Delay only pixel-decoder optimization while P64 dynamics bootstrap.
+
+    The full production forward still runs during the warmup, so metrics expose
+    the untrained RGB path. Token, geometry, policy, and physical-action losses
+    remain unchanged. Once the warmup ends this returns the sealed objective
+    object unchanged; there is no second loss or teacher path.
+    """
+
+    warmup_steps = int(runtime["train"].get("rgb_decoder_warmup_steps", 0))
+    if step >= warmup_steps:
+        return objective
+    return replace(
+        objective,
+        **{name: 0.0 for name in _RGB_OBJECTIVE_WEIGHTS},
+    )
 
 
 def _batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
@@ -1711,6 +1751,9 @@ def main() -> None:
         last_log = time.monotonic()
         for step in range(start_step, stop_after_step):
             lr = _learning_rate(step, runtime)
+            training_objective = _training_objective_for_step(
+                step, runtime, objective
+            )
             for group in optimizer.param_groups:
                 group["lr"] = lr
             accumulated: dict[str, torch.Tensor] = {}
@@ -1757,11 +1800,11 @@ def main() -> None:
                                 appearance_teacher_ratio=_training_appearance_teacher_ratio(
                                     step, runtime
                                 ),
-                                objective=objective,
+                                objective=training_objective,
                                 step=step,
                             ),
                             batch=batch,
-                            config=objective,
+                            config=training_objective,
                             perceptual_model=perceptual_model,
                             rgb_perceptual_chunk_size=int(
                                 runtime["train"].get("rgb_perceptual_chunk_size", 4)
@@ -1774,11 +1817,16 @@ def main() -> None:
                         + value.detach() / accumulation
                     )
             completed = step + 1
+            ownership_audited_this_step = False
             # Audit before clipping/zeroing.  Fresh runs must prove all owners
-            # on their first real optimizer step; resumed runs inherit the
-            # immutable proof stored in the committed checkpoint metadata.
-            if gradient_ownership is None:
+            # on the first step where every sealed objective owner is active;
+            # resumed runs inherit the immutable proof in checkpoint metadata.
+            rgb_decoder_warmup_steps = int(
+                runtime["train"].get("rgb_decoder_warmup_steps", 0)
+            )
+            if gradient_ownership is None and step >= rgb_decoder_warmup_steps:
                 gradient_ownership = audit_gradient_ownership(native_model)
+                ownership_audited_this_step = True
                 if context.is_rank0:
                     _atomic_json_no_clobber(
                         output_root / "gradient_ownership.json",
@@ -1812,6 +1860,9 @@ def main() -> None:
                         "lr": lr,
                         "source_id": source_id,
                         "grad_norm": float(grad_tensor.cpu()),
+                        "rgb_decoder_warmup_active": (
+                            step < rgb_decoder_warmup_steps
+                        ),
                         "seconds_per_log_interval": time.monotonic() - last_log,
                         **metrics,
                     }
@@ -1829,7 +1880,7 @@ def main() -> None:
                         record["direct_vggt"] = dict(input_adapter.metrics)
                     if async_pipeline is not None:
                         record["direct_pipeline"] = dict(async_pipeline.metrics)
-                    if completed == 1:
+                    if ownership_audited_this_step:
                         record["gradient_ownership"] = gradient_ownership
                     last_log = time.monotonic()
                     print(json.dumps(record, sort_keys=True), flush=True)
@@ -1853,6 +1904,11 @@ def main() -> None:
                     print(json.dumps(record, sort_keys=True), flush=True)
                     _append_jsonl(log_path, record)
             if completed in checkpoint_steps:
+                if gradient_ownership is None:
+                    raise PretrainError(
+                        "checkpoint cannot precede the first full-objective "
+                        "gradient ownership audit"
+                    )
                 manager.save(
                     step=completed,
                     model=model,

@@ -690,7 +690,20 @@ class MultiViewTokenFuser(nn.Module):
     def __init__(self, cfg: NativeWorldModelConfig):
         super().__init__()
         self.num_views = cfg.num_views
-        self.in_proj = nn.Linear(cfg.token_dim, cfg.view_hidden, bias=False)
+        self.original_v7_anchor = cfg.rgb_original_v7_context
+        if self.original_v7_anchor:
+            # Preserve the canonical V7 anchor path exactly: the head-camera
+            # P64 token reaches the state stream without first being compressed
+            # through the auxiliary-view attention width. Auxiliary views are
+            # a zero-init residual on top of it, never a replacement for it.
+            self.anchor_projection = nn.Linear(
+                cfg.token_dim, cfg.state_hidden, bias=True
+            )
+            self.auxiliary_projection = nn.Linear(
+                cfg.token_dim, cfg.view_hidden, bias=False
+            )
+        else:
+            self.in_proj = nn.Linear(cfg.token_dim, cfg.view_hidden, bias=False)
         self.view_embed = nn.Parameter(
             torch.empty(1, 1, cfg.num_views, 1, cfg.view_hidden)
         )
@@ -701,13 +714,26 @@ class MultiViewTokenFuser(nn.Module):
         )
         self.ff_norm = RMSNorm(cfg.view_hidden)
         self.ff = SwiGLU(cfg.view_hidden, cfg.view_ff_mult, cfg.dropout)
-        self.gate = nn.Linear(cfg.view_hidden, 1, bias=False)
-        nn.init.zeros_(self.gate.weight)
-        self.out_proj = nn.Linear(cfg.view_hidden, cfg.state_hidden, bias=False)
+        if self.original_v7_anchor:
+            self.output_projection = nn.Linear(
+                cfg.view_hidden, cfg.state_hidden, bias=False
+            )
+            self.residual_gate = nn.Parameter(torch.ones(()))
+            nn.init.zeros_(self.output_projection.weight)
+        else:
+            self.gate = nn.Linear(cfg.view_hidden, 1, bias=False)
+            nn.init.zeros_(self.gate.weight)
+            self.out_proj = nn.Linear(
+                cfg.view_hidden, cfg.state_hidden, bias=False
+            )
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.view_embed, std=0.02)
-        nn.init.zeros_(self.gate.weight)
+        if self.original_v7_anchor:
+            nn.init.zeros_(self.output_projection.weight)
+            nn.init.ones_(self.residual_gate)
+        else:
+            nn.init.zeros_(self.gate.weight)
 
     def forward(self, tokens: torch.Tensor, view_mask: torch.Tensor) -> torch.Tensor:
         batch, frames, views, patches, _ = tokens.shape
@@ -717,14 +743,25 @@ class MultiViewTokenFuser(nn.Module):
             raise ValueError("view_mask must be [B,T,V]")
         if not bool(view_mask[:, :, 0].all()):
             raise ValueError("every context frame must contain the head anchor view")
-        value = self.in_proj(tokens) + self.view_embed
+        if self.original_v7_anchor:
+            anchor_state = self.anchor_projection(tokens[:, :, 0])
+            value = self.auxiliary_projection(tokens) + self.view_embed
+        else:
+            value = self.in_proj(tokens) + self.view_embed
         anchor = value[:, :, 0].reshape(batch * frames, patches, -1)
         if views == 1:
+            dependency_modules = [self.cross, self.ff]
+            if self.original_v7_anchor:
+                dependency_modules.extend(
+                    [self.auxiliary_projection, self.output_projection]
+                )
             dependency = sum(
                 parameter.reshape(-1)[0] * 0.0
-                for module in (self.cross, self.ff)
+                for module in dependency_modules
                 for parameter in module.parameters()
             )
+            if self.original_v7_anchor:
+                return anchor_state + dependency.to(dtype=anchor_state.dtype)
             fused = anchor + dependency.to(dtype=anchor.dtype)
         else:
             auxiliary = value[:, :, 1:].reshape(
@@ -751,6 +788,11 @@ class MultiViewTokenFuser(nn.Module):
             )
             residual = residual + self.ff(self.ff_norm(residual))
             residual = residual * has_auxiliary[:, None, None].to(residual.dtype)
+            if self.original_v7_anchor:
+                residual = self.output_projection(residual).view(
+                    batch, frames, patches, -1
+                )
+                return anchor_state + torch.tanh(self.residual_gate) * residual
             gate = torch.tanh(self.gate.weight.mean())
             fused = anchor + gate * residual
         return self.out_proj(fused.view(batch, frames, patches, -1))

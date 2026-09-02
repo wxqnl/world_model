@@ -14,7 +14,12 @@ from wm3d.training.runtime_contract import (
     validate_direct_raw_data_closure,
     validate_runtime_profile,
 )
-from wm3d.training.pretrain import _collate_and_trim, _learning_rate
+from wm3d.training.pretrain import (
+    _collate_and_trim,
+    _learning_rate,
+    _training_objective_for_step,
+)
+from wm3d.training.native_objective import NativeObjectiveConfig
 from wm3d.data.step_sampler import ExactSourceSchedule
 
 
@@ -96,6 +101,33 @@ def test_cudnn_benchmark_is_an_optional_boolean_execution_tuning() -> None:
         invalid_value["train"]["cudnn_benchmark"] = invalid
         with pytest.raises(RuntimeContractError, match="cudnn_benchmark"):
             validate_runtime_profile(invalid_value)
+
+
+def test_rgb_decoder_warmup_preserves_non_rgb_objectives() -> None:
+    runtime = copy.deepcopy(_load("h100_8_fsdp2.yaml"))
+    runtime["train"]["rgb_decoder_warmup_steps"] = 5
+    runtime["train"]["checkpoint_steps"] = [6]
+    validate_runtime_profile(runtime)
+
+    objective = NativeObjectiveConfig(
+        token_mse=1.25,
+        action_fine=2.5,
+        rgb_l1=1.2,
+        rgb_perceptual=0.55,
+        rgb_motion_l1=1.0,
+    )
+    warmup = _training_objective_for_step(4, runtime, objective)
+    assert warmup.token_mse == objective.token_mse
+    assert warmup.action_fine == objective.action_fine
+    assert warmup.rgb_l1 == 0.0
+    assert warmup.rgb_perceptual == 0.0
+    assert warmup.rgb_motion_l1 == 0.0
+    assert _training_objective_for_step(5, runtime, objective) is objective
+
+    invalid = copy.deepcopy(runtime)
+    invalid["train"]["checkpoint_steps"] = [5]
+    with pytest.raises(RuntimeContractError, match="follow the RGB decoder warmup"):
+        validate_runtime_profile(invalid)
 
 
 def test_v7_aligned_rgb_warmstart_is_explicit_and_model_only() -> None:

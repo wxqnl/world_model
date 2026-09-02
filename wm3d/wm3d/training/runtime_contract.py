@@ -235,6 +235,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "validation_micro_batch_size",
         "activation_checkpointing",
         "cudnn_benchmark",
+        "rgb_decoder_warmup_steps",
         "rgb_decode_chunk_size",
         "rgb_perceptual_chunk_size",
         "rgb_flow_teacher",
@@ -288,6 +289,31 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         and not isinstance(train["cudnn_benchmark"], bool)
     ):
         raise RuntimeContractError("train.cudnn_benchmark must be boolean")
+    rgb_decoder_warmup_steps = train.get("rgb_decoder_warmup_steps", 0)
+    if (
+        isinstance(rgb_decoder_warmup_steps, bool)
+        or not isinstance(rgb_decoder_warmup_steps, int)
+        or not 0 <= rgb_decoder_warmup_steps < int(train["total_steps"])
+    ):
+        raise RuntimeContractError(
+            "train.rgb_decoder_warmup_steps must be an integer in "
+            "[0, total_steps)"
+        )
+    if rgb_decoder_warmup_steps:
+        checkpoint_steps = train["checkpoint_steps"]
+        if not isinstance(checkpoint_steps, list) or not checkpoint_steps:
+            raise RuntimeContractError(
+                "train.checkpoint_steps must be a non-empty list"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= rgb_decoder_warmup_steps
+            for value in checkpoint_steps
+        ):
+            raise RuntimeContractError(
+                "every checkpoint step must follow the RGB decoder warmup"
+            )
     if (
         "rgb_decode_chunk_size" in train
         and (

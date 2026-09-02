@@ -99,6 +99,45 @@ def test_multiview_fuser_preserves_anchor_and_uses_auxiliary_as_residual() -> No
         fuser(tokens, mask),
     )
 
+    changed_anchor = tokens.clone()
+    changed_anchor[:, :, 0] += 3.0
+    assert not torch.equal(fuser(changed_anchor, mask), fuser(tokens, mask))
+
+    mono_mask = mask.clone()
+    mono_mask[:, :, 1:] = False
+    torch.testing.assert_close(
+        fuser(changed_auxiliary, mono_mask),
+        fuser(tokens, mono_mask),
+    )
+
+
+def test_original_v7_fuser_keeps_raw_anchor_and_zero_init_auxiliary() -> None:
+    cfg = replace(
+        _tiny_config(),
+        rgb_context_enabled=True,
+        rgb_original_v7_context=True,
+    )
+    torch.manual_seed(6)
+    fuser = MultiViewTokenFuser(cfg).eval()
+    tokens = torch.randn(2, cfg.T, cfg.num_views, cfg.P, cfg.token_dim)
+    mask = torch.ones(2, cfg.T, cfg.num_views, dtype=torch.bool)
+
+    baseline = fuser(tokens, mask)
+    torch.testing.assert_close(
+        baseline,
+        fuser.anchor_projection(tokens[:, :, 0]),
+    )
+    changed_auxiliary = tokens.clone()
+    changed_auxiliary[:, :, 1] += 3.0
+    torch.testing.assert_close(fuser(changed_auxiliary, mask), baseline)
+
+    with torch.no_grad():
+        fuser.output_projection.weight.normal_(mean=0.0, std=0.1)
+    assert not torch.equal(
+        fuser(changed_auxiliary, mask),
+        fuser(tokens, mask),
+    )
+
     mono_mask = mask.clone()
     mono_mask[:, :, 1:] = False
     torch.testing.assert_close(
