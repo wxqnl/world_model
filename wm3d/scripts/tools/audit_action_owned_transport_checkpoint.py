@@ -26,6 +26,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from wm3d.data.direct_raw import DIRECT_RAW_DATA_CLOSURE_SCHEMA
+from wm3d.data.step_sampler import StepAddressedBatchSampler
 from wm3d.models.direct_vggt_builder import build_direct_vggt_teacher
 from wm3d.models.model_factory import build_world_model
 from wm3d.models.native_world_model import NativeWorldModel
@@ -63,11 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--source-count", type=int, default=3)
     parser.add_argument("--pair-batch-size", type=int, default=2)
     parser.add_argument("--pairs-per-source", type=int, default=1)
-    parser.add_argument("--max-loader-steps", type=int, default=96)
+    parser.add_argument("--max-loader-steps", type=int, default=4096)
     parser.add_argument("--minimum-distance", type=float)
     return parser.parse_args()
 
@@ -177,6 +179,25 @@ def validate_materialized_k8_batch(batch: Mapping[str, torch.Tensor]) -> None:
     ):
         if name not in batch or batch[name].ndim < 2 or batch[name].shape[1] != expected:
             raise AuditError(f"{name} does not preserve the real K8 horizon")
+
+
+def plan_source_candidate_steps(
+    sampler: StepAddressedBatchSampler,
+    *,
+    max_steps: int,
+    source_count: int,
+) -> dict[str, list[int]]:
+    """Scan deterministic step addresses without reading dataset samples."""
+
+    selected: dict[str, list[int]] = {}
+    for optimizer_step in range(max_steps):
+        source_name = str(sampler.describe_step(optimizer_step)["source_name"])
+        selected.setdefault(source_name, []).append(optimizer_step)
+    if len(selected) < source_count:
+        raise AuditError(
+            f"schedule exposes only {len(selected)} sources in {max_steps} steps"
+        )
+    return selected
 
 
 def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -569,21 +590,30 @@ def main() -> None:
 
     dataset, profile = _build_mixed_dataset(
         config,
-        split="val",
+        split=args.split,
         device=device,
         rank=0,
     )
-    loader = _make_loader(
-        dataset,
-        profile,
-        runtime,
+    address_sampler = StepAddressedBatchSampler(
+        dataset.source_spans,
+        dataset.source_names,
+        {
+            name: profile.source_weights[name]
+            for name in dataset.source_names
+        },
         rank=0,
         world_size=1,
-        start_step=0,
-        num_steps=args.max_loader_steps,
+        start_optimizer_step=0,
+        num_optimizer_steps=args.max_loader_steps,
         seed=seed,
         gradient_accumulation=1,
         micro_batch_size=args.pair_batch_size,
+        source_episode_spans=getattr(dataset, "source_episode_spans", None),
+    )
+    candidate_steps = plan_source_candidate_steps(
+        address_sampler,
+        max_steps=args.max_loader_steps,
+        source_count=args.source_count,
     )
     input_adapter = None
     if config["data_closure"].get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
@@ -602,96 +632,131 @@ def main() -> None:
     motion_threshold = float(
         config["objective_profile"]["objective"]["rgb_motion_threshold"]
     )
-    for loader_step, cpu_batch in enumerate(loader):
-        validate_action_k8_batch(cpu_batch)
-        source_ids = torch.unique(cpu_batch["source_id"])
-        if source_ids.numel() != 1:
-            raise AuditError("step-addressed validation batch mixed sources")
-        source_id = int(source_ids.item())
-        if source_id in completed_sources:
-            continue
-        attempted_sources[source_id] = attempted_sources.get(source_id, 0) + 1
-        _, _, preliminary_valid, _ = build_action_variants(
-            cpu_batch,
-            step=checkpoint_step + loader_step,
-            minimum_distance=minimum_distance,
-        )
-        if not bool(preliminary_valid.any()):
-            continue
-        if input_adapter is not None:
-            cpu_batch = input_adapter.materialize(cpu_batch)
-        validate_materialized_k8_batch(cpu_batch)
-        batch = _batch_to_device(cpu_batch, device)
-        batch = _materialize_rgb_flow_targets(batch, flow_teacher)
-        variants, permutation, valid, distance = build_action_variants(
-            batch,
-            step=checkpoint_step + loader_step,
-            minimum_distance=minimum_distance,
-        )
-        valid_indices = torch.nonzero(valid, as_tuple=False).flatten().tolist()
+    for planned_source, optimizer_steps in candidate_steps.items():
         accepted = 0
-        for index in valid_indices:
-            selected_batches = {
-                label: _single(value, int(index))
-                for label, value in variants.items()
-            }
-            target_batch = selected_batches["normal"]
-            target_context = target_batch["context_rgb"][:, None]
-            target_motion = (
-                target_batch["target_rgb"].float() - target_context.float()
-            ).abs().mean(dim=3, keepdim=True) > motion_threshold
-            target_motion &= target_batch["target_rgb_mask"].bool()
-            if not bool(target_motion.any()):
-                continue
-            outputs = {
-                label: _forward_eval(model, value)
-                for label, value in selected_batches.items()
-            }
-            invariant_noop = _policy_invariants(
-                outputs["normal"], outputs["physical_noop"]
+        for loader_step in optimizer_steps:
+            loader = _make_loader(
+                dataset,
+                profile,
+                runtime,
+                rank=0,
+                world_size=1,
+                start_step=loader_step,
+                num_steps=1,
+                seed=seed,
+                gradient_accumulation=1,
+                micro_batch_size=args.pair_batch_size,
             )
-            invariant_wrong = _policy_invariants(
-                outputs["normal"], outputs["distant_mismatch"]
-            )
-            if not all((*invariant_noop.values(), *invariant_wrong.values())):
-                raise AuditError("future candidate action leaked into policy/action-free")
+            cpu_batch = next(iter(loader))
+            validate_action_k8_batch(cpu_batch)
+            source_ids = torch.unique(cpu_batch["source_id"])
+            if source_ids.numel() != 1:
+                raise AuditError("step-addressed validation batch mixed sources")
+            source_id = int(source_ids.item())
             source_name = str(profile.source_order[source_id])
-            paired_index = int(permutation[int(index)].item())
-            records.append(
-                {
-                    "source_id": source_id,
-                    "source_name": source_name,
-                    "sample_index": int(batch["sample_index"][int(index)].item()),
-                    "paired_sample_index": int(
-                        batch["sample_index"][paired_index].item()
-                    ),
-                    "loader_step": loader_step,
-                    "pair_distance": float(distance[int(index)].item()),
-                    "variants": {
-                        label: variant_metrics(
-                            output,
-                            target_batch,
-                            motion_threshold=motion_threshold,
-                        )
-                        for label, output in outputs.items()
-                    },
-                    "responses": {
-                        label: _response_rms(
-                            outputs["normal"], outputs[label], target_batch
-                        )
-                        for label in ("physical_noop", "distant_mismatch")
-                    },
-                    "invariants": {
-                        "physical_noop": invariant_noop,
-                        "distant_mismatch": invariant_wrong,
-                    },
-                }
+            if source_name != planned_source:
+                raise AuditError("candidate loader did not preserve its planned source")
+            attempted_sources[source_id] = attempted_sources.get(source_id, 0) + 1
+            _, _, preliminary_valid, _ = build_action_variants(
+                cpu_batch,
+                step=checkpoint_step + loader_step,
+                minimum_distance=minimum_distance,
             )
-            accepted += 1
+            if not bool(preliminary_valid.any()):
+                continue
+            if input_adapter is not None:
+                cpu_batch = input_adapter.materialize(cpu_batch)
+            validate_materialized_k8_batch(cpu_batch)
+            batch = _batch_to_device(cpu_batch, device)
+            batch = _materialize_rgb_flow_targets(batch, flow_teacher)
+            variants, permutation, valid, distance = build_action_variants(
+                batch,
+                step=checkpoint_step + loader_step,
+                minimum_distance=minimum_distance,
+            )
+            valid_indices = torch.nonzero(valid, as_tuple=False).flatten().tolist()
+            for index in valid_indices:
+                selected_batches = {
+                    label: _single(value, int(index))
+                    for label, value in variants.items()
+                }
+                target_batch = selected_batches["normal"]
+                target_context = target_batch["context_rgb"][:, None]
+                target_motion = (
+                    target_batch["target_rgb"].float() - target_context.float()
+                ).abs().mean(dim=3, keepdim=True) > motion_threshold
+                target_motion &= target_batch["target_rgb_mask"].bool()
+                if not bool(target_motion.any()):
+                    continue
+                outputs = {
+                    label: _forward_eval(model, value)
+                    for label, value in selected_batches.items()
+                }
+                invariant_noop = _policy_invariants(
+                    outputs["normal"], outputs["physical_noop"]
+                )
+                invariant_wrong = _policy_invariants(
+                    outputs["normal"], outputs["distant_mismatch"]
+                )
+                if not all((*invariant_noop.values(), *invariant_wrong.values())):
+                    raise AuditError(
+                        "future candidate action leaked into policy/action-free"
+                    )
+                paired_index = int(permutation[int(index)].item())
+                records.append(
+                    {
+                        "source_id": source_id,
+                        "source_name": source_name,
+                        "sample_index": int(
+                            batch["sample_index"][int(index)].item()
+                        ),
+                        "paired_sample_index": int(
+                            batch["sample_index"][paired_index].item()
+                        ),
+                        "loader_step": loader_step,
+                        "pair_distance": float(distance[int(index)].item()),
+                        "variants": {
+                            label: variant_metrics(
+                                output,
+                                target_batch,
+                                motion_threshold=motion_threshold,
+                            )
+                            for label, output in outputs.items()
+                        },
+                        "responses": {
+                            label: _response_rms(
+                                outputs["normal"], outputs[label], target_batch
+                            )
+                            for label in ("physical_noop", "distant_mismatch")
+                        },
+                        "invariants": {
+                            "physical_noop": invariant_noop,
+                            "distant_mismatch": invariant_wrong,
+                        },
+                    }
+                )
+                accepted += 1
+                if accepted >= args.pairs_per_source:
+                    break
             if accepted >= args.pairs_per_source:
                 break
-        if accepted:
+        if accepted >= args.pairs_per_source:
             completed_sources.add(source_id)
+            latest = records[-1]
+            print(
+                json.dumps(
+                    {
+                        "progress": "accepted_source",
+                        "source": planned_source,
+                        "sample_index": latest["sample_index"],
+                        "paired_sample_index": latest["paired_sample_index"],
+                        "pair_distance": latest["pair_distance"],
+                        "pairs": accepted,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         if len(completed_sources) >= args.source_count:
             break
 
@@ -710,6 +775,8 @@ def main() -> None:
         "checkpoint_step": checkpoint_step,
         "checkpoint_resume_mode": inspection["resume_mode"],
         "validation_seed": seed,
+        "data_split": args.split,
+        "generalization_evaluation": args.split == "val",
         "minimum_action_distance": minimum_distance,
         "requested_source_count": args.source_count,
         "pair_batch_size": args.pair_batch_size,

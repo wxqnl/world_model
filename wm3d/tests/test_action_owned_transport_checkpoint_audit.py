@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import torch
 
 from scripts.tools import audit_action_owned_transport_checkpoint as audit
@@ -39,6 +41,22 @@ def _action_batch() -> dict[str, torch.Tensor]:
         "action_normalization_offset": offset,
         "action_normalization_scale": scale,
     }
+
+
+def test_cli_defaults_to_val_and_allows_explicit_train(monkeypatch) -> None:
+    base = [
+        "audit",
+        "--runtime",
+        "runtime.yaml",
+        "--checkpoint",
+        "step_00000100",
+        "--output",
+        "receipt.json",
+    ]
+    monkeypatch.setattr(sys, "argv", base)
+    assert audit.parse_args().split == "val"
+    monkeypatch.setattr(sys, "argv", [*base, "--split", "train"])
+    assert audit.parse_args().split == "train"
 
 
 def test_action_variants_use_physical_noop_and_compatible_distant_pair() -> None:
@@ -266,3 +284,45 @@ def test_post_materialization_k8_validation_rejects_missing_targets() -> None:
         assert "target_tokens" in str(error)
     else:
         raise AssertionError("missing materialized targets passed K8 validation")
+
+
+def test_candidate_plan_scans_addresses_without_loading_batches() -> None:
+    class Describer:
+        def __init__(self) -> None:
+            self.sources = ("a", "a", "b", "c", "d", "a", "b", "c")
+            self.calls: list[int] = []
+
+        def describe_step(self, optimizer_step: int) -> dict[str, object]:
+            self.calls.append(optimizer_step)
+            return {"source_name": self.sources[optimizer_step]}
+
+    describer = Describer()
+    result = audit.plan_source_candidate_steps(
+        describer, max_steps=8, source_count=3
+    )
+
+    assert result == {
+        "a": [0, 1, 5],
+        "b": [2, 6],
+        "c": [3, 7],
+        "d": [4],
+    }
+    assert describer.calls == list(range(8))
+
+
+def test_candidate_plan_keeps_fourth_source_if_an_earlier_source_fails() -> None:
+    class Describer:
+        sources = ("no_motion", "valid_b", "valid_c", "valid_d")
+
+        def describe_step(self, optimizer_step: int) -> dict[str, object]:
+            return {"source_name": self.sources[optimizer_step]}
+
+    result = audit.plan_source_candidate_steps(
+        Describer(), max_steps=4, source_count=3
+    )
+    successful = {
+        source for source in result if source != "no_motion"
+    }
+
+    assert tuple(result) == ("no_motion", "valid_b", "valid_c", "valid_d")
+    assert len(successful) == 3
