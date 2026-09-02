@@ -462,6 +462,25 @@ def _clear_rgb_decoder_gradients_during_warmup(
         parameter.grad = None
 
 
+def _rgb_decoder_forward_enabled(
+    step: int,
+    runtime: Mapping[str, Any],
+) -> bool:
+    """Return whether the pixel decoder should execute for this train step.
+
+    The ordinary warmup keeps the full RGB forward for diagnostics. Formal
+    runs may opt into an equivalent compute-only optimization that passes an
+    empty frame list to the already-supported decoder short circuit while all
+    RGB objectives are sealed to zero and RGB parameters are optimizer-frozen.
+    """
+
+    warmup_steps = int(runtime["train"].get("rgb_decoder_warmup_steps", 0))
+    skip_forward = bool(
+        runtime["train"].get("rgb_decoder_warmup_skip_forward", False)
+    )
+    return not (skip_forward and step < warmup_steps)
+
+
 def _batch_to_device(batch: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
     return {
         name: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
@@ -596,12 +615,13 @@ def _forward(
     *,
     appearance_teacher_ratio: float = 0.0,
     compute_zero_action_control: bool = False,
+    decode_rgb: bool = True,
 ) -> Mapping[str, torch.Tensor]:
     indices = batch["rgb_frame_indices"]
     if indices.ndim != 2 or not bool((indices == indices[:1]).all()):
         raise PretrainError("RGB supervision indices drifted within a batch")
     kwargs = {name: batch[name] for name in _MODEL_INPUTS}
-    kwargs["rgb_frame_indices"] = indices[0].tolist()
+    kwargs["rgb_frame_indices"] = indices[0].tolist() if decode_rgb else ()
     kwargs["world_times_s"] = _relative_world_times_for_model(
         kwargs["world_times_s"],
         context_length=int(kwargs["world_tokens"].shape[1]),
@@ -810,7 +830,9 @@ def _forward_with_action_counterfactual(
     objective: Any,
     step: int | None = None,
     diagnostic_force_context_pixel_action: bool = False,
+    decode_rgb: bool = True,
 ) -> Mapping[str, torch.Tensor]:
+    rgb_kwargs = {} if decode_rgb else {"decode_rgb": False}
     output = dict(
         _forward(
             model,
@@ -819,6 +841,7 @@ def _forward_with_action_counterfactual(
             compute_zero_action_control=(
                 objective.action_counterfactual_token_advantage > 0.0
             ),
+            **rgb_kwargs,
         )
     )
     if not _action_counterfactual_enabled(objective):
@@ -832,6 +855,7 @@ def _forward_with_action_counterfactual(
                 model,
                 _zero_future_factual_action(batch),
                 appearance_teacher_ratio=appearance_teacher_ratio,
+                **rgb_kwargs,
             )
         output["zero_action_rgb"] = zero_output["rgb"].detach()
     rank_weight, separation_weight = _scheduled_context_pixel_action_weights(
@@ -881,6 +905,7 @@ def _forward_with_action_counterfactual(
             model,
             selected_wrong,
             appearance_teacher_ratio=appearance_teacher_ratio,
+            **rgb_kwargs,
         )
         output["shuffled_action_rgb"] = wrong_output["rgb"]
         output["shuffled_action_indices"] = selected_indices
@@ -1773,6 +1798,7 @@ def main() -> None:
             training_objective = _training_objective_for_step(
                 step, runtime, objective
             )
+            decode_rgb = _rgb_decoder_forward_enabled(step, runtime)
             for group in optimizer.param_groups:
                 group["lr"] = lr
             accumulated: dict[str, torch.Tensor] = {}
@@ -1821,6 +1847,7 @@ def main() -> None:
                                 ),
                                 objective=training_objective,
                                 step=step,
+                                decode_rgb=decode_rgb,
                             ),
                             batch=batch,
                             config=training_objective,
@@ -1885,6 +1912,7 @@ def main() -> None:
                         "rgb_decoder_warmup_active": (
                             step < rgb_decoder_warmup_steps
                         ),
+                        "rgb_decoder_forward_skipped": not decode_rgb,
                         "seconds_per_log_interval": time.monotonic() - last_log,
                         **metrics,
                     }

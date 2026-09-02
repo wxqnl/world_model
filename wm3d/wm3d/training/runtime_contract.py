@@ -236,6 +236,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "activation_checkpointing",
         "cudnn_benchmark",
         "rgb_decoder_warmup_steps",
+        "rgb_decoder_warmup_skip_forward",
         "rgb_decode_chunk_size",
         "rgb_perceptual_chunk_size",
         "rgb_flow_teacher",
@@ -298,6 +299,18 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError(
             "train.rgb_decoder_warmup_steps must be an integer in "
             "[0, total_steps)"
+        )
+    rgb_decoder_warmup_skip_forward = train.get(
+        "rgb_decoder_warmup_skip_forward", False
+    )
+    if not isinstance(rgb_decoder_warmup_skip_forward, bool):
+        raise RuntimeContractError(
+            "train.rgb_decoder_warmup_skip_forward must be boolean"
+        )
+    if rgb_decoder_warmup_skip_forward and rgb_decoder_warmup_steps == 0:
+        raise RuntimeContractError(
+            "train.rgb_decoder_warmup_skip_forward requires a positive "
+            "rgb_decoder_warmup_steps"
         )
     if rgb_decoder_warmup_steps:
         checkpoint_steps = train["checkpoint_steps"]

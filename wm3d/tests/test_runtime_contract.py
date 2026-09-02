@@ -18,6 +18,7 @@ from wm3d.training.pretrain import (
     _clear_rgb_decoder_gradients_during_warmup,
     _collate_and_trim,
     _learning_rate,
+    _rgb_decoder_forward_enabled,
     _training_objective_for_step,
 )
 from wm3d.training.native_objective import NativeObjectiveConfig
@@ -130,6 +131,31 @@ def test_rgb_decoder_warmup_preserves_non_rgb_objectives() -> None:
     invalid["train"]["checkpoint_steps"] = [5]
     with pytest.raises(RuntimeContractError, match="follow the RGB decoder warmup"):
         validate_runtime_profile(invalid)
+
+
+def test_rgb_decoder_warmup_forward_skip_is_explicit_and_bounded() -> None:
+    runtime = copy.deepcopy(_load("h100_8_fsdp2.yaml"))
+    runtime["train"]["rgb_decoder_warmup_steps"] = 5
+    runtime["train"]["rgb_decoder_warmup_skip_forward"] = True
+    runtime["train"]["checkpoint_steps"] = [6]
+    validate_runtime_profile(runtime)
+
+    assert not _rgb_decoder_forward_enabled(4, runtime)
+    assert _rgb_decoder_forward_enabled(5, runtime)
+
+    disabled = copy.deepcopy(runtime)
+    disabled["train"]["rgb_decoder_warmup_skip_forward"] = False
+    assert _rgb_decoder_forward_enabled(4, disabled)
+
+    invalid_type = copy.deepcopy(runtime)
+    invalid_type["train"]["rgb_decoder_warmup_skip_forward"] = 1
+    with pytest.raises(RuntimeContractError, match="must be boolean"):
+        validate_runtime_profile(invalid_type)
+
+    missing_warmup = copy.deepcopy(runtime)
+    missing_warmup["train"]["rgb_decoder_warmup_steps"] = 0
+    with pytest.raises(RuntimeContractError, match="requires a positive"):
+        validate_runtime_profile(missing_warmup)
 
 
 def test_rgb_decoder_warmup_prevents_adamw_decay_and_step_aging() -> None:

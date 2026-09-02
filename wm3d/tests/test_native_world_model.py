@@ -273,6 +273,36 @@ def test_one_core_handles_bimanual_nonuniform_state_and_action_times() -> None:
     assert torch.all((output["policy_action"][output["policy_gripper_mask"]] <= 1))
 
 
+def test_empty_rgb_frame_list_skips_decoder_without_changing_other_outputs() -> None:
+    cfg = _tiny_config()
+    model = NativeWorldModel(cfg).eval()
+    batch = _batch(cfg)
+    image_decoder_calls = 0
+
+    def count_image_decoder_calls(_module, _inputs, _output) -> None:
+        nonlocal image_decoder_calls
+        image_decoder_calls += 1
+
+    handle = model.rgb_head.image_decoder.register_forward_hook(
+        count_image_decoder_calls
+    )
+    try:
+        full = model(**batch)
+        calls_after_full = image_decoder_calls
+        skipped = model(**batch, rgb_frame_indices=())
+    finally:
+        handle.remove()
+
+    assert calls_after_full > 0
+    assert image_decoder_calls == calls_after_full
+    assert skipped["rgb"].numel() == 0
+    assert tuple(skipped["rgb_frame_indices"].shape) == (0,)
+    for name, value in full.items():
+        if name.startswith("rgb"):
+            continue
+        torch.testing.assert_close(skipped[name], value, rtol=0.0, atol=0.0)
+
+
 def test_policy_only_needs_no_future_candidate_and_is_future_invariant() -> None:
     cfg = replace(
         _tiny_config(),
