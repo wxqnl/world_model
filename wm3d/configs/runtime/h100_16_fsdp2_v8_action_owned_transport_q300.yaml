@@ -1,0 +1,68 @@
+schema: wm3d_v8_runtime_profile_v1
+name: h100_16_fsdp2_v8_action_owned_transport_q300
+expected_world_size: 16
+distributed:
+  strategy: fsdp2
+  initialization: meta_sharded
+  shard_degree: 8
+  param_dtype: bf16
+  reduce_dtype: fp32
+  output_dtype: bf16
+  reshard_after_forward: false
+  find_unused_parameters: false
+  broadcast_buffers: false
+  timeout_minutes: 30
+train:
+  # RAFT target construction is qualification-only and memory intensive.
+  # Sampling and source weights are unchanged; only the global batch is 128.
+  micro_batch_size: 8
+  validation_micro_batch_size: 1
+  gradient_accumulation: 1
+  global_batch_size: 128
+  # Preserve the production 500-step LR warmup; qualification stops via CLI
+  # immediately after the step-300 checkpoint.
+  total_steps: 501
+  seed: 3407
+  validation_seed: 7340
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
+  gradient_clip: 1.0
+  log_every: 10
+  validate_every: 100
+  validation_steps: 5
+  checkpoint_interval: 5000
+  checkpoint_steps: [20, 100, 300]
+  activation_checkpointing: true
+  rgb_decode_chunk_size: 16
+  rgb_perceptual_chunk_size: 8
+  rgb_flow_teacher:
+    source_root: /data/Minko/external/WorldArena/video_quality/WorldArena/third_party/RAFT
+    checkpoint: /data/Minko/models/worldarena_v1/raft/RAFT/models/raft-things.pth
+    input_size: 128
+    iterations: 12
+    output_grid: 32
+    batch_chunk: 32
+    flow_max_pixels: 128.0
+    consistency_relative: 0.01
+    consistency_absolute: 0.5
+  appearance_teacher_start_ratio: 0.0
+  appearance_teacher_end_ratio: 0.0
+  appearance_teacher_decay_steps: 1
+  appearance_teacher0_every_steps: 2
+  appearance_validation_three_way: false
+optimizer:
+  name: adamw
+  start_lr: 0.000001
+  peak_lr: 0.00001
+  min_lr: 0.000001
+  betas: [0.9, 0.95]
+  eps: 0.00000001
+  weight_decay: 0.02
+schedule:
+  name: warmup_stable_cosine
+  warmup_steps: 500
+  stable_fraction: 0.8
+checkpoint:
+  allow_topology_reshard: false
+  async_save: false
