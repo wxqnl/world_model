@@ -25,6 +25,8 @@ from wm3d.models.native_world_model import (
     OriginalV7RGBActionAdapter,
     OriginalV7FactualDecoderLayer,
     StateActionBridge,
+    normalized_physical_noop_action,
+    normalized_physical_zero_action,
     _warp_rgb_feature_with_pixel_flow,
 )
 from wm3d.models.model_factory import build_world_model
@@ -671,7 +673,7 @@ def test_policy_calibration_is_exact_identity_at_initialization() -> None:
         torch.testing.assert_close(baseline[name], conditioned[name], rtol=0, atol=0)
 
 
-def test_learned_policy_calibration_changes_only_policy_coordinates() -> None:
+def test_learned_state_calibration_changes_only_policy_coordinates() -> None:
     cfg = replace(_tiny_config(), policy_calibration_conditioning=True)
     model = NativeWorldModel(cfg).eval()
     assert model.policy_calibration is not None
@@ -681,12 +683,6 @@ def test_learned_policy_calibration_changes_only_policy_coordinates() -> None:
     batch = _batch(cfg)
     baseline = model(**batch)
     changed = dict(batch)
-    action_offset = batch["action_normalization_offset"].clone()
-    action_scale = batch["action_normalization_scale"].clone()
-    action_offset[..., :6] += 0.25
-    action_scale[..., :6] *= 3.0
-    changed["action_normalization_offset"] = action_offset
-    changed["action_normalization_scale"] = action_scale
     state_offset = batch["state_normalization_offset"].clone()
     state_scale = batch["state_normalization_scale"].clone()
     state_offset[..., :9] -= 0.5
@@ -1557,13 +1553,15 @@ def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:
         2, cfg.num_views, dtype=torch.bool
     )
     output = model(**batch)
-    output["rgb"].float().mean().backward()
+    (
+        output["rgb"].float().mean()
+        + output["rgb_motion_logit"].float().mean()
+    ).backward()
     for parameter in (
         decoder.token_proj[0].weight,
         decoder.action_proj[0].weight,
         decoder.task_proj[1].weight,
         decoder.flow_head.weight,
-        decoder.residual_head.weight,
         decoder.motion_head.weight,
     ):
         assert parameter.grad is not None
@@ -1571,7 +1569,7 @@ def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:
         assert parameter.grad.abs().sum() > 0
 
 
-def test_action_owned_transport_motion_gate_cannot_restore_raw_context() -> None:
+def test_action_owned_transport_flow_is_not_attenuated_by_motion_gate() -> None:
     cfg = replace(
         _tiny_action_owned_transport_config(),
         rgb_v7_high_frequency_refiner=False,
@@ -1583,21 +1581,27 @@ def test_action_owned_transport_motion_gate_cannot_restore_raw_context() -> None
         decoder.flow_head.bias[0] = torch.atanh(
             torch.tensor(4.0 / (0.5 * float(cfg.rgb_size)))
         )
-        decoder.residual_head.weight.zero_()
-        residual_value = 0.05
-        decoder.residual_head.bias.fill_(
-            torch.atanh(
-                torch.tensor(residual_value / cfg.rgb_context_residual_scale)
-            )
-        )
         decoder.motion_head.weight.zero_()
-        decoder.motion_head.bias.zero_()
+        decoder.motion_head.bias.fill_(-100.0)
+
+    assert not hasattr(decoder, "residual_head")
 
     horizontal = torch.linspace(0.0, 1.0, cfg.rgb_size).square().view(
         1, 1, 1, cfg.rgb_size
     )
     context = horizontal.expand(1, 3, cfg.rgb_size, -1).contiguous()
-    rgb, _, motion, flow, _ = decoder(
+    rgb_low_motion, _, motion, flow_low_motion, _ = decoder(
+        torch.zeros(1, cfg.P, cfg.token_dim),
+        torch.zeros(1, cfg.rgb_hidden, 1, 1),
+        None,
+        None,
+        torch.zeros(1, 7),
+        torch.zeros(1, cfg.task_dim),
+        context,
+    )
+    with torch.no_grad():
+        decoder.motion_head.bias.fill_(100.0)
+    rgb_high_motion, _, _, flow_high_motion, _ = decoder(
         torch.zeros(1, cfg.P, cfg.token_dim),
         torch.zeros(1, cfg.rgb_hidden, 1, 1),
         None,
@@ -1607,20 +1611,60 @@ def test_action_owned_transport_motion_gate_cannot_restore_raw_context() -> None
         context,
     )
 
-    torch.testing.assert_close(motion, torch.full_like(motion, 0.5))
-    assert float(flow[:, 0].mean()) > 1.9
+    assert float(motion.max()) < 1.0e-6
+    assert float(flow_low_motion[:, 0].mean()) > 3.9
+    torch.testing.assert_close(flow_low_motion, flow_high_motion, rtol=0, atol=0)
+    torch.testing.assert_close(rgb_low_motion, rgb_high_motion, rtol=0, atol=0)
     expected, _ = _warp_rgb_feature_with_pixel_flow(
         context,
-        flow,
+        flow_low_motion,
         image_height=cfg.rgb_size,
         image_width=cfg.rgb_size,
     )
-    # The output must be transport plus a residual gated only by the supervised
-    # motion support. Neither a raw-context blend nor model-controlled
-    # out-of-bounds flow may open a larger redraw path.
-    expected = torch.clamp(expected + 0.5 * residual_value, 0.0, 1.0)
-    torch.testing.assert_close(rgb, expected, rtol=0, atol=1.0e-6)
-    assert not torch.allclose(rgb, context, rtol=0, atol=1.0e-5)
+    # RGB is exactly the transported context when the zero-initialized
+    # high-frequency refiner is disabled.  Motion logits cannot open a redraw
+    # path or suppress the applied flow.
+    torch.testing.assert_close(rgb_low_motion, expected, rtol=0, atol=1.0e-6)
+    assert not torch.allclose(rgb_low_motion, context, rtol=0, atol=1.0e-5)
+
+
+def test_action_owned_transport_closed_motion_keeps_flow_gradient_and_identity() -> None:
+    cfg = replace(
+        _tiny_action_owned_transport_config(),
+        rgb_v7_high_frequency_refiner=False,
+    )
+    decoder = NativeActionOwnedTransportRGBImageDecoder(cfg).train()
+    with torch.no_grad():
+        decoder.flow_head.weight.zero_()
+        decoder.flow_head.bias.zero_()
+        decoder.motion_head.weight.zero_()
+        decoder.motion_head.bias.fill_(-100.0)
+    context = torch.rand(1, 3, cfg.rgb_size, cfg.rgb_size)
+    inputs = (
+        torch.randn(1, cfg.P, cfg.token_dim),
+        torch.zeros(1, cfg.rgb_hidden, 1, 1),
+        None,
+        None,
+        torch.randn(1, 7),
+        torch.randn(1, cfg.task_dim),
+        context,
+    )
+    identity_rgb, _, _, identity_flow, _ = decoder(*inputs)
+    torch.testing.assert_close(identity_flow, torch.zeros_like(identity_flow))
+    torch.testing.assert_close(identity_rgb, context, rtol=0, atol=5.0e-6)
+
+    with torch.no_grad():
+        decoder.flow_head.weight.normal_(std=1.0e-3)
+    decoder.zero_grad(set_to_none=True)
+    moved_rgb, _, motion, moved_flow, _ = decoder(*inputs)
+    moved_rgb.float().square().mean().backward()
+    assert float(motion.max()) < 1.0e-6
+    assert moved_flow.abs().sum() > 0
+    assert decoder.flow_head.weight.grad is not None
+    assert torch.isfinite(decoder.flow_head.weight.grad).all()
+    assert decoder.flow_head.weight.grad.abs().sum() > 0
+    # RGB no longer depends on the auxiliary motion head.
+    assert decoder.motion_head.weight.grad is None
 
 
 def test_action_owned_transport_supports_non_power_of_two_rgb_size() -> None:
@@ -1881,6 +1925,191 @@ def test_canonical_v7_adapter_keeps_multi_group_factual_contract() -> None:
             normalization_offset=offset,
             normalization_scale=scale,
         )
+
+
+def test_canonical_action_adapter_returns_source_independent_physical_units() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    adapter = OriginalV7RGBActionAdapter(cfg)
+    batch = 1
+    fine = torch.zeros(
+        batch,
+        cfg.K,
+        cfg.max_action_groups,
+        cfg.max_action_substeps,
+        cfg.max_action_dim,
+    )
+    fine_mask = torch.zeros_like(fine, dtype=torch.bool)
+    fine_sample_mask = torch.zeros(fine.shape[:-1], dtype=torch.bool)
+    coarse = torch.zeros(batch, cfg.K, cfg.max_action_groups, cfg.max_action_dim)
+    coarse_mask = torch.zeros_like(coarse, dtype=torch.bool)
+    offset = torch.zeros(batch, cfg.max_action_groups, cfg.max_action_dim)
+    scale = torch.ones_like(offset)
+    offset[0, 0] = torch.tensor([0.01, -0.02, 0.03, 0.04, -0.05, 0.06, 0.0])
+    scale[0, 0] = torch.tensor([0.5, 0.25, 2.0, 0.2, 0.4, 0.5, 1.0])
+
+    fine_physical = torch.tensor(
+        [
+            [0.010, 0.020, -0.030, 0.0, 0.0, 0.10, 0.0],
+            [-0.004, 0.006, 0.012, 0.0, 0.0, 0.20, 0.37],
+        ]
+    )
+    fine[0, 0, 0, :2] = (
+        fine_physical - offset[0, 0]
+    ) / scale[0, 0]
+    fine_mask[0, 0, 0, :2] = True
+    fine_sample_mask[0, 0, 0, :2] = True
+
+    coarse_physical = torch.tensor(
+        [-0.03, 0.04, 0.05, 0.07, -0.08, 0.09, 0.23]
+    )
+    coarse[0, 1, 0] = (coarse_physical - offset[0, 0]) / scale[0, 0]
+    coarse_mask[0, 1, 0] = True
+
+    semantics = torch.tensor(
+        [
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["absolute_gripper_close01"],
+        ],
+        dtype=torch.long,
+    )
+    semantic_ids = torch.zeros_like(offset, dtype=torch.long)
+    semantic_ids[0, 0] = semantics
+    group_mask = torch.tensor([[True, False]])
+
+    action = adapter(
+        fine_values=fine,
+        fine_dim_mask=fine_mask,
+        fine_sample_mask=fine_sample_mask,
+        coarse_values=coarse,
+        coarse_dim_mask=coarse_mask,
+        action_semantic_ids=semantic_ids,
+        group_mask=group_mask,
+        normalization_offset=offset,
+        normalization_scale=scale,
+    )
+    expected_fine = torch.tensor(
+        [0.006, 0.026, -0.018, 0.0, 0.0, 0.30, 0.37]
+    )
+    torch.testing.assert_close(action[0, 0], expected_fine, atol=1.0e-5, rtol=0)
+    torch.testing.assert_close(action[0, 1], coarse_physical, atol=1.0e-6, rtol=0)
+
+    zero_fine = normalized_physical_noop_action(
+        fine, fine_mask, semantic_ids, offset, scale, group_axis=2
+    )
+    zero_coarse = normalized_physical_noop_action(
+        coarse, coarse_mask, semantic_ids, offset, scale, group_axis=2
+    )
+    zero_action = adapter(
+        fine_values=zero_fine,
+        fine_dim_mask=fine_mask,
+        fine_sample_mask=fine_sample_mask,
+        coarse_values=zero_coarse,
+        coarse_dim_mask=coarse_mask,
+        action_semantic_ids=semantic_ids,
+        group_mask=group_mask,
+        normalization_offset=offset,
+        normalization_scale=scale,
+    )
+    expected_noop = torch.zeros_like(zero_action)
+    expected_noop[0, 0, 6] = 0.37
+    expected_noop[0, 1, 6] = 0.23
+    torch.testing.assert_close(zero_action, expected_noop)
+
+    numeric_zero = adapter(
+        fine_values=normalized_physical_zero_action(
+            fine, fine_mask, semantic_ids, offset, scale, group_axis=2
+        ),
+        fine_dim_mask=fine_mask,
+        fine_sample_mask=fine_sample_mask,
+        coarse_values=normalized_physical_zero_action(
+            coarse, coarse_mask, semantic_ids, offset, scale, group_axis=2
+        ),
+        coarse_dim_mask=coarse_mask,
+        action_semantic_ids=semantic_ids,
+        group_mask=group_mask,
+        normalization_offset=offset,
+        normalization_scale=scale,
+    )
+    torch.testing.assert_close(numeric_zero, torch.zeros_like(numeric_zero))
+
+
+def test_canonical_action_is_equal_across_different_source_normalizers() -> None:
+    cfg = _tiny_original_v7_rgb_config()
+    adapter = OriginalV7RGBActionAdapter(cfg)
+    batch = 2
+    physical = torch.tensor([0.02, -0.03, 0.04, 0.10, -0.15, 0.20, 0.35])
+    offset = torch.zeros(batch, cfg.max_action_groups, cfg.max_action_dim)
+    scale = torch.ones_like(offset)
+    offset[0, 0] = torch.tensor([0.01, -0.02, 0.03, 0.04, 0.05, -0.06, 0.0])
+    scale[0, 0] = torch.tensor([0.002, 0.003, 0.004, 0.02, 0.03, 0.04, 1.0])
+    offset[1, 0] = torch.tensor([-0.20, 0.30, -0.40, -0.10, 0.20, 0.30, 0.0])
+    scale[1, 0] = torch.tensor([0.02, 0.03, 0.04, 0.20, 0.30, 0.40, 1.0])
+    coarse = torch.zeros(batch, cfg.K, cfg.max_action_groups, cfg.max_action_dim)
+    coarse_mask = torch.zeros_like(coarse, dtype=torch.bool)
+    coarse[:, :, 0] = (
+        physical[None, None] - offset[:, None, 0]
+    ) / scale[:, None, 0]
+    coarse_mask[:, :, 0] = True
+    fine = torch.zeros(
+        batch,
+        cfg.K,
+        cfg.max_action_groups,
+        cfg.max_action_substeps,
+        cfg.max_action_dim,
+    )
+    fine_mask = torch.zeros_like(fine, dtype=torch.bool)
+    fine_sample_mask = torch.zeros(fine.shape[:-1], dtype=torch.bool)
+    semantics = torch.tensor(
+        [
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["absolute_gripper_close01"],
+        ],
+        dtype=torch.long,
+    )
+    semantic_ids = torch.zeros_like(offset, dtype=torch.long)
+    semantic_ids[:, 0] = semantics
+    group_mask = torch.tensor([[True, False], [True, False]])
+    action = adapter(
+        fine_values=fine,
+        fine_dim_mask=fine_mask,
+        fine_sample_mask=fine_sample_mask,
+        coarse_values=coarse,
+        coarse_dim_mask=coarse_mask,
+        action_semantic_ids=semantic_ids,
+        group_mask=group_mask,
+        normalization_offset=offset,
+        normalization_scale=scale,
+    )
+    expected = physical.view(1, 1, 7).expand(batch, cfg.K, -1)
+    torch.testing.assert_close(action, expected, atol=1.0e-6, rtol=0)
+
+    noop_coarse = normalized_physical_noop_action(
+        coarse, coarse_mask, semantic_ids, offset, scale, group_axis=2
+    )
+    noop = adapter(
+        fine_values=fine,
+        fine_dim_mask=fine_mask,
+        fine_sample_mask=fine_sample_mask,
+        coarse_values=noop_coarse,
+        coarse_dim_mask=coarse_mask,
+        action_semantic_ids=semantic_ids,
+        group_mask=group_mask,
+        normalization_offset=offset,
+        normalization_scale=scale,
+    )
+    expected_noop = torch.zeros_like(noop)
+    expected_noop[..., 6] = 0.35
+    torch.testing.assert_close(noop, expected_noop, atol=1.0e-6, rtol=0)
 
 
 def test_multi_group_factual_query_uses_group_aware_post_block_action() -> None:

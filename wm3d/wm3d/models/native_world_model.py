@@ -2648,14 +2648,111 @@ class _ZeroProjection(nn.Conv2d):
             nn.init.zeros_(self.bias)
 
 
-class OriginalV7RGBActionAdapter(nn.Module):
-    """Recover the exact seven-dimensional command consumed by V7 RGB.
+def normalized_physical_noop_action(
+    values: torch.Tensor,
+    dim_mask: torch.Tensor,
+    action_semantic_ids: torch.Tensor,
+    normalization_offset: torch.Tensor,
+    normalization_scale: torch.Tensor,
+    *,
+    group_axis: int,
+) -> torch.Tensor:
+    """Encode a physical no-op control in a source-normalized tensor.
 
-    V8 retains source-rate, masked, normalized and grouped action tensors. The
-    original V7 renderer consumed one per-horizon
-    [dx,dy,dz,rx,ry,rz,close01] command, not a pooled hidden representation.
-    This parameter-free adapter composes the unique canonical arm group into
-    that proven ABI. Other groups remain available to factual P64 and policy.
+    Dataset tensors use ``(physical - offset) / scale``.  Filling those tensors
+    with numeric zero therefore means the source mean, not a physical no-op.
+    Counterfactual controls must use this helper so that incremental motion
+    means zero metres/radians/rates for every source.  Absolute gripper,
+    absolute joint and opaque controller channels are preserved: numeric zero
+    is not a meaningful no-op for those semantics.
+    """
+
+    if values.shape != dim_mask.shape or dim_mask.dtype != torch.bool:
+        raise ValueError("physical-noop values and masks must align")
+    group_axis = int(group_axis) % values.ndim
+    expected_stats = (values.shape[0], values.shape[group_axis], values.shape[-1])
+    if (
+        tuple(action_semantic_ids.shape) != expected_stats
+        or tuple(normalization_offset.shape) != expected_stats
+        or normalization_scale.shape != normalization_offset.shape
+        or not bool(torch.isfinite(normalization_offset).all())
+        or not bool(torch.isfinite(normalization_scale).all())
+        or bool((normalization_scale <= 0).any())
+    ):
+        raise ValueError("physical-noop normalization statistics are invalid")
+    broadcast = [1] * values.ndim
+    broadcast[0] = values.shape[0]
+    broadcast[group_axis] = values.shape[group_axis]
+    broadcast[-1] = values.shape[-1]
+    offset = normalization_offset.to(dtype=values.dtype).reshape(broadcast)
+    scale = normalization_scale.to(dtype=values.dtype).reshape(broadcast)
+    encoded_zero = -offset / scale
+    zeroable_ids = torch.as_tensor(
+        (
+            ACTION_SEMANTIC_IDS["delta_position_m"],
+            ACTION_SEMANTIC_IDS["delta_rotation_axis_angle_rad"],
+            ACTION_SEMANTIC_IDS["joint_delta_rad"],
+            ACTION_SEMANTIC_IDS["base_velocity_mps"],
+            ACTION_SEMANTIC_IDS["base_yaw_rate_rps"],
+            ACTION_SEMANTIC_IDS["joint_velocity_rps"],
+        ),
+        dtype=action_semantic_ids.dtype,
+        device=action_semantic_ids.device,
+    )
+    zeroable = action_semantic_ids[..., None].eq(zeroable_ids).any(dim=-1)
+    semantic_shape = [1] * values.ndim
+    semantic_shape[0] = values.shape[0]
+    semantic_shape[group_axis] = values.shape[group_axis]
+    semantic_shape[-1] = values.shape[-1]
+    zeroable = zeroable.reshape(semantic_shape)
+    preserved = torch.where(dim_mask, values, torch.zeros_like(values))
+    return torch.where(dim_mask & zeroable, encoded_zero, preserved)
+
+
+def normalized_physical_zero_action(
+    values: torch.Tensor,
+    dim_mask: torch.Tensor,
+    action_semantic_ids: torch.Tensor,
+    normalization_offset: torch.Tensor,
+    normalization_scale: torch.Tensor,
+    *,
+    group_axis: int,
+) -> torch.Tensor:
+    """Encode numeric physical zero for every valid action dimension.
+
+    This is the model-internal counterfactual anchor.  Unlike the pose no-op
+    helper above, it also maps absolute/binary channels to physical zero so
+    factual gripper or controller values remain observable after centering.
+    """
+
+    # Reuse all shape/statistics validation from the no-op helper.
+    normalized_physical_noop_action(
+        values,
+        dim_mask,
+        action_semantic_ids,
+        normalization_offset,
+        normalization_scale,
+        group_axis=group_axis,
+    )
+    group_axis = int(group_axis) % values.ndim
+    broadcast = [1] * values.ndim
+    broadcast[0] = values.shape[0]
+    broadcast[group_axis] = values.shape[group_axis]
+    broadcast[-1] = values.shape[-1]
+    offset = normalization_offset.to(dtype=values.dtype).reshape(broadcast)
+    scale = normalization_scale.to(dtype=values.dtype).reshape(broadcast)
+    return torch.where(dim_mask, -offset / scale, torch.zeros_like(values))
+
+
+class OriginalV7RGBActionAdapter(nn.Module):
+    """Compose source-normalized commands into one physical Kx7 action ABI.
+
+    The input retains source-rate, masked, normalized and grouped tensors.  The
+    output is source-independent physical motion:
+    ``[metres, base-frame SO(3) rotvec radians, absolute close01]``.  Fine
+    controller substeps are de-normalized before translation summation and
+    rotation composition; coarse effects are de-normalized once.  This keeps
+    identical physical commands identical across data sources.
     """
 
     _EXPECTED_SEMANTICS = (
@@ -2769,30 +2866,19 @@ class OriginalV7RGBActionAdapter(nn.Module):
                 "every canonical V7 arm group/horizon requires a real command"
             )
 
-        translation = (
-            fine[..., :3] * fine_valid[..., :3].to(dtype=fine.dtype)
-        ).sum(dim=3)
-        physical_rotation = torch.where(
-            fine_valid[..., 3:6],
-            fine[..., 3:6] * scale[:, None, :, None, 3:6]
-            + offset[:, None, :, None, 3:6],
-            torch.zeros_like(fine[..., 3:6]),
+        fine_offset = offset[:, None, :, None, :7].to(dtype=fine.dtype)
+        fine_scale = scale[:, None, :, None, :7].to(dtype=fine.dtype)
+        physical_fine = torch.where(
+            fine_valid,
+            fine[..., :7] * fine_scale + fine_offset,
+            torch.zeros_like(fine[..., :7]),
         )
-        zero_rotation = torch.where(
-            fine_valid[..., 3:6],
-            offset[:, None, :, None, 3:6].expand_as(fine[..., 3:6]),
-            torch.zeros_like(fine[..., 3:6]),
-        )
+        translation = physical_fine[..., :3].sum(dim=3)
+        physical_rotation = physical_fine[..., 3:6]
         rotation_valid = fine_valid[..., 3:6].any(dim=-1)
         rotation, rotation_present = compose_axis_angle_sequence(
             physical_rotation, rotation_valid, left_multiply=True
         )
-        zero_rotation, zero_rotation_present = compose_axis_angle_sequence(
-            zero_rotation, rotation_valid, left_multiply=True
-        )
-        if not torch.equal(rotation_present, zero_rotation_present):
-            raise RuntimeError("V7 RGB factual/zero rotation masks differ")
-        rotation = (rotation - zero_rotation) / scale[:, None, :, 3:6]
         rotation = rotation * rotation_present[..., None].to(rotation.dtype)
 
         substeps = fine.shape[3]
@@ -2801,17 +2887,21 @@ class OriginalV7RGBActionAdapter(nn.Module):
         ).view(1, 1, 1, substeps)
         grip_valid = fine_valid[..., 6]
         last_index = torch.where(grip_valid, substep_index, -1).amax(dim=3)
-        grip = fine[..., 6].gather(3, last_index.clamp_min(0).unsqueeze(3))
+        grip = physical_fine[..., 6].gather(
+            3, last_index.clamp_min(0).unsqueeze(3)
+        )
         grip = grip.squeeze(3)
         grip = torch.where(last_index >= 0, grip, torch.zeros_like(grip))
         fine_action = torch.cat(
-            (translation, rotation, (grip > 0.5).to(dtype=fine.dtype)[..., None]),
+            (translation, rotation, grip[..., None]),
             dim=-1,
         )
 
-        coarse_action = coarse[..., :7].clone()
-        coarse_action[..., 6] = (coarse_action[..., 6] > 0.5).to(
-            dtype=coarse_action.dtype
+        coarse_action = torch.where(
+            coarse_mask,
+            coarse[..., :7] * scale[:, None, :, :7].to(dtype=coarse.dtype)
+            + offset[:, None, :, :7].to(dtype=coarse.dtype),
+            torch.zeros_like(coarse[..., :7]),
         )
         grouped_action = torch.where(
             fine_present[..., None], fine_action, coarse_action
@@ -2951,10 +3041,11 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
 
     The observed image is an appearance carrier, not a future-state input.  It
     reaches every output pixel only through a backward flow predicted from the
-    factual future state.  The separately supervised change mask gates only a
-    bounded redraw correction for changed or newly visible pixels; it cannot
-    select an unwarped copy of the current image.  Static identity is therefore
-    represented by zero flow, not by a copy-last bypass.
+    factual future state.  The separately supervised change mask is auxiliary
+    and cannot attenuate that flow.  There is no full-frequency redraw path;
+    the optional bounded zero-DC refiner can add only high-frequency detail.
+    Static identity is therefore represented by zero flow rather than by a
+    copy-last bypass.
     """
 
     def __init__(self, cfg: NativeWorldModelConfig):
@@ -3002,7 +3093,6 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
         )
 
         self.flow_head = _RGBTransportFlowHead(flow_channels, 2, 3, padding=1)
-        self.residual_head = _RGBDetailHead(final_channels, 3, 3, padding=1)
         self.motion_head = _RGBTransportMotionHead(
             final_channels, 1, 3, padding=1
         )
@@ -3136,39 +3226,29 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
             )
         motion_logit = self.motion_head(value)
         motion = torch.sigmoid(motion_logit)
-        # The supervised change support is part of the transport itself: it
-        # converts static pixels to exact identity flow while preserving a
-        # continuous gradient for moving pixels.  This prevents the raw flow
-        # field from translating the background merely to reduce foreground
-        # error, without reintroducing a raw-context output blend.
-        flow_pixels = raw_flow_pixels * motion.float()
+        # Flow is the sole low-frequency motion owner.  Do not multiply it by
+        # the learned motion probability: doing so creates a copy-last local
+        # optimum and attenuates both RGB and flow-teacher gradients whenever
+        # the gate is small.  Static identity is learned as zero flow.
+        flow_pixels = raw_flow_pixels
         transported, warp_valid = _warp_rgb_feature_with_pixel_flow(
             context_base,
             flow_pixels,
             image_height=self.cfg.rgb_size,
             image_width=self.cfg.rgb_size,
         )
-        residual = torch.tanh(self.residual_head(value).float()) * float(
-            self.cfg.rgb_context_residual_scale
-        )
-        # The transported image is the only appearance base. The supervised
-        # motion mask is also the only gate for the bounded redraw path. Warp
-        # validity remains diagnostic only: letting a model-controlled
-        # out-of-bounds sample open the residual would permit a degenerate
-        # full-frame redraw that bypasses transport.
+        # The transported image is the only appearance base.  In particular,
+        # there is no full-frequency residual that can redraw the moving
+        # region instead of learning transport.  Warp validity remains a
+        # diagnostic and never opens another rendering path.
         warp_invalid = (~warp_valid).to(dtype=torch.float32)
-        correction_support = motion.float()
-        rgb = torch.clamp(
-            transported.float() + correction_support * residual,
-            0.0,
-            1.0,
-        ).to(dtype=value.dtype)
+        rgb = transported
         if self.high_frequency_refiner is not None:
             rgb = torch.clamp(
-                rgb + self.high_frequency_refiner(tokens, value),
+                rgb.float() + self.high_frequency_refiner(tokens, value),
                 0.0,
                 1.0,
-            )
+            ).to(dtype=value.dtype)
         disocclusion_logit = torch.where(
             warp_valid,
             torch.full_like(warp_invalid, -8.0),
@@ -4995,6 +5075,22 @@ class NativeWorldModel(nn.Module):
         zero_centered_encoded: Optional[torch.Tensor] = None
         centered_summary: Optional[torch.Tensor] = None
         zero_centered_summary: Optional[torch.Tensor] = None
+        zero_physical_fine_action = normalized_physical_zero_action(
+            future_factual_fine_action_values,
+            future_factual_fine_action_mask,
+            action_semantic_ids,
+            action_normalization_offset,
+            action_normalization_scale,
+            group_axis=2,
+        )
+        zero_physical_coarse_action = normalized_physical_zero_action(
+            future_factual_coarse_action_values,
+            future_factual_coarse_action_mask,
+            action_semantic_ids,
+            action_normalization_offset,
+            action_normalization_scale,
+            group_axis=2,
+        )
         if self.factual_action is not None:
             factual_encoded, factual_encoded_mask, factual_summary = encode_factual(
                 future_factual_fine_action_values,
@@ -5004,8 +5100,8 @@ class NativeWorldModel(nn.Module):
             # physical command. This removes time/semantic/group/embodiment
             # constants while preserving every real grouped action token.
             zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
-                torch.zeros_like(future_factual_fine_action_values),
-                torch.zeros_like(future_factual_coarse_action_values),
+                zero_physical_fine_action,
+                zero_physical_coarse_action,
             )
             if not torch.equal(factual_encoded_mask, zero_encoded_mask):
                 raise RuntimeError("factual and zero action masks must be identical")
@@ -5163,12 +5259,9 @@ class NativeWorldModel(nn.Module):
             grouped_stream_action = self.factual_v7_stream_action(
                 grouped_canonical_action
             )
-            exact_group = (
-                single_group[:, None, None, None]
-                & canonical_groups[:, None, :, None]
-            )
+            physical_group = canonical_groups[:, None, :, None]
             state_action = torch.where(
-                exact_group,
+                physical_group,
                 grouped_state_action,
                 self.factual_v7_action_memory(factual_action),
             ).reshape(batch, cfg.K * cfg.max_action_groups, cfg.state_hidden)
@@ -5176,7 +5269,7 @@ class NativeWorldModel(nn.Module):
                 observed_state_flat
             )
             action_future = torch.where(
-                exact_group,
+                physical_group,
                 grouped_stream_action,
                 factual_action,
             ).reshape(
@@ -5376,8 +5469,8 @@ class NativeWorldModel(nn.Module):
             )
             zero_action_stream, zero_action_stream_mask = (
                 encode_factual_action_stream(
-                    torch.zeros_like(future_factual_fine_action_values),
-                    torch.zeros_like(future_factual_coarse_action_values),
+                    zero_physical_fine_action,
+                    zero_physical_coarse_action,
                 )
             )
             if not torch.equal(

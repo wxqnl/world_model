@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_v8_action_owned_rgb_transport
 architecture: native_world_model
-expected_parameter_count: 1280701687
+expected_parameter_count: 1280698228
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -73,9 +73,9 @@ model:
   rgb_decode_chunk_size: 32
   rgb_size: 256
   rgb_decode_indices: [0, 1, 2, 3, 4, 5, 6, 7]
-  # The observed image is only an appearance carrier: factual P64 predicts its
-  # dense transport, changed-pixel support and bounded disocclusion correction.
-  # No unwarped RGB feature or copy path can bypass the future state.
+  # The observed image is only an appearance carrier: factual P64 predicts the
+  # exact dense transport applied to it. The motion head is auxiliary only;
+  # there is no gate, unwarped RGB path or full-frequency redraw shortcut.
   rgb_context_enabled: true
   rgb_original_v7_context: false
   rgb_action_owned_transport: true

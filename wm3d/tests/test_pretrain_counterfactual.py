@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from wm3d.data.grouped_robot import ACTION_SEMANTIC_IDS
 from wm3d.training import pretrain
 from wm3d.training.native_objective import NativeObjectiveConfig
 
@@ -19,13 +20,25 @@ def _objective(*, token: bool, rgb: bool) -> SimpleNamespace:
 def test_counterfactual_forward_uses_grad_token_control_and_detached_rgb_control(
     monkeypatch,
 ) -> None:
-    fine = torch.randn(2, 3, requires_grad=True)
-    coarse = torch.randn(2, 3, requires_grad=True)
-    mask = torch.ones(2, 3, dtype=torch.bool)
+    fine = torch.randn(2, 1, 1, 1, 3, requires_grad=True)
+    coarse = torch.randn(2, 1, 1, 3, requires_grad=True)
+    fine_mask = torch.ones_like(fine, dtype=torch.bool)
+    coarse_mask = torch.ones_like(coarse, dtype=torch.bool)
+    offset = torch.tensor([[[0.2, -0.4, 0.6]]]).expand(2, -1, -1).clone()
+    scale = torch.tensor([[[0.5, 2.0, 0.25]]]).expand(2, -1, -1).clone()
+    semantics = torch.full(
+        (2, 1, 3),
+        ACTION_SEMANTIC_IDS["delta_position_m"],
+        dtype=torch.long,
+    )
     batch = {
         "future_factual_fine_action_values": fine,
         "future_factual_coarse_action_values": coarse,
-        "future_factual_fine_action_mask": mask,
+        "future_factual_fine_action_mask": fine_mask,
+        "future_factual_coarse_action_mask": coarse_mask,
+        "action_semantic_ids": semantics,
+        "action_normalization_offset": offset,
+        "action_normalization_scale": scale,
     }
     calls: list[dict[str, torch.Tensor]] = []
     controls: list[bool] = []
@@ -62,9 +75,16 @@ def test_counterfactual_forward_uses_grad_token_control_and_detached_rgb_control
     torch.testing.assert_close(
         calls[0]["future_factual_fine_action_values"], fine
     )
-    assert calls[1]["future_factual_fine_action_values"].count_nonzero() == 0
-    assert calls[1]["future_factual_coarse_action_values"].count_nonzero() == 0
-    assert calls[1]["future_factual_fine_action_mask"] is mask
+    expected_noop = -offset / scale
+    torch.testing.assert_close(
+        calls[1]["future_factual_fine_action_values"],
+        expected_noop[:, None, :, None, :],
+    )
+    torch.testing.assert_close(
+        calls[1]["future_factual_coarse_action_values"],
+        expected_noop[:, None, :, :],
+    )
+    assert calls[1]["future_factual_fine_action_mask"] is fine_mask
     assert output["pred_tokens"].requires_grad
     assert output["zero_action_pred_tokens"].requires_grad
     assert not output["zero_action_rgb"].requires_grad

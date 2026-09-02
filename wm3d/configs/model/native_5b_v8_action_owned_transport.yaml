@@ -2,7 +2,7 @@ schema: wm3d_v8_model_profile_v1
 name: native_5b_v8_action_owned_rgb_transport
 architecture: native_world_model
 # Sealed after constructing this exact profile on meta and real FSDP2 shards.
-expected_parameter_count: 5315156855
+expected_parameter_count: 5315151668
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -63,8 +63,9 @@ model:
   max_aux_tokens: 16
   aux_dim: 256
   max_aux_type_id: 128
-  # P144 is the action-conditioned future-state grid; RGB transport is decoded
-  # from it at every future horizon.
+  # P144 is the action-conditioned future-state grid; it predicts the exact
+  # ungated RGB transport applied at every future horizon. The motion head is
+  # auxiliary and no full-frequency redraw path exists.
   rgb_hidden: 1536
   rgb_res_blocks: 1
   rgb_decode_chunk_size: 2

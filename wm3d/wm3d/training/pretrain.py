@@ -39,7 +39,10 @@ from wm3d.data.formal_cache_adapter import (
     build_formal_cache_dataset,
 )
 from wm3d.models.model_factory import build_world_model
-from wm3d.models.native_world_model import NativeWorldModel
+from wm3d.models.native_world_model import (
+    NativeWorldModel,
+    normalized_physical_noop_action,
+)
 from wm3d.models.direct_vggt_builder import build_direct_vggt_teacher
 from wm3d.training.async_input import AsyncCudaInputPipeline
 from wm3d.training.distributed_checkpoint import (
@@ -812,13 +815,39 @@ def _zero_future_factual_action(
     batch: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     zero_batch = dict(batch)
-    for name in (
+    required = (
         "future_factual_fine_action_values",
+        "future_factual_fine_action_mask",
         "future_factual_coarse_action_values",
-    ):
-        if name not in batch:
-            raise PretrainError(f"action counterfactual requires {name}")
-        zero_batch[name] = torch.zeros_like(batch[name])
+        "future_factual_coarse_action_mask",
+        "action_normalization_offset",
+        "action_normalization_scale",
+    )
+    missing = [name for name in required if name not in batch]
+    if missing:
+        raise PretrainError(
+            "action counterfactual requires " + ", ".join(missing)
+        )
+    zero_batch["future_factual_fine_action_values"] = (
+        normalized_physical_noop_action(
+            batch["future_factual_fine_action_values"],
+            batch["future_factual_fine_action_mask"],
+            batch["action_semantic_ids"],
+            batch["action_normalization_offset"],
+            batch["action_normalization_scale"],
+            group_axis=2,
+        )
+    )
+    zero_batch["future_factual_coarse_action_values"] = (
+        normalized_physical_noop_action(
+            batch["future_factual_coarse_action_values"],
+            batch["future_factual_coarse_action_mask"],
+            batch["action_semantic_ids"],
+            batch["action_normalization_offset"],
+            batch["action_normalization_scale"],
+            group_axis=2,
+        )
+    )
     return zero_batch
 
 
