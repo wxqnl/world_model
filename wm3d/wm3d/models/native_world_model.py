@@ -947,6 +947,24 @@ class GroupedSignalEncoder(nn.Module):
             else None
         )
         self.coarse_value = nn.Linear(cfg.max_action_dim * 2, output_dim, bias=False)
+        # The direct residual is a standard zero-initialized adapter. Its
+        # output is exactly zero at initialization while the projection
+        # weights receive action-dependent gradients on the first step.
+        self.direct_fine_value = (
+            _ZeroInitializedLinear(cfg.max_action_dim * 2, output_dim, bias=False)
+            if self.condition_on_normalization
+            else None
+        )
+        self.direct_fine_aggregate = (
+            _ZeroInitializedLinear(cfg.max_action_dim * 4, output_dim, bias=False)
+            if self.condition_on_normalization
+            else None
+        )
+        self.direct_coarse_value = (
+            _ZeroInitializedLinear(cfg.max_action_dim * 2, output_dim, bias=False)
+            if self.condition_on_normalization
+            else None
+        )
         self.normalization = (
             nn.Linear(cfg.max_action_dim * 3, output_dim, bias=False)
             if self.condition_on_normalization
@@ -965,13 +983,13 @@ class GroupedSignalEncoder(nn.Module):
         self.action_semantic = nn.Embedding(cfg.max_action_semantic_id, output_dim)
         self.group = nn.Embedding(cfg.max_group_id, output_dim)
         self.embodiment = nn.Embedding(cfg.max_embodiments, output_dim)
-        # The V7 direct anchor was sufficient for its predominantly
-        # single-owner action layout.  V8 permits several simultaneous
-        # physical owners, so route each group's linear action feature before
-        # pooling.  A zero-initialized bounded gate keeps the untrained direct
-        # adapter exactly closed, so it cannot corrupt the shared dense path.
-        # Its derivative is one at zero, allowing the existing objective to
-        # open and route each physical owner without adding another head.
+        # V8 permits several simultaneous physical owners. The zero-start
+        # projections above keep the untrained residual closed without
+        # blocking their gradients. This bounded group modulation starts at
+        # identity and becomes group-specific only after the physical mapping
+        # itself has started learning. Zero-gating a random projection here
+        # would make the real projection gradient exactly zero at step 0 and
+        # force identity learning through a random basis.
         self.direct_group_gain = (
             _ZeroInitializedEmbedding(cfg.max_group_id, output_dim)
             if self.condition_on_normalization
@@ -1079,8 +1097,16 @@ class GroupedSignalEncoder(nn.Module):
         # time/identity mixing, nonlinearities, and RMS normalization.  The
         # factual branch centers this feature against physical zero and uses
         # it as the V7-compatible same-horizon block-0 anchor.
-        direct_fine_tokens = self.fine_value(fine_pair)
-        fine_tokens = direct_fine_tokens + self.time(fine_dt)
+        fine_value_tokens = self.fine_value(fine_pair)
+        fine_tokens = fine_value_tokens + self.time(fine_dt)
+        if include_direct_physical:
+            if self.direct_fine_value is None:
+                raise RuntimeError("direct fine-action projection is unavailable")
+            direct_fine_tokens = self.direct_fine_value(fine_pair)
+        else:
+            # The value is unused by the legacy return contract, but keeping
+            # it aligned avoids a second shape path.
+            direct_fine_tokens = fine_value_tokens
         if normalization_token is not None:
             fine_tokens = fine_tokens + normalization_token[:, None, :, None]
         fine_tokens = fine_tokens + F.silu(
@@ -1123,7 +1149,16 @@ class GroupedSignalEncoder(nn.Module):
             )
             aggregate_feature = self.fine_aggregate(aggregate)
             fine_summary = fine_summary + aggregate_feature
-            direct_fine_summary = direct_fine_summary + aggregate_feature
+            if include_direct_physical:
+                if self.direct_fine_aggregate is None:
+                    raise RuntimeError(
+                        "direct fine-action aggregate projection is unavailable"
+                    )
+                direct_fine_summary = (
+                    direct_fine_summary + self.direct_fine_aggregate(aggregate)
+                )
+            else:
+                direct_fine_summary = direct_fine_summary + aggregate_feature
 
         coarse_pair = torch.cat(
             (
@@ -1132,8 +1167,13 @@ class GroupedSignalEncoder(nn.Module):
             ),
             dim=-1,
         )
-        direct_coarse_summary = self.coarse_value(coarse_pair)
-        coarse_summary = direct_coarse_summary
+        coarse_summary = self.coarse_value(coarse_pair)
+        if include_direct_physical:
+            if self.direct_coarse_value is None:
+                raise RuntimeError("direct coarse-action projection is unavailable")
+            direct_coarse_summary = self.direct_coarse_value(coarse_pair)
+        else:
+            direct_coarse_summary = coarse_summary
         if normalization_token is not None:
             coarse_summary = coarse_summary + normalization_token[:, None]
         real_coarse = coarse_dim_mask.any(dim=-1)
@@ -1155,7 +1195,7 @@ class GroupedSignalEncoder(nn.Module):
         if include_direct_physical:
             if self.direct_group_gain is None:
                 raise RuntimeError("direct physical action group router is unavailable")
-            group_gain = torch.tanh(self.direct_group_gain(group_ids))
+            group_gain = 1.0 + torch.tanh(self.direct_group_gain(group_ids))
             direct_signal = direct_signal * group_gain[:, None]
         signal = (
             fine_summary * fine_present[..., None].to(dtype=fine_summary.dtype)
