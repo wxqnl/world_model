@@ -349,15 +349,17 @@ def _factual_control_temporal_advantage(
     mask: torch.Tensor,
     margin: float,
     epsilon: float,
+    symmetric_control_gradient: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Rank the factual P64 trajectory against a detached control trajectory.
+    """Rank the factual P64 trajectory against a control trajectory.
 
     Absolute P64 reconstruction is dominated by static scene content.  The
     action objective therefore compares adjacent future-token deltas and
-    normalizes each sample by its detached target-delta RMS.  The control side
-    is a reference threshold only: pushing a no-op or mismatched trajectory
-    away from the target would not improve the factual prediction and, for a
-    centered zero anchor, cannot change that control's next forward value.
+    normalizes each sample by its detached target-delta RMS.  A physical no-op
+    is a one-sided reference and must remain detached.  A real, compatible
+    wrong action is a contrastive negative: allowing its error to participate
+    in the hinge gradient cancels the shared action-independent shortcut and
+    makes the action-dependent path own the ranking margin.
     """
 
     if factual.shape != target.shape or control.shape != target.shape:
@@ -395,8 +397,13 @@ def _factual_control_temporal_advantage(
         sample_valid,
         epsilon=epsilon,
     )
+    rank_control_error = (
+        control_error
+        if symmetric_control_gradient
+        else control_error.detach()
+    )
     advantage = _masked_mean(
-        torch.relu(float(margin) + factual_error - control_error.detach()),
+        torch.relu(float(margin) + factual_error - rank_control_error),
         sample_valid,
         epsilon=epsilon,
     )
@@ -834,6 +841,7 @@ def compute_native_objective(
             mask=token_mask[..., None],
             margin=config.action_counterfactual_token_margin,
             epsilon=epsilon,
+            symmetric_control_gradient=False,
         )
     appearance_l1 = zero
     appearance_teacher_l1 = zero
@@ -1619,6 +1627,7 @@ def compute_native_objective(
                     mask=selected_token_mask,
                     margin=config.action_counterfactual_token_margin,
                     epsilon=epsilon,
+                    symmetric_control_gradient=True,
                 )
                 context_token_action_acc = context_token_action_gap.gt(0).to(
                     dtype=context_token_action_gap.dtype

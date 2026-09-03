@@ -18,7 +18,7 @@ from wm3d.training.native_objective import (
 )
 
 
-def test_temporal_action_rank_only_pulls_factual_toward_target() -> None:
+def test_temporal_action_rank_keeps_physical_noop_one_sided() -> None:
     target = torch.tensor([0.0, 1.0, 3.0]).view(1, 3, 1, 1)
     factual = torch.tensor([0.0, 0.5, 1.0]).view_as(target).requires_grad_()
     control = torch.zeros_like(target, requires_grad=True)
@@ -31,6 +31,7 @@ def test_temporal_action_rank_only_pulls_factual_toward_target() -> None:
         mask=mask,
         margin=0.01,
         epsilon=1.0e-6,
+        symmetric_control_gradient=False,
     )
     assert control_error.item() > 0
     assert gain.item() > 0
@@ -46,6 +47,7 @@ def test_temporal_action_rank_only_pulls_factual_toward_target() -> None:
         mask=mask,
         margin=0.01,
         epsilon=1.0e-6,
+        symmetric_control_gradient=False,
     )
     assert worse_gain.item() < 0
     assert active_rank.item() > 0
@@ -53,6 +55,46 @@ def test_temporal_action_rank_only_pulls_factual_toward_target() -> None:
     assert worse_factual.grad is not None
     assert worse_factual.grad.abs().sum() > 0
     assert better_control.grad is None
+
+
+def test_temporal_action_rank_backpropagates_real_wrong_action_symmetrically() -> None:
+    target = torch.tensor([0.0, 1.0, 3.0]).view(1, 3, 1, 1)
+    factual = torch.tensor([0.0, 0.2, 0.4]).view_as(target).requires_grad_()
+    wrong = torch.tensor([0.0, 0.9, 2.8]).view_as(target).requires_grad_()
+    mask = torch.ones(1, 3, 1, 1, dtype=torch.bool)
+
+    _, gain_before, rank, _ = _factual_control_temporal_advantage(
+        factual=factual,
+        control=wrong,
+        target=target,
+        mask=mask,
+        margin=0.01,
+        epsilon=1.0e-6,
+        symmetric_control_gradient=True,
+    )
+    assert gain_before.item() < 0
+    assert rank.item() > 0
+    rank.backward()
+    assert factual.grad is not None
+    assert wrong.grad is not None
+    assert torch.isfinite(factual.grad).all()
+    assert torch.isfinite(wrong.grad).all()
+    assert factual.grad.abs().sum() > 0
+    assert wrong.grad.abs().sum() > 0
+
+    learning_rate = 0.01
+    factual_after = (factual - learning_rate * factual.grad).detach()
+    wrong_after = (wrong - learning_rate * wrong.grad).detach()
+    _, gain_after, _, _ = _factual_control_temporal_advantage(
+        factual=factual_after,
+        control=wrong_after,
+        target=target,
+        mask=mask,
+        margin=0.01,
+        epsilon=1.0e-6,
+        symmetric_control_gradient=True,
+    )
+    assert gain_after > gain_before
 
 
 def test_flow_aligned_p256_target_uses_backward_pixel_transport() -> None:
