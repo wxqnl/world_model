@@ -341,6 +341,73 @@ def _factual_zero_advantage(
     return zero_error_mean, gain, advantage, response_rms
 
 
+def _factual_control_temporal_advantage(
+    *,
+    factual: torch.Tensor,
+    control: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    margin: float,
+    epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Rank the factual P64 trajectory against a detached control trajectory.
+
+    Absolute P64 reconstruction is dominated by static scene content.  The
+    action objective therefore compares adjacent future-token deltas and
+    normalizes each sample by its detached target-delta RMS.  The control side
+    is a reference threshold only: pushing a no-op or mismatched trajectory
+    away from the target would not improve the factual prediction and, for a
+    centered zero anchor, cannot change that control's next forward value.
+    """
+
+    if factual.shape != target.shape or control.shape != target.shape:
+        raise NativeObjectiveError(
+            "factual, control, and target token trajectories must align"
+        )
+    if factual.ndim < 2 or int(factual.shape[1]) < 2:
+        raise NativeObjectiveError(
+            "temporal action ranking requires at least two future steps"
+        )
+    expanded_mask = torch.broadcast_to(mask, target.shape).bool()
+    pair_mask = expanded_mask[:, 1:] & expanded_mask[:, :-1]
+    factual_delta = factual[:, 1:].float() - factual[:, :-1].float()
+    control_delta = control[:, 1:].float() - control[:, :-1].float()
+    target_delta = target[:, 1:].float() - target[:, :-1].float()
+
+    target_rms = _masked_per_sample_mean(
+        target_delta.square(), pair_mask, epsilon=epsilon
+    ).clamp_min(0.0).sqrt().detach()
+    factual_rms_error = _masked_per_sample_mean(
+        (factual_delta - target_delta).square(), pair_mask, epsilon=epsilon
+    ).add(epsilon * epsilon).sqrt()
+    control_rms_error = _masked_per_sample_mean(
+        (control_delta - target_delta).square(), pair_mask, epsilon=epsilon
+    ).add(epsilon * epsilon).sqrt()
+    scale_floor = float(epsilon) ** 0.5
+    factual_error = factual_rms_error / target_rms.clamp_min(scale_floor)
+    control_error = control_rms_error / target_rms.clamp_min(scale_floor)
+    sample_valid = pair_mask.flatten(1).any(dim=1) & target_rms.gt(scale_floor)
+    control_error_mean = _masked_mean(
+        control_error.detach(), sample_valid, epsilon=epsilon
+    )
+    gain = _masked_mean(
+        control_error.detach() - factual_error.detach(),
+        sample_valid,
+        epsilon=epsilon,
+    )
+    advantage = _masked_mean(
+        torch.relu(float(margin) + factual_error - control_error.detach()),
+        sample_valid,
+        epsilon=epsilon,
+    )
+    response_rms = _masked_mean(
+        (factual.float() - control.float()).square(),
+        expanded_mask,
+        epsilon=epsilon,
+    ).sqrt()
+    return control_error_mean, gain, advantage, response_rms
+
+
 def _charbonnier(value: torch.Tensor, epsilon: float) -> torch.Tensor:
     return torch.sqrt(value.square() + epsilon * epsilon)
 
@@ -737,6 +804,8 @@ def compute_native_objective(
     zero = token_mse.new_zeros(())
     zero_action_token_mse = zero
     action_counterfactual_token_gain = zero
+    action_counterfactual_token_temporal_control_error = zero
+    action_counterfactual_token_temporal_gain = zero
     action_counterfactual_token_advantage = zero
     action_counterfactual_token_response_rms = zero
     if config.action_counterfactual_token_advantage > 0.0:
@@ -744,19 +813,27 @@ def compute_native_objective(
             raise NativeObjectiveError(
                 "token counterfactual requires zero_action_pred_tokens"
             )
+        control_tokens = output["zero_action_pred_tokens"]
+        zero_action_token_mse = _masked_mean(
+            (control_tokens - target_tokens).square(),
+            token_mask[..., None],
+            epsilon=epsilon,
+        )
+        action_counterfactual_token_gain = (
+            zero_action_token_mse.detach() - token_mse.detach()
+        )
         (
-            zero_action_token_mse,
-            action_counterfactual_token_gain,
+            action_counterfactual_token_temporal_control_error,
+            action_counterfactual_token_temporal_gain,
             action_counterfactual_token_advantage,
             action_counterfactual_token_response_rms,
-        ) = _factual_zero_advantage(
+        ) = _factual_control_temporal_advantage(
             factual=output["pred_tokens"],
-            zero_action=output["zero_action_pred_tokens"],
+            control=control_tokens,
             target=target_tokens,
             mask=token_mask[..., None],
             margin=config.action_counterfactual_token_margin,
             epsilon=epsilon,
-            absolute_error=False,
         )
     appearance_l1 = zero
     appearance_teacher_l1 = zero
@@ -1172,6 +1249,10 @@ def compute_native_objective(
     context_pixel_action_gap = zero
     context_pixel_action_rgb_gap = zero
     context_pixel_action_response_rms = zero
+    context_token_action_rank = zero
+    context_token_action_acc = zero
+    context_token_action_gap = zero
+    context_token_action_response_rms = zero
     context_pixel_action_negative_distance = zero
     context_pixel_action_valid_fraction = output.get(
         "shuffled_action_valid_fraction", zero
@@ -1518,6 +1599,30 @@ def compute_native_objective(
             selected_valid = selected_valid.to(
                 device=target_rgb.device, dtype=torch.bool
             )
+            if "shuffled_action_pred_tokens" in output:
+                factual_tokens = output["pred_tokens"].index_select(0, indices)
+                wrong_tokens = output["shuffled_action_pred_tokens"]
+                selected_target_tokens = target_tokens.index_select(0, indices)
+                selected_token_mask = token_mask.index_select(0, indices)[..., None]
+                selected_token_mask = selected_token_mask & selected_valid.view(
+                    -1, *([1] * (selected_token_mask.ndim - 1))
+                )
+                (
+                    _wrong_temporal_error,
+                    context_token_action_gap,
+                    context_token_action_rank,
+                    context_token_action_response_rms,
+                ) = _factual_control_temporal_advantage(
+                    factual=factual_tokens,
+                    control=wrong_tokens,
+                    target=selected_target_tokens,
+                    mask=selected_token_mask,
+                    margin=config.action_counterfactual_token_margin,
+                    epsilon=epsilon,
+                )
+                context_token_action_acc = context_token_action_gap.gt(0).to(
+                    dtype=context_token_action_gap.dtype
+                )
             factual_rgb = output["rgb"].index_select(0, indices).float()
             wrong_rgb = output["shuffled_action_rgb"].float()
             selected_target = target_rgb.index_select(0, indices).float()
@@ -1818,6 +1923,12 @@ def compute_native_objective(
         "token_cosine": token_cosine,
         "zero_action_token_mse": zero_action_token_mse,
         "action_counterfactual_token_gain": action_counterfactual_token_gain,
+        "action_counterfactual_token_temporal_control_error": (
+            action_counterfactual_token_temporal_control_error
+        ),
+        "action_counterfactual_token_temporal_gain": (
+            action_counterfactual_token_temporal_gain
+        ),
         "action_counterfactual_token_advantage": (
             action_counterfactual_token_advantage
         ),
@@ -1871,6 +1982,10 @@ def compute_native_objective(
         "context_pixel_action_gap": context_pixel_action_gap,
         "context_pixel_action_rgb_gap": context_pixel_action_rgb_gap,
         "context_pixel_action_response_rms": context_pixel_action_response_rms,
+        "context_token_action_rank": context_token_action_rank,
+        "context_token_action_acc": context_token_action_acc,
+        "context_token_action_gap": context_token_action_gap,
+        "context_token_action_response_rms": context_token_action_response_rms,
         "context_pixel_action_negative_distance": (
             context_pixel_action_negative_distance
         ),
@@ -1968,7 +2083,8 @@ def compute_native_objective(
         * action_counterfactual_token_advantage
         + config.action_counterfactual_rgb_advantage
         * action_counterfactual_rgb_advantage
-        + context_pixel_action_rank_weight * context_pixel_action_rank
+        + context_pixel_action_rank_weight
+        * (context_pixel_action_rank + context_token_action_rank)
         + context_pixel_action_separation_weight
         * context_pixel_action_separation
     )

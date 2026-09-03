@@ -5397,9 +5397,9 @@ class NativeWorldModel(nn.Module):
         factual_encoded_mask: Optional[torch.Tensor] = None
         zero_encoded_mask: Optional[torch.Tensor] = None
         centered_encoded: Optional[torch.Tensor] = None
-        zero_centered_encoded: Optional[torch.Tensor] = None
+        noop_centered_encoded: Optional[torch.Tensor] = None
         centered_summary: Optional[torch.Tensor] = None
-        zero_centered_summary: Optional[torch.Tensor] = None
+        noop_centered_summary: Optional[torch.Tensor] = None
         zero_physical_fine_action = normalized_physical_zero_action(
             future_factual_fine_action_values,
             future_factual_fine_action_mask,
@@ -5409,6 +5409,22 @@ class NativeWorldModel(nn.Module):
             group_axis=2,
         )
         zero_physical_coarse_action = normalized_physical_zero_action(
+            future_factual_coarse_action_values,
+            future_factual_coarse_action_mask,
+            action_semantic_ids,
+            action_normalization_offset,
+            action_normalization_scale,
+            group_axis=2,
+        )
+        noop_physical_fine_action = normalized_physical_noop_action(
+            future_factual_fine_action_values,
+            future_factual_fine_action_mask,
+            action_semantic_ids,
+            action_normalization_offset,
+            action_normalization_scale,
+            group_axis=2,
+        )
+        noop_physical_coarse_action = normalized_physical_noop_action(
             future_factual_coarse_action_values,
             future_factual_coarse_action_mask,
             action_semantic_ids,
@@ -5432,18 +5448,26 @@ class NativeWorldModel(nn.Module):
                 raise RuntimeError("factual and zero action masks must be identical")
             zero_encoded_anchor = zero_encoded.detach()
             centered_encoded = factual_encoded - zero_encoded_anchor
-            zero_centered_encoded = zero_encoded - zero_encoded_anchor
+            noop_encoded, noop_encoded_mask, noop_summary = encode_factual(
+                noop_physical_fine_action,
+                noop_physical_coarse_action,
+            )
+            if not torch.equal(factual_encoded_mask, noop_encoded_mask):
+                raise RuntimeError("factual and no-op action masks must be identical")
+            noop_centered_encoded = noop_encoded - zero_encoded_anchor
             if factual_summary is not None:
-                if zero_summary is None:
-                    raise RuntimeError("zero action summary is unavailable")
+                if zero_summary is None or noop_summary is None:
+                    raise RuntimeError("zero/no-op action summaries are unavailable")
                 zero_summary_anchor = zero_summary.detach()
                 centered_summary = factual_summary - zero_summary_anchor
-                zero_centered_summary = zero_summary - zero_summary_anchor
+                noop_centered_summary = noop_summary - zero_summary_anchor
 
         canonical_action_cond: Optional[torch.Tensor] = None
         canonical_grouped_action: Optional[torch.Tensor] = None
         canonical_group_mask: Optional[torch.Tensor] = None
         canonical_single_group: Optional[torch.Tensor] = None
+        canonical_noop_action_cond: Optional[torch.Tensor] = None
+        canonical_noop_grouped_action: Optional[torch.Tensor] = None
         legacy_v7_factual = (
             cfg.factual_v7_early_action_conditioning
             and not cfg.rgb_action_owned_transport
@@ -5481,6 +5505,32 @@ class NativeWorldModel(nn.Module):
                 selected_action,
                 torch.zeros_like(selected_action),
             )
+            if legacy_v7_factual:
+                (
+                    canonical_noop_grouped_action,
+                    canonical_noop_group_mask,
+                ) = self.original_v7_rgb_action(
+                    fine_values=noop_physical_fine_action,
+                    fine_dim_mask=future_factual_fine_action_mask,
+                    fine_sample_mask=future_factual_fine_sample_mask,
+                    coarse_values=noop_physical_coarse_action,
+                    coarse_dim_mask=future_factual_coarse_action_mask,
+                    action_semantic_ids=action_semantic_ids,
+                    group_mask=action_group_mask,
+                    normalization_offset=action_normalization_offset,
+                    normalization_scale=action_normalization_scale,
+                    return_grouped=True,
+                )
+                if not torch.equal(canonical_group_mask, canonical_noop_group_mask):
+                    raise RuntimeError("factual and no-op canonical groups must match")
+                selected_noop_action = OriginalV7RGBActionAdapter._select_future_group(
+                    canonical_noop_grouped_action, canonical_group_index
+                )
+                canonical_noop_action_cond = torch.where(
+                    canonical_single_group[:, None, None],
+                    selected_noop_action,
+                    torch.zeros_like(selected_noop_action),
+                )
 
         def encode_factual_action_stream(
             fine_values: torch.Tensor,
@@ -5799,8 +5849,8 @@ class NativeWorldModel(nn.Module):
             )
             zero_action_stream, zero_action_stream_mask = (
                 encode_factual_action_stream(
-                    zero_physical_fine_action,
-                    zero_physical_coarse_action,
+                    noop_physical_fine_action,
+                    noop_physical_coarse_action,
                 )
             )
             if not torch.equal(
@@ -5916,32 +5966,28 @@ class NativeWorldModel(nn.Module):
                 assert canonical_grouped_action is not None
                 assert canonical_group_mask is not None
                 assert canonical_single_group is not None
+                assert canonical_noop_action_cond is not None
+                assert canonical_noop_grouped_action is not None
                 zero_action_future = run_v7_fullsequence_factual(
                     zero_action_stream,
                     zero_action_stream_mask,
-                    torch.zeros(
-                        batch,
-                        cfg.K,
-                        7,
-                        dtype=zero_action_stream.dtype,
-                        device=zero_action_stream.device,
-                    ),
-                    torch.zeros_like(canonical_grouped_action),
+                    canonical_noop_action_cond,
+                    canonical_noop_grouped_action,
                     canonical_group_mask,
                     canonical_single_group,
                     repeats=cfg.factual_dynamics_repeats,
                     residual_scale=cfg.factual_action_residual_scale,
                 )
             else:
-                if zero_centered_encoded is None or zero_encoded_mask is None:
-                    raise RuntimeError("centered zero-action tokens are unavailable")
+                if noop_centered_encoded is None or zero_encoded_mask is None:
+                    raise RuntimeError("centered no-op action tokens are unavailable")
                 zero_factual_observed_state = encode_v7_factual_state(
-                    zero_centered_summary
+                    noop_centered_summary
                 )
                 zero_action_future = refine_factual(
-                    zero_centered_encoded,
+                    noop_centered_encoded,
                     zero_encoded_mask,
-                    zero_centered_summary,
+                    noop_centered_summary,
                     zero_factual_observed_state,
                     repeats=cfg.factual_dynamics_repeats,
                     residual_scale=cfg.factual_action_residual_scale,

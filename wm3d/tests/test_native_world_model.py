@@ -3608,11 +3608,21 @@ def test_zero_action_control_reuses_the_exact_factual_path() -> None:
 
     output = model(**batch, compute_zero_action_control=True)
     zero_batch = dict(batch)
-    zero_batch["future_factual_fine_action_values"] = torch.zeros_like(
-        batch["future_factual_fine_action_values"]
+    zero_batch["future_factual_fine_action_values"] = normalized_physical_noop_action(
+        batch["future_factual_fine_action_values"],
+        batch["future_factual_fine_action_mask"],
+        batch["action_semantic_ids"],
+        batch["action_normalization_offset"],
+        batch["action_normalization_scale"],
+        group_axis=2,
     )
-    zero_batch["future_factual_coarse_action_values"] = torch.zeros_like(
-        batch["future_factual_coarse_action_values"]
+    zero_batch["future_factual_coarse_action_values"] = normalized_physical_noop_action(
+        batch["future_factual_coarse_action_values"],
+        batch["future_factual_coarse_action_mask"],
+        batch["action_semantic_ids"],
+        batch["action_normalization_offset"],
+        batch["action_normalization_scale"],
+        group_axis=2,
     )
     explicit = model(**zero_batch)
 

@@ -8,6 +8,7 @@ from wm3d.training.native_objective import (
     NativeObjectiveConfig,
     NativeObjectiveError,
     _charbonnier,
+    _factual_control_temporal_advantage,
     _factual_zero_advantage,
     _masked_rgb_perceptual,
     _warp_token_grid_with_pixel_flow,
@@ -15,6 +16,43 @@ from wm3d.training.native_objective import (
     compose_policy_to_world_intervals,
     compute_native_objective,
 )
+
+
+def test_temporal_action_rank_only_pulls_factual_toward_target() -> None:
+    target = torch.tensor([0.0, 1.0, 3.0]).view(1, 3, 1, 1)
+    factual = torch.tensor([0.0, 0.5, 1.0]).view_as(target).requires_grad_()
+    control = torch.zeros_like(target, requires_grad=True)
+    mask = torch.ones(1, 3, 1, 1, dtype=torch.bool)
+
+    control_error, gain, rank, response = _factual_control_temporal_advantage(
+        factual=factual,
+        control=control,
+        target=target,
+        mask=mask,
+        margin=0.01,
+        epsilon=1.0e-6,
+    )
+    assert control_error.item() > 0
+    assert gain.item() > 0
+    assert rank.item() == pytest.approx(0.0)
+    assert response.item() > 0
+
+    worse_factual = torch.zeros_like(target, requires_grad=True)
+    better_control = torch.tensor([0.0, 0.9, 2.8]).view_as(target).requires_grad_()
+    _, worse_gain, active_rank, _ = _factual_control_temporal_advantage(
+        factual=worse_factual,
+        control=better_control,
+        target=target,
+        mask=mask,
+        margin=0.01,
+        epsilon=1.0e-6,
+    )
+    assert worse_gain.item() < 0
+    assert active_rank.item() > 0
+    active_rank.backward()
+    assert worse_factual.grad is not None
+    assert worse_factual.grad.abs().sum() > 0
+    assert better_control.grad is None
 
 
 def test_flow_aligned_p256_target_uses_backward_pixel_transport() -> None:
@@ -1054,9 +1092,10 @@ def test_coarse_only_batch_has_zero_fine_count_but_nonzero_policy_gradient() -> 
     assert losses["appearance_mse"].item() > 0
     assert losses["zero_action_token_mse"].item() == pytest.approx(1.0)
     assert losses["action_counterfactual_token_gain"].item() == pytest.approx(0.0)
-    assert losses["action_counterfactual_token_advantage"].item() == pytest.approx(
-        0.01
-    )
+    # A temporally stationary target has no action-direction signal and is
+    # intentionally excluded from the trajectory rank.
+    assert losses["action_counterfactual_token_advantage"].item() == 0.0
+    assert losses["action_counterfactual_token_temporal_gain"].item() == 0.0
     assert losses["action_counterfactual_token_response_rms"].item() == pytest.approx(
         2.0
     )

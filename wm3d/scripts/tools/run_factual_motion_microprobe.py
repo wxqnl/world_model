@@ -549,7 +549,10 @@ def main() -> None:
                 ),
                 "early_factual_state_block": _gradient_norm(model.state_blocks[0]),
                 "factual_token_output": _gradient_norm(model.factual_token_output),
-                "renderer_action_projection": _gradient_norm(decoder.action_proj),
+                # The action-owned renderer has no direct action shortcut:
+                # factual P64 is its only motion input.  Audit that actual
+                # P64-to-pixel projection instead of a removed bypass module.
+                "renderer_token_projection": _gradient_norm(decoder.token_proj),
                 "flow_head": _gradient_norm(decoder.flow_head),
             }
             if any(value <= 0.0 for value in gradient_norms.values()):

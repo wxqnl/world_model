@@ -937,6 +937,11 @@ def _forward_with_action_counterfactual(
             **rgb_kwargs,
         )
         output["shuffled_action_rgb"] = wrong_output["rgb"]
+        # Reuse the same already-required counterfactual forward for P64
+        # trajectory ranking.  This adds no model branch or extra forward: it
+        # simply exposes the factual token prediction that was previously
+        # discarded while only the RGB output was supervised.
+        output["shuffled_action_pred_tokens"] = wrong_output["pred_tokens"]
         output["shuffled_action_indices"] = selected_indices
         output["shuffled_action_valid"] = selected_valid
         output["shuffled_action_valid_fraction"] = valid.float().mean()
