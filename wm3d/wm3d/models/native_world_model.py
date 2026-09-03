@@ -5556,7 +5556,13 @@ class NativeWorldModel(nn.Module):
             )
             if not torch.equal(factual_encoded_mask, zero_encoded_mask):
                 raise RuntimeError("factual and zero action masks must be identical")
-            zero_encoded_anchor = zero_encoded.detach()
+            # Numeric zero is a coordinate origin, not a frozen control
+            # branch.  Keep both encoder evaluations differentiable so the
+            # parameter gradient is taken with respect to the physical
+            # displacement (factual - zero), matching the centered forward
+            # value.  Detaching this anchor leaves the forward value correct
+            # but trains the projection on the source z-score itself.
+            zero_encoded_anchor = zero_encoded
             centered_encoded = factual_encoded - zero_encoded_anchor
             (
                 noop_encoded,
@@ -5573,13 +5579,13 @@ class NativeWorldModel(nn.Module):
             if factual_summary is not None:
                 if zero_summary is None or noop_summary is None:
                     raise RuntimeError("zero/no-op action summaries are unavailable")
-                zero_summary_anchor = zero_summary.detach()
+                zero_summary_anchor = zero_summary
                 centered_summary = factual_summary - zero_summary_anchor
                 noop_centered_summary = noop_summary - zero_summary_anchor
             if cfg.rgb_action_owned_transport:
                 if factual_direct is None or zero_direct is None or noop_direct is None:
                     raise RuntimeError("direct physical action features are unavailable")
-                direct_anchor = zero_direct.detach()
+                direct_anchor = zero_direct
                 centered_direct = factual_direct - direct_anchor
                 noop_centered_direct = noop_direct - direct_anchor
                 direct_weight = factual_encoded_mask[..., None].to(

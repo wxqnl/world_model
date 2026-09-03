@@ -2151,8 +2151,8 @@ def test_direct_physical_feature_is_linear_around_physical_zero() -> None:
     numeric_zero, zero_valid = direct(numeric_zero_values)
     assert torch.equal(valid, minus_valid)
     assert torch.equal(valid, zero_valid)
-    centered_plus = plus - numeric_zero.detach()
-    centered_minus = minus - numeric_zero.detach()
+    centered_plus = plus - numeric_zero
+    centered_minus = minus - numeric_zero
     torch.testing.assert_close(
         centered_plus, -centered_minus, rtol=1.0e-5, atol=1.0e-6
     )
@@ -2189,11 +2189,22 @@ def test_numeric_physical_zero_reaches_block_zero_without_direct_update() -> Non
 
     handle = model.state_blocks[0].register_forward_pre_hook(record)
     try:
-        model(**batch)
+        output = model(**batch)
     finally:
         handle.remove()
     assert len(block_inputs) == 2
     torch.testing.assert_close(block_inputs[1], block_inputs[0], rtol=0, atol=0)
+
+    output["pred_tokens"].float().square().mean().backward()
+    assert model.factual_action is not None
+    factual_action_gradients = [
+        parameter.grad
+        for parameter in model.factual_action.parameters()
+        if parameter.grad is not None
+    ]
+    assert factual_action_gradients
+    assert all(torch.isfinite(gradient).all() for gradient in factual_action_gradients)
+    assert sum(gradient.abs().sum() for gradient in factual_action_gradients) == 0
 
 
 def test_direct_group_router_starts_as_unit_map_and_preserves_identity() -> None:
@@ -2312,12 +2323,12 @@ def test_physical_noop_preserves_absolute_direct_channels() -> None:
     noop_values = normalized_physical_noop_action(
         fine, fine_mask, semantics, offset, scale, group_axis=2
     )
-    factual_centered = direct(fine) - direct(numeric_zero_values).detach()
-    noop_centered = direct(noop_values) - direct(numeric_zero_values).detach()
+    factual_centered = direct(fine) - direct(numeric_zero_values)
+    noop_centered = direct(noop_values) - direct(numeric_zero_values)
 
     delta_only = fine.clone()
     delta_only[..., 1:] = 0
-    delta_response = direct(delta_only) - direct(numeric_zero_values).detach()
+    delta_response = direct(delta_only) - direct(numeric_zero_values)
     torch.testing.assert_close(
         factual_centered - noop_centered,
         delta_response,
