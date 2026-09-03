@@ -953,6 +953,73 @@ class WSABackendAdapter(nn.Module):
             raise FloatingPointError("foundation action inference is non-finite")
         return action.unsqueeze(0)
 
+    @torch.inference_mode()
+    def infer_joint(
+        self,
+        *,
+        input_image: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        proprio: torch.Tensor,
+        current_native_3d: torch.Tensor,
+        current_native_3d_view_mask: torch.Tensor,
+        factual_action: torch.Tensor,
+        action_time_s: torch.Tensor,
+        action_element_mask: torch.Tensor,
+        num_video_frames: int,
+        num_inference_steps: int,
+        seed: int | None,
+    ) -> Mapping[str, Any]:
+        """Run official joint video/action sampling with WM3D conditions bound."""
+
+        if (
+            self._active_time_update is not None
+            or self._active_native_3d_update is not None
+        ):
+            raise RuntimeError("concurrent WSA backend forwards are forbidden")
+        if input_image.ndim != 4 or input_image.shape[0] != 1:
+            raise FoundationModelError(
+                "foundation joint inference currently requires batch size one"
+            )
+        if factual_action.shape != action_time_s.shape or (
+            action_time_s.shape != action_element_mask.shape
+        ):
+            raise FoundationModelError(
+                "joint action, time, and element-mask shapes disagree"
+            )
+        if action_time_s.ndim != 3 or action_time_s.shape[0] != 1:
+            raise FoundationModelError("joint action tensors must be [1,H,D]")
+        if proprio.ndim == 3 and proprio.shape[1] == 1:
+            proprio = proprio[:, 0]
+        if proprio.ndim != 2 or proprio.shape[0] != 1:
+            raise FoundationModelError("joint proprio must resolve to [1,D]")
+        mask = action_element_mask.bool()
+        factual_action = factual_action.masked_fill(~mask, 0.0)
+        self._active_time_update = self.action_time(action_time_s, mask)
+        self._active_native_3d_update = self.native_3d_state(
+            current_native_3d, current_native_3d_view_mask
+        )
+        try:
+            result = self.wsa_model.infer_joint(
+                prompt=None,
+                input_image=input_image,
+                num_video_frames=int(num_video_frames),
+                action_horizon=int(action_time_s.shape[1]),
+                action=factual_action,
+                proprio=proprio,
+                context=context,
+                context_mask=context_mask,
+                num_inference_steps=int(num_inference_steps),
+                seed=seed,
+                test_action_with_infer_action=False,
+            )
+        finally:
+            self._active_time_update = None
+            self._active_native_3d_update = None
+        if not isinstance(result, Mapping) or "video" not in result:
+            raise FoundationModelError("WSA joint inference returned no video")
+        return result
+
 
 class FoundationWorldModel(nn.Module):
     """Joint WSA-Large video, action and native-3D model."""
@@ -1110,6 +1177,59 @@ class FoundationWorldModel(nn.Module):
                 self.cfg.max_action_groups,
                 self.cfg.max_action_dim,
             ),
+        }
+
+    @torch.inference_mode()
+    def predict_joint(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        num_inference_steps: int = 20,
+        seed: int | None = None,
+        zero_future_action: bool = False,
+    ) -> Mapping[str, Any]:
+        """Generate K8 video and action with the train-identical WM3D ABI."""
+
+        video = batch["video"]
+        action = batch["action"]
+        action_time_s = batch["action_time_s"]
+        element_mask = batch["action_element_mask"].bool()
+        if video.ndim != 5 or video.shape[0] != 1:
+            raise FoundationModelError(
+                "foundation joint serving currently requires one video sample"
+            )
+        if action.shape != action_time_s.shape or action.shape != element_mask.shape:
+            raise FoundationModelError("joint serving action ABI changed")
+        if action.shape[-1] != self.cfg.action_width:
+            raise FoundationModelError("joint serving action width changed")
+        if num_inference_steps <= 0:
+            raise FoundationModelError("num_inference_steps must be positive")
+        proprio = batch["proprio"]
+        if proprio.ndim == 3 and proprio.shape[1] == 1:
+            proprio = proprio[:, 0]
+        if proprio.ndim != 2 or proprio.shape != (1, self.cfg.state_width):
+            raise FoundationModelError("joint proprio must resolve to [1,D]")
+        context, context_mask = self._fused_context(batch)
+        factual_action = torch.zeros_like(action) if zero_future_action else action
+        result = self.backend.infer_joint(
+            input_image=video[:, :, 0],
+            context=context,
+            context_mask=context_mask,
+            proprio=proprio,
+            current_native_3d=batch["vggt_current_tokens"],
+            current_native_3d_view_mask=batch["vggt_current_view_mask"],
+            factual_action=factual_action,
+            action_time_s=action_time_s,
+            action_element_mask=element_mask,
+            num_video_frames=int(video.shape[2]),
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+        )
+        return {
+            "video": result["video"],
+            "action_normalized": result.get("action"),
+            "factual_action_normalized": factual_action,
+            "action_element_mask": element_mask,
         }
 
     def parameter_counts(self) -> Mapping[str, int]:

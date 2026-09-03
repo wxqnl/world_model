@@ -212,6 +212,15 @@ class _Backend(nn.Module):
             dtype=torch.float32,
         )
 
+    def infer_joint(self, **kwargs):
+        self.sample = kwargs
+        return {
+            "video": [torch.tensor(index) for index in range(kwargs["num_video_frames"])],
+            "action": torch.zeros(
+                kwargs["action_time_s"].shape[1:], dtype=torch.float32
+            ),
+        }
+
 
 def test_foundation_model_keeps_wsa_context_and_robot_extensions_bounded() -> None:
     config = _config()
@@ -317,3 +326,51 @@ def test_foundation_action_serving_reuses_training_context_and_denormalizes() ->
     assert result["action_physical"].shape == (1, 8, 2, 3)
     assert torch.equal(result["action_physical"][..., 0, :], torch.full((1, 8, 3), 2.0))
     assert torch.equal(result["action_physical"][..., 1, :], torch.zeros(1, 8, 3))
+
+
+def test_foundation_joint_serving_reuses_training_conditions_and_zero_ablation() -> None:
+    config = _config()
+    backend = _Backend()
+    model = FoundationWorldModel(config, backend=backend)
+    action_valid = torch.tensor([[1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+    state_valid = torch.tensor([[1, 1, 0, 0]], dtype=torch.bool)
+    action = torch.randn(1, 8, 6)
+    batch = {
+        "wan_context": torch.randn(1, 5, 32),
+        "wan_context_mask": torch.ones(1, 5, dtype=torch.bool),
+        "action_group_ids": torch.tensor([[1, 0]]),
+        "action_group_mask": torch.tensor([[1, 0]], dtype=torch.bool),
+        "action_semantic_ids": torch.ones(1, 2, 3, dtype=torch.long),
+        "state_semantic_ids": torch.ones(1, 2, 2, dtype=torch.long),
+        "embodiment_ids": torch.ones(1, dtype=torch.long),
+        "action_normalization_offset": torch.zeros(1, 2, 3),
+        "action_normalization_scale": torch.ones(1, 2, 3),
+        "state_normalization_offset": torch.zeros(1, 2, 2),
+        "state_normalization_scale": torch.ones(1, 2, 2),
+        "history_action": torch.randn(1, 4, 6),
+        "history_action_element_mask": action_valid[:, None].expand(-1, 4, -1),
+        "history_action_time_s": torch.tensor(
+            [-0.20, -0.15, -0.10, -0.05]
+        )[None, :, None].expand(1, -1, 6),
+        "video": torch.randn(1, 3, 9, 48, 32),
+        "action": action,
+        "action_dim_is_pad": ~action_valid,
+        "action_time_s": torch.arange(8, dtype=torch.float32)[None, :, None]
+        .mul(0.05)
+        .expand(1, -1, 6),
+        "action_element_mask": action_valid[:, None].expand(-1, 8, -1),
+        "proprio": torch.randn(1, 1, 4),
+        "proprio_dim_is_pad": ~state_valid,
+        "vggt_current_tokens": torch.randn(1, 3, 4, 8),
+        "vggt_current_view_mask": torch.ones(1, 3, dtype=torch.bool),
+    }
+    result = model.predict_joint(
+        batch, num_inference_steps=4, seed=11, zero_future_action=True
+    )
+    assert len(result["video"]) == 9
+    assert backend.sample is not None
+    assert backend.sample["num_inference_steps"] == 4
+    assert backend.sample["seed"] == 11
+    assert torch.equal(backend.sample["input_image"], batch["video"][:, :, 0])
+    assert torch.equal(backend.sample["factual_action"], torch.zeros_like(action))
+    assert torch.equal(result["factual_action_normalized"], torch.zeros_like(action))
