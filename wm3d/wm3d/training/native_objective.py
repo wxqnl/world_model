@@ -1153,6 +1153,8 @@ def compute_native_objective(
     rgb_motion_fraction = zero
     rgb_flow_teacher = zero
     rgb_flow_epe = zero
+    rgb_flow_moving_epe = zero
+    rgb_flow_static_epe = zero
     rgb_flow_prediction_magnitude = zero
     rgb_flow_target_magnitude = zero
     rgb_flow_magnitude_ratio = zero
@@ -1395,16 +1397,42 @@ def compute_native_objective(
                     dim=3, keepdim=True
                 ).sqrt()
                 moving = target_flow_magnitude >= 1.0
-                flow_weight = 1.0 + config.rgb_motion_gain * moving.to(
-                    dtype=flow_epe_map.dtype
-                )
                 # Pair normalized head displacement with a dimensionless
                 # teacher loss so its raw-logit gradient is resolution stable.
+                # Moving pixels are sparse, so static and moving visible
+                # regions receive equal per-sample mass instead of allowing
+                # zero-flow background to dominate a global mean.
                 flow_range_pixels = 0.5 * float(max(target_rgb.shape[-2:]))
-                rgb_flow_teacher = _masked_mean(
-                    (flow_epe_map / flow_range_pixels) * flow_weight,
-                    visible,
-                    epsilon=epsilon,
+                normalized_flow_epe = flow_epe_map / flow_range_pixels
+                moving_visible = visible & moving
+                static_visible = visible & ~moving
+                rgb_flow_moving_epe = _masked_mean(
+                    flow_epe_map, moving_visible, epsilon=epsilon
+                )
+                rgb_flow_static_epe = _masked_mean(
+                    flow_epe_map, static_visible, epsilon=epsilon
+                )
+                moving_loss = _masked_per_sample_mean(
+                    normalized_flow_epe, moving_visible, epsilon=epsilon
+                )
+                static_loss = _masked_per_sample_mean(
+                    normalized_flow_epe, static_visible, epsilon=epsilon
+                )
+                has_moving = moving_visible.flatten(1).any(dim=1).to(
+                    dtype=flow_epe_map.dtype
+                )
+                has_static = static_visible.flatten(1).any(dim=1).to(
+                    dtype=flow_epe_map.dtype
+                )
+                per_sample_flow_teacher = (
+                    moving_loss * has_moving + static_loss * has_static
+                ) / (has_moving + has_static).clamp_min(1.0)
+                has_visible = (has_moving + has_static) > 0
+                rgb_flow_teacher = (
+                    per_sample_flow_teacher
+                    * has_visible.to(dtype=per_sample_flow_teacher.dtype)
+                ).sum() / has_visible.sum().clamp_min(1).to(
+                    dtype=per_sample_flow_teacher.dtype
                 )
                 rgb_flow_epe = _masked_mean(
                     flow_epe_map, visible, epsilon=epsilon
@@ -1818,6 +1846,8 @@ def compute_native_objective(
         "rgb_motion_fraction": rgb_motion_fraction,
         "rgb_flow_teacher": rgb_flow_teacher,
         "rgb_flow_epe": rgb_flow_epe,
+        "rgb_flow_moving_epe": rgb_flow_moving_epe,
+        "rgb_flow_static_epe": rgb_flow_static_epe,
         "rgb_flow_prediction_magnitude": rgb_flow_prediction_magnitude,
         "rgb_flow_target_magnitude": rgb_flow_target_magnitude,
         "rgb_flow_magnitude_ratio": rgb_flow_magnitude_ratio,

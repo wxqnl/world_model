@@ -44,7 +44,7 @@ def test_5b_presets_match_action_owned_5b_and_64_h200(
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_087_822_644
+    assert model["expected_parameter_count"] == 5_081_531_188
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_enabled"] is False
@@ -68,6 +68,7 @@ def test_5b_presets_match_action_owned_5b_and_64_h200(
     assert model["model"]["rgb_v7_high_frequency_scale"] == 0.0625
     assert model["model"]["rgb_context_residual_scale"] == 0.75
     assert model["model"]["rgb_context_motion_blend_gain"] == 0.0
+    assert model["model"]["rgb_context_action_scale"] == 0.0
     assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
     assert objective["objective"]["rgb_l1"] == 1.2
     assert objective["objective"]["rgb_charbonnier"] == 0.0
@@ -80,9 +81,9 @@ def test_5b_presets_match_action_owned_5b_and_64_h200(
     assert objective["objective"]["action_counterfactual_rgb_advantage"] == 0.0
     assert objective["objective"]["action_counterfactual_rgb_margin"] == 0.002
     assert objective["objective"]["context_pixel_action_rank_weight"] == 2.0
-    assert objective["objective"]["context_pixel_action_separation_weight"] == 0.5
-    assert objective["objective"]["context_pixel_action_rank_start_step"] == 30000
-    assert objective["objective"]["context_pixel_action_rank_ramp_steps"] == 10000
+    assert objective["objective"]["context_pixel_action_separation_weight"] == 0.0
+    assert objective["objective"]["context_pixel_action_rank_start_step"] == 0
+    assert objective["objective"]["context_pixel_action_rank_ramp_steps"] == 1000
     assert objective["objective"]["context_pixel_action_rank_every"] == 8
     assert objective["objective"]["context_pixel_action_rank_batch_size"] == 1
     assert objective["objective"]["context_pixel_action_rank_margin"] == 0.003

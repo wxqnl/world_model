@@ -36,7 +36,7 @@ def test_1b_streaming_presets_use_action_owned_1b_and_saturating_batch() -> None
         (ROOT / "configs/model/native_1b_v8_action_owned_transport.yaml").read_text()
     )
     validate_model_profile(model)
-    assert model["expected_parameter_count"] == 1_192_794_292
+    assert model["expected_parameter_count"] == 1_190_107_316
     assert model["model"]["P"] == 64
     assert model["model"]["appearance_P"] == 256
     assert model["model"]["appearance_enabled"] is False
@@ -48,6 +48,7 @@ def test_1b_streaming_presets_use_action_owned_1b_and_saturating_batch() -> None
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75
     assert model["model"]["rgb_context_motion_blend_gain"] == 0.0
+    assert model["model"]["rgb_context_action_scale"] == 0.0
     assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
 
     expected = {

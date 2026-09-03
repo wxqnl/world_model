@@ -1534,6 +1534,7 @@ def _tiny_action_owned_transport_config() -> NativeWorldModelConfig:
         rgb_original_v7_context=False,
         rgb_action_owned_transport=True,
         rgb_context_motion_blend_gain=0.0,
+        rgb_context_action_scale=0.0,
     )
 
 
@@ -1560,13 +1561,13 @@ def test_action_owned_transport_rejects_legacy_factual_configuration(
     [
         (
             "native_1b_v8_action_owned_transport.yaml",
-            1_192_794_292,
+            1_190_107_316,
             64,
             8,
         ),
         (
             "native_5b_v8_action_owned_transport.yaml",
-            5_087_822_644,
+            5_081_531_188,
             144,
             16,
         ),
@@ -1614,7 +1615,7 @@ def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:
     decoder = model.rgb_head.image_decoder
     assert isinstance(decoder, NativeActionOwnedTransportRGBImageDecoder)
     assert not any(name.startswith("ctx") for name, _ in decoder.named_modules())
-    assert decoder.action_proj[0].in_features == cfg.state_hidden
+    assert not hasattr(decoder, "action_proj")
 
     batch = _original_v7_batch(cfg)
     batch["context_rgb"] = torch.rand(
@@ -1630,7 +1631,6 @@ def test_action_owned_transport_has_no_unwarped_context_feature_path() -> None:
     ).backward()
     for parameter in (
         decoder.token_proj[0].weight,
-        decoder.action_proj[0].weight,
         decoder.task_proj[1].weight,
         decoder.flow_head.weight,
         decoder.motion_head.weight,
@@ -1655,7 +1655,7 @@ def test_action_owned_transport_flow_is_not_attenuated_by_motion_gate() -> None:
         decoder.motion_head.weight.zero_()
         decoder.motion_head.bias.fill_(-100.0)
 
-    assert not hasattr(decoder, "residual_head")
+    assert not hasattr(decoder, "innovation_head")
 
     horizontal = torch.linspace(0.0, 1.0, cfg.rgb_size).square().view(
         1, 1, 1, cfg.rgb_size
@@ -2051,63 +2051,35 @@ def test_factual_frame_action_modulation_is_spatial_causal_and_zero_exact() -> N
     torch.testing.assert_close(zero, state, rtol=0, atol=0)
 
 
-def test_action_owned_renderer_hint_is_local_not_hidden_cumulative() -> None:
-    cfg = replace(
-        _tiny_action_owned_transport_config(), rgb_decode_chunk_size=2
-    )
+def test_action_owned_renderer_has_no_direct_action_shortcut() -> None:
+    cfg = _tiny_action_owned_transport_config()
     torch.manual_seed(818)
-    model = NativeWorldModel(cfg).eval()
-
-    class ConstantPerHorizonFactual(torch.nn.Module):
-        condition_on_normalization = True
-
-        def forward(self, *, fine_values, group_mask, **_kwargs):
-            scalar = fine_values[..., 0].mean(dim=3)
-            encoded = scalar[..., None].expand(
-                -1, -1, -1, cfg.state_hidden
-            )
-            valid = group_mask[:, None].expand(-1, cfg.K, -1)
-            return encoded * valid[..., None], valid
-
-    model.factual_action = ConstantPerHorizonFactual()
-    batch = _original_v7_batch(cfg)
-    batch = {
-        name: (
-            value[:1].clone()
-            if isinstance(value, torch.Tensor)
-            and value.ndim > 0
-            and value.shape[0] == 2
-            else value
-        )
-        for name, value in batch.items()
-    }
-    batch["context_rgb"] = torch.zeros(
-        1, cfg.num_views, 3, cfg.rgb_size, cfg.rgb_size
+    decoder = NativeActionOwnedTransportRGBImageDecoder(cfg).eval()
+    assert not hasattr(decoder, "action_proj")
+    tokens = torch.randn(1, cfg.P, cfg.token_dim)
+    view = torch.randn(1, cfg.rgb_hidden, 1, 1)
+    task = torch.randn(1, cfg.task_dim)
+    context = torch.rand(1, 3, cfg.rgb_size, cfg.rgb_size)
+    zeros = decoder(
+        tokens,
+        view,
+        None,
+        None,
+        torch.zeros(1, cfg.state_hidden),
+        task,
+        context,
     )
-    batch["context_rgb_mask"] = torch.ones(
-        1, cfg.num_views, dtype=torch.bool
+    changed = decoder(
+        tokens,
+        view,
+        None,
+        None,
+        torch.randn(1, cfg.state_hidden),
+        task,
+        context,
     )
-    fine = torch.zeros_like(batch["future_factual_fine_action_values"])
-    fine[..., 0] = 1.0
-    batch["future_factual_fine_action_values"] = fine
-    batch["future_factual_coarse_action_values"] = torch.zeros_like(
-        batch["future_factual_coarse_action_values"]
-    )
-    decoder = model.rgb_head.image_decoder
-    captured: list[torch.Tensor] = []
-
-    def record(_module, inputs) -> None:
-        captured.append(inputs[0].detach().clone())
-
-    handle = decoder.action_proj[0].register_forward_pre_hook(record)
-    try:
-        model(**batch)
-    finally:
-        handle.remove()
-    assert captured
-    assert all(chunk.shape[0] == cfg.K for chunk in captured)
-    for chunk in captured:
-        torch.testing.assert_close(chunk[0], chunk[1], rtol=0, atol=0)
+    for factual, shortcut_attempt in zip(zeros, changed):
+        torch.testing.assert_close(factual, shortcut_attempt, rtol=0, atol=0)
 
 
 def test_original_v7_future_action_enters_before_factual_state_blocks() -> None:

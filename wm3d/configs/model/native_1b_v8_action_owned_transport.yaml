@@ -1,7 +1,7 @@
 schema: wm3d_v8_model_profile_v1
 name: native_1b_v8_action_owned_rgb_transport
 architecture: native_world_model
-expected_parameter_count: 1192794292
+expected_parameter_count: 1190107316
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state
@@ -88,7 +88,9 @@ model:
   rgb_render_action_free_prior: false
   rgb_context_residual_scale: 0.75
   rgb_context_motion_blend_gain: 0.0
-  rgb_context_action_scale: 1.0
+  # Future action already conditions every factual P64 state block. A second
+  # global renderer shortcut let RGB respond without making P64 action-correct.
+  rgb_context_action_scale: 0.0
   rgb_context_appearance_delta_scale: 0.0
   rgb_detail_residual_scale: 0.0
   geom_hidden: 512

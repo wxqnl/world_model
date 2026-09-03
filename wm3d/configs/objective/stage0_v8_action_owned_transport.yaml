@@ -46,12 +46,14 @@ objective:
   action_counterfactual_rgb_advantage: 0.0
   action_counterfactual_rgb_margin: 0.002
 
-  # Preserve the sparse late V7 wrong-action curriculum.  It is inactive in
-  # the short qualification and remains part of the long-run contract.
+  # Make the correct command beat a compatible real wrong command from early
+  # training. The sparse one-sample forward and slow ramp remain subordinate
+  # to reconstruction. Target-agnostic separation is disabled because it can
+  # reward arbitrary sensitivity without rewarding the correct future.
   context_pixel_action_rank_weight: 2.0
-  context_pixel_action_separation_weight: 0.5
-  context_pixel_action_rank_start_step: 30000
-  context_pixel_action_rank_ramp_steps: 10000
+  context_pixel_action_separation_weight: 0.0
+  context_pixel_action_rank_start_step: 0
+  context_pixel_action_rank_ramp_steps: 1000
   context_pixel_action_rank_every: 8
   context_pixel_action_rank_batch_size: 1
   context_pixel_action_rank_margin: 0.003

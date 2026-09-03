@@ -419,9 +419,9 @@ class NativeWorldModelConfig:
                 raise ValueError(
                     "action-owned RGB transport has no independent appearance lane"
                 )
-            if self.rgb_context_action_scale <= 0.0:
+            if self.rgb_context_action_scale != 0.0:
                 raise ValueError(
-                    "action-owned RGB transport requires normalized action conditioning"
+                    "action-owned RGB transport must receive future action only through factual P64"
                 )
             if self.rgb_context_appearance_delta_scale != 0.0:
                 raise ValueError(
@@ -3152,11 +3152,10 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
 
     The observed image is an appearance carrier, not a future-state input.  It
     reaches every output pixel only through a backward flow predicted from the
-    factual future state.  The separately supervised change mask is auxiliary
-    and cannot attenuate that flow.  There is no full-frequency redraw path;
+    factual future state. The separately supervised change mask is auxiliary
+    and cannot attenuate that flow. There is no full-frequency redraw path;
     the optional bounded zero-DC refiner can add only high-frequency detail.
-    Static identity is therefore represented by zero flow rather than by a
-    copy-last bypass.
+    Static identity is represented by zero flow rather than a copy bypass.
     """
 
     def __init__(self, cfg: NativeWorldModelConfig):
@@ -3186,15 +3185,6 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
             nn.GroupNorm(_rgb_norm_groups(hidden), hidden),
             nn.SiLU(inplace=True),
             _RGBConvBlock(hidden, hidden),
-        )
-        # The transport head consumes the same source-normalized, masked,
-        # time-aware action effect as the factual world path.  Treating every
-        # OXE controller coordinate as metres/radians was both false for
-        # several sources and inconsistent with the proven V7/OXE recipe.
-        self.action_proj = nn.Sequential(
-            nn.Linear(cfg.state_hidden, hidden, bias=False),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden, hidden, bias=False),
         )
         self.task_proj = nn.Sequential(
             nn.LayerNorm(cfg.task_dim),
@@ -3278,12 +3268,11 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
             or context_indices.device != context_rgb.device
         ):
             raise ValueError("transport context indices must be aligned int64")
-        if factual_action_summary is None or factual_action_summary.shape != (
-            tokens.shape[0],
-            self.cfg.state_hidden,
+        if factual_action_summary is not None and factual_action_summary.shape != (
+            tokens.shape[0], self.cfg.state_hidden
         ):
             raise ValueError(
-                "normalized cumulative action effect must align to transport RGB slots"
+                "factual action summary must align to transport RGB slots"
             )
         if task_embedding.shape != (tokens.shape[0], self.cfg.task_dim):
             raise ValueError("task embedding must align to transport RGB slots")
@@ -3300,8 +3289,6 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
                 align_corners=False,
             ).to(dtype=tokens.dtype)
         value = value + view_embedding.to(dtype=value.dtype)
-        action = self.action_proj(factual_action_summary).to(dtype=value.dtype)
-        value = value + float(self.cfg.rgb_context_action_scale) * action[:, :, None, None]
         task = self.task_proj(task_embedding).to(dtype=value.dtype)
         value = value + task[:, :, None, None]
 

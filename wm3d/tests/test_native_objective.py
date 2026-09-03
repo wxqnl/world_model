@@ -449,9 +449,11 @@ def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None
     )
 
     assert losses["rgb_flow_epe"].item() == pytest.approx(4.0, rel=1.0e-5)
-    assert losses["rgb_flow_teacher"].item() == pytest.approx(8.0, rel=1.0e-5)
+    assert losses["rgb_flow_teacher"].item() == pytest.approx(2.0, rel=1.0e-5)
     assert losses["rgb_flow_prediction_magnitude"].item() == pytest.approx(0.0)
     assert losses["rgb_flow_target_magnitude"].item() == pytest.approx(4.0)
+    assert losses["rgb_flow_moving_epe"].item() == pytest.approx(4.0, rel=1.0e-5)
+    assert losses["rgb_flow_static_epe"].item() == pytest.approx(0.0)
     assert losses["rgb_flow_magnitude_ratio"].item() == pytest.approx(0.0)
     assert losses["rgb_disocclusion_bce"].item() == pytest.approx(
         torch.log(torch.tensor(2.0)).item()
@@ -464,6 +466,73 @@ def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None
         disocclusion_logit.grad is not None
         and disocclusion_logit.grad.abs().sum() > 0
     )
+
+
+def test_rgb_flow_teacher_balances_sparse_motion_and_static_regions() -> None:
+    rgb = torch.zeros(1, 1, 1, 3, 4, 4)
+    flow = torch.zeros(1, 1, 1, 2, 4, 4, requires_grad=True)
+    flow_target = torch.zeros(1, 1, 1, 2, 2, 2)
+    flow_target[..., 0, 0, 0] = 4.0
+    policy = torch.zeros(1, 1, 1, 1)
+    output = {
+        "pred_tokens": torch.zeros(1, 1, 1, 2),
+        "rgb": rgb,
+        "rgb_flow_pixels": flow,
+        "rgb_disocclusion_logit": torch.zeros(1, 1, 1, 1, 4, 4),
+        "depth": torch.ones(1, 1, 1, 1),
+        "point": torch.zeros(1, 1, 1, 1, 3),
+        "camera_pose": torch.zeros(1, 1, 1, 9),
+        "policy_action_raw": policy,
+        "policy_action_normalized": policy,
+        "policy_action": policy,
+        "policy_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "policy_gripper_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_binary_mask": torch.zeros_like(policy, dtype=torch.bool),
+        "policy_query_dt": torch.tensor([[[0.5]]]),
+    }
+    batch = {
+        "target_tokens": torch.zeros(1, 1, 1, 2),
+        "target_rgb": torch.zeros_like(rgb),
+        "target_rgb_mask": torch.ones(1, 1, 1, 1, 1, 1, dtype=torch.bool),
+        "context_rgb": torch.zeros(1, 1, 3, 4, 4),
+        "context_rgb_mask": torch.ones(1, 1, dtype=torch.bool),
+        "rgb_flow_target_pixels": flow_target,
+        "rgb_disocclusion_target": torch.zeros(1, 1, 1, 1, 2, 2),
+        "target_fine_action": torch.zeros_like(policy),
+        "target_fine_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "future_world_boundaries_dt": torch.tensor([[0.0, 1.0]]),
+        "composition_operator_ids": torch.tensor(
+            [[[COMPOSITION_OPERATOR_IDS["last"]]]]
+        ),
+        "target_coarse_action_normalized": torch.zeros(1, 1, 1, 1),
+        "target_coarse_action_mask": torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        "action_normalization_offset": torch.zeros(1, 1, 1),
+        "action_normalization_scale": torch.ones(1, 1, 1),
+    }
+    losses = compute_native_objective(
+        output=output,
+        batch=batch,
+        config=NativeObjectiveConfig(
+            token_mse=0.0,
+            token_cosine=0.0,
+            rgb_l1=0.0,
+            rgb_charbonnier=0.0,
+            rgb_gradient=0.0,
+            rgb_flow_teacher=1.0,
+            depth_log=0.0,
+            point=0.0,
+            camera_pose=0.0,
+            action_fine=0.0,
+            action_coarse=0.0,
+        ),
+    )
+    # One moving pixel and three static pixels each contribute half of the
+    # per-sample objective. The old global mean returned approximately 2.0.
+    assert losses["rgb_flow_teacher"].item() == pytest.approx(1.0, abs=5.0e-4)
+    assert losses["rgb_flow_moving_epe"].item() == pytest.approx(4.0, rel=1.0e-5)
+    assert losses["rgb_flow_static_epe"].item() == pytest.approx(0.001, rel=1.0e-5)
+    losses["total"].backward()
+    assert flow.grad is not None and flow.grad.abs().sum() > 0
 
 
 def test_normalized_appearance_motion_l1_supervises_changed_patches() -> None:
