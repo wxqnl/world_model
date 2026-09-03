@@ -193,6 +193,93 @@ def test_rgb_motion_objective_separates_static_and_changed_pixels() -> None:
     assert motion_logit.grad is not None and motion_logit.grad.abs().sum() > 0
 
 
+def test_v7_signed_temporal_geometry_is_relative_and_directional() -> None:
+    target_depth = torch.tensor(
+        [[[[1.0, 2.0, 3.0, 1000.0]], [[1.0, 3.0, 5.0, -1000.0]]]]
+    )
+    depth_mask = torch.tensor(
+        [[[[True, True, True, False]], [[True, True, True, False]]]]
+    )
+    target_point = torch.zeros(1, 2, 1, 4, 3)
+    target_point[0, 0, 0, :, 0] = torch.tensor([0.0, 1.0, 2.0, 1000.0])
+    target_point[0, 1, 0, :, 0] = torch.tensor([1.0, 2.0, 4.0, -1000.0])
+    point_mask = depth_mask.clone()
+    policy = torch.zeros(1, 1, 1, 1)
+    batch = {
+        "target_tokens": torch.zeros(1, 2, 1, 2),
+        "target_depth": target_depth,
+        "target_depth_mask": depth_mask,
+        "target_point": target_point,
+        "target_point_mask": point_mask,
+        "target_fine_action": torch.zeros_like(policy),
+        "target_fine_action_mask": torch.ones_like(policy, dtype=torch.bool),
+        "future_world_boundaries_dt": torch.tensor([[0.0, 1.0, 2.0]]),
+        "composition_operator_ids": torch.tensor(
+            [[[COMPOSITION_OPERATOR_IDS["last"]]]]
+        ),
+        "target_coarse_action_normalized": torch.zeros(1, 2, 1, 1),
+        "target_coarse_action_mask": torch.ones(1, 2, 1, 1, dtype=torch.bool),
+        "action_normalization_offset": torch.zeros(1, 1, 1),
+        "action_normalization_scale": torch.ones(1, 1, 1),
+    }
+    config = NativeObjectiveConfig(
+        token_mse=0.0,
+        token_cosine=0.0,
+        rgb_l1=0.0,
+        rgb_charbonnier=0.0,
+        rgb_gradient=0.0,
+        depth_log=0.0,
+        depth_temporal=0.2,
+        point=0.0,
+        point_temporal=0.05,
+        camera_pose=0.0,
+        action_fine=0.0,
+        action_coarse=0.0,
+    )
+
+    def evaluate(
+        depth_prediction: torch.Tensor,
+        point_prediction: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        output = {
+            "pred_tokens": torch.zeros(1, 2, 1, 2),
+            "rgb": torch.empty(1, 0, 1, 3, 2, 2),
+            "depth": depth_prediction,
+            "point": point_prediction,
+            "camera_pose": torch.zeros(1, 2, 1, 9),
+            "policy_action_raw": policy,
+            "policy_action_normalized": policy,
+            "policy_action": policy,
+            "policy_action_mask": torch.ones_like(policy, dtype=torch.bool),
+            "policy_gripper_mask": torch.zeros_like(policy, dtype=torch.bool),
+            "policy_binary_mask": torch.zeros_like(policy, dtype=torch.bool),
+            "policy_query_dt": torch.tensor([[[0.5]]]),
+        }
+        return compute_native_objective(output=output, batch=batch, config=config)
+
+    scaled_depth = target_depth.clone()
+    scaled_depth[:, 0] *= 2.0
+    scaled_depth[:, 1] *= 3.0
+    scaled_point = target_point * 2.0 + 7.0
+    matching = evaluate(scaled_depth, scaled_point)
+    assert matching["depth_temporal"].item() == pytest.approx(0.0, abs=1.0e-6)
+    assert matching["point_temporal"].item() == pytest.approx(0.0, abs=1.0e-6)
+
+    reversed_depth = target_depth.flip(1).clone().requires_grad_(True)
+    reversed_point = target_point.flip(1).clone().requires_grad_(True)
+    reversed_losses = evaluate(reversed_depth, reversed_point)
+    assert reversed_losses["depth_temporal"].item() > 0.0
+    assert reversed_losses["point_temporal"].item() > 0.0
+    torch.testing.assert_close(
+        reversed_losses["total"],
+        0.2 * reversed_losses["depth_temporal"]
+        + 0.05 * reversed_losses["point_temporal"],
+    )
+    reversed_losses["total"].backward()
+    assert reversed_depth.grad is not None and reversed_depth.grad.abs().sum() > 0
+    assert reversed_point.grad is not None and reversed_point.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("selected_valid", [True, False])
 def test_original_v7_rgb_action_rank_trains_factual_and_wrong_graphs(
     selected_valid: bool,

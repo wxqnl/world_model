@@ -45,7 +45,9 @@ class NativeObjectiveConfig:
     rgb_disocclusion_dice: float = 0.0
     rgb_disocclusion_pos_weight: float = 1.0
     depth_log: float = 1.5
+    depth_temporal: float = 0.0
     point: float = 0.5
+    point_temporal: float = 0.0
     camera_pose: float = 0.1
     action_fine: float = 2.0
     action_coarse: float = 1.0
@@ -169,6 +171,52 @@ def _masked_mean(
         mask = torch.broadcast_to(mask, value.shape)
     weight = mask.to(dtype=value.dtype)
     return (value * weight).sum() / weight.sum().clamp_min(epsilon)
+
+
+def _normalise_depth_per_frame(
+    depth: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    epsilon: float,
+) -> torch.Tensor:
+    """Remove the independent scale of every [B,K,V] depth frame."""
+
+    depth_float = depth.float()
+    valid = mask.bool() & torch.isfinite(depth_float)
+    masked = depth_float.masked_fill(~valid, torch.nan)
+    median = torch.nanmedian(masked, dim=-1).values
+    median = torch.where(
+        valid.any(dim=-1) & torch.isfinite(median),
+        median.clamp_min(epsilon),
+        torch.ones_like(median),
+    )
+    normalised = depth_float / median[..., None]
+    return torch.where(valid, normalised, torch.zeros_like(normalised))
+
+
+def _normalise_points_per_window(
+    points: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    epsilon: float,
+) -> torch.Tensor:
+    """Remove each [B,K,V,P,3] window's translation and global scale."""
+
+    points_float = points.float()
+    valid = mask.bool() & torch.isfinite(points_float).all(dim=-1)
+    weight = valid[..., None].to(dtype=points_float.dtype)
+    safe_points = torch.where(valid[..., None], points_float, 0.0)
+    denominator = weight.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
+    center = safe_points.sum(dim=(1, 2, 3), keepdim=True) / denominator
+    centered = points_float - center
+    safe_centered = torch.where(valid[..., None], centered, 0.0)
+    squared_radius = safe_centered.square().sum(dim=-1, keepdim=True)
+    scale = (
+        (squared_radius * weight).sum(dim=(1, 2, 3), keepdim=True)
+        / denominator
+    ).sqrt().clamp_min(max(epsilon, 1.0e-3))
+    normalised = centered / scale
+    return torch.where(valid[..., None], normalised, torch.zeros_like(normalised))
 
 
 def _warp_token_grid_with_pixel_flow(
@@ -1587,6 +1635,7 @@ def compute_native_objective(
         )
 
     depth_log = zero
+    depth_temporal = zero
     if "target_depth" in batch:
         depth_mask = batch.get(
             "target_depth_mask", torch.isfinite(batch["target_depth"]) & (batch["target_depth"] > 0)
@@ -1599,8 +1648,29 @@ def compute_native_objective(
             depth_mask,
             epsilon=epsilon,
         )
+        if config.depth_temporal > 0.0 and output["depth"].shape[1] >= 2:
+            depth_valid_mask = depth_mask.bool()
+            predicted_depth = _normalise_depth_per_frame(
+                output["depth"], depth_valid_mask, epsilon=epsilon
+            )
+            target_depth = _normalise_depth_per_frame(
+                batch["target_depth"], depth_valid_mask, epsilon=epsilon
+            )
+            depth_pair_mask = depth_valid_mask[:, 1:] & depth_valid_mask[:, :-1]
+            predicted_depth_delta = predicted_depth[:, 1:] - predicted_depth[:, :-1]
+            target_depth_delta = target_depth[:, 1:] - target_depth[:, :-1]
+            depth_temporal = _masked_mean(
+                (predicted_depth_delta - target_depth_delta).abs(),
+                depth_pair_mask,
+                epsilon=epsilon,
+            )
+    elif config.depth_temporal > 0.0:
+        raise NativeObjectiveError(
+            "depth_temporal requires target_depth supervision"
+        )
 
     point = zero
+    point_temporal = zero
     if "target_point" in batch:
         point_mask = batch.get(
             "target_point_mask", torch.isfinite(batch["target_point"]).all(dim=-1)
@@ -1611,6 +1681,31 @@ def compute_native_objective(
             ),
             point_mask[..., None],
             epsilon=epsilon,
+        )
+        if config.point_temporal > 0.0 and output["point"].shape[1] >= 2:
+            point_valid_mask = point_mask.bool()
+            predicted_point = _normalise_points_per_window(
+                output["point"], point_valid_mask, epsilon=epsilon
+            )
+            target_point = _normalise_points_per_window(
+                batch["target_point"], point_valid_mask, epsilon=epsilon
+            )
+            point_pair_mask = point_valid_mask[:, 1:] & point_valid_mask[:, :-1]
+            predicted_point_delta = predicted_point[:, 1:] - predicted_point[:, :-1]
+            target_point_delta = target_point[:, 1:] - target_point[:, :-1]
+            point_temporal = _masked_mean(
+                F.smooth_l1_loss(
+                    predicted_point_delta,
+                    target_point_delta,
+                    reduction="none",
+                    beta=config.huber_delta,
+                ),
+                point_pair_mask[..., None],
+                epsilon=epsilon,
+            )
+    elif config.point_temporal > 0.0:
+        raise NativeObjectiveError(
+            "point_temporal requires target_point supervision"
         )
 
     camera_pose = zero
@@ -1757,7 +1852,9 @@ def compute_native_objective(
             context_pixel_action_separation_weight
         ),
         "depth_log": depth_log,
+        "depth_temporal": depth_temporal,
         "point": point,
+        "point_temporal": point_temporal,
         "camera_pose": camera_pose,
         "action_fine": action_fine,
         "action_fine_continuous": fine_continuous,
@@ -1830,7 +1927,9 @@ def compute_native_objective(
         + config.rgb_disocclusion_bce * rgb_disocclusion_bce
         + config.rgb_disocclusion_dice * rgb_disocclusion_dice
         + config.depth_log * depth_log
+        + config.depth_temporal * depth_temporal
         + config.point * point
+        + config.point_temporal * point_temporal
         + config.camera_pose * camera_pose
         + config.action_fine * action_fine
         + config.action_coarse * action_coarse
