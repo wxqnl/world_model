@@ -12,9 +12,12 @@ from wm3d.data.foundation_input import (
 
 class _VGGT(nn.Module):
     def forward(self, images, view_mask, **_kwargs):
-        assert images.shape[:3] == (2, 1, 3)
-        assert view_mask.shape == (2, 1, 3)
-        return {"view_tokens": torch.ones(2, 1, 3, 144, 2048)}
+        assert images.shape[:3] == (2, 3, 3)
+        assert view_mask.shape == (2, 3, 3)
+        tokens = torch.ones(2, 3, 3, 144, 2048)
+        tokens[:, 1].mul_(2)
+        tokens[:, 2].mul_(3)
+        return {"view_tokens": tokens}
 
 
 def _batch() -> dict[str, object]:
@@ -58,6 +61,7 @@ def _batch() -> dict[str, object]:
         ),
         "task_text": ["pick", "place"],
         "source_id": torch.zeros(batch_size, dtype=torch.long),
+        "sample_index": torch.tensor([0, 3], dtype=torch.long),
         "action_group_ids": torch.tensor([[1, 0], [1, 0]]),
         "action_group_mask": torch.tensor([[1, 0], [1, 0]], dtype=torch.bool),
         "action_semantic_ids": torch.ones(batch_size, groups, action_dim, dtype=torch.long),
@@ -70,7 +74,7 @@ def _batch() -> dict[str, object]:
     }
 
 
-def test_input_adapter_binds_wan_context_and_final_future_vggt() -> None:
+def test_input_adapter_binds_current_sampled_k8_and_final_vggt() -> None:
     bridge = FoundationBridgeConfig(
         context_frames=2,
         future_frames=4,
@@ -94,5 +98,16 @@ def test_input_adapter_binds_wan_context_and_final_future_vggt() -> None:
     output = adapter.materialize(_batch())
     assert output["video"].shape == (2, 3, 5, 48, 32)
     assert output["wan_context"].shape == (2, 5, 32)
+    assert output["vggt_current_tokens"].shape == (2, 3, 144, 2048)
+    assert not torch.is_inference(output["vggt_current_tokens"])
+    assert output["vggt_rollout_target_tokens"].shape == (2, 3, 64, 2048)
+    assert not torch.is_inference(output["vggt_rollout_target_tokens"])
+    assert output["vggt_rollout_target_horizon"].tolist() == [0, 3]
+    assert not torch.is_inference(output["vggt_rollout_target_horizon"])
     assert output["vggt_future_tokens"].shape == (2, 3, 144, 2048)
+    assert torch.equal(
+        output["vggt_future_tokens"],
+        torch.full_like(output["vggt_future_tokens"], 3),
+    )
     assert adapter.metrics["calls"] == 1
+    assert adapter.metrics["vggt_frames"] == 6

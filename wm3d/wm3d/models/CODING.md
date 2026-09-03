@@ -2,9 +2,15 @@
 
 - `NativeWorldModel` remains the shared implementation for native 1B/5B profiles.
 - `FoundationWorldModel` is the V10 WSA-Large adapter. Keep the official Wan2.2 video,
-  ActionDiT, Future3D and MoT owners intact; WM3D additions are limited to grouped robot,
-  exact-time and frozen-VGGT target adapters.
+  ActionDiT, Future3D and MoT owners intact. The native-3D extension may zero-gate the observed
+  per-view P144 state into Future3D and causally read K8xP64 state deltas from the shared tokens;
+  it must not expand or replace the MoT owners.
 - WSA-Large does not use Qwen3-VL. Do not add WSA-Base/Qwen components to the foundation profile.
+- Keep the foundation token hierarchy explicit: P144 joint current state, K8xP64 temporal rollout,
+  and the released WSA P1296 final output. Do not globally increase `P` without an isolated
+  quality/throughput comparison.
+- Clean future action/time/mask may condition video and native-3D world prediction, but never the
+  ActionDiT policy output. Future VGGT targets are loss-only and never model inputs.
 - Keep policy state action-free and factual world refinement explicitly action-conditioned.
 - Preserve continuous time, masks, grouped embodiment identity, and explicit RGB/depth/point/pose
   heads.

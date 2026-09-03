@@ -10,6 +10,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 import torch
+import torch.nn.functional as F
 
 from wm3d.data.foundation_bridge import (
     FoundationBridgeConfig,
@@ -24,6 +25,29 @@ FOUNDATION_CONTEXT_STORE_SCHEMA = "wm3d_foundation_context_store_v1"
 
 class FoundationInputError(ValueError):
     pass
+
+
+def _resize_token_grid(tokens: torch.Tensor, output_tokens: int) -> torch.Tensor:
+    if tokens.ndim != 4:
+        raise FoundationInputError("VGGT tokens must be [B,V,P,D]")
+    batch, views, patches, width = tokens.shape
+    source_grid = isqrt(patches)
+    target_grid = isqrt(int(output_tokens))
+    if source_grid**2 != patches or target_grid**2 != int(output_tokens):
+        raise FoundationInputError("VGGT token grids must be square")
+    if source_grid == target_grid:
+        return tokens
+    value = F.interpolate(
+        tokens.permute(0, 1, 3, 2)
+        .reshape(batch * views, width, source_grid, source_grid)
+        .float(),
+        size=(target_grid, target_grid),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return value.reshape(batch, views, width, int(output_tokens)).permute(
+        0, 1, 3, 2
+    ).to(dtype=tokens.dtype)
 
 
 class FoundationContextStore:
@@ -93,6 +117,8 @@ class FoundationInputAdapter(torch.nn.Module):
         context_store: FoundationContextStore,
         vggt_encoder: NativeVGGTEncoder,
         device: torch.device | str,
+        native_3d_context_tokens: int = 144,
+        native_3d_rollout_tokens: int = 64,
         native_3d_target_tokens: int = 144,
     ) -> None:
         super().__init__()
@@ -103,9 +129,16 @@ class FoundationInputAdapter(torch.nn.Module):
         self.vggt_encoder.requires_grad_(False)
         self.vggt_encoder.eval()
         self.device = torch.device(device)
+        self.native_3d_context_tokens = int(native_3d_context_tokens)
+        self.native_3d_rollout_tokens = int(native_3d_rollout_tokens)
         self.native_3d_target_tokens = int(native_3d_target_tokens)
+        if self.native_3d_context_tokens != self.native_3d_target_tokens:
+            raise FoundationInputError(
+                "current and final VGGT grids must share the P144 encoder pass"
+            )
         self.calls = 0
         self.samples = 0
+        self.vggt_frames = 0
         self.vggt_seconds = 0.0
 
     def train(self, mode: bool = True) -> "FoundationInputAdapter":
@@ -113,42 +146,75 @@ class FoundationInputAdapter(torch.nn.Module):
         self.vggt_encoder.eval()
         return self
 
-    @torch.inference_mode()
-    def _future_vggt_target(
-        self, images: torch.Tensor, view_mask: torch.Tensor
-    ) -> torch.Tensor:
-        index = self.bridge.context_frames + self.bridge.future_frames - 1
-        selected = images[:, index : index + 1].to(
-            self.device, non_blocking=True
-        ).float().div_(255.0)
-        selected_mask = view_mask[:, index : index + 1].to(
-            self.device, non_blocking=True
-        )
-        output = self.vggt_encoder(
-            selected,
-            selected_mask,
-            geometry_row_mask=torch.ones(
-                selected.shape[:2], dtype=torch.bool, device=self.device
+    def _native_3d_targets(
+        self,
+        images: torch.Tensor,
+        view_mask: torch.Tensor,
+        sample_index: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch = images.shape[0]
+        if sample_index.shape != (batch,) or sample_index.dtype != torch.long:
+            raise FoundationInputError("sample_index must be int64 [B]")
+        current_index = self.bridge.context_frames - 1
+        horizon = sample_index.remainder(self.bridge.future_frames)
+        rows = torch.arange(batch, device=images.device)
+        sampled_index = horizon.to(device=images.device) + self.bridge.context_frames
+        final_index = self.bridge.context_frames + self.bridge.future_frames - 1
+        selected = torch.stack(
+            (
+                images[:, current_index],
+                images[rows, sampled_index],
+                images[:, final_index],
             ),
-            appearance_row_mask=torch.zeros(
-                selected.shape[:2], dtype=torch.bool, device=self.device
+            dim=1,
+        ).to(self.device, non_blocking=True).float().div_(255.0)
+        selected_mask = torch.stack(
+            (
+                view_mask[:, current_index],
+                view_mask[rows, sampled_index],
+                view_mask[:, final_index],
             ),
-            rgb_row_mask=torch.zeros(
-                selected.shape[:2], dtype=torch.bool, device=self.device
-            ),
-        )
-        target = output["view_tokens"][:, 0]
+            dim=1,
+        ).to(self.device, non_blocking=True)
+        with torch.inference_mode():
+            output = self.vggt_encoder(
+                selected,
+                selected_mask,
+                geometry_row_mask=torch.ones(
+                    selected.shape[:2], dtype=torch.bool, device=self.device
+                ),
+                appearance_row_mask=torch.zeros(
+                    selected.shape[:2], dtype=torch.bool, device=self.device
+                ),
+                rgb_row_mask=torch.zeros(
+                    selected.shape[:2], dtype=torch.bool, device=self.device
+                ),
+            )
+        # Frozen teachers must not create an autograd graph, but their outputs
+        # are consumed by differentiable rollout losses. Clone after leaving
+        # inference mode so PyTorch may safely save them for backward.
+        tokens = output["view_tokens"].clone()
         expected = (
             images.shape[0],
+            3,
             self.bridge.num_views,
-            self.native_3d_target_tokens,
+            self.native_3d_context_tokens,
             2048,
         )
-        if tuple(target.shape) != expected or not bool(torch.isfinite(target).all()):
+        if tuple(tokens.shape) != expected or not bool(torch.isfinite(tokens).all()):
             raise FoundationInputError(
-                f"VGGT foundation target changed to {tuple(target.shape)}"
+                f"VGGT foundation sequence changed to {tuple(tokens.shape)}"
             )
-        return target
+        return {
+            "vggt_current_tokens": tokens[:, 0],
+            "vggt_current_view_mask": selected_mask[:, 0],
+            "vggt_rollout_target_tokens": _resize_token_grid(
+                tokens[:, 1], self.native_3d_rollout_tokens
+            ),
+            "vggt_rollout_target_horizon": horizon.to(self.device),
+            "vggt_rollout_target_view_mask": selected_mask[:, 1],
+            "vggt_future_tokens": tokens[:, 2],
+        }
 
     def materialize(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         images = batch.get("direct_rgb_uint8")
@@ -159,13 +225,21 @@ class FoundationInputAdapter(torch.nn.Module):
         tasks = sample["task_text"]
         wan_context, wan_mask = self.context_store.lookup(tasks)
         started = time.perf_counter()
-        target = self._future_vggt_target(images, view_mask.bool())
+        sample_index = batch.get("sample_index")
+        if not isinstance(sample_index, torch.Tensor):
+            raise FoundationInputError(
+                "foundation data must preserve sample_index for deterministic K8 supervision"
+            )
+        native_3d = self._native_3d_targets(
+            images, view_mask.bool(), sample_index.long()
+        )
         self.vggt_seconds += time.perf_counter() - started
         sample["wan_context"] = wan_context
         sample["wan_context_mask"] = wan_mask
-        sample["vggt_future_tokens"] = target
+        sample.update(native_3d)
         self.calls += 1
         self.samples += int(images.shape[0])
+        self.vggt_frames += int(images.shape[0]) * 3
         return sample
 
     @property
@@ -173,6 +247,7 @@ class FoundationInputAdapter(torch.nn.Module):
         return {
             "calls": self.calls,
             "samples": self.samples,
+            "vggt_frames": self.vggt_frames,
             "vggt_seconds": self.vggt_seconds,
         }
 
@@ -188,7 +263,7 @@ def build_foundation_input_adapter(
     encoder_contract = _strict_encoder(Path(str(closure["encoder_contract_path"])))
     encoder_config = replace(
         encoder_contract,
-        token_grid=isqrt(model.native_3d_target_tokens),
+        token_grid=isqrt(model.native_3d_context_tokens),
         appearance_token_grid=0,
         appearance_feature_layer=-1,
         target_rgb_size=model.video_height,
@@ -213,5 +288,7 @@ def build_foundation_input_adapter(
             local_files_only=True,
         ),
         device=device,
+        native_3d_context_tokens=model.native_3d_context_tokens,
+        native_3d_rollout_tokens=model.native_3d_rollout_tokens,
         native_3d_target_tokens=model.native_3d_target_tokens,
     )

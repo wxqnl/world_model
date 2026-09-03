@@ -59,6 +59,12 @@ class FoundationWorldModelConfig:
     aux_dim: int = 1
     rgb_size: int = 256
     rgb_decode_indices: tuple[int, ...] = tuple(range(8))
+    # Native-3D uses a hierarchical token budget. P64 is the inexpensive
+    # temporal rollout grid, while P144 matches the pretrained WSA per-view
+    # Future3D query grid. The official high-resolution P1296 decoder remains
+    # owned by the WSA checkpoint.
+    native_3d_context_tokens: int = 144
+    native_3d_rollout_tokens: int = 64
     native_3d_target_tokens: int = 144
 
     # WSA/Wan canvas and context widths.
@@ -81,6 +87,7 @@ class FoundationWorldModelConfig:
     video_loss_weight: float = 1.0
     action_loss_weight: float = 1.0
     native_3d_loss_weight: float = 0.1
+    native_3d_rollout_loss_weight: float = 0.05
     activation_checkpointing: bool = True
     dtype: str = "bf16"
 
@@ -116,6 +123,8 @@ class FoundationWorldModelConfig:
             "robot_conditioning_hidden",
             "action_time_fourier_dim",
             "wsa_action_horizon",
+            "native_3d_context_tokens",
+            "native_3d_rollout_tokens",
             "native_3d_target_tokens",
         ):
             if int(getattr(self, name)) <= 0:
@@ -126,9 +135,24 @@ class FoundationWorldModelConfig:
             )
         if self.P != 64 or self.token_dim != 2048:
             raise FoundationModelError("foundation data contract must be P64x2048")
-        target_grid = isqrt(self.native_3d_target_tokens)
-        if target_grid**2 != self.native_3d_target_tokens:
-            raise FoundationModelError("native_3d_target_tokens must form a square")
+        for name in (
+            "native_3d_context_tokens",
+            "native_3d_rollout_tokens",
+            "native_3d_target_tokens",
+        ):
+            value = int(getattr(self, name))
+            grid = isqrt(value)
+            if grid**2 != value:
+                raise FoundationModelError(f"{name} must form a square")
+        if self.native_3d_rollout_tokens != self.P:
+            raise FoundationModelError(
+                "native-3D rollout tokens must match the P64 data contract"
+            )
+        if self.native_3d_context_tokens != self.native_3d_target_tokens:
+            raise FoundationModelError(
+                "the first native-3D foundation profile uses one P144 VGGT grid "
+                "for current-state input and final-state supervision"
+            )
         if self.K % 4 or self.video_height % 16 or self.video_width % 16:
             raise FoundationModelError("Wan video shape is not VAE compatible")
         if self.video_height % 3 or self.video_width % 2:
@@ -150,6 +174,7 @@ class FoundationWorldModelConfig:
             "video_loss_weight",
             "action_loss_weight",
             "native_3d_loss_weight",
+            "native_3d_rollout_loss_weight",
         ):
             if float(getattr(self, name)) <= 0:
                 raise FoundationModelError(f"{name} must be positive")
@@ -439,34 +464,347 @@ class BoundVGGTTeacher(nn.Module):
         return tuple(flattened for _ in range(self.layers))
 
 
+def _resize_spatial_tokens(
+    tokens: torch.Tensor, output_tokens: int
+) -> torch.Tensor:
+    """Resize a per-view square token grid without mixing cameras."""
+
+    if tokens.ndim != 4:
+        raise FoundationModelError("native-3D tokens must be [B,V,P,D]")
+    batch, views, patches, width = tokens.shape
+    source_grid = isqrt(patches)
+    target_grid = isqrt(int(output_tokens))
+    if source_grid**2 != patches or target_grid**2 != int(output_tokens):
+        raise FoundationModelError("native-3D token grids must be square")
+    if source_grid == target_grid:
+        return tokens
+    resized = F.interpolate(
+        tokens.permute(0, 1, 3, 2)
+        .reshape(batch * views, width, source_grid, source_grid)
+        .float(),
+        size=(target_grid, target_grid),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.reshape(batch, views, width, int(output_tokens)).permute(
+        0, 1, 3, 2
+    ).to(dtype=tokens.dtype)
+
+
+class Native3DStateConditioner(nn.Module):
+    """Inject the observed P144 native state into WSA Future3D queries.
+
+    The gate starts at exact zero, so loading this adapter leaves the released
+    WSA checkpoint numerically unchanged.  Missing cameras are zeroed before
+    the update, and views are never pooled together.
+    """
+
+    def __init__(
+        self,
+        *,
+        token_dim: int,
+        hidden_dim: int,
+        num_views: int,
+        tokens_per_view: int,
+    ) -> None:
+        super().__init__()
+        self.num_views = int(num_views)
+        self.tokens_per_view = int(tokens_per_view)
+        self.norm = nn.LayerNorm(token_dim)
+        self.projection = nn.Linear(token_dim, hidden_dim, bias=False)
+        self.gate = nn.Parameter(torch.zeros(hidden_dim))
+
+    def forward(
+        self, tokens: torch.Tensor, view_mask: torch.Tensor
+    ) -> torch.Tensor:
+        expected = (self.num_views, self.tokens_per_view)
+        if tokens.ndim != 4 or tuple(tokens.shape[1:3]) != expected:
+            raise FoundationModelError(
+                "observed native-3D state does not match the WSA P144 view grid"
+            )
+        if tuple(view_mask.shape) != tuple(tokens.shape[:2]):
+            raise FoundationModelError("observed native-3D view mask changed")
+        if not bool(view_mask.any(dim=1).all()):
+            raise FoundationModelError("every sample requires an observed 3D view")
+        update = self.projection(self.norm(tokens))
+        update = update * view_mask[..., None, None].to(dtype=update.dtype)
+        update = update * torch.tanh(self.gate)[None, None, None]
+        return update.reshape(tokens.shape[0], -1, update.shape[-1])
+
+
+class Native3DRolloutHead(nn.Module):
+    """Causally decode K future P64 states from WSA and physical actions.
+
+    The MoT sequence remains P144/view.  A factorized temporal readout adds
+    only O(K*P64) work and avoids expanding the 30-layer joint attention to
+    K*P144 tokens.  Source-native fine commands are grouped by world interval
+    without interpolation.  Each recurrent update depends on the preceding
+    state, the shared WSA Future3D representation and that interval's clean
+    action/time/mask tuple.  This is a world-only path and cannot affect the
+    ActionDiT policy prediction.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        token_dim: int,
+        num_views: int,
+        context_tokens_per_view: int,
+        rollout_tokens_per_view: int,
+        horizons: int,
+        action_dim: int,
+    ) -> None:
+        super().__init__()
+        self.num_views = int(num_views)
+        self.context_tokens_per_view = int(context_tokens_per_view)
+        self.rollout_tokens_per_view = int(rollout_tokens_per_view)
+        self.horizons = int(horizons)
+        bottleneck = max(64, min(256, hidden_dim // 4))
+        self.current_norm = nn.LayerNorm(token_dim)
+        self.current_projection = nn.Linear(token_dim, hidden_dim, bias=False)
+        self.shared_norm = nn.LayerNorm(hidden_dim)
+        self.state_norm = nn.LayerNorm(hidden_dim)
+        self.state_projection = nn.Linear(hidden_dim, bottleneck, bias=False)
+        self.shared_projection = nn.Linear(hidden_dim, bottleneck, bias=False)
+        self.action_projection = nn.Linear(
+            3 * int(action_dim), bottleneck, bias=False
+        )
+        self.horizon_embedding = nn.Parameter(
+            torch.randn(self.horizons, bottleneck) * 0.02
+        )
+        self.state_update = nn.Linear(bottleneck, hidden_dim, bias=False)
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output = nn.Linear(hidden_dim, token_dim)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(
+        self,
+        shared_tokens: torch.Tensor,
+        current: torch.Tensor,
+        action: torch.Tensor,
+        action_time_s: torch.Tensor,
+        action_element_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        expected = self.num_views * self.context_tokens_per_view
+        if shared_tokens.ndim != 3 or shared_tokens.shape[1] != expected:
+            raise FoundationModelError(
+                "shared Future3D tokens do not match the P144/view contract"
+            )
+        if (
+            action.ndim != 3
+            or action_time_s.shape != action.shape
+            or action_element_mask.shape != action.shape
+        ):
+            raise FoundationModelError(
+                "native-3D rollout action/time/mask shapes disagree"
+            )
+        if action.shape[1] % self.horizons:
+            raise FoundationModelError(
+                "source-native future commands must divide into K intervals"
+            )
+        if action_element_mask.dtype != torch.bool:
+            raise FoundationModelError("native-3D rollout action mask must be boolean")
+        batch, _sequence, hidden = shared_tokens.shape
+        if current.ndim != 4 or tuple(current.shape[:3]) != (
+            batch,
+            self.num_views,
+            self.context_tokens_per_view,
+        ):
+            raise FoundationModelError(
+                "current native-3D state does not match the P144/view contract"
+            )
+        spatial = shared_tokens.reshape(
+            batch,
+            self.num_views,
+            self.context_tokens_per_view,
+            hidden,
+        )
+        spatial = _resize_spatial_tokens(spatial, self.rollout_tokens_per_view)
+        current_p64 = _resize_spatial_tokens(
+            current.to(device=spatial.device, dtype=spatial.dtype),
+            self.rollout_tokens_per_view,
+        )
+        state = self.current_projection(self.current_norm(current_p64))
+        shared_drive = self.shared_projection(self.shared_norm(spatial))
+
+        mask = action_element_mask.to(device=action.device)
+        command = torch.cat(
+            (
+                action.masked_fill(~mask, 0.0),
+                action_time_s.masked_fill(~mask, 0.0),
+                mask.to(dtype=action.dtype),
+            ),
+            dim=-1,
+        )
+        command = self.action_projection(command.to(dtype=spatial.dtype))
+        substeps = action.shape[1] // self.horizons
+        command = command.reshape(batch, self.horizons, substeps, -1).mean(dim=2)
+
+        predictions: list[torch.Tensor] = []
+        for index in range(self.horizons):
+            drive = (
+                self.state_projection(self.state_norm(state))
+                + shared_drive
+                + command[:, index, None, None]
+                + self.horizon_embedding[index][None, None, None].to(
+                    dtype=spatial.dtype
+                )
+            )
+            state = state + self.state_update(F.silu(drive))
+            residual = self.output(self.output_norm(state))
+            predictions.append(current_p64 + residual)
+        return torch.stack(predictions, dim=1)
+
+    def loss(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        horizon: torch.Tensor,
+        view_mask: torch.Tensor,
+        current: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        expected = (
+            prediction.shape[0],
+            self.horizons,
+            self.num_views,
+            self.rollout_tokens_per_view,
+        )
+        if prediction.ndim != 5 or tuple(prediction.shape[:4]) != expected:
+            raise FoundationModelError("native-3D rollout prediction shape changed")
+        if tuple(target.shape) != tuple(prediction.shape[:1] + prediction.shape[2:]):
+            raise FoundationModelError("native-3D rollout target shape changed")
+        if horizon.shape != prediction.shape[:1] or horizon.dtype != torch.long:
+            raise FoundationModelError("native-3D rollout horizon must be int64 [B]")
+        if bool(((horizon < 0) | (horizon >= self.horizons)).any()):
+            raise FoundationModelError("native-3D rollout horizon is out of range")
+        if tuple(view_mask.shape) != (prediction.shape[0], self.num_views):
+            raise FoundationModelError("native-3D rollout view mask changed")
+        rows = torch.arange(prediction.shape[0], device=prediction.device)
+        selected = prediction[rows, horizon]
+        valid = view_mask.to(device=selected.device, dtype=torch.bool)
+        if not bool(valid.any(dim=1).all()):
+            raise FoundationModelError("every rollout target requires a real view")
+        current_p64 = _resize_spatial_tokens(
+            current.to(device=selected.device, dtype=selected.dtype),
+            self.rollout_tokens_per_view,
+        )
+        target_valid = target.to(device=selected.device, dtype=selected.dtype)[valid]
+        pred_delta = (selected - current_p64)[valid].float()
+        target_delta = (target_valid - current_p64[valid]).float()
+        direction_per_view = F.cosine_similarity(
+            pred_delta.flatten(1), target_delta.flatten(1), dim=-1
+        )
+        target_scale = target_delta.detach().square().mean(
+            dim=(-2, -1), keepdim=True
+        ).sqrt().clamp_min(1.0e-3)
+        smooth_l1 = F.smooth_l1_loss(
+            pred_delta / target_scale,
+            target_delta / target_scale,
+        )
+        # A single normalized robust regression already constrains both
+        # direction and amplitude.  Do not optimize cosine at exact zero
+        # prediction: its denominator creates a very large first-step
+        # gradient.  Direction remains an explicit detached acceptance metric.
+        loss = smooth_l1
+        direction = direction_per_view.mean()
+        amplitude_ratio = (
+            pred_delta.square().mean().sqrt()
+            / target_delta.square().mean().sqrt().clamp_min(1.0e-8)
+        )
+        return loss, {
+            "loss_native_3d_rollout_delta_smooth_l1": smooth_l1.detach(),
+            "native_3d_rollout_direction": direction.detach(),
+            "native_3d_rollout_amplitude_ratio": amplitude_ratio.detach(),
+        }
+
+
 class WSABackendAdapter(nn.Module):
-    """Add WM3D time and VGGT contracts without forking WSA's MoT core."""
+    """Add WM3D time and native-3D contracts without forking WSA's MoT core."""
 
     def __init__(
         self,
         wsa_model: nn.Module,
         *,
-        native_3d_loss_weight: float,
-        action_time_fourier_dim: int,
+        config: FoundationWorldModelConfig,
     ) -> None:
         super().__init__()
         self.wsa_model = wsa_model
         action_expert = self.wsa_model.action_expert
         self.action_time = ActionTimeConditioner(
-            int(action_expert.hidden_dim), action_time_fourier_dim
+            int(action_expert.hidden_dim), config.action_time_fourier_dim
         )
-        query_layers = tuple(self.wsa_model.future_3d_expert.query_layer_indices)
+        future_3d = self.wsa_model.future_3d_expert
+        query_layers = tuple(future_3d.query_layer_indices)
+        if int(future_3d.da3_num_views) != config.num_views:
+            raise FoundationModelError("WSA Future3D view count changed")
+        if int(future_3d.query_tokens_per_view) != config.native_3d_context_tokens:
+            raise FoundationModelError(
+                "P144 current-state grid must match WSA Future3D queries/view"
+            )
         self.vggt_teacher = BoundVGGTTeacher(
-            int(self.wsa_model.future_3d_expert.da3_tokens_per_view),
+            int(future_3d.da3_tokens_per_view),
             len(query_layers),
         )
         self.wsa_model.da3_teacher = self.vggt_teacher
         self.wsa_model.da3_teacher_layers = tuple(range(len(query_layers)))
         self.wsa_model.da3_layer_weights = tuple(1.0 for _ in query_layers)
-        self.wsa_model.loss_lambda_3d = float(native_3d_loss_weight)
+        self.wsa_model.loss_lambda_3d = float(config.native_3d_loss_weight)
+        self.native_3d_state = Native3DStateConditioner(
+            token_dim=config.token_dim,
+            hidden_dim=int(future_3d.hidden_dim),
+            num_views=config.num_views,
+            tokens_per_view=config.native_3d_context_tokens,
+        )
+        self.native_3d_rollout = Native3DRolloutHead(
+            hidden_dim=int(future_3d.hidden_dim),
+            token_dim=config.token_dim,
+            num_views=config.num_views,
+            context_tokens_per_view=config.native_3d_context_tokens,
+            rollout_tokens_per_view=config.native_3d_rollout_tokens,
+            horizons=config.K,
+            action_dim=config.action_width,
+        )
+        self.native_3d_rollout_loss_weight = float(
+            config.native_3d_rollout_loss_weight
+        )
         self._active_time_update: torch.Tensor | None = None
+        self._active_native_3d_update: torch.Tensor | None = None
+        self._capture_rollout = False
+        self._captured_rollout_tokens: torch.Tensor | None = None
         self._time_hook = action_expert.action_encoder.register_forward_hook(
             self._inject_action_time
+        )
+        self._base_future_3d_pre_dit = future_3d.pre_dit
+
+        def conditioned_pre_dit(
+            _future_3d: nn.Module, *args: Any, **kwargs: Any
+        ) -> Mapping[str, Any]:
+            pre = self._base_future_3d_pre_dit(*args, **kwargs)
+            if self._active_native_3d_update is None:
+                raise RuntimeError("observed native-3D state was not bound")
+            update = self._active_native_3d_update
+            if pre["tokens"].shape != update.shape:
+                raise FoundationModelError(
+                    "observed native-3D update shape changed inside WSA"
+                )
+            pre = dict(pre)
+            pre["tokens"] = pre["tokens"] + update.to(
+                device=pre["tokens"].device, dtype=pre["tokens"].dtype
+            )
+            return pre
+
+        future_3d.pre_dit = types.MethodType(conditioned_pre_dit, future_3d)
+
+        def capture_rollout(
+            _module: nn.Module, _inputs: tuple[torch.Tensor, ...], output: torch.Tensor
+        ) -> None:
+            if self._capture_rollout:
+                self._captured_rollout_tokens = output
+
+        self._rollout_hook = future_3d.layer_norms[-1].register_forward_hook(
+            capture_rollout
         )
 
     def _inject_action_time(
@@ -482,12 +820,25 @@ class WSABackendAdapter(nn.Module):
         self,
         sample: Mapping[str, torch.Tensor],
         vggt_target: torch.Tensor,
+        current_native_3d: torch.Tensor,
+        current_native_3d_view_mask: torch.Tensor,
+        rollout_target: torch.Tensor,
+        rollout_horizon: torch.Tensor,
+        rollout_view_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        if self._active_time_update is not None:
+        if (
+            self._active_time_update is not None
+            or self._active_native_3d_update is not None
+        ):
             raise RuntimeError("concurrent WSA backend forwards are forbidden")
         self._active_time_update = self.action_time(
             sample["action_time_s"], sample["action_element_mask"]
         )
+        self._active_native_3d_update = self.native_3d_state(
+            current_native_3d, current_native_3d_view_mask
+        )
+        self._capture_rollout = True
+        self._captured_rollout_tokens = None
         self.vggt_teacher.bind(vggt_target)
         try:
             total, metrics = self.wsa_model.training_loss(
@@ -496,9 +847,31 @@ class WSABackendAdapter(nn.Module):
                 collect_detailed_loss_dict=True,
                 loss_dict_as_tensors=True,
             )
+            captured = self._captured_rollout_tokens
+            if captured is None:
+                raise RuntimeError("WSA Future3D rollout state was not captured")
+            rollout_prediction = self.native_3d_rollout(
+                captured,
+                current_native_3d,
+                sample["action"],
+                sample["action_time_s"],
+                sample["action_element_mask"],
+            )
+            rollout_loss, rollout_metrics = self.native_3d_rollout.loss(
+                rollout_prediction,
+                rollout_target,
+                rollout_horizon,
+                rollout_view_mask,
+                current_native_3d,
+            )
+            weighted_rollout = self.native_3d_rollout_loss_weight * rollout_loss
+            total = total + weighted_rollout
         finally:
             self.vggt_teacher.clear()
             self._active_time_update = None
+            self._active_native_3d_update = None
+            self._capture_rollout = False
+            self._captured_rollout_tokens = None
         result = {"total": total}
         result.update(
             {
@@ -510,6 +883,10 @@ class WSABackendAdapter(nn.Module):
                 for name, value in metrics.items()
             }
         )
+        result.update(rollout_metrics)
+        result["loss_native_3d_rollout"] = rollout_loss.detach()
+        result["loss_native_3d_rollout_w"] = weighted_rollout.detach()
+        result["native_3d_context_gate_rms"] = self.native_3d_state.gate.float().square().mean().sqrt().detach()
         return result
 
     @torch.inference_mode()
@@ -520,6 +897,8 @@ class WSABackendAdapter(nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         proprio: torch.Tensor,
+        current_native_3d: torch.Tensor,
+        current_native_3d_view_mask: torch.Tensor,
         action_time_s: torch.Tensor,
         action_element_mask: torch.Tensor,
         num_inference_steps: int,
@@ -527,7 +906,10 @@ class WSABackendAdapter(nn.Module):
     ) -> torch.Tensor:
         """Run ActionDiT with the same source-native time update used in training."""
 
-        if self._active_time_update is not None:
+        if (
+            self._active_time_update is not None
+            or self._active_native_3d_update is not None
+        ):
             raise RuntimeError("concurrent WSA backend forwards are forbidden")
         if input_image.ndim != 4 or input_image.shape[0] != 1:
             raise FoundationModelError(
@@ -544,6 +926,9 @@ class WSABackendAdapter(nn.Module):
         self._active_time_update = self.action_time(
             action_time_s, action_element_mask.bool()
         )
+        self._active_native_3d_update = self.native_3d_state(
+            current_native_3d, current_native_3d_view_mask
+        )
         try:
             result = self.wsa_model.infer_action(
                 prompt=None,
@@ -557,6 +942,7 @@ class WSABackendAdapter(nn.Module):
             )
         finally:
             self._active_time_update = None
+            self._active_native_3d_update = None
         action = result.get("action")
         expected = (int(action_time_s.shape[1]), int(action_time_s.shape[2]))
         if not isinstance(action, torch.Tensor) or tuple(action.shape) != expected:
@@ -617,7 +1003,15 @@ class FoundationWorldModel(nn.Module):
             "future_3d_images": batch["future_3d_images"],
             "future_3d_img_masks": batch["future_3d_img_masks"],
         }
-        result = self.backend(sample, batch["vggt_future_tokens"])
+        result = self.backend(
+            sample,
+            batch["vggt_future_tokens"],
+            batch["vggt_current_tokens"],
+            batch["vggt_current_view_mask"],
+            batch["vggt_rollout_target_tokens"],
+            batch["vggt_rollout_target_horizon"],
+            batch["vggt_rollout_target_view_mask"],
+        )
         if "total" not in result or result["total"].ndim != 0:
             raise FoundationModelError("foundation backend must return scalar total")
         if not bool(torch.isfinite(result["total"])):
@@ -679,6 +1073,8 @@ class FoundationWorldModel(nn.Module):
             context=context,
             context_mask=context_mask,
             proprio=proprio,
+            current_native_3d=batch["vggt_current_tokens"],
+            current_native_3d_view_mask=batch["vggt_current_view_mask"],
             action_time_s=action_time_s,
             action_element_mask=element_mask,
             num_inference_steps=num_inference_steps,
@@ -728,7 +1124,9 @@ class FoundationWorldModel(nn.Module):
             "trainable": count(self, True),
             "wsa_backend": count(self.backend),
             "wm3d_conditioning": count(self.robot_conditioner)
-            + count(self.robot_fusion),
+            + count(self.robot_fusion)
+            + count(self.backend.native_3d_state)
+            + count(self.backend.native_3d_rollout),
         }
 
     def gradient_owner_modules(self) -> Mapping[str, tuple[nn.Module, ...]]:
@@ -742,6 +1140,8 @@ class FoundationWorldModel(nn.Module):
                 self.robot_conditioner,
                 self.robot_fusion,
             ),
+            "foundation_native_3d_state": (self.backend.native_3d_state,),
+            "foundation_native_3d_rollout": (self.backend.native_3d_rollout,),
         }
         proprio = getattr(wsa_model, "proprio_encoder", None)
         if proprio is not None and any(p.requires_grad for p in proprio.parameters()):
@@ -880,8 +1280,7 @@ def build_foundation_world_model(
     policy.train(True)
     backend = WSABackendAdapter(
         policy.model,
-        native_3d_loss_weight=config.native_3d_loss_weight,
-        action_time_fourier_dim=config.action_time_fourier_dim,
+        config=config,
     )
     # WSA loads itself onto the requested device, while the WM3D fusion/robot
     # adapters above are newly initialized modules. Keep the

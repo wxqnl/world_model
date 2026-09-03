@@ -9,3 +9,7 @@
 - The foundation bridge may reshape source-native commands but must never interpolate them. Three
   views form one WSA canvas; exact command timestamps, grouped masks and source normalization remain
   recoverable at serving.
+- The foundation native-3D teacher encodes exactly three timestamps in one frozen VGGT call: last
+  observation, one deterministic sampled K8 target, and the final target. The sampled horizon comes
+  from the sealed sample index; targets never enter the model input. Spatial resizing is per view and
+  must not mix cameras.

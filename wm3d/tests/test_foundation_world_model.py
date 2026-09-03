@@ -9,6 +9,8 @@ from wm3d.models.foundation_world_model import (
     FoundationWorldModel,
     FoundationWorldModelConfig,
     GroupedRobotConditioner,
+    Native3DRolloutHead,
+    Native3DStateConditioner,
     ResidualContextFusion,
 )
 
@@ -102,15 +104,104 @@ def test_vggt_teacher_upsamples_spatial_grid_without_gradients() -> None:
     assert not outputs[0].requires_grad
 
 
+def test_native_3d_state_is_exact_wsa_identity_then_uses_each_view() -> None:
+    module = Native3DStateConditioner(
+        token_dim=8,
+        hidden_dim=12,
+        num_views=3,
+        tokens_per_view=4,
+    )
+    tokens = torch.randn(2, 3, 4, 8)
+    view_mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool)
+    initial = module(tokens, view_mask)
+    assert torch.equal(initial, torch.zeros_like(initial))
+    module.gate.data.fill_(0.1)
+    changed = module(tokens, view_mask).reshape(2, 3, 4, 12)
+    assert bool((changed[:, :2] != 0).any())
+    assert torch.equal(changed[1, 2], torch.zeros_like(changed[1, 2]))
+
+
+def test_native_3d_rollout_decodes_all_horizons_with_one_sampled_target() -> None:
+    head = Native3DRolloutHead(
+        hidden_dim=12,
+        token_dim=8,
+        num_views=3,
+        context_tokens_per_view=4,
+        rollout_tokens_per_view=4,
+        horizons=3,
+        action_dim=6,
+    )
+    shared = torch.randn(2, 12, 12, requires_grad=True)
+    target = torch.randn(2, 3, 4, 8)
+    current = torch.randn(2, 3, 4, 8)
+    action = torch.randn(2, 6, 6, requires_grad=True)
+    action_time = torch.arange(6, dtype=torch.float32)[None, :, None].expand_as(
+        action
+    )
+    action_mask = torch.ones_like(action, dtype=torch.bool)
+    prediction = head(shared, current, action, action_time, action_mask)
+    assert torch.equal(prediction, current[:, None].expand_as(prediction))
+    loss, metrics = head.loss(
+        prediction,
+        target,
+        torch.tensor([0, 2]),
+        torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool),
+        current,
+    )
+    assert prediction.shape == (2, 3, 3, 4, 8)
+    assert torch.isfinite(loss)
+    assert set(metrics) == {
+        "loss_native_3d_rollout_delta_smooth_l1",
+        "native_3d_rollout_direction",
+        "native_3d_rollout_amplitude_ratio",
+    }
+    loss.backward()
+    assert head.output.weight.grad is not None
+    assert bool((head.output.weight.grad != 0).any())
+    torch.optim.SGD(head.parameters(), lr=0.01).step()
+    shared.grad = None
+    action.grad = None
+    prediction = head(shared, current, action, action_time, action_mask)
+    loss, _metrics = head.loss(
+        prediction,
+        target,
+        torch.tensor([0, 2]),
+        torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool),
+        current,
+    )
+    loss.backward()
+    assert shared.grad is not None
+    assert bool((shared.grad != 0).any())
+    assert action.grad is not None
+    assert bool((action.grad != 0).any())
+
+
 class _Backend(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.sample = None
+        self.calls = 0
 
-    def forward(self, sample, vggt_target):
+    def forward(
+        self,
+        sample,
+        vggt_target,
+        current_native_3d,
+        current_native_3d_view_mask,
+        rollout_target,
+        rollout_horizon,
+        rollout_view_mask,
+    ):
+        del current_native_3d_view_mask, rollout_horizon, rollout_view_mask
+        self.calls += 1
         self.sample = sample
-        loss = (sample["context"].float().square().mean() + vggt_target.float().square().mean()) * self.scale
+        loss = (
+            sample["context"].float().square().mean()
+            + vggt_target.float().square().mean()
+            + current_native_3d.float().square().mean()
+            + rollout_target.float().square().mean()
+        ) * self.scale
         return {"total": loss, "loss_video": loss.detach()}
 
     def infer_action(self, **kwargs):
@@ -164,10 +255,18 @@ def test_foundation_model_keeps_wsa_context_and_robot_extensions_bounded() -> No
         "future_3d_images": torch.randn(batch_size, 3, 3, 24, 24),
         "future_3d_img_masks": torch.ones(batch_size, 3, dtype=torch.bool),
         "vggt_future_tokens": torch.randn(batch_size, 3, 4, 8),
+        "vggt_current_tokens": torch.randn(batch_size, 3, 4, 8),
+        "vggt_current_view_mask": torch.ones(batch_size, 3, dtype=torch.bool),
+        "vggt_rollout_target_tokens": torch.randn(batch_size, 3, 4, 8),
+        "vggt_rollout_target_horizon": torch.tensor([0, 3]),
+        "vggt_rollout_target_view_mask": torch.ones(
+            batch_size, 3, dtype=torch.bool
+        ),
     }
     output = model(batch)
     output["total"].backward()
     assert backend.sample is not None
+    assert backend.calls == 1
     assert backend.sample["context"].shape == (batch_size, 5, 32)
     assert model.robot_fusion.gate.grad is not None
     assert backend.scale.grad is not None
@@ -205,6 +304,8 @@ def test_foundation_action_serving_reuses_training_context_and_denormalizes() ->
         "action_element_mask": action_valid[:, None].expand(-1, 8, -1),
         "proprio": torch.randn(1, 1, 4),
         "proprio_dim_is_pad": ~state_valid,
+        "vggt_current_tokens": torch.randn(1, 3, 4, 8),
+        "vggt_current_view_mask": torch.ones(1, 3, dtype=torch.bool),
     }
     result = model.predict_action(batch, num_inference_steps=4, seed=7)
     assert backend.sample is not None

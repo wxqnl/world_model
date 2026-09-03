@@ -34,6 +34,11 @@ model:
   aux_dim: 1
   rgb_size: 256
   rgb_decode_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+  # Hierarchical native-3D capacity: P144 is already the released WSA
+  # Future3D query grid per view. K8 dynamics are decoded at P64, while the
+  # released P1296 final-state output head remains intact.
+  native_3d_context_tokens: 144
+  native_3d_rollout_tokens: 64
   native_3d_target_tokens: 144
   video_height: 384
   video_width: 320
@@ -49,6 +54,7 @@ model:
   wan_context_store_path: /data/Minko/wm3d_foundation_context
   video_loss_weight: 1.0
   action_loss_weight: 1.0
-  native_3d_loss_weight: 0.1
+  native_3d_loss_weight: 0.05
+  native_3d_rollout_loss_weight: 0.05
   activation_checkpointing: true
   dtype: bf16
