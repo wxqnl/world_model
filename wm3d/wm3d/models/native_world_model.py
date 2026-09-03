@@ -750,6 +750,13 @@ class _ZeroInitializedLinear(nn.Linear):
             nn.init.zeros_(self.bias)
 
 
+class _ZeroInitializedEmbedding(nn.Embedding):
+    """Embedding that remains zero after meta-shard materialization."""
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.weight)
+
+
 class MultiViewTokenFuser(nn.Module):
     """Fuse auxiliary cameras into the head-camera coordinate.
 
@@ -958,6 +965,17 @@ class GroupedSignalEncoder(nn.Module):
         self.action_semantic = nn.Embedding(cfg.max_action_semantic_id, output_dim)
         self.group = nn.Embedding(cfg.max_group_id, output_dim)
         self.embodiment = nn.Embedding(cfg.max_embodiments, output_dim)
+        # The V7 direct anchor was sufficient for its predominantly
+        # single-owner action layout.  V8 permits several simultaneous
+        # physical owners, so route each group's linear action feature before
+        # pooling.  A zero-initialized diagonal gain starts as the exact V7
+        # unit map, remains linear in the physical value, and can separate
+        # arm/base/controller commands without adding another action head.
+        self.direct_group_gain = (
+            _ZeroInitializedEmbedding(cfg.max_group_id, output_dim)
+            if self.condition_on_normalization
+            else None
+        )
         self.output_norm = RMSNorm(output_dim)
 
     def forward(
@@ -975,7 +993,8 @@ class GroupedSignalEncoder(nn.Module):
         embodiment_ids: torch.Tensor,
         normalization_offset: Optional[torch.Tensor] = None,
         normalization_scale: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        include_direct_physical: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         cfg = self.cfg
         if fine_values.shape != fine_dim_mask.shape:
             raise ValueError("fine action values and dimension mask must match")
@@ -1055,7 +1074,12 @@ class GroupedSignalEncoder(nn.Module):
             ),
             dim=-1,
         )
-        fine_tokens = self.fine_value(fine_pair) + self.time(fine_dt)
+        # Preserve a source-normalized, linear physical-action feature before
+        # time/identity mixing, nonlinearities, and RMS normalization.  The
+        # factual branch centers this feature against physical zero and uses
+        # it as the V7-compatible same-horizon block-0 anchor.
+        direct_fine_tokens = self.fine_value(fine_pair)
+        fine_tokens = direct_fine_tokens + self.time(fine_dt)
         if normalization_token is not None:
             fine_tokens = fine_tokens + normalization_token[:, None, :, None]
         fine_tokens = fine_tokens + F.silu(
@@ -1066,6 +1090,8 @@ class GroupedSignalEncoder(nn.Module):
         fine_summary = (fine_tokens * fine_weight).sum(dim=3)
         fine_count = fine_weight.sum(dim=3).clamp_min(1.0)
         fine_summary = fine_summary / fine_count
+        direct_fine_summary = (direct_fine_tokens * fine_weight).sum(dim=3)
+        direct_fine_summary = direct_fine_summary / fine_count
         if self.fine_aggregate is not None:
             fine_dim_valid = fine_dim_mask & fine_sample_mask[..., None]
             fine_dim_weight = fine_dim_valid.to(dtype=fine_values.dtype)
@@ -1094,7 +1120,9 @@ class GroupedSignalEncoder(nn.Module):
                 ),
                 dim=-1,
             )
-            fine_summary = fine_summary + self.fine_aggregate(aggregate)
+            aggregate_feature = self.fine_aggregate(aggregate)
+            fine_summary = fine_summary + aggregate_feature
+            direct_fine_summary = direct_fine_summary + aggregate_feature
 
         coarse_pair = torch.cat(
             (
@@ -1103,12 +1131,31 @@ class GroupedSignalEncoder(nn.Module):
             ),
             dim=-1,
         )
-        coarse_summary = self.coarse_value(coarse_pair)
+        direct_coarse_summary = self.coarse_value(coarse_pair)
+        coarse_summary = direct_coarse_summary
         if normalization_token is not None:
             coarse_summary = coarse_summary + normalization_token[:, None]
         real_coarse = coarse_dim_mask.any(dim=-1)
         fine_present = real_fine.any(dim=3)
+        if include_direct_physical and bool((fine_present & real_coarse).any()):
+            raise ValueError(
+                "direct physical action requires exactly one fine/coarse lane "
+                "per group and horizon"
+            )
         source_count = fine_present.to(torch.int32) + real_coarse.to(torch.int32)
+        direct_signal = (
+            direct_fine_summary
+            * fine_present[..., None].to(dtype=direct_fine_summary.dtype)
+            + direct_coarse_summary
+            * real_coarse[..., None].to(dtype=direct_coarse_summary.dtype)
+        ) / source_count.clamp_min(1)[..., None].to(
+            dtype=direct_fine_summary.dtype
+        )
+        if include_direct_physical:
+            if self.direct_group_gain is None:
+                raise RuntimeError("direct physical action group router is unavailable")
+            group_gain = 1.0 + torch.tanh(self.direct_group_gain(group_ids))
+            direct_signal = direct_signal * group_gain[:, None]
         signal = (
             fine_summary * fine_present[..., None].to(dtype=fine_summary.dtype)
             + coarse_summary * real_coarse[..., None].to(dtype=coarse_summary.dtype)
@@ -1124,7 +1171,11 @@ class GroupedSignalEncoder(nn.Module):
         signal = signal + self.embodiment(embodiment_ids)[:, None, None]
         valid = group_mask[:, None, :] & source_count.gt(0)
         signal = self.output_norm(signal)
-        return signal * group_mask[:, None, :, None].to(signal.dtype), valid
+        encoded = signal * group_mask[:, None, :, None].to(signal.dtype)
+        if include_direct_physical:
+            direct_signal = direct_signal * valid[..., None].to(direct_signal.dtype)
+            return encoded, valid, direct_signal
+        return encoded, valid
 
 
 class CanonicalV7ActionTokenEncoder(nn.Module):
@@ -4920,6 +4971,36 @@ class NativeWorldModel(nn.Module):
             dim=1,
         )
 
+    def _apply_factual_direct_action(
+        self,
+        state: torch.Tensor,
+        direct_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the physical command to its matching future slot before block 0.
+
+        This is the original V7 causal anchor: no scene-query attention,
+        nonlinearity, normalization, or horizon pooling is allowed between the
+        source-normalized command projection and its future state slot.
+        """
+
+        cfg = self.cfg
+        batch = state.shape[0]
+        expected_state = (batch, cfg.T + cfg.K, cfg.P, cfg.state_hidden)
+        if tuple(state.shape) != expected_state:
+            raise ValueError(f"factual state must be {expected_state}")
+        expected_action = (batch, cfg.K, cfg.state_hidden)
+        if tuple(direct_action.shape) != expected_action:
+            raise ValueError(
+                f"direct factual action must be {expected_action}"
+            )
+        return torch.cat(
+            (
+                state[:, : cfg.T],
+                state[:, cfg.T :] + direct_action[:, :, None, :],
+            ),
+            dim=1,
+        )
+
     def forward(
         self,
         *,
@@ -5204,10 +5285,15 @@ class NativeWorldModel(nn.Module):
         def encode_factual(
             fine_values: torch.Tensor,
             coarse_values: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        ) -> tuple[
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]:
             if self.factual_action is None:
                 raise RuntimeError("grouped factual summary encoder is unavailable")
-            encoded, encoded_mask = self.factual_action(
+            encoded_result = self.factual_action(
                 fine_values=fine_values,
                 fine_dim_mask=future_factual_fine_action_mask,
                 fine_dt=future_factual_fine_action_dt,
@@ -5228,7 +5314,13 @@ class NativeWorldModel(nn.Module):
                     if self.factual_action.condition_on_normalization
                     else None
                 ),
+                include_direct_physical=cfg.rgb_action_owned_transport,
             )
+            direct: Optional[torch.Tensor] = None
+            if cfg.rgb_action_owned_transport:
+                encoded, encoded_mask, direct = encoded_result
+            else:
+                encoded, encoded_mask = encoded_result
             summary: Optional[torch.Tensor] = None
             if (
                 cfg.factual_action_residual_scale > 0.0
@@ -5238,12 +5330,13 @@ class NativeWorldModel(nn.Module):
                 weight = encoded_mask[..., None].to(dtype=encoded.dtype)
                 summary = (encoded * weight).sum(dim=2)
                 summary = summary / weight.sum(dim=2).clamp_min(1.0)
-            return encoded, encoded_mask, summary
+            return encoded, encoded_mask, summary, direct
 
         def refine_factual(
             encoded: torch.Tensor,
             encoded_mask: torch.Tensor,
             summary: Optional[torch.Tensor],
+            direct_summary: Optional[torch.Tensor],
             observed_state: torch.Tensor,
             *,
             repeats: int,
@@ -5268,6 +5361,14 @@ class NativeWorldModel(nn.Module):
                 ):
                     raise RuntimeError(
                         "group-preserving factual state conditioner is unavailable"
+                    )
+                if direct_summary is None or tuple(direct_summary.shape) != (
+                    batch,
+                    cfg.K,
+                    cfg.state_hidden,
+                ):
+                    raise ValueError(
+                        "direct physical action must align to [B,K,state_hidden]"
                     )
 
                 # Preserve each physical owner until it reaches every future
@@ -5298,12 +5399,9 @@ class NativeWorldModel(nn.Module):
                     allowed_mask=safe_group_valid[:, None, None, :],
                 ).reshape(batch, cfg.K, cfg.P, cfg.state_hidden)
                 action_gate = torch.tanh(action_update)
-                candidate_state = torch.cat(
-                    (
-                        factual_state_input[:, : cfg.T],
-                        future_seed + residual_scale * action_update,
-                    ),
-                    dim=1,
+                candidate_state = self._apply_factual_direct_action(
+                    factual_state_input,
+                    direct_summary,
                 )
                 candidate_action = factual_action_input
                 candidate_action_index = 0
@@ -5400,6 +5498,8 @@ class NativeWorldModel(nn.Module):
         noop_centered_encoded: Optional[torch.Tensor] = None
         centered_summary: Optional[torch.Tensor] = None
         noop_centered_summary: Optional[torch.Tensor] = None
+        centered_direct_summary: Optional[torch.Tensor] = None
+        noop_centered_direct_summary: Optional[torch.Tensor] = None
         zero_physical_fine_action = normalized_physical_zero_action(
             future_factual_fine_action_values,
             future_factual_fine_action_mask,
@@ -5433,14 +5533,24 @@ class NativeWorldModel(nn.Module):
             group_axis=2,
         )
         if self.factual_action is not None:
-            factual_encoded, factual_encoded_mask, factual_summary = encode_factual(
+            (
+                factual_encoded,
+                factual_encoded_mask,
+                factual_summary,
+                factual_direct,
+            ) = encode_factual(
                 future_factual_fine_action_values,
                 future_factual_coarse_action_values,
             )
             # Center against the exact same masked encoding of the zero
             # physical command. This removes time/semantic/group/embodiment
             # constants while preserving every real grouped action token.
-            zero_encoded, zero_encoded_mask, zero_summary = encode_factual(
+            (
+                zero_encoded,
+                zero_encoded_mask,
+                zero_summary,
+                zero_direct,
+            ) = encode_factual(
                 zero_physical_fine_action,
                 zero_physical_coarse_action,
             )
@@ -5448,7 +5558,12 @@ class NativeWorldModel(nn.Module):
                 raise RuntimeError("factual and zero action masks must be identical")
             zero_encoded_anchor = zero_encoded.detach()
             centered_encoded = factual_encoded - zero_encoded_anchor
-            noop_encoded, noop_encoded_mask, noop_summary = encode_factual(
+            (
+                noop_encoded,
+                noop_encoded_mask,
+                noop_summary,
+                noop_direct,
+            ) = encode_factual(
                 noop_physical_fine_action,
                 noop_physical_coarse_action,
             )
@@ -5461,6 +5576,22 @@ class NativeWorldModel(nn.Module):
                 zero_summary_anchor = zero_summary.detach()
                 centered_summary = factual_summary - zero_summary_anchor
                 noop_centered_summary = noop_summary - zero_summary_anchor
+            if cfg.rgb_action_owned_transport:
+                if factual_direct is None or zero_direct is None or noop_direct is None:
+                    raise RuntimeError("direct physical action features are unavailable")
+                direct_anchor = zero_direct.detach()
+                centered_direct = factual_direct - direct_anchor
+                noop_centered_direct = noop_direct - direct_anchor
+                direct_weight = factual_encoded_mask[..., None].to(
+                    dtype=centered_direct.dtype
+                )
+                direct_denom = direct_weight.sum(dim=2).clamp_min(1.0)
+                centered_direct_summary = (
+                    centered_direct * direct_weight
+                ).sum(dim=2) / direct_denom
+                noop_centered_direct_summary = (
+                    noop_centered_direct * direct_weight
+                ).sum(dim=2) / direct_denom
 
         canonical_action_cond: Optional[torch.Tensor] = None
         canonical_grouped_action: Optional[torch.Tensor] = None
@@ -5876,6 +6007,7 @@ class NativeWorldModel(nn.Module):
                 centered_encoded,
                 factual_encoded_mask,
                 centered_summary,
+                centered_direct_summary,
                 factual_observed_state,
                 repeats=cfg.factual_dynamics_repeats,
                 residual_scale=cfg.factual_action_residual_scale,
@@ -5920,6 +6052,7 @@ class NativeWorldModel(nn.Module):
                 centered_encoded,
                 factual_encoded_mask,
                 centered_summary,
+                centered_direct_summary,
                 factual_observed_state,
                 repeats=render_repeats,
                 residual_scale=render_residual_scale,
@@ -5988,6 +6121,7 @@ class NativeWorldModel(nn.Module):
                     noop_centered_encoded,
                     zero_encoded_mask,
                     noop_centered_summary,
+                    noop_centered_direct_summary,
                     zero_factual_observed_state,
                     repeats=cfg.factual_dynamics_repeats,
                     residual_scale=cfg.factual_action_residual_scale,

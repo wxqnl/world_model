@@ -2,7 +2,7 @@ schema: wm3d_v8_model_profile_v1
 name: native_5b_v8_action_owned_rgb_transport
 architecture: native_world_model
 # Sealed after constructing this exact profile on meta and real FSDP2 shards.
-expected_parameter_count: 5081531188
+expected_parameter_count: 5081858868
 sampling:
   mode: observed_monotonic_subsequence
   history_action_leading_boundary: observed_previous_state

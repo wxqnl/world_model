@@ -1561,13 +1561,13 @@ def test_action_owned_transport_rejects_legacy_factual_configuration(
     [
         (
             "native_1b_v8_action_owned_transport.yaml",
-            1_190_107_316,
+            1_190_312_116,
             64,
             8,
         ),
         (
             "native_5b_v8_action_owned_transport.yaml",
-            5_081_531_188,
+            5_081_858_868,
             144,
             16,
         ),
@@ -2049,6 +2049,311 @@ def test_factual_frame_action_modulation_is_spatial_causal_and_zero_exact() -> N
         scale=1.0,
     )
     torch.testing.assert_close(zero, state, rtol=0, atol=0)
+
+
+def test_factual_direct_action_is_same_horizon_zero_exact_and_not_in_place() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(820)
+    model = NativeWorldModel(cfg).eval()
+    state = torch.randn(1, cfg.T + cfg.K, cfg.P, cfg.state_hidden)
+    original = state.clone()
+    direct = torch.zeros(1, cfg.K, cfg.state_hidden)
+    direct[:, 1] = torch.randn(1, cfg.state_hidden)
+    direct.requires_grad_()
+
+    conditioned = model._apply_factual_direct_action(state, direct)
+    torch.testing.assert_close(state, original, rtol=0, atol=0)
+    torch.testing.assert_close(
+        conditioned[:, : cfg.T], original[:, : cfg.T], rtol=0, atol=0
+    )
+    delta = conditioned[:, cfg.T :] - original[:, cfg.T :]
+    torch.testing.assert_close(
+        delta[:, 0], torch.zeros_like(delta[:, 0]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        delta[:, 1],
+        direct[:, 1, None].expand(-1, cfg.P, -1),
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+    delta.square().mean().backward()
+    assert direct.grad is not None
+    assert direct.grad[:, 0].count_nonzero() == 0
+    assert direct.grad[:, 1].abs().sum() > 0
+
+    zero = model._apply_factual_direct_action(
+        state, torch.zeros_like(direct)
+    )
+    torch.testing.assert_close(zero, state, rtol=0, atol=0)
+
+
+def test_direct_physical_feature_is_linear_around_physical_zero() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(821)
+    model = NativeWorldModel(cfg).eval()
+    assert model.factual_action is not None
+    assert model.factual_action.fine_value.bias is None
+    assert model.factual_action.coarse_value.bias is None
+    batch = _single_group_action_owned_batch(cfg)
+    fine_mask = torch.zeros_like(
+        batch["future_factual_fine_action_mask"], dtype=torch.bool
+    )
+    fine_mask[:, :, 0, :, 0] = True
+    sample_mask = fine_mask.any(dim=-1)
+    coarse = torch.zeros_like(batch["future_factual_coarse_action_values"])
+    coarse_mask = torch.zeros_like(
+        batch["future_factual_coarse_action_mask"], dtype=torch.bool
+    )
+    offset = batch["action_normalization_offset"].clone()
+    scale = batch["action_normalization_scale"].clone()
+    offset[:, 0, 0] = 0.37
+    scale[:, 0, 0] = 2.5
+
+    def normalized_motion(value: float) -> torch.Tensor:
+        physical = torch.zeros_like(batch["future_factual_fine_action_values"])
+        physical[:, :, 0, :, 0] = value
+        broadcast_offset = offset[:, None, :, None]
+        broadcast_scale = scale[:, None, :, None]
+        return torch.where(
+            fine_mask,
+            (physical - broadcast_offset) / broadcast_scale,
+            torch.zeros_like(physical),
+        )
+
+    def direct(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        encoded = model.factual_action(
+            fine_values=values,
+            fine_dim_mask=fine_mask,
+            fine_dt=batch["future_factual_fine_action_dt"],
+            fine_sample_mask=sample_mask,
+            coarse_values=coarse,
+            coarse_dim_mask=coarse_mask,
+            action_semantic_ids=batch["action_semantic_ids"],
+            group_ids=batch["action_group_ids"],
+            group_mask=batch["action_group_mask"],
+            embodiment_ids=batch["embodiment_ids"],
+            normalization_offset=offset,
+            normalization_scale=scale,
+            include_direct_physical=True,
+        )
+        return encoded[2], encoded[1]
+
+    plus, valid = direct(normalized_motion(0.6))
+    minus, minus_valid = direct(normalized_motion(-0.6))
+    numeric_zero_values = normalized_physical_zero_action(
+        normalized_motion(0.6),
+        fine_mask,
+        batch["action_semantic_ids"],
+        offset,
+        scale,
+        group_axis=2,
+    )
+    numeric_zero, zero_valid = direct(numeric_zero_values)
+    assert torch.equal(valid, minus_valid)
+    assert torch.equal(valid, zero_valid)
+    centered_plus = plus - numeric_zero.detach()
+    centered_minus = minus - numeric_zero.detach()
+    torch.testing.assert_close(
+        centered_plus, -centered_minus, rtol=1.0e-5, atol=1.0e-6
+    )
+    assert numeric_zero.abs().sum() > 0
+    assert centered_plus[:, :, 0].abs().sum() > 0
+    assert centered_plus[:, :, 1].count_nonzero() == 0
+
+
+def test_numeric_physical_zero_reaches_block_zero_without_direct_update() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(822)
+    model = NativeWorldModel(cfg).eval()
+    batch = _single_group_action_owned_batch(cfg)
+    batch["future_factual_fine_action_values"] = normalized_physical_zero_action(
+        batch["future_factual_fine_action_values"],
+        batch["future_factual_fine_action_mask"],
+        batch["action_semantic_ids"],
+        batch["action_normalization_offset"],
+        batch["action_normalization_scale"],
+        group_axis=2,
+    )
+    batch["future_factual_coarse_action_values"] = normalized_physical_zero_action(
+        batch["future_factual_coarse_action_values"],
+        batch["future_factual_coarse_action_mask"],
+        batch["action_semantic_ids"],
+        batch["action_normalization_offset"],
+        batch["action_normalization_scale"],
+        group_axis=2,
+    )
+    block_inputs: list[torch.Tensor] = []
+
+    def record(_module, inputs) -> None:
+        block_inputs.append(inputs[0].detach().clone())
+
+    handle = model.state_blocks[0].register_forward_pre_hook(record)
+    try:
+        model(**batch)
+    finally:
+        handle.remove()
+    assert len(block_inputs) == 2
+    torch.testing.assert_close(block_inputs[1], block_inputs[0], rtol=0, atol=0)
+
+
+def test_direct_group_router_starts_as_unit_map_and_preserves_identity() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(823)
+    model = NativeWorldModel(cfg).eval()
+    encoder = model.factual_action
+    assert encoder is not None
+    assert encoder.direct_group_gain is not None
+    torch.testing.assert_close(
+        encoder.direct_group_gain.weight,
+        torch.zeros_like(encoder.direct_group_gain.weight),
+        rtol=0,
+        atol=0,
+    )
+    batch = _single_group_action_owned_batch(cfg)
+    group_mask = torch.tensor([[True, True]])
+    group_ids = torch.tensor([[1, 2]])
+    fine = batch["future_factual_fine_action_values"][:, :, :1].expand(
+        -1, -1, 2, -1, -1
+    ).clone()
+    fine_mask = batch["future_factual_fine_action_mask"][:, :, :1].expand_as(
+        fine
+    ).clone()
+    fine_sample_mask = batch["future_factual_fine_sample_mask"][:, :, :1].expand(
+        -1, -1, 2, -1
+    ).clone()
+    semantics = batch["action_semantic_ids"][:, :1].expand(-1, 2, -1).clone()
+    offset = batch["action_normalization_offset"][:, :1].expand(-1, 2, -1).clone()
+    scale = batch["action_normalization_scale"][:, :1].expand(-1, 2, -1).clone()
+    coarse = batch["future_factual_coarse_action_values"][:, :, :1].expand(
+        -1, -1, 2, -1
+    ).clone()
+    coarse_mask = batch["future_factual_coarse_action_mask"][:, :, :1].expand_as(
+        coarse
+    ).clone()
+
+    def direct() -> torch.Tensor:
+        return encoder(
+            fine_values=fine,
+            fine_dim_mask=fine_mask,
+                fine_dt=batch["future_factual_fine_action_dt"][:, :, :1].expand(
+                -1, -1, 2, -1
+            ),
+            fine_sample_mask=fine_sample_mask,
+            coarse_values=coarse,
+            coarse_dim_mask=coarse_mask,
+            action_semantic_ids=semantics,
+            group_ids=group_ids,
+            group_mask=group_mask,
+            embodiment_ids=batch["embodiment_ids"],
+            normalization_offset=offset,
+            normalization_scale=scale,
+            include_direct_physical=True,
+        )[2]
+
+    unit = direct()
+    torch.testing.assert_close(unit[:, :, 0], unit[:, :, 1], rtol=0, atol=0)
+    with torch.no_grad():
+        encoder.direct_group_gain.weight[2].fill_(0.5)
+    routed = direct()
+    torch.testing.assert_close(routed[:, :, 0], unit[:, :, 0], rtol=0, atol=0)
+    assert not torch.allclose(routed[:, :, 1], unit[:, :, 1])
+
+
+def test_physical_noop_preserves_absolute_direct_channels() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(824)
+    model = NativeWorldModel(cfg).eval()
+    encoder = model.factual_action
+    assert encoder is not None
+    batch = _single_group_action_owned_batch(cfg)
+    fine = torch.zeros_like(batch["future_factual_fine_action_values"])
+    fine_mask = torch.zeros_like(
+        batch["future_factual_fine_action_mask"], dtype=torch.bool
+    )
+    fine_sample_mask = torch.zeros_like(
+        batch["future_factual_fine_sample_mask"], dtype=torch.bool
+    )
+    fine_mask[:, :, 0, 0, :3] = True
+    fine_sample_mask[:, :, 0, 0] = True
+    semantics = torch.zeros_like(batch["action_semantic_ids"])
+    semantics[:, 0, 0] = ACTION_SEMANTIC_IDS["delta_position_m"]
+    semantics[:, 0, 1] = ACTION_SEMANTIC_IDS["absolute_gripper_close01"]
+    semantics[:, 0, 2] = ACTION_SEMANTIC_IDS["controller_command"]
+    offset = torch.zeros_like(batch["action_normalization_offset"])
+    scale = torch.ones_like(batch["action_normalization_scale"])
+    fine[:, :, 0, 0, 0] = 0.4
+    fine[:, :, 0, 0, 1] = 0.23
+    fine[:, :, 0, 0, 2] = 0.37
+    coarse = torch.zeros_like(batch["future_factual_coarse_action_values"])
+    coarse_mask = torch.zeros_like(
+        batch["future_factual_coarse_action_mask"], dtype=torch.bool
+    )
+
+    def direct(values: torch.Tensor) -> torch.Tensor:
+        return encoder(
+            fine_values=values,
+            fine_dim_mask=fine_mask,
+            fine_dt=batch["future_factual_fine_action_dt"],
+            fine_sample_mask=fine_sample_mask,
+            coarse_values=coarse,
+            coarse_dim_mask=coarse_mask,
+            action_semantic_ids=semantics,
+            group_ids=batch["action_group_ids"],
+            group_mask=batch["action_group_mask"],
+            embodiment_ids=batch["embodiment_ids"],
+            normalization_offset=offset,
+            normalization_scale=scale,
+            include_direct_physical=True,
+        )[2]
+
+    numeric_zero_values = normalized_physical_zero_action(
+        fine, fine_mask, semantics, offset, scale, group_axis=2
+    )
+    noop_values = normalized_physical_noop_action(
+        fine, fine_mask, semantics, offset, scale, group_axis=2
+    )
+    factual_centered = direct(fine) - direct(numeric_zero_values).detach()
+    noop_centered = direct(noop_values) - direct(numeric_zero_values).detach()
+
+    delta_only = fine.clone()
+    delta_only[..., 1:] = 0
+    delta_response = direct(delta_only) - direct(numeric_zero_values).detach()
+    torch.testing.assert_close(
+        factual_centered - noop_centered,
+        delta_response,
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+    assert noop_centered.abs().sum() > 0
+
+
+def test_direct_physical_feature_rejects_double_counted_fine_and_coarse() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    model = NativeWorldModel(cfg).eval()
+    assert model.factual_action is not None
+    batch = _single_group_action_owned_batch(cfg)
+    coarse_mask = torch.zeros_like(
+        batch["future_factual_coarse_action_mask"], dtype=torch.bool
+    )
+    coarse_mask[:, :, 0, 0] = True
+    with pytest.raises(ValueError, match="exactly one fine/coarse lane"):
+        model.factual_action(
+            fine_values=batch["future_factual_fine_action_values"],
+            fine_dim_mask=batch["future_factual_fine_action_mask"],
+            fine_dt=batch["future_factual_fine_action_dt"],
+            fine_sample_mask=batch["future_factual_fine_sample_mask"],
+            coarse_values=torch.zeros_like(
+                batch["future_factual_coarse_action_values"]
+            ),
+            coarse_dim_mask=coarse_mask,
+            action_semantic_ids=batch["action_semantic_ids"],
+            group_ids=batch["action_group_ids"],
+            group_mask=batch["action_group_mask"],
+            embodiment_ids=batch["embodiment_ids"],
+            normalization_offset=batch["action_normalization_offset"],
+            normalization_scale=batch["action_normalization_scale"],
+            include_direct_physical=True,
+        )
 
 
 def test_action_owned_renderer_has_no_direct_action_shortcut() -> None:
