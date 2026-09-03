@@ -2225,7 +2225,7 @@ def test_numeric_physical_zero_reaches_block_zero_without_direct_update() -> Non
     assert sum(gradient.abs().sum() for gradient in factual_action_gradients) == 0
 
 
-def test_direct_group_router_starts_closed_and_remains_trainable() -> None:
+def test_direct_group_router_starts_live_and_remains_trainable() -> None:
     cfg = _tiny_action_owned_transport_config()
     torch.manual_seed(823)
     model = NativeWorldModel(cfg).eval()
@@ -2240,7 +2240,7 @@ def test_direct_group_router_starts_closed_and_remains_trainable() -> None:
         encoder.direct_fine_aggregate,
         encoder.direct_coarse_value,
     ):
-        torch.testing.assert_close(projection.weight, torch.zeros_like(projection.weight))
+        assert projection.weight.abs().sum() > 0
     torch.testing.assert_close(
         encoder.direct_group_gain.weight,
         torch.zeros_like(encoder.direct_group_gain.weight),
@@ -2288,9 +2288,10 @@ def test_direct_group_router_starts_closed_and_remains_trainable() -> None:
             include_direct_physical=True,
         )[2]
 
-    closed = direct()
-    torch.testing.assert_close(closed, torch.zeros_like(closed), rtol=0, atol=0)
-    closed.sum().backward()
+    live = direct()
+    assert live.abs().sum() > 0
+    torch.testing.assert_close(live[:, :, 0], live[:, :, 1], rtol=0, atol=0)
+    live.square().sum().backward()
     projection_gradients = (
         encoder.direct_fine_value.weight.grad,
         encoder.direct_fine_aggregate.weight.grad,
@@ -2309,7 +2310,7 @@ def test_direct_group_router_starts_closed_and_remains_trainable() -> None:
     gain_gradient = encoder.direct_group_gain.weight.grad
     assert gain_gradient is not None
     assert torch.isfinite(gain_gradient).all()
-    assert gain_gradient.abs().sum() == 0
+    assert gain_gradient.abs().sum() > 0
 
     encoder.zero_grad(set_to_none=True)
     _open_direct_physical_adapter(encoder)
@@ -2323,6 +2324,70 @@ def test_direct_group_router_starts_closed_and_remains_trainable() -> None:
     torch.testing.assert_close(
         routed[:, :, 0] / (1.0 + torch.tanh(routed.new_tensor(0.25))),
         routed[:, :, 1] / (1.0 + torch.tanh(routed.new_tensor(0.5))),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+
+
+def test_direct_physical_projection_is_source_normalization_invariant() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(825)
+    model = NativeWorldModel(cfg).eval()
+    encoder = model.factual_action
+    assert encoder is not None
+    batch = _single_group_action_owned_batch(cfg)
+    mask = batch["future_factual_fine_action_mask"]
+    sample_mask = batch["future_factual_fine_sample_mask"]
+    physical = torch.linspace(
+        -0.2,
+        0.4,
+        batch["future_factual_fine_action_values"].numel(),
+    ).reshape_as(batch["future_factual_fine_action_values"])
+    physical = torch.where(mask, physical, torch.zeros_like(physical))
+    offset_a = torch.zeros_like(batch["action_normalization_offset"])
+    scale_a = torch.ones_like(batch["action_normalization_scale"])
+    offset_b = torch.full_like(offset_a, 0.37)
+    scale_b = torch.full_like(scale_a, 2.25)
+
+    def centered(offset: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        broadcast_offset = offset[:, None, :, None]
+        broadcast_scale = scale[:, None, :, None]
+        normalized = torch.where(
+            mask,
+            (physical - broadcast_offset) / broadcast_scale,
+            torch.zeros_like(physical),
+        )
+        numeric_zero = normalized_physical_zero_action(
+            normalized,
+            mask,
+            batch["action_semantic_ids"],
+            offset,
+            scale,
+            group_axis=2,
+        )
+
+        def project(values: torch.Tensor) -> torch.Tensor:
+            return encoder(
+                fine_values=values,
+                fine_dim_mask=mask,
+                fine_dt=batch["future_factual_fine_action_dt"],
+                fine_sample_mask=sample_mask,
+                coarse_values=batch["future_factual_coarse_action_values"],
+                coarse_dim_mask=batch["future_factual_coarse_action_mask"],
+                action_semantic_ids=batch["action_semantic_ids"],
+                group_ids=batch["action_group_ids"],
+                group_mask=batch["action_group_mask"],
+                embodiment_ids=batch["embodiment_ids"],
+                normalization_offset=offset,
+                normalization_scale=scale,
+                include_direct_physical=True,
+            )[2]
+
+        return project(normalized) - project(numeric_zero)
+
+    torch.testing.assert_close(
+        centered(offset_a, scale_a),
+        centered(offset_b, scale_b),
         rtol=1.0e-5,
         atol=1.0e-6,
     )

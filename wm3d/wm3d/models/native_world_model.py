@@ -947,21 +947,25 @@ class GroupedSignalEncoder(nn.Module):
             else None
         )
         self.coarse_value = nn.Linear(cfg.max_action_dim * 2, output_dim, bias=False)
-        # The direct residual is a standard zero-initialized adapter. Its
-        # output is exactly zero at initialization while the projection
-        # weights receive action-dependent gradients on the first step.
+        # The block-0 residual consumes de-normalized physical values. Keep
+        # it live at initialization, as in V7: centering factual and no-op
+        # commands against the same numeric-physical-zero encoding makes the
+        # zero residual exact without a learned gate or a closed projection.
+        # A zero-initialized mapping learned too slowly during LR warmup and,
+        # more importantly, projecting source z-scores made identical
+        # physical commands disagree across source-specific profiles.
         self.direct_fine_value = (
-            _ZeroInitializedLinear(cfg.max_action_dim * 2, output_dim, bias=False)
+            nn.Linear(cfg.max_action_dim * 2, output_dim, bias=False)
             if self.condition_on_normalization
             else None
         )
         self.direct_fine_aggregate = (
-            _ZeroInitializedLinear(cfg.max_action_dim * 4, output_dim, bias=False)
+            nn.Linear(cfg.max_action_dim * 4, output_dim, bias=False)
             if self.condition_on_normalization
             else None
         )
         self.direct_coarse_value = (
-            _ZeroInitializedLinear(cfg.max_action_dim * 2, output_dim, bias=False)
+            nn.Linear(cfg.max_action_dim * 2, output_dim, bias=False)
             if self.condition_on_normalization
             else None
         )
@@ -1047,6 +1051,8 @@ class GroupedSignalEncoder(nn.Module):
             raise ValueError("action_semantic_ids must be [B,G,A]")
 
         normalization_token: Optional[torch.Tensor] = None
+        direct_fine_values: Optional[torch.Tensor] = None
+        direct_coarse_values: Optional[torch.Tensor] = None
         if self.condition_on_normalization:
             expected_normalization = (
                 batch,
@@ -1081,6 +1087,29 @@ class GroupedSignalEncoder(nn.Module):
             )
             assert self.normalization is not None
             normalization_token = self.normalization(calibration)
+            if include_direct_physical:
+                fine_offset = normalization_offset[:, None, :, None].to(
+                    dtype=fine_values.dtype
+                )
+                fine_scale = normalization_scale[:, None, :, None].to(
+                    dtype=fine_values.dtype
+                )
+                direct_fine_values = torch.where(
+                    fine_dim_mask,
+                    fine_values * fine_scale + fine_offset,
+                    torch.zeros_like(fine_values),
+                )
+                coarse_offset = normalization_offset[:, None].to(
+                    dtype=coarse_values.dtype
+                )
+                coarse_scale = normalization_scale[:, None].to(
+                    dtype=coarse_values.dtype
+                )
+                direct_coarse_values = torch.where(
+                    coarse_dim_mask,
+                    coarse_values * coarse_scale + coarse_offset,
+                    torch.zeros_like(coarse_values),
+                )
         elif normalization_offset is not None or normalization_scale is not None:
             raise ValueError(
                 "normalization statistics were supplied to an uncalibrated encoder"
@@ -1102,7 +1131,16 @@ class GroupedSignalEncoder(nn.Module):
         if include_direct_physical:
             if self.direct_fine_value is None:
                 raise RuntimeError("direct fine-action projection is unavailable")
-            direct_fine_tokens = self.direct_fine_value(fine_pair)
+            if direct_fine_values is None:
+                raise RuntimeError("de-normalized fine actions are unavailable")
+            direct_fine_pair = torch.cat(
+                (
+                    direct_fine_values,
+                    fine_dim_mask.to(dtype=direct_fine_values.dtype),
+                ),
+                dim=-1,
+            )
+            direct_fine_tokens = self.direct_fine_value(direct_fine_pair)
         else:
             # The value is unused by the legacy return contract, but keeping
             # it aligned avoids a second shape path.
@@ -1154,8 +1192,35 @@ class GroupedSignalEncoder(nn.Module):
                     raise RuntimeError(
                         "direct fine-action aggregate projection is unavailable"
                     )
+                if direct_fine_values is None:
+                    raise RuntimeError("de-normalized fine actions are unavailable")
+                direct_per_dim_sum = (
+                    direct_fine_values * fine_dim_weight
+                ).sum(dim=3)
+                direct_per_dim_mean = (
+                    direct_per_dim_sum / per_dim_count.clamp_min(1.0)
+                )
+                direct_gathered_last = direct_fine_values.gather(
+                    3,
+                    last_index.clamp_min(0)
+                    .unsqueeze(3)
+                    .expand(-1, -1, -1, 1, -1),
+                ).squeeze(3)
+                direct_per_dim_last = direct_gathered_last * last_index.ge(0).to(
+                    direct_gathered_last.dtype
+                )
+                direct_aggregate = torch.cat(
+                    (
+                        direct_per_dim_mean,
+                        direct_per_dim_sum,
+                        direct_per_dim_last,
+                        per_dim_count / float(substeps),
+                    ),
+                    dim=-1,
+                )
                 direct_fine_summary = (
-                    direct_fine_summary + self.direct_fine_aggregate(aggregate)
+                    direct_fine_summary
+                    + self.direct_fine_aggregate(direct_aggregate)
                 )
             else:
                 direct_fine_summary = direct_fine_summary + aggregate_feature
@@ -1171,7 +1236,16 @@ class GroupedSignalEncoder(nn.Module):
         if include_direct_physical:
             if self.direct_coarse_value is None:
                 raise RuntimeError("direct coarse-action projection is unavailable")
-            direct_coarse_summary = self.direct_coarse_value(coarse_pair)
+            if direct_coarse_values is None:
+                raise RuntimeError("de-normalized coarse actions are unavailable")
+            direct_coarse_pair = torch.cat(
+                (
+                    direct_coarse_values,
+                    coarse_dim_mask.to(dtype=direct_coarse_values.dtype),
+                ),
+                dim=-1,
+            )
+            direct_coarse_summary = self.direct_coarse_value(direct_coarse_pair)
         else:
             direct_coarse_summary = coarse_summary
         if normalization_token is not None:
