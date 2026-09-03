@@ -17,7 +17,9 @@
 - canary：1,000 steps
 - 正式训练：600,000 steps，从正式 run 的 step 0 开始
 
-V8 使用 source-normalized、group-preserving 的 factual action conditioner 学习未来状态。
+V8 使用 group-preserving 的 factual action conditioner 学习未来状态。数据张量先按每个
+source 封存的 offset/scale 精确还原为共同物理单位，再进入 block-0 direct projection；
+factual command 与同 mask 的物理 no-op 使用同一编码相减，因此 zero update 严格为 0。
 factual P144 是唯一运动所有者，并预测 renderer 实际应用的 backward flow；最后观测 RGB
 只能通过该 flow 传输到未来帧，motion head 不会衰减它。高频 refiner 只补充有界高通细节，
 不能改变低频位置或运动。future candidate 不进入 policy/action-free trunk。
@@ -125,6 +127,8 @@ canary 通过需要满足：
 - 64 个 rank、H200、NVLink、IB 和 ECC preflight 正常；
 - loss、grad norm 和梯度所有权指标全部有限；
 - factual decoder、RGB decoder、action head 和 policy 都有非零梯度；
+- 同一物理 action 在不同 source normalization 下产生一致的 direct conditioning；
+- correct action 在多个 source/seed 上优于 physical no-op 与 shuffle；
 - future action 对 policy/action-free 输出的差异严格为 0；
 - step100、step500、step1000 checkpoint 完整，resume、eval 和 verify 均通过。
 

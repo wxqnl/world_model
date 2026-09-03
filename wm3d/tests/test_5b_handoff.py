@@ -7,13 +7,37 @@ import sys
 
 import yaml
 import pytest
+import torch
 
 from scripts.data.materialize_oxe_default import build_templates
-from wm3d.models.model_factory import validate_model_profile
+from wm3d.models.model_factory import build_world_model, validate_model_profile
 from wm3d.training.runtime_contract import validate_runtime_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_5b_factual_direct_action_is_live_and_physical() -> None:
+    profile = yaml.safe_load(
+        (ROOT / "configs/model/native_5b_v8_action_owned_transport.yaml").read_text()
+    )
+    with torch.device("meta"):
+        model = build_world_model(profile)
+    factual_action = model.factual_action
+    assert factual_action is not None
+    assert factual_action.direct_action_space == "physical"
+    assert type(factual_action.direct_fine_value) is torch.nn.Linear
+    assert type(factual_action.direct_fine_aggregate) is torch.nn.Linear
+    assert type(factual_action.direct_coarse_value) is torch.nn.Linear
+
+
+def test_5b_shell_gate_matches_published_model_and_objective() -> None:
+    wrapper = (ROOT / "scripts/cluster/wm3d_5b.sh").read_text()
+    assert '"rgb_context_action_scale": 0.0' in wrapper
+    assert '"context_pixel_action_separation_weight": 0.0' in wrapper
+    assert '"context_pixel_action_rank_start_step": 0' in wrapper
+    assert '"context_pixel_action_rank_ramp_steps": 1000' in wrapper
+    assert 'factual_action.direct_action_space != "physical"' in wrapper
 
 
 @pytest.mark.parametrize(

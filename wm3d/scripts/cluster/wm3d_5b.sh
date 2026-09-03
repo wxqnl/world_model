@@ -125,7 +125,7 @@ required = {
     "rgb_context_alignment_enabled": False,
     "rgb_render_action_free_prior": False,
     "rgb_context_motion_blend_gain": 0.0,
-    "rgb_context_action_scale": 1.0,
+    "rgb_context_action_scale": 0.0,
     "rgb_context_appearance_delta_scale": 0.0,
     "rgb_detail_residual_scale": 0.0,
 }
@@ -156,9 +156,9 @@ required_weights = {
     "action_counterfactual_token_advantage": 1.0,
     "action_counterfactual_token_margin": 0.005,
     "context_pixel_action_rank_weight": 2.0,
-    "context_pixel_action_separation_weight": 0.5,
-    "context_pixel_action_rank_start_step": 30000,
-    "context_pixel_action_rank_ramp_steps": 10000,
+    "context_pixel_action_separation_weight": 0.0,
+    "context_pixel_action_rank_start_step": 0,
+    "context_pixel_action_rank_ramp_steps": 1000,
     "context_pixel_action_rank_every": 8,
     "context_pixel_action_rank_batch_size": 1,
     "context_pixel_action_rank_margin": 0.003,
@@ -176,6 +176,17 @@ if wrong_weights:
     raise SystemExit(f"5B V8 objective mismatch: {wrong_weights}")
 with torch.device("meta"):
     built = build_world_model(model)
+factual_action = getattr(built, "factual_action", None)
+if factual_action is None or factual_action.direct_action_space != "physical":
+    raise SystemExit("5B V8 factual direct action must use physical units")
+for name in (
+    "direct_fine_value",
+    "direct_fine_aggregate",
+    "direct_coarse_value",
+):
+    projection = getattr(factual_action, name, None)
+    if type(projection) is not torch.nn.Linear:
+        raise SystemExit(f"5B V8 {name} must be a live Linear projection")
 print(
     "5B V8 contract passed: "
     f"parameters={sum(parameter.numel() for parameter in built.parameters()):,}"
