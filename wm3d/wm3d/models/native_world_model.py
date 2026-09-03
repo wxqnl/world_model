@@ -4881,6 +4881,58 @@ class NativeWorldModel(nn.Module):
             (state[:, : cfg.T] + summary[:, :, None], state[:, cfg.T :]), dim=1
         )
 
+    def _apply_factual_frame_action_modulation(
+        self,
+        state: torch.Tensor,
+        action_gate: torch.Tensor,
+        *,
+        scale: float,
+    ) -> torch.Tensor:
+        """Refresh future P64 with its same-horizon physical command.
+
+        The initial action-owned injection is an additive seed. With one
+        active group, ordinary cross-attention reduces that seed to the same
+        channel vector at every patch. Reusing its per-horizon bounded gate
+        after each factual state block and multiplying by the current patch
+        representation keeps the command present while making its effect
+        spatially non-homogeneous. The centered action encoder and bias-free
+        projections make a zero command an exact no-op. Observed slots are
+        never modified here.
+        """
+
+        cfg = self.cfg
+        batch = state.shape[0]
+        expected_state = (
+            batch,
+            cfg.T + cfg.K,
+            cfg.P,
+            cfg.state_hidden,
+        )
+        if tuple(state.shape) != expected_state:
+            raise ValueError(f"factual state must be {expected_state}")
+        expected_gate = (batch, cfg.K, cfg.P, cfg.state_hidden)
+        if tuple(action_gate.shape) != expected_gate:
+            raise ValueError(f"factual frame-action gate must be {expected_gate}")
+        if not isfinite(scale) or scale < 0.0:
+            raise ValueError("factual frame-action modulation scale is invalid")
+        if scale == 0.0:
+            return state
+        if self.factual_state_action_query_norm is None:
+            raise RuntimeError(
+                "factual frame-action modulation norm is unavailable"
+            )
+
+        future = state[:, cfg.T :]
+        normalized_future = self.factual_state_action_query_norm(future)
+        spatial_update = action_gate * normalized_future
+        return torch.cat(
+            (
+                state[:, : cfg.T],
+                future + float(scale) * spatial_update,
+            ),
+            dim=1,
+        )
+
     def forward(
         self,
         *,
@@ -5232,10 +5284,11 @@ class NativeWorldModel(nn.Module):
                     )
 
                 # Preserve each physical owner until it reaches every future
-                # patch.  This is the V7/OXE first-conditioning point, extended
-                # without averaging base/arm/mode owners into one token.  A
-                # one-group command reduces to V7's shared update; subsequent
-                # spatial/causal-temporal blocks localize and accumulate it.
+                # patch. This is the V7/OXE first-conditioning point, extended
+                # without averaging base/arm/mode owners into one token. The
+                # resulting per-horizon gate is reused after every state block;
+                # otherwise a one-group command remains a common channel bias
+                # that the following shared trunk can rotate away.
                 future_seed = factual_state_input[:, cfg.T :]
                 grouped_action = encoded * encoded_mask[..., None].to(
                     dtype=encoded.dtype
@@ -5257,6 +5310,7 @@ class NativeWorldModel(nn.Module):
                     flat_grouped_action,
                     allowed_mask=safe_group_valid[:, None, None, :],
                 ).reshape(batch, cfg.K, cfg.P, cfg.state_hidden)
+                action_gate = torch.tanh(action_update)
                 candidate_state = torch.cat(
                     (
                         factual_state_input[:, : cfg.T],
@@ -5266,11 +5320,19 @@ class NativeWorldModel(nn.Module):
                 )
                 candidate_action = factual_action_input
                 candidate_action_index = 0
+                per_block_action_scale = residual_scale / float(
+                    max(1, len(self.state_blocks))
+                )
                 for state_index, state_block in enumerate(self.state_blocks):
                     candidate_state = self._run(
                         state_block,
                         candidate_state,
                         enabled=cfg.activation_checkpointing,
+                    )
+                    candidate_state = self._apply_factual_frame_action_modulation(
+                        candidate_state,
+                        action_gate,
+                        scale=per_block_action_scale,
                     )
                     for _ in range(self._action_steps[state_index]):
                         candidate_action = self._run(

@@ -2005,6 +2005,52 @@ def test_action_owned_conditioner_keeps_group_tokens_distinct() -> None:
     assert not torch.allclose(baseline["pred_tokens"], changed["pred_tokens"])
 
 
+def test_factual_frame_action_modulation_is_spatial_causal_and_zero_exact() -> None:
+    cfg = _tiny_action_owned_transport_config()
+    torch.manual_seed(819)
+    model = NativeWorldModel(cfg).eval()
+    state = torch.randn(
+        1,
+        cfg.T + cfg.K,
+        cfg.P,
+        cfg.state_hidden,
+    )
+    action_gate = torch.zeros(
+        1,
+        cfg.K,
+        cfg.P,
+        cfg.state_hidden,
+    )
+    action_gate[:, 0] = torch.randn(1, 1, cfg.state_hidden)
+    action_gate.requires_grad_()
+
+    conditioned = model._apply_factual_frame_action_modulation(
+        state,
+        action_gate,
+        scale=1.0,
+    )
+    torch.testing.assert_close(
+        conditioned[:, : cfg.T], state[:, : cfg.T], rtol=0, atol=0
+    )
+    delta = conditioned[:, cfg.T :] - state[:, cfg.T :]
+    assert delta[:, 0].abs().sum() > 0
+    assert not torch.allclose(delta[:, 0, 0], delta[:, 0, 1])
+    torch.testing.assert_close(
+        delta[:, 1:], torch.zeros_like(delta[:, 1:]), rtol=0, atol=0
+    )
+    delta.square().mean().backward()
+    assert action_gate.grad is not None
+    assert torch.isfinite(action_gate.grad).all()
+    assert action_gate.grad[:, 0].abs().sum() > 0
+
+    zero = model._apply_factual_frame_action_modulation(
+        state,
+        torch.zeros_like(action_gate),
+        scale=1.0,
+    )
+    torch.testing.assert_close(zero, state, rtol=0, atol=0)
+
+
 def test_action_owned_renderer_hint_is_local_not_hidden_cumulative() -> None:
     cfg = replace(
         _tiny_action_owned_transport_config(), rgb_decode_chunk_size=2
