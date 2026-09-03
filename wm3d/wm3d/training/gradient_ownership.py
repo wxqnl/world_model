@@ -31,9 +31,20 @@ class GradientOwnershipError(RuntimeError):
 
 
 def _required_owner_modules(
-    model: NativeWorldModel,
+    model: nn.Module,
 ) -> Mapping[str, tuple[nn.Module, ...]]:
     """Return disjoint, capability-level module owners required by Stage0."""
+
+    if not isinstance(model, NativeWorldModel):
+        provider = getattr(model, "gradient_owner_modules", None)
+        if not callable(provider):
+            raise GradientOwnershipError(
+                f"{type(model).__name__} does not declare gradient owners"
+            )
+        owners = dict(provider())
+        if not owners or any(not modules for modules in owners.values()):
+            raise GradientOwnershipError("gradient owner module table is empty")
+        return owners
 
     policy_modules: list[nn.Module] = [
         model.history_action,
@@ -88,9 +99,12 @@ def _required_owner_modules(
 
 
 def _required_owner_parameters(
-    model: NativeWorldModel,
+    model: nn.Module,
 ) -> Mapping[str, tuple[nn.Parameter, ...]]:
     """Assign root parameters that are not owned by a child module."""
+
+    if not isinstance(model, NativeWorldModel):
+        return {}
 
     owners: dict[str, tuple[nn.Parameter, ...]] = {
         "native_state_inputs": (
@@ -128,7 +142,7 @@ def _required_owner_parameters(
     return owners
 
 
-def required_gradient_owner_names(model: NativeWorldModel) -> tuple[str, ...]:
+def required_gradient_owner_names(model: nn.Module) -> tuple[str, ...]:
     return tuple(
         name
         for name in (
@@ -140,7 +154,7 @@ def required_gradient_owner_names(model: NativeWorldModel) -> tuple[str, ...]:
 
 
 def _owner_parameters(
-    model: NativeWorldModel,
+    model: nn.Module,
 ) -> Mapping[str, tuple[nn.Parameter, ...]]:
     owners = {
         name: tuple(_unique_parameters(modules))
@@ -227,7 +241,7 @@ def _unique_parameters(modules: Iterable[nn.Module]) -> Iterable[nn.Parameter]:
                 yield parameter
 
 
-def audit_gradient_ownership(model: NativeWorldModel) -> dict[str, object]:
+def audit_gradient_ownership(model: nn.Module) -> dict[str, object]:
     """Collect and validate one real backward pass without gathering shards."""
 
     owners: dict[str, dict[str, object]] = {}
@@ -288,7 +302,7 @@ def audit_gradient_ownership(model: NativeWorldModel) -> dict[str, object]:
 
 
 def validate_gradient_ownership_receipt(
-    receipt: Mapping[str, Any], model: NativeWorldModel
+    receipt: Mapping[str, Any], model: nn.Module
 ) -> None:
     """Validate checkpoint audit metadata without trusting a boolean flag."""
 

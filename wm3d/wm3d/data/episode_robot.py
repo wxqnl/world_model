@@ -606,6 +606,9 @@ def assemble_robot_window_from_prepared_episode(
         "target_fine_action_mask": torch.from_numpy(target_fine_mask),
         "target_coarse_action": torch.from_numpy(packed.coarse_action_values[T:]),
         "target_coarse_action_mask": torch.from_numpy(packed.coarse_action_mask[T:]),
+        "history_world_boundaries_dt": torch.from_numpy(
+            (boundaries[: T + 1] - policy_start).astype(np.float32)
+        ),
         "future_world_boundaries_dt": torch.from_numpy(
             (boundaries[T:] - policy_start).astype(np.float32)
         ),

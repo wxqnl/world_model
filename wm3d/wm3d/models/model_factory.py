@@ -1,4 +1,4 @@
-"""Single native-model construction path for training, evaluation and serving."""
+"""Single model construction path for training, evaluation and serving."""
 from __future__ import annotations
 
 import math
@@ -10,6 +10,28 @@ from .native_world_model import (
     NativeWorldModel,
     native_config_from_mapping,
 )
+
+
+SUPPORTED_ARCHITECTURES = {"native_world_model", "foundation_world_model"}
+
+
+def model_config_from_profile(profile: Mapping[str, Any]) -> Any:
+    """Return the typed model config for any supported architecture."""
+
+    architecture = str(profile.get("architecture", ""))
+    model_mapping = profile.get("model")
+    if not isinstance(model_mapping, dict):
+        raise ValueError(f"{architecture or 'model'} profile requires a model mapping")
+    if architecture == "native_world_model":
+        return native_config_from_mapping(model_mapping)
+    if architecture == "foundation_world_model":
+        from .foundation_world_model import foundation_config_from_mapping
+
+        return foundation_config_from_mapping(model_mapping)
+    raise ValueError(
+        f"unsupported model architecture {architecture!r}; "
+        f"expected one of {sorted(SUPPORTED_ARCHITECTURES)}"
+    )
 
 
 def validate_model_profile(profile: Mapping[str, Any]) -> None:
@@ -69,15 +91,7 @@ def validate_model_profile(profile: Mapping[str, Any]) -> None:
             raise ValueError(f"sampling.{name} must be positive")
     if not 0 < float(sampling["minimum_horizon_coverage"]) <= 1:
         raise ValueError("sampling.minimum_horizon_coverage must be in (0,1]")
-    architecture = str(profile.get("architecture", ""))
-    model_mapping = profile.get("model")
-    if architecture != "native_world_model":
-        raise ValueError(
-            "WM3D release profiles require architecture=native_world_model"
-        )
-    if not isinstance(model_mapping, dict):
-        raise ValueError("native_world_model profile requires a model mapping")
-    config = native_config_from_mapping(model_mapping)
+    config = model_config_from_profile(profile)
     if "future_offsets_seconds" in sampling:
         offsets = sampling["future_offsets_seconds"]
         if not isinstance(offsets, list) or len(offsets) != int(config.K):
@@ -119,10 +133,8 @@ def validate_model_data_compatibility(
     """
 
     validate_model_profile(profile)
-    if profile.get("architecture") != "native_world_model":
-        raise ValueError("unified WM3D data requires architecture=native_world_model")
-    model = profile["model"]
-    cfg = native_config_from_mapping(model)
+    architecture = str(profile.get("architecture"))
+    cfg = model_config_from_profile(profile)
     representation = data_profile.cache_representation
 
     model_p = int(cfg.P)
@@ -133,7 +145,7 @@ def validate_model_data_compatibility(
         raise ValueError("model/cache spatial token counts must be square grids")
     if model_grid > cache_grid:
         raise ValueError("model spatial grid exceeds the shared episode cache")
-    if cfg.appearance_enabled:
+    if architecture == "native_world_model" and cfg.appearance_enabled:
         available_appearance_grid = (
             int(
                 representation.get("appearance_token_grid", cache_grid)
@@ -155,7 +167,10 @@ def validate_model_data_compatibility(
     ):
         if int(getattr(cfg, model_field)) != int(representation[cache_field]):
             raise ValueError(f"model/cache {label} mismatch")
-    if int(cfg.rgb_size) > int(representation["rgb_size"]):
+    if (
+        architecture == "native_world_model"
+        and int(cfg.rgb_size) > int(representation["rgb_size"])
+    ):
         raise ValueError("model RGB target exceeds the shared episode cache")
 
     max_groups = int(cfg.max_action_groups)
@@ -196,14 +211,31 @@ def validate_model_data_compatibility(
                 raise ValueError("state semantic id exceeds model embedding capacity")
 
 
-def build_world_model(profile: Mapping[str, object]) -> NativeWorldModel:
-    """Build the shared 1B/5B native model from an architecture profile."""
+def build_world_model(
+    profile: Mapping[str, object], *, device: object | None = None
+) -> Any:
+    """Build the configured model without creating an alternate factory."""
 
     validate_model_profile(profile)
     model_mapping = profile.get("model")
     if not isinstance(model_mapping, dict):
-        raise ValueError("native_world_model profile requires a model mapping")
-    model = NativeWorldModel(native_config_from_mapping(model_mapping))
+        raise ValueError("model profile requires a model mapping")
+    architecture = str(profile.get("architecture"))
+    if architecture == "native_world_model":
+        model = NativeWorldModel(native_config_from_mapping(model_mapping))
+    elif architecture == "foundation_world_model":
+        if device is None:
+            raise ValueError("foundation_world_model construction requires a device")
+        from .foundation_world_model import (
+            build_foundation_world_model,
+            foundation_config_from_mapping,
+        )
+
+        model = build_foundation_world_model(
+            foundation_config_from_mapping(model_mapping), device=device
+        )
+    else:
+        raise ValueError(f"unsupported model architecture {architecture!r}")
     expected = profile.get("expected_parameter_count")
     if expected is not None:
         observed = sum(parameter.numel() for parameter in model.parameters())

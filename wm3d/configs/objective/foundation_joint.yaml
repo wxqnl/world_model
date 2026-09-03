@@ -1,0 +1,5 @@
+schema: wm3d_v8_objective_profile_v1
+name: foundation_joint_owned_by_model
+objective:
+  schema: wm3d_foundation_joint_objective_v1
+  owner: wsa_joint_training_loss

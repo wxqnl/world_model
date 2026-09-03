@@ -448,6 +448,15 @@ class _DirectWindowSource:
         self.task_loads += 1
         return task
 
+    def task_text(self, task_id: str) -> str:
+        """Return the sealed instruction for an already-indexed task."""
+
+        with self._metadata_lock:
+            value = str(self._load_task(task_id).task_text).strip()
+        if not value:
+            raise CacheDataError("direct raw task text is empty")
+        return value
+
     def _load_episode(self, task: CacheTask) -> _DirectEpisode:
         cached = self._episodes.pop(task.task_id, None)
         if cached is not None:
@@ -1069,8 +1078,9 @@ class DirectRawDataset(UnifiedCacheDataset):
         action["state_normalization_scale"] = normalization.state_scale
         return action, prepared_robot.task_embedding
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, index: int) -> dict[str, Any]:
         entry = self.entries[int(index)]
+        task_id = self._task_id_by_feature[entry.feature_shard]
         (
             images,
             view_mask,
@@ -1102,6 +1112,7 @@ class DirectRawDataset(UnifiedCacheDataset):
             "direct_frame_keys": frame_keys,
             "world_times_s": world_times,
             "task_embedding": task_embedding.to(torch.float32),
+            "task_text": self._source.task_text(task_id),
             "aux_values": aux_values,
             "aux_mask": torch.zeros(aux_values.shape[:-1], dtype=torch.bool),
             "aux_type_ids": torch.zeros(aux_values.shape[:-1], dtype=torch.int64),

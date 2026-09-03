@@ -39,11 +39,13 @@ from wm3d.data.formal_cache_adapter import (
     build_formal_cache_dataset,
 )
 from wm3d.models.model_factory import build_world_model
+from wm3d.models.foundation_world_model import FoundationWorldModel
 from wm3d.models.native_world_model import (
     NativeWorldModel,
     normalized_physical_noop_action,
 )
 from wm3d.models.direct_vggt_builder import build_direct_vggt_teacher
+from wm3d.data.foundation_input import build_foundation_input_adapter
 from wm3d.training.async_input import AsyncCudaInputPipeline
 from wm3d.training.distributed_checkpoint import (
     DistributedCheckpointManager,
@@ -1207,6 +1209,7 @@ def _validate(
     input_adapter: Any | None = None,
     rgb_flow_teacher: FrozenBidirectionalRAFTRuntime | None = None,
     training_step: int = 0,
+    foundation_mode: bool = False,
 ) -> dict[str, Any]:
     count = int(runtime_profile["train"]["validation_steps"])
     loader = _make_loader(
@@ -1221,8 +1224,10 @@ def _validate(
         gradient_accumulation=1,
         micro_batch_size=_validation_micro_batch_size(runtime_profile),
     )
-    settings = [("teacher0", 0.0)]
-    if bool(runtime_profile["train"].get("appearance_validation_three_way", False)):
+    settings = [("foundation", 0.0)] if foundation_mode else [("teacher0", 0.0)]
+    if not foundation_mode and bool(
+        runtime_profile["train"].get("appearance_validation_three_way", False)
+    ):
         settings.extend(
             (
                 (
@@ -1240,23 +1245,29 @@ def _validate(
         if input_adapter is not None:
             cpu_batch = input_adapter.materialize(cpu_batch)
         batch = _batch_to_device(cpu_batch, context.device)
-        batch = _materialize_rgb_flow_targets(batch, rgb_flow_teacher)
+        if not foundation_mode:
+            batch = _materialize_rgb_flow_targets(batch, rgb_flow_teacher)
         for label, ratio in settings:
             with autocast_context(strategy_from_mapping(runtime_profile["distributed"])):
-                losses = compute_native_objective(
-                    output=_forward_with_action_counterfactual(
-                        model,
-                        batch,
-                        appearance_teacher_ratio=ratio,
-                        objective=objective,
-                    ),
-                    batch=batch,
-                    config=objective,
-                    perceptual_model=perceptual_model,
-                    rgb_perceptual_chunk_size=int(
-                        runtime_profile["train"].get("rgb_perceptual_chunk_size", 4)
-                    ),
-                )
+                if foundation_mode:
+                    losses = model(batch)
+                else:
+                    losses = compute_native_objective(
+                        output=_forward_with_action_counterfactual(
+                            model,
+                            batch,
+                            appearance_teacher_ratio=ratio,
+                            objective=objective,
+                        ),
+                        batch=batch,
+                        config=objective,
+                        perceptual_model=perceptual_model,
+                        rgb_perceptual_chunk_size=int(
+                            runtime_profile["train"].get(
+                                "rgb_perceptual_chunk_size", 4
+                            )
+                        ),
+                    )
             for name, value in losses.items():
                 totals[label][name] = (
                     totals[label].get(name, torch.zeros_like(value)) + value
@@ -1268,7 +1279,7 @@ def _validate(
         )
         for label, label_totals in totals.items()
     }
-    result: dict[str, Any] = dict(reduced["teacher0"])
+    result: dict[str, Any] = dict(reduced[settings[0][0]])
     if len(settings) > 1:
         result["appearance_three_way"] = {
             label: {"teacher_ratio": ratio, "metrics": reduced[label]}
@@ -1280,7 +1291,7 @@ def _validate(
 def _run_contract(
     config: Mapping[str, Any],
     parameter_counts: Mapping[str, int],
-    native_model: NativeWorldModel,
+    raw_model: torch.nn.Module,
     warmstart_model: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract = {
@@ -1296,7 +1307,7 @@ def _run_contract(
             config["runtime_profile"].get("resources")
         ),
         "parameter_counts": dict(parameter_counts),
-        "required_gradient_owners": list(required_gradient_owner_names(native_model)),
+        "required_gradient_owners": list(required_gradient_owner_names(raw_model)),
     }
     if warmstart_model is not None:
         contract["warmstart_model"] = dict(warmstart_model)
@@ -1455,7 +1466,7 @@ def _topology_contract_sha256(config: Mapping[str, Any]) -> str:
 
 
 def _restore_gradient_ownership(
-    metadata: Mapping[str, Any], native_model: NativeWorldModel
+    metadata: Mapping[str, Any], raw_model: torch.nn.Module
 ) -> Mapping[str, Any]:
     saved = metadata.get("gradient_ownership")
     if not isinstance(saved, Mapping):
@@ -1463,7 +1474,7 @@ def _restore_gradient_ownership(
             "resume checkpoint lacks a passed Stage0 gradient-ownership audit"
         )
     try:
-        validate_gradient_ownership_receipt(saved, native_model)
+        validate_gradient_ownership_receipt(saved, raw_model)
     except GradientOwnershipError as exc:
         raise PretrainError(
             "resume checkpoint gradient-ownership audit is invalid"
@@ -1475,6 +1486,10 @@ def main() -> None:
     args = parse_args()
     config, config_sha = load_materialized_runtime(args.runtime)
     runtime = config["runtime_profile"]
+    architecture = str(config["model_profile"]["architecture"])
+    foundation_mode = architecture == "foundation_world_model"
+    if architecture not in {"native_world_model", "foundation_world_model"}:
+        raise PretrainError(f"unsupported training architecture {architecture!r}")
     strategy = strategy_from_mapping(runtime["distributed"])
     context = initialize_distributed(strategy)
     async_pipeline: AsyncCudaInputPipeline | None = None
@@ -1575,7 +1590,20 @@ def main() -> None:
             return
 
         input_adapter = None
-        if config["data_closure"].get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+        direct_raw = (
+            config["data_closure"].get("schema")
+            == DIRECT_RAW_DATA_CLOSURE_SCHEMA
+        )
+        if foundation_mode:
+            if not direct_raw:
+                raise PretrainError(
+                    "foundation_world_model requires the sealed direct-raw closure"
+                )
+            input_adapter = build_foundation_input_adapter(
+                config, device=context.device
+            )
+            input_adapter.eval()
+        elif direct_raw:
             input_adapter = build_direct_vggt_teacher(
                 config, device=context.device
             )
@@ -1583,6 +1611,11 @@ def main() -> None:
 
         rgb_flow_teacher = None
         rgb_flow_mapping = runtime["train"].get("rgb_flow_teacher")
+        if foundation_mode and rgb_flow_mapping is not None:
+            raise PretrainError(
+                "foundation_world_model owns its joint video objective and rejects "
+                "the native RGB-flow teacher"
+            )
         if rgb_flow_mapping is not None:
             rgb_flow_teacher = FrozenBidirectionalRAFTRuntime(
                 raft_config_from_mapping(rgb_flow_mapping),
@@ -1597,21 +1630,33 @@ def main() -> None:
             )
             or _environment_flag("WM3D_CUDNN_BENCHMARK"),
         )
-        # FSDP2 constructs on meta and initializes global DTensor shards after
-        # wrapping.  No rank ever owns a full 5B fp32 CPU/GPU replica.
-        construction_device = (
-            torch.device("meta")
-            if strategy.initialization == "meta_sharded"
-            else context.device
+        effective_model_profile = dict(config["model_profile"])
+        effective_model = dict(effective_model_profile["model"])
+        effective_model["activation_checkpointing"] = bool(
+            runtime["train"].get(
+                "activation_checkpointing",
+                effective_model["activation_checkpointing"],
+            )
         )
-        with torch.device(construction_device):
-            effective_model_profile = dict(config["model_profile"])
-            effective_model = dict(effective_model_profile["model"])
-            effective_model["activation_checkpointing"] = bool(
-                runtime["train"].get(
-                    "activation_checkpointing",
-                    effective_model["activation_checkpointing"],
+        effective_model_profile["model"] = effective_model
+        if foundation_mode:
+            if strategy.strategy != "ddp" or strategy.initialization != "direct":
+                raise PretrainError(
+                    "the first foundation release requires direct DDP pretrained "
+                    "loading; FSDP2 needs a separate sharded weight loader"
                 )
+            model = build_world_model(
+                effective_model_profile, device=context.device
+            )
+            if not isinstance(model, FoundationWorldModel):
+                raise PretrainError("foundation model factory returned the wrong type")
+        else:
+            # FSDP2 constructs on meta and initializes global DTensor shards after
+            # wrapping. No rank ever owns a full fp32 CPU/GPU replica.
+            construction_device = (
+                torch.device("meta")
+                if strategy.initialization == "meta_sharded"
+                else context.device
             )
             effective_model["rgb_decode_chunk_size"] = int(
                 runtime["train"].get(
@@ -1619,12 +1664,12 @@ def main() -> None:
                     effective_model["rgb_decode_chunk_size"],
                 )
             )
-            effective_model_profile["model"] = effective_model
-            model = build_world_model(effective_model_profile)
-        if not isinstance(model, NativeWorldModel):
-            raise PretrainError("unified pretrain currently requires native_world_model")
-        native_model = model
-        parameter_counts = native_model.parameter_counts()
+            with torch.device(construction_device):
+                model = build_world_model(effective_model_profile)
+            if not isinstance(model, NativeWorldModel):
+                raise PretrainError("native model factory returned the wrong type")
+        raw_model = model
+        parameter_counts = raw_model.parameter_counts()
         wrapped = wrap_model(
             model,
             context,
@@ -1655,8 +1700,13 @@ def main() -> None:
                 new_parameter_prefixes=prefixes,
             )
         optimizer_cfg = runtime["optimizer"]
+        trainable_parameters = [
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise PretrainError("model exposes no trainable parameters")
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            trainable_parameters,
             lr=float(optimizer_cfg["peak_lr"]),
             betas=tuple(float(value) for value in optimizer_cfg["betas"]),
             eps=float(optimizer_cfg["eps"]),
@@ -1664,10 +1714,15 @@ def main() -> None:
             foreach=False,
         )
         initialize_adamw_state(optimizer)
-        objective = objective_config_from_mapping(config["objective_profile"]["objective"])
-        perceptual_model = build_rgb_perceptual_model(
-            objective, device=context.device
-        )
+        objective = None
+        perceptual_model = None
+        if not foundation_mode:
+            objective = objective_config_from_mapping(
+                config["objective_profile"]["objective"]
+            )
+            perceptual_model = build_rgb_perceptual_model(
+                objective, device=context.device
+            )
 
         output_root = Path(config["run"]["output_root"])
         status: list[Any] = [None]
@@ -1697,7 +1752,7 @@ def main() -> None:
                 contract = _run_contract(
                     config,
                     parameter_counts,
-                    native_model,
+                    raw_model,
                     warmstart_model=contract_warmstart,
                 )
                 _atomic_json_no_clobber(output_root / "run_contract.json", contract)
@@ -1776,7 +1831,7 @@ def main() -> None:
             if int(progress.get("next_optimizer_step", -1)) != expected_step:
                 raise PretrainError("checkpoint sampler progress is not exact")
             start_step = int(metadata["step"])
-            gradient_ownership = _restore_gradient_ownership(metadata, native_model)
+            gradient_ownership = _restore_gradient_ownership(metadata, raw_model)
         total_steps = int(runtime["train"]["total_steps"])
         if start_step >= total_steps:
             raise PretrainError("checkpoint already reached total_steps")
@@ -1824,10 +1879,16 @@ def main() -> None:
         last_log = time.monotonic()
         for step in range(start_step, stop_after_step):
             lr = _learning_rate(step, runtime)
-            training_objective = _training_objective_for_step(
-                step, runtime, objective
+            training_objective = (
+                None
+                if foundation_mode
+                else _training_objective_for_step(step, runtime, objective)
             )
-            decode_rgb = _rgb_decoder_forward_enabled(step, runtime)
+            decode_rgb = (
+                True
+                if foundation_mode
+                else _rgb_decoder_forward_enabled(step, runtime)
+            )
             for group in optimizer.param_groups:
                 group["lr"] = lr
             accumulated: dict[str, torch.Tensor] = {}
@@ -1850,9 +1911,10 @@ def main() -> None:
                     batch = _batch_to_device(cpu_batch, context.device)
                 else:
                     batch = async_pipeline.consume()
-                batch = _materialize_rgb_flow_targets(
-                    batch, rgb_flow_teacher
-                )
+                if not foundation_mode:
+                    batch = _materialize_rgb_flow_targets(
+                        batch, rgb_flow_teacher
+                    )
                 unique = torch.unique(batch["source_id"])
                 if unique.numel() != 1:
                     raise PretrainError("one micro-batch mixed multiple sources")
@@ -1867,24 +1929,31 @@ def main() -> None:
                     async_pipeline.submit()
                 with no_sync_context(model, enabled=not final_micro):
                     with autocast_context(strategy):
-                        losses = compute_native_objective(
-                            output=_forward_with_action_counterfactual(
-                                model,
-                                batch,
-                                appearance_teacher_ratio=_training_appearance_teacher_ratio(
-                                    step, runtime
+                        if foundation_mode:
+                            losses = model(batch)
+                        else:
+                            losses = compute_native_objective(
+                                output=_forward_with_action_counterfactual(
+                                    model,
+                                    batch,
+                                    appearance_teacher_ratio=(
+                                        _training_appearance_teacher_ratio(
+                                            step, runtime
+                                        )
+                                    ),
+                                    objective=training_objective,
+                                    step=step,
+                                    decode_rgb=decode_rgb,
                                 ),
-                                objective=training_objective,
-                                step=step,
-                                decode_rgb=decode_rgb,
-                            ),
-                            batch=batch,
-                            config=training_objective,
-                            perceptual_model=perceptual_model,
-                            rgb_perceptual_chunk_size=int(
-                                runtime["train"].get("rgb_perceptual_chunk_size", 4)
-                            ),
-                        )
+                                batch=batch,
+                                config=training_objective,
+                                perceptual_model=perceptual_model,
+                                rgb_perceptual_chunk_size=int(
+                                    runtime["train"].get(
+                                        "rgb_perceptual_chunk_size", 4
+                                    )
+                                ),
+                            )
                     (losses["total"] / accumulation).backward()
                 for name, value in losses.items():
                     accumulated[name] = (
@@ -1892,18 +1961,21 @@ def main() -> None:
                         + value.detach() / accumulation
                     )
             completed = step + 1
-            _clear_rgb_decoder_gradients_during_warmup(
-                native_model, step, runtime
-            )
+            if not foundation_mode:
+                _clear_rgb_decoder_gradients_during_warmup(
+                    raw_model, step, runtime
+                )
             ownership_audited_this_step = False
             # Audit before clipping/zeroing.  Fresh runs must prove all owners
             # on the first step where every sealed objective owner is active;
             # resumed runs inherit the immutable proof in checkpoint metadata.
-            rgb_decoder_warmup_steps = int(
-                runtime["train"].get("rgb_decoder_warmup_steps", 0)
+            audit_start_step = (
+                int(getattr(raw_model, "gradient_audit_start_step", 0))
+                if foundation_mode
+                else int(runtime["train"].get("rgb_decoder_warmup_steps", 0))
             )
-            if gradient_ownership is None and step >= rgb_decoder_warmup_steps:
-                gradient_ownership = audit_gradient_ownership(native_model)
+            if gradient_ownership is None and step >= audit_start_step:
+                gradient_ownership = audit_gradient_ownership(raw_model)
                 ownership_audited_this_step = True
                 if context.is_rank0:
                     _atomic_json_no_clobber(
@@ -1939,9 +2011,11 @@ def main() -> None:
                         "source_id": source_id,
                         "grad_norm": float(grad_tensor.cpu()),
                         "rgb_decoder_warmup_active": (
-                            step < rgb_decoder_warmup_steps
+                            not foundation_mode and step < audit_start_step
                         ),
-                        "rgb_decoder_forward_skipped": not decode_rgb,
+                        "rgb_decoder_forward_skipped": (
+                            not foundation_mode and not decode_rgb
+                        ),
                         "seconds_per_log_interval": time.monotonic() - last_log,
                         **metrics,
                     }
@@ -1956,7 +2030,9 @@ def main() -> None:
                     if direct_raw_metrics is not None:
                         record["direct_raw"] = dict(direct_raw_metrics)
                     if input_adapter is not None:
-                        record["direct_vggt"] = dict(input_adapter.metrics)
+                        record[
+                            "foundation_input" if foundation_mode else "direct_vggt"
+                        ] = dict(input_adapter.metrics)
                     if async_pipeline is not None:
                         record["direct_pipeline"] = dict(async_pipeline.metrics)
                     if ownership_audited_this_step:
@@ -1977,6 +2053,7 @@ def main() -> None:
                     input_adapter=input_adapter,
                     rgb_flow_teacher=rgb_flow_teacher,
                     training_step=completed,
+                    foundation_mode=foundation_mode,
                 )
                 if context.is_rank0:
                     record = {"step": completed, "validation": validation}

@@ -41,48 +41,19 @@ OBJECTIVE_PROFILE_SCHEMA = "wm3d_v8_objective_profile_v1"
 DATA_CLOSURE_SCHEMA = "wm3d_v8_dataset_closure_v2"
 _PLACEHOLDER = re.compile(r"PENDING|MATERIALIZE_REQUIRED|__")
 
-
-_STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
-    "appearance_enabled",
-    "appearance_P",
-    "appearance_context_frames",
-    "appearance_hidden",
-    "appearance_layers",
-    "appearance_heads",
-    "appearance_ff_mult",
-    "appearance_autoregressive_steps",
+_LEGACY_STREAMING_NON_BINDING_FIELDS = {
     "appearance_action_residual_scale",
-    "appearance_flow_aligned_detail",
-    "appearance_state_detail",
-    "appearance_detail_dim",
-    "policy_task_modulation",
-    "policy_calibration_conditioning",
+    "appearance_autoregressive_steps",
     "factual_dynamics_repeats",
     "factual_action_residual_scale",
-    "factual_v7_early_action_conditioning",
-    "factual_v7_early_action_scale",
     "factual_v7_bridge_layers_state",
     "render_factual_dynamics_repeats",
     "render_factual_action_residual_scale",
-    "rgb_context_enabled",
-    "rgb_original_v7_context",
-    "rgb_action_owned_transport",
-    "rgb_v7_high_frequency_refiner",
-    "rgb_v7_high_frequency_channels",
-    "rgb_v7_high_frequency_scale",
+    "policy_task_modulation",
     "rgb_context_alignment_enabled",
     "rgb_render_action_free_prior",
-    "rgb_context_residual_scale",
-    "rgb_context_motion_blend_gain",
     "rgb_context_action_scale",
     "rgb_context_appearance_delta_scale",
-    "rgb_detail_residual_scale",
-    # Decoder capacity, batching, and the subset of raw-video horizons decoded
-    # for RGB supervision do not alter the sealed window/token metadata.
-    "rgb_hidden",
-    "rgb_res_blocks",
-    "rgb_decode_chunk_size",
-    "rgb_decode_indices",
 }
 
 
@@ -91,12 +62,32 @@ class RuntimeContractError(ValueError):
 
 
 def _streaming_model_data_core(model_profile: Mapping[str, Any]) -> dict[str, Any]:
-    """Return model fields that constrain an existing streaming-data seal."""
-    return {
-        name: item
-        for name, item in model_profile["model"].items()
-        if name not in _STREAMING_MODEL_DATA_NON_BINDING_FIELDS
-    }
+    """Return the architecture-neutral fields that constrain raw windows."""
+
+    if "architecture" not in model_profile:
+        return {
+            name: value
+            for name, value in model_profile["model"].items()
+            if name not in _LEGACY_STREAMING_NON_BINDING_FIELDS
+        }
+    model = model_profile.get("model")
+    if not isinstance(model, Mapping):
+        raise RuntimeContractError("sealed model profile lacks a model mapping")
+    fields = (
+        "T",
+        "P",
+        "K",
+        "token_dim",
+        "task_dim",
+        "num_views",
+        "rgb_size",
+    )
+    if any(name not in model for name in fields):
+        missing = sorted(name for name in fields if name not in model)
+        raise RuntimeContractError(
+            f"sealed model profile lacks raw-data fields: {missing}"
+        )
+    return {name: int(model[name]) for name in fields}
 
 
 def canonical_sha256(value: object) -> str:
@@ -1016,7 +1007,14 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
         allowed={"schema", "name", "objective"},
         label="objective profile",
     )
-    objective_config_from_mapping(objective["objective"])
+    if model.get("architecture") == "foundation_world_model":
+        from wm3d.models.foundation_world_model import (
+            validate_foundation_objective,
+        )
+
+        validate_foundation_objective(objective["objective"])
+    else:
+        objective_config_from_mapping(objective["objective"])
     closure = value["data_closure"]
     if closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
         try:
@@ -1068,7 +1066,6 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
         runtime_core = _streaming_model_data_core(model)
         if (
             sealed_model.get("schema") != model.get("schema")
-            or sealed_model.get("architecture") != model.get("architecture")
             or sealed_model.get("sampling") != model.get("sampling")
             or sealed_core != runtime_core
         ):

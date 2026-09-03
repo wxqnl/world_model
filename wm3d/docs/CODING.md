@@ -8,6 +8,8 @@
 - `WM3D_STAGE1_UNIFIED.md` owns the Stage0-to-Stage1 workflow.
 - `WM3D_RELEASE_VALIDATION.md` records evidence and the boundary between pipeline correctness
   and model quality.
+- `WM3D_WSA_FOUNDATION.md` owns the experimental V10 WSA-Large architecture, asset preparation,
+  environment, data bridge, training and evidence boundary.
 - Commands must match `run_wm3d.sh --help`; paths and filenames must exist in the repository.
 - Use `WM3D` for the current project. Mention an older release only when explaining an audited
   migration or immutable legacy asset.

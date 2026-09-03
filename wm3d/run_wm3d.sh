@@ -12,6 +12,14 @@ usage() {
 WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
 
   ./run_wm3d.sh env
+  ./run_wm3d.sh foundation-env
+  ./run_wm3d.sh foundation-fetch --output <WSA-Large目录> \
+    --wan-output <Wan2.2-TI2V-5B目录> [--endpoint <镜像>]
+  ./run_wm3d.sh foundation-context --metadata-root <streaming_metadata目录> \
+    --wan-model-root <Wan2.2目录> --upstream-source-root <WSA源码目录> \
+    --output <文本上下文目录>
+  ./run_wm3d.sh foundation-preflight <torchrun 参数...> -- --runtime <runtime.yaml>
+  ./run_wm3d.sh foundation-train <torchrun 参数...> -- <训练参数...>
   ./run_wm3d.sh lock-resolve <resolve_source_lock.py 参数...>
   ./run_wm3d.sh download <download_sources.py 参数...>
   ./run_wm3d.sh agibot-existing-check --snapshot-root <已下载的 AgiBotWorld2026 目录>
@@ -118,11 +126,51 @@ torchrun_preflight_split() {
     -m wm3d.training.pretrain "${app_args[@]}" --preflight-only
 }
 
+foundation_torchrun_split() {
+  local preflight=$1
+  shift
+  local torch_args=()
+  local app_args=()
+  local seen=0
+  for argument in "$@"; do
+    if [[ "${argument}" == -- && ${seen} -eq 0 ]]; then
+      seen=1
+    elif [[ ${seen} -eq 0 ]]; then
+      torch_args+=("${argument}")
+    else
+      [[ "${argument}" != --preflight-only ]] || {
+        echo "foundation-preflight: --preflight-only 由统一入口自动追加，禁止重复传入。" >&2
+        exit 2
+      }
+      app_args+=("${argument}")
+    fi
+  done
+  [[ ${seen} -eq 1 && ${#app_args[@]} -gt 0 ]] || {
+    echo "foundation train/preflight: 必须用 -- 分隔 torchrun 和应用参数。" >&2
+    exit 2
+  }
+  local python_bin=${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}
+  [[ -x "${python_bin}" ]] || {
+    echo "找不到 ${python_bin}；先运行 ./run_wm3d.sh foundation-env。" >&2
+    exit 2
+  }
+  if [[ "${preflight}" == 1 ]]; then
+    "${python_bin}" -m torch.distributed.run "${torch_args[@]}" \
+      -m wm3d.training.pretrain "${app_args[@]}" --preflight-only
+  else
+    "${python_bin}" -m torch.distributed.run "${torch_args[@]}" \
+      -m wm3d.training.pretrain "${app_args[@]}"
+  fi
+}
+
 command=${1:-}
 [[ -n "${command}" ]] || { usage; exit 2; }
 shift || true
 need_python_unless_env() {
-  [[ "${command}" == env || "${command}" == smoke-real || "${command}" == 1b || \
+  [[ "${command}" == env || "${command}" == foundation-env || \
+     "${command}" == foundation-fetch || "${command}" == foundation-context || \
+     "${command}" == foundation-preflight || "${command}" == foundation-train || \
+     "${command}" == smoke-real || "${command}" == 1b || \
      "${command}" == 5b || \
      "${command}" == -h || "${command}" == --help || "${command}" == help ]] || need_python
 }
@@ -133,6 +181,20 @@ case "${command}" in
     [[ $# -eq 0 ]] || { usage; exit 2; }
     exec bash environments/bootstrap_environment.sh
     ;;
+  foundation-env)
+    [[ $# -eq 0 ]] || { usage; exit 2; }
+    exec bash environments/bootstrap_foundation_environment.sh
+    ;;
+  foundation-fetch)
+    exec "${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}" \
+      scripts/data/fetch_foundation_weights.py "$@"
+    ;;
+  foundation-context)
+    exec "${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}" \
+      scripts/data/build_foundation_context.py "$@"
+    ;;
+  foundation-preflight) foundation_torchrun_split 1 "$@" ;;
+  foundation-train) foundation_torchrun_split 0 "$@" ;;
   lock-resolve) exec "${PYTHON_BIN}" scripts/data/resolve_source_lock.py "$@" ;;
   download) exec "${PYTHON_BIN}" scripts/data/download_sources.py "$@" ;;
   agibot-existing-check) exec "${PYTHON_BIN}" scripts/data/check_existing_agibot2026.py "$@" ;;

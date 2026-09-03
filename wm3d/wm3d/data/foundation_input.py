@@ -1,0 +1,217 @@
+"""Train/serve-identical inputs for the WSA-backed WM3D foundation model."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+import json
+from math import isqrt
+from pathlib import Path
+import time
+from typing import Any, Mapping, Sequence
+
+import torch
+
+from wm3d.data.foundation_bridge import (
+    FoundationBridgeConfig,
+    FoundationBridgeError,
+    build_foundation_sample,
+)
+from wm3d.encoders.native_vggt import NativeVGGTEncoder
+
+
+FOUNDATION_CONTEXT_STORE_SCHEMA = "wm3d_foundation_context_store_v1"
+
+
+class FoundationInputError(ValueError):
+    pass
+
+
+class FoundationContextStore:
+    """Immutable Wan text contexts keyed by the exact task string."""
+
+    def __init__(
+        self,
+        tasks: Sequence[str],
+        context: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> None:
+        normalized = tuple(str(item).strip() for item in tasks)
+        if not normalized or any(not item for item in normalized):
+            raise FoundationInputError("foundation context tasks must be non-empty")
+        if len(set(normalized)) != len(normalized):
+            raise FoundationInputError("foundation context tasks must be unique")
+        if context.ndim != 3 or mask.ndim != 2:
+            raise FoundationInputError("Wan context store tensors have invalid ranks")
+        if context.shape[:2] != mask.shape or context.shape[0] != len(normalized):
+            raise FoundationInputError("Wan context store tensors disagree with task index")
+        if mask.dtype != torch.bool:
+            raise FoundationInputError("Wan context mask must be boolean")
+        if not bool(torch.isfinite(context).all()) or not bool(mask.any(dim=1).all()):
+            raise FoundationInputError("Wan context store contains invalid entries")
+        self.tasks = normalized
+        self.context = context.cpu().contiguous()
+        self.mask = mask.cpu().contiguous()
+        self._row = {task: index for index, task in enumerate(normalized)}
+
+    @classmethod
+    def from_directory(cls, root: Path | str) -> "FoundationContextStore":
+        from safetensors.torch import load_file
+
+        directory = Path(root).expanduser().resolve(strict=True)
+        index_path = directory / "index.json"
+        tensor_path = directory / "context.safetensors"
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+        if payload.get("schema") != FOUNDATION_CONTEXT_STORE_SCHEMA:
+            raise FoundationInputError("foundation context store schema mismatch")
+        if set(payload) != {"schema", "tasks"}:
+            raise FoundationInputError("foundation context store index fields changed")
+        tensors = load_file(str(tensor_path), device="cpu")
+        if set(tensors) != {"context", "mask"}:
+            raise FoundationInputError("foundation context tensor fields changed")
+        return cls(payload["tasks"], tensors["context"], tensors["mask"].bool())
+
+    def lookup(self, tasks: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        rows: list[int] = []
+        for raw in tasks:
+            task = str(raw).strip()
+            if task not in self._row:
+                raise FoundationInputError(
+                    f"task is absent from the sealed Wan context store: {task!r}"
+                )
+            rows.append(self._row[task])
+        index = torch.tensor(rows, dtype=torch.long)
+        return self.context.index_select(0, index), self.mask.index_select(0, index)
+
+
+class FoundationInputAdapter(torch.nn.Module):
+    """Materialize WSA video, Wan task context and frozen VGGT targets."""
+
+    def __init__(
+        self,
+        bridge: FoundationBridgeConfig,
+        *,
+        context_store: FoundationContextStore,
+        vggt_encoder: NativeVGGTEncoder,
+        device: torch.device | str,
+        native_3d_target_tokens: int = 144,
+    ) -> None:
+        super().__init__()
+        bridge.validate()
+        self.bridge = bridge
+        self.context_store = context_store
+        self.vggt_encoder = vggt_encoder
+        self.vggt_encoder.requires_grad_(False)
+        self.vggt_encoder.eval()
+        self.device = torch.device(device)
+        self.native_3d_target_tokens = int(native_3d_target_tokens)
+        self.calls = 0
+        self.samples = 0
+        self.vggt_seconds = 0.0
+
+    def train(self, mode: bool = True) -> "FoundationInputAdapter":
+        super().train(mode)
+        self.vggt_encoder.eval()
+        return self
+
+    @torch.inference_mode()
+    def _future_vggt_target(
+        self, images: torch.Tensor, view_mask: torch.Tensor
+    ) -> torch.Tensor:
+        index = self.bridge.context_frames + self.bridge.future_frames - 1
+        selected = images[:, index : index + 1].to(
+            self.device, non_blocking=True
+        ).float().div_(255.0)
+        selected_mask = view_mask[:, index : index + 1].to(
+            self.device, non_blocking=True
+        )
+        output = self.vggt_encoder(
+            selected,
+            selected_mask,
+            geometry_row_mask=torch.ones(
+                selected.shape[:2], dtype=torch.bool, device=self.device
+            ),
+            appearance_row_mask=torch.zeros(
+                selected.shape[:2], dtype=torch.bool, device=self.device
+            ),
+            rgb_row_mask=torch.zeros(
+                selected.shape[:2], dtype=torch.bool, device=self.device
+            ),
+        )
+        target = output["view_tokens"][:, 0]
+        expected = (
+            images.shape[0],
+            self.bridge.num_views,
+            self.native_3d_target_tokens,
+            2048,
+        )
+        if tuple(target.shape) != expected or not bool(torch.isfinite(target).all()):
+            raise FoundationInputError(
+                f"VGGT foundation target changed to {tuple(target.shape)}"
+            )
+        return target
+
+    def materialize(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        images = batch.get("direct_rgb_uint8")
+        view_mask = batch.get("direct_view_mask")
+        if not isinstance(images, torch.Tensor) or not isinstance(view_mask, torch.Tensor):
+            raise FoundationBridgeError("foundation input requires direct raw RGB")
+        sample = build_foundation_sample(batch, self.bridge)
+        tasks = sample["task_text"]
+        wan_context, wan_mask = self.context_store.lookup(tasks)
+        started = time.perf_counter()
+        target = self._future_vggt_target(images, view_mask.bool())
+        self.vggt_seconds += time.perf_counter() - started
+        sample["wan_context"] = wan_context
+        sample["wan_context_mask"] = wan_mask
+        sample["vggt_future_tokens"] = target
+        self.calls += 1
+        self.samples += int(images.shape[0])
+        return sample
+
+    @property
+    def metrics(self) -> Mapping[str, float | int]:
+        return {
+            "calls": self.calls,
+            "samples": self.samples,
+            "vggt_seconds": self.vggt_seconds,
+        }
+
+
+def build_foundation_input_adapter(
+    runtime: Mapping[str, Any], *, device: torch.device | str
+) -> FoundationInputAdapter:
+    from scripts.data.run_cache_worker import _strict_encoder
+    from wm3d.models.foundation_world_model import foundation_config_from_mapping
+
+    model = foundation_config_from_mapping(runtime["model_profile"]["model"])
+    closure = runtime["data_closure"]
+    encoder_contract = _strict_encoder(Path(str(closure["encoder_contract_path"])))
+    encoder_config = replace(
+        encoder_contract,
+        token_grid=isqrt(model.native_3d_target_tokens),
+        appearance_token_grid=0,
+        appearance_feature_layer=-1,
+        target_rgb_size=model.video_height,
+    )
+    return FoundationInputAdapter(
+        FoundationBridgeConfig(
+            context_frames=model.T,
+            future_frames=model.K,
+            num_views=model.num_views,
+            video_height=model.video_height,
+            video_width=model.video_width,
+            max_action_groups=model.max_action_groups,
+            max_action_dim=model.max_action_dim,
+            max_state_dim=model.max_state_dim,
+        ),
+        context_store=FoundationContextStore.from_directory(
+            model.wan_context_store_path
+        ),
+        vggt_encoder=NativeVGGTEncoder(
+            encoder_config,
+            device=str(device),
+            local_files_only=True,
+        ),
+        device=device,
+        native_3d_target_tokens=model.native_3d_target_tokens,
+    )

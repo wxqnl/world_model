@@ -1,9 +1,14 @@
 # WM3D
 
-WM3D 是动作条件的原生 3D 世界模型。模型使用真实时间戳，在显式 3D 状态上预测未来
-native token、RGB、depth、point 和 camera pose，并由同一核心输出可执行的 grouped
-robot action。1B 与 5B 共享模型类、数据 ABI、训练器和 checkpoint 合同，只选择不同
-profile。
+`v10` 分支新增一条 WSA-Large foundation 路线：以 Wan2.2 视频专家、ActionDiT、Future3D
+和 Mixture-of-Transformers 为基座，接入 WM3D 的 grouped robot、真实时间戳、source-specific
+归一化和 frozen VGGT 监督。WSA-Large 本身不使用 Qwen3-VL，因此 V10 也不引入 Qwen。
+架构、环境、权重、数据桥、训练命令和当前证据见
+[WM3D V10 WSA-Large foundation](docs/WM3D_WSA_FOUNDATION.md)。
+
+原有 native 路线继续保留，作为已经验证的数据 ABI、训练器和对照基线：它使用真实时间戳，
+在显式 3D 状态上预测未来 native token、RGB、depth、point 和 camera pose，并输出 grouped
+robot action。V10 不会原地修改或恢复任何正在运行的 V8 checkpoint。
 
 ```mermaid
 flowchart LR

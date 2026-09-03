@@ -26,8 +26,10 @@ from .grouped_normalization import (
     validate_grouped_lane_mask,
 )
 from .manifest_contract import CacheIndexEntry, DataProfile, load_cache_index, sha256_file
-from wm3d.models.model_factory import validate_model_data_compatibility
-from wm3d.models.native_world_model import native_config_from_mapping
+from wm3d.models.model_factory import (
+    model_config_from_profile,
+    validate_model_data_compatibility,
+)
 
 
 class CacheDataError(RuntimeError):
@@ -378,7 +380,8 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         entries = load_cache_index(index_path, expected_sha256=index_sha256)
         if split not in {"train", "val", "test"}:
             raise CacheDataError(f"invalid split {split!r}")
-        model = native_config_from_mapping(model_profile["model"]).__dict__
+        typed_model = model_config_from_profile(model_profile)
+        model = dict(vars(typed_model))
         sampling = model_profile["sampling"]
         self.T = int(model["T"])
         self.K = int(model["K"])
@@ -398,10 +401,12 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         if int(model["rgb_size"]) > int(representation["rgb_size"]):
             raise CacheDataError("model RGB target exceeds cached RGB resolution")
         self.model = model
-        self.appearance_enabled = bool(model["appearance_enabled"])
-        self.appearance_context_frames = int(model["appearance_context_frames"])
+        self.appearance_enabled = bool(model.get("appearance_enabled", False))
+        self.appearance_context_frames = int(
+            model.get("appearance_context_frames", self.T)
+        )
         self.appearance_grid = _square_grid(
-            int(model["appearance_P"]), label="appearance model"
+            int(model.get("appearance_P", model["P"])), label="appearance model"
         )
         self.appearance_cache_grid = (
             int(representation.get("appearance_token_grid", self.cache_grid))
@@ -496,8 +501,14 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         return dict(self._source_spans)
 
     @staticmethod
-    def _validate_sample(result: Mapping[str, torch.Tensor], entry: CacheIndexEntry) -> None:
+    def _validate_sample(result: Mapping[str, Any], entry: CacheIndexEntry) -> None:
         for name, value in result.items():
+            if name == "task_text":
+                if not isinstance(value, str) or not value.strip():
+                    raise CacheDataError(
+                        f"sample {entry.sample_id} field 'task_text' is empty"
+                    )
+                continue
             if not isinstance(value, torch.Tensor):
                 raise CacheDataError(
                     f"sample {entry.sample_id} field {name!r} is not a tensor"
