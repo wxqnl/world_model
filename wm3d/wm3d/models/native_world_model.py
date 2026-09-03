@@ -968,9 +968,10 @@ class GroupedSignalEncoder(nn.Module):
         # The V7 direct anchor was sufficient for its predominantly
         # single-owner action layout.  V8 permits several simultaneous
         # physical owners, so route each group's linear action feature before
-        # pooling.  A zero-initialized diagonal gain starts as the exact V7
-        # unit map, remains linear in the physical value, and can separate
-        # arm/base/controller commands without adding another action head.
+        # pooling.  A zero-initialized bounded gate keeps the untrained direct
+        # adapter exactly closed, so it cannot corrupt the shared dense path.
+        # Its derivative is one at zero, allowing the existing objective to
+        # open and route each physical owner without adding another head.
         self.direct_group_gain = (
             _ZeroInitializedEmbedding(cfg.max_group_id, output_dim)
             if self.condition_on_normalization
@@ -1154,7 +1155,7 @@ class GroupedSignalEncoder(nn.Module):
         if include_direct_physical:
             if self.direct_group_gain is None:
                 raise RuntimeError("direct physical action group router is unavailable")
-            group_gain = 1.0 + torch.tanh(self.direct_group_gain(group_ids))
+            group_gain = torch.tanh(self.direct_group_gain(group_ids))
             direct_signal = direct_signal * group_gain[:, None]
         signal = (
             fine_summary * fine_present[..., None].to(dtype=fine_summary.dtype)

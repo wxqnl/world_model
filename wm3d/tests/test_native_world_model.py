@@ -1860,10 +1860,14 @@ def _single_group_action_owned_batch(
     return single
 
 
-def test_action_owned_factual_injection_preserves_command_magnitude() -> None:
+def test_action_owned_open_factual_injection_preserves_command_magnitude() -> None:
     cfg = _tiny_action_owned_transport_config()
     torch.manual_seed(815)
     model = NativeWorldModel(cfg).eval()
+    assert model.factual_action is not None
+    assert model.factual_action.direct_group_gain is not None
+    with torch.no_grad():
+        model.factual_action.direct_group_gain.weight.fill_(0.5)
     responses: list[float] = []
     for magnitude in (0.25, 0.5, 1.0, 2.0):
         batch = _single_group_action_owned_batch(cfg)
@@ -2094,6 +2098,9 @@ def test_direct_physical_feature_is_linear_around_physical_zero() -> None:
     assert model.factual_action is not None
     assert model.factual_action.fine_value.bias is None
     assert model.factual_action.coarse_value.bias is None
+    assert model.factual_action.direct_group_gain is not None
+    with torch.no_grad():
+        model.factual_action.direct_group_gain.weight.fill_(0.5)
     batch = _single_group_action_owned_batch(cfg)
     fine_mask = torch.zeros_like(
         batch["future_factual_fine_action_mask"], dtype=torch.bool
@@ -2207,7 +2214,7 @@ def test_numeric_physical_zero_reaches_block_zero_without_direct_update() -> Non
     assert sum(gradient.abs().sum() for gradient in factual_action_gradients) == 0
 
 
-def test_direct_group_router_starts_as_unit_map_and_preserves_identity() -> None:
+def test_direct_group_router_starts_closed_and_remains_trainable() -> None:
     cfg = _tiny_action_owned_transport_config()
     torch.manual_seed(823)
     model = NativeWorldModel(cfg).eval()
@@ -2261,13 +2268,28 @@ def test_direct_group_router_starts_as_unit_map_and_preserves_identity() -> None
             include_direct_physical=True,
         )[2]
 
-    unit = direct()
-    torch.testing.assert_close(unit[:, :, 0], unit[:, :, 1], rtol=0, atol=0)
+    closed = direct()
+    torch.testing.assert_close(closed, torch.zeros_like(closed), rtol=0, atol=0)
+    closed.sum().backward()
+    gain_gradient = encoder.direct_group_gain.weight.grad
+    assert gain_gradient is not None
+    assert torch.isfinite(gain_gradient).all()
+    assert gain_gradient[group_ids.unique()].abs().sum() > 0
+
+    encoder.zero_grad(set_to_none=True)
     with torch.no_grad():
+        encoder.direct_group_gain.weight[1].fill_(0.25)
         encoder.direct_group_gain.weight[2].fill_(0.5)
     routed = direct()
-    torch.testing.assert_close(routed[:, :, 0], unit[:, :, 0], rtol=0, atol=0)
-    assert not torch.allclose(routed[:, :, 1], unit[:, :, 1])
+    assert routed[:, :, 0].abs().sum() > 0
+    assert routed[:, :, 1].abs().sum() > 0
+    assert not torch.allclose(routed[:, :, 0], routed[:, :, 1])
+    torch.testing.assert_close(
+        routed[:, :, 0] / torch.tanh(routed.new_tensor(0.25)),
+        routed[:, :, 1] / torch.tanh(routed.new_tensor(0.5)),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
 
 
 def test_physical_noop_preserves_absolute_direct_channels() -> None:
@@ -2276,6 +2298,9 @@ def test_physical_noop_preserves_absolute_direct_channels() -> None:
     model = NativeWorldModel(cfg).eval()
     encoder = model.factual_action
     assert encoder is not None
+    assert encoder.direct_group_gain is not None
+    with torch.no_grad():
+        encoder.direct_group_gain.weight.fill_(0.5)
     batch = _single_group_action_owned_batch(cfg)
     fine = torch.zeros_like(batch["future_factual_fine_action_values"])
     fine_mask = torch.zeros_like(
