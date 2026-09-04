@@ -611,10 +611,10 @@ def main() -> None:
     if (
         model.cfg.K != 8
         or tuple(model.cfg.rgb_decode_indices) != tuple(range(8))
-        or not model.cfg.rgb_action_owned_transport
+        or not model.cfg.physical_factual_pass
         or model.cfg.rgb_original_v7_context
     ):
-        raise AuditError("model is not the full-K8 action-owned transport contract")
+        raise AuditError("model is not the full-K8 physical factual RGB contract")
     load_full_model(model, checkpoint)
     model.eval()
 
@@ -649,12 +649,14 @@ def main() -> None:
     if config["data_closure"].get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
         input_adapter = build_direct_vggt_teacher(config, device=device)
         input_adapter.eval()
-    flow_mapping = runtime["train"].get("rgb_flow_teacher")
-    if flow_mapping is None:
-        raise AuditError("action-owned transport audit requires sealed RGB flow teacher")
-    flow_teacher = FrozenBidirectionalRAFTRuntime(
-        raft_config_from_mapping(flow_mapping), device=device
-    )
+    flow_teacher = None
+    if model.cfg.rgb_action_owned_transport:
+        flow_mapping = runtime["train"].get("rgb_flow_teacher")
+        if flow_mapping is None:
+            raise AuditError("action-owned transport audit requires sealed RGB flow teacher")
+        flow_teacher = FrozenBidirectionalRAFTRuntime(
+            raft_config_from_mapping(flow_mapping), device=device
+        )
 
     records: list[dict[str, Any]] = []
     completed_sources: set[int] = set()
@@ -698,7 +700,8 @@ def main() -> None:
                 cpu_batch = input_adapter.materialize(cpu_batch)
             validate_materialized_k8_batch(cpu_batch)
             batch = _batch_to_device(cpu_batch, device)
-            batch = _materialize_rgb_flow_targets(batch, flow_teacher)
+            if flow_teacher is not None:
+                batch = _materialize_rgb_flow_targets(batch, flow_teacher)
             variants, permutation, valid, distance = build_action_variants(
                 batch,
                 step=checkpoint_step + loader_step,
@@ -800,6 +803,7 @@ def main() -> None:
         raise AuditError("paired audit source coverage is incomplete")
     receipt = {
         "schema": SCHEMA,
+        "rgb_decoder": "native_direct" if model.cfg.rgb_action_owned_direct else "action_owned_transport",
         "runtime_path": str(args.runtime.resolve(strict=True)),
         "checkpoint_path": str(checkpoint),
         "checkpoint_step": checkpoint_step,
