@@ -19,6 +19,7 @@ def main():
     p.add_argument("--output",type=Path,required=True)
     p.add_argument("--pixel-units",action="store_true")
     p.add_argument("--real-negative-every-step",action="store_true")
+    p.add_argument("--occlusion-completion", action="store_true")
     p.add_argument("--steps",type=int,default=96)
     p.add_argument("--seed",type=int,default=7340)
     args=p.parse_args()
@@ -31,6 +32,11 @@ def main():
     body["activation_checkpointing"]=runtime["train"].get("activation_checkpointing",body["activation_checkpointing"])
     body["rgb_decode_chunk_size"]=runtime["train"].get("rgb_decode_chunk_size",body["rgb_decode_chunk_size"])
     profile["model"]=body
+    if args.occlusion_completion:
+        body["rgb_transport_occlusion_completion"] = True
+        final_channels = max(32, int(body["rgb_hidden"]) // 8)
+        added_parameters = (final_channels * 9 + 1) + ((final_channels + 3) * 32 * 9 + 32) + 32 * 3
+        profile["expected_parameter_count"] = int(profile["expected_parameter_count"]) + added_parameters
     with torch.device(device):
         model=audit.build_world_model(profile)
     count=sum(p.numel() for p in model.parameters())
@@ -42,6 +48,10 @@ def main():
         objective=replace(objective,action_counterfactual_token_advantage=0.0,
             context_pixel_action_rank_every=1,context_pixel_action_rank_ramp_steps=0)
     objective.validate()
+    if args.occlusion_completion:
+        objective = replace(objective, rgb_disocclusion_bce=0.03,
+                            rgb_disocclusion_dice=0.03)
+        objective.validate()
     perceptual=build_rgb_perceptual_model(objective,device=device)
     oc=runtime["optimizer"]
     optimizer=torch.optim.AdamW(model.parameters(),lr=float(oc["peak_lr"]),
@@ -63,6 +73,22 @@ def main():
                 batch[key]=value
         batches.append(audit._batch_to_device(batch,device))
     reports=[]; training=[]
+    def visibility_metrics(output, batch):
+        target = batch["target_rgb"].float()
+        valid = batch["target_rgb_mask"].bool() & batch["context_rgb_mask"].bool()[:, None, :, None, None, None]
+        occ = batch["rgb_disocclusion_target"].float()
+        occ = torch.nn.functional.interpolate(
+            occ.flatten(0, 2), size=target.shape[-2:], mode="nearest"
+        ).reshape(*target.shape[:3], 1, *target.shape[-2:]) >= 0.5
+        error = (output["rgb"].float() - target).abs()
+        values = {}
+        for name, mask in (("visible", valid & ~occ), ("disoccluded", valid & occ)):
+            weights = torch.broadcast_to(mask, error.shape)
+            values[name + "_l1"] = float((error * weights).sum() / weights.sum().clamp_min(1))
+        values["disocclusion_target_fraction"] = float(audit._masked_mean(occ.float(), valid))
+        values["disocclusion_prediction_fraction"] = float(audit._masked_mean(
+            torch.sigmoid(output["rgb_disocclusion_logit"].float()), valid))
+        return values
     def evaluate(step):
         model.eval(); records=[]
         for batch in batches:
@@ -75,6 +101,7 @@ def main():
                 raise RuntimeError("Future action leaked into policy/action-free")
             records.append({"source_id":int(batch["source_id"][0]),
                 "sample_indices":batch["sample_index"].tolist(),
+                "visibility":{label:visibility_metrics(out,batch) for label,out in outputs.items()},
                 "variants":{label:audit.variant_metrics(out,batch,motion_threshold=objective.rgb_motion_threshold)
                             for label,out in outputs.items()},
                 "responses":{label:audit._response_rms(outputs["normal"],outputs[label],batch)
@@ -103,7 +130,7 @@ def main():
         if not bool(torch.isfinite(norm)): raise RuntimeError("Nonfinite gradient")
         if step==0:
             owners={}
-            for prefix in ("factual_action","factual_token_output","rgb_head.image_decoder.flow_head","action_head"):
+            for prefix in ("factual_action","factual_token_output","rgb_head.image_decoder.flow_head","rgb_head.image_decoder.occlusion_head","rgb_head.image_decoder.occlusion_completion","action_head"):
                 parameters=[p for name,p in model.named_parameters() if name.replace("_checkpoint_wrapped_module.","").startswith(prefix) and p.grad is not None]
                 owners[prefix]={"tensors":len(parameters),"norm":float(torch.stack([p.grad.float().square().sum() for p in parameters]).sum().sqrt()) if parameters else None}
             print(json.dumps({"event":"gradient_owners","owners":owners}),flush=True)
@@ -118,6 +145,7 @@ def main():
         "fresh_initialization":True,"checkpoint_loaded":False,"parameter_count":count,
         "pixel_units":args.pixel_units,"seed":args.seed,"steps":args.steps,
         "real_negative_every_step":args.real_negative_every_step,
+        "occlusion_completion":args.occlusion_completion,
         "batch_size":int(batches[0]["source_id"].shape[0]),"source_balanced_diagnostic":True,
         "production_lr_schedule":True,"elapsed_seconds":time.monotonic()-start,
         "evaluations":reports,"training":training}

@@ -1738,6 +1738,83 @@ def test_action_owned_transport_closed_motion_keeps_flow_gradient_and_identity()
     assert decoder.motion_head.weight.grad is None
 
 
+def test_transport_occlusion_completion_zero_init_and_gradient_ownership() -> None:
+    cfg = replace(
+        _tiny_action_owned_transport_config(),
+        rgb_v7_high_frequency_refiner=False,
+    )
+    torch.manual_seed(927)
+    baseline = NativeActionOwnedTransportRGBImageDecoder(cfg).train()
+    torch.manual_seed(927)
+    decoder = NativeActionOwnedTransportRGBImageDecoder(
+        replace(cfg, rgb_transport_occlusion_completion=True)
+    ).train()
+    for key, value in baseline.state_dict().items():
+        torch.testing.assert_close(value, decoder.state_dict()[key], rtol=0, atol=0)
+    inputs = (
+        torch.randn(1, cfg.P, cfg.token_dim),
+        torch.randn(1, cfg.rgb_hidden, 1, 1),
+        None, None, None,
+        torch.randn(1, cfg.task_dim),
+        torch.rand(1, 3, cfg.rgb_size, cfg.rgb_size),
+    )
+    old_output = baseline(*inputs)
+    output = decoder(*inputs)
+    torch.testing.assert_close(output[0], old_output[0], rtol=0, atol=0)
+    torch.testing.assert_close(output[3], old_output[3], rtol=0, atol=0)
+    output[0].float().square().mean().backward()
+    for parameter in (
+        decoder.flow_head.weight, decoder.occlusion_completion[-1].weight
+    ):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
+    assert decoder.occlusion_head.weight.grad is None
+    assert decoder.occlusion_head.bias.grad is None
+    decoder.zero_grad(set_to_none=True)
+    output = decoder(*inputs)
+    target = torch.zeros_like(output[-1])
+    target[..., :cfg.rgb_size // 2, :cfg.rgb_size // 2] = 1.0
+    torch.nn.functional.binary_cross_entropy_with_logits(
+        output[-1].float(), target.float()
+    ).backward()
+    assert decoder.occlusion_head.weight.grad is not None
+    assert torch.isfinite(decoder.occlusion_head.weight.grad).all()
+    assert decoder.occlusion_head.weight.grad.abs().sum() > 0
+
+
+def test_transport_completion_mask_cannot_attenuate_flow_or_change_visible_base() -> None:
+    cfg = replace(
+        _tiny_action_owned_transport_config(),
+        rgb_v7_high_frequency_refiner=False,
+        rgb_transport_occlusion_completion=True,
+    )
+    decoder = NativeActionOwnedTransportRGBImageDecoder(cfg).eval()
+    with torch.no_grad():
+        decoder.flow_head.weight.zero_()
+        decoder.flow_head.bias.zero_()
+        decoder.occlusion_head.weight.zero_()
+        decoder.occlusion_head.bias.fill_(-100.0)
+        decoder.occlusion_completion[0].weight.zero_()
+        decoder.occlusion_completion[0].bias.fill_(1.0)
+        decoder.occlusion_completion[-1].weight.fill_(0.1)
+    context = torch.full((1, 3, cfg.rgb_size, cfg.rgb_size), 0.2)
+    inputs = (
+        torch.zeros(1, cfg.P, cfg.token_dim),
+        torch.zeros(1, cfg.rgb_hidden, 1, 1),
+        None, None, None, torch.zeros(1, cfg.task_dim), context,
+    )
+    closed = decoder(*inputs)
+    with torch.no_grad():
+        decoder.occlusion_head.bias.fill_(100.0)
+    opened = decoder(*inputs)
+    torch.testing.assert_close(closed[0], context, rtol=0, atol=5e-6)
+    torch.testing.assert_close(closed[3], opened[3], rtol=0, atol=0)
+    # A warp-only renderer cannot create a different flat colour from this
+    # constant input; completion can, without changing the flow.
+    assert float((opened[0] - closed[0]).abs().mean()) > 0.1
+
+
 def test_action_owned_transport_supports_non_power_of_two_rgb_size() -> None:
     cfg = replace(
         _tiny_action_owned_transport_config(),
@@ -1759,8 +1836,9 @@ def test_action_owned_transport_supports_non_power_of_two_rgb_size() -> None:
     assert flow.shape == (1, 2, 24, 24)
 
 
-def test_action_owned_transport_action_changes_rgb_not_policy_or_action_free() -> None:
-    cfg = _tiny_action_owned_transport_config()
+@pytest.mark.parametrize("completion", [False, True])
+def test_action_owned_transport_action_changes_rgb_not_policy_or_action_free(completion) -> None:
+    cfg = replace(_tiny_action_owned_transport_config(), rgb_transport_occlusion_completion=completion)
     torch.manual_seed(813)
     model = NativeWorldModel(cfg).eval()
     batch = _original_v7_batch(cfg)

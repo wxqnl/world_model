@@ -145,6 +145,8 @@ class NativeWorldModelConfig:
     # may reach a future frame only through that predicted transport; it is
     # never exposed as an unwarped U-Net skip or an unconditional copy path.
     rgb_action_owned_transport: bool = False
+    # Backward-compatible completion of appearance that flow cannot carry.
+    rgb_transport_occlusion_completion: bool = False
     # Optional V8 clarity head on top of the proven V7 renderer. It consumes
     # only factual P64 and the final 256x256 decoder feature; a fixed zero-DC
     # high-pass operator removes low frequency before the bounded correction
@@ -323,6 +325,10 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_original_v7_context must be boolean")
         if not isinstance(self.rgb_action_owned_transport, bool):
             raise ValueError("rgb_action_owned_transport must be boolean")
+        if not isinstance(self.rgb_transport_occlusion_completion, bool):
+            raise ValueError("rgb_transport_occlusion_completion must be boolean")
+        if self.rgb_transport_occlusion_completion and not self.rgb_action_owned_transport:
+            raise ValueError("occlusion completion requires action-owned transport")
         if self.rgb_original_v7_context and self.rgb_action_owned_transport:
             raise ValueError(
                 "original V7 RGB and action-owned transport are mutually exclusive"
@@ -3319,8 +3325,10 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
     The observed image is an appearance carrier, not a future-state input.  It
     reaches every output pixel only through a backward flow predicted from the
     factual future state. The separately supervised change mask is auxiliary
-    and cannot attenuate that flow. There is no full-frequency redraw path;
-    the optional bounded zero-DC refiner can add only high-frequency detail.
+    and cannot attenuate that flow. Default transport has no full-frequency
+    completion; the optional bounded zero-DC refiner adds high-frequency detail.
+    The experimental occlusion-completion option adds bounded colour residuals
+    under detached soft visibility support. It is not a hard region-only mask.
     Static identity is represented by zero flow rather than a copy bypass.
     """
 
@@ -3375,6 +3383,22 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
                 cfg,
                 feature_channels=final_channels,
             )
+        if cfg.rgb_transport_occlusion_completion:
+            # Preserve existing parameter initialization in paired fresh runs.
+            devices = (
+                [self.flow_head.weight.device.index]
+                if self.flow_head.weight.device.type == "cuda"
+                else []
+            )
+            with torch.random.fork_rng(devices=devices):
+                self.occlusion_head = _RGBTransportMotionHead(
+                    final_channels, 1, 3, padding=1
+                )
+                self.occlusion_completion = nn.Sequential(
+                    nn.Conv2d(final_channels + 3, 32, 3, padding=1),
+                    nn.SiLU(inplace=True),
+                    _ZeroProjection(32, 3, kernel_size=1, bias=False),
+                )
 
     def forward(
         self,
@@ -3507,23 +3531,39 @@ class NativeActionOwnedTransportRGBImageDecoder(nn.Module):
             image_height=self.cfg.rgb_size,
             image_width=self.cfg.rgb_size,
         )
-        # The transported image is the only appearance base.  In particular,
-        # there is no full-frequency residual that can redraw the moving
-        # region instead of learning transport.  Warp validity remains a
-        # diagnostic and never opens another rendering path.
+        # Transport remains the appearance base. The opt-in completion below
+        # supplies missing colour under soft visibility support; neither its
+        # mask nor warp validity attenuates the predicted flow.
         warp_invalid = (~warp_valid).to(dtype=torch.float32)
         rgb = transported
+        if self.cfg.rgb_transport_occlusion_completion:
+            disocclusion_logit = self.occlusion_head(value)
+            # Visibility learns its existing label, not an RGB-loss shortcut.
+            # No gradient from RGB may enlarge the completion mask.
+            completion_support = torch.maximum(
+                torch.sigmoid(disocclusion_logit.float()).detach(),
+                warp_invalid,
+            )
+            correction = torch.tanh(
+                self.occlusion_completion(
+                    torch.cat((value, transported.to(dtype=value.dtype)), dim=1)
+                ).float()
+            )
+            rgb = torch.clamp(
+                transported.float() + completion_support * correction, 0.0, 1.0
+            ).to(dtype=value.dtype)
+        else:
+            disocclusion_logit = torch.where(
+                warp_valid,
+                torch.full_like(warp_invalid, -8.0),
+                torch.full_like(warp_invalid, 8.0),
+            )
         if self.high_frequency_refiner is not None:
             rgb = torch.clamp(
                 rgb.float() + self.high_frequency_refiner(tokens, value),
                 0.0,
                 1.0,
             ).to(dtype=value.dtype)
-        disocclusion_logit = torch.where(
-            warp_valid,
-            torch.full_like(warp_invalid, -8.0),
-            torch.full_like(warp_invalid, 8.0),
-        )
         return (
             rgb,
             motion_logit,

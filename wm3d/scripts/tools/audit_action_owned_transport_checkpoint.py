@@ -547,8 +547,8 @@ def main() -> None:
     args = parse_args()
     if args.output.exists():
         raise AuditError("output receipt must be new")
-    if args.source_count < 3:
-        raise AuditError("paired checkpoint audit requires at least three sources")
+    if args.source_count <= 0:
+        raise AuditError("source-count must be positive; fewer than three is limited coverage, not a cross-source gate")
     if args.pair_batch_size < 2 or args.pairs_per_source <= 0:
         raise AuditError("paired audit requires a batch of at least two real windows")
     if args.max_loader_steps < args.source_count:
@@ -779,6 +779,13 @@ def main() -> None:
         "validation_seed": seed,
         "data_split": args.split,
         "generalization_evaluation": args.split == "val",
+        "multi_source_heldout_evaluation": args.split == "val" and summary["source_count"] >= 3,
+        "coverage_limitation": (
+            "Training-split diagnostic; not held-out generalization."
+            if args.split != "val" else
+            "Fewer than three held-out sources; cannot establish multi-source generalization."
+            if summary["source_count"] < 3 else None
+        ),
         "minimum_action_distance": minimum_distance,
         "requested_source_count": args.source_count,
         "pair_batch_size": args.pair_batch_size,

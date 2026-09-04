@@ -1496,9 +1496,9 @@ def compute_native_objective(
                 ).sqrt()
                 moving = target_flow_magnitude >= 1.0
                 # Both tensors already represent full-image pixels. Dividing
-                # by the head's output range would silently shrink the motion
-                # supervision relative to RGB losses (128x at 256px). Keep
-                # that historical behavior only for old sealed runtimes.
+                # by the head's output range normalizes this loss, not flow
+                # predictions. Pixel-unit mode changes the effective weight
+                # (128x at 256px); it is an explicit diagnostic, not a units fix.
                 flow_loss_divisor = (
                     1.0
                     if config.rgb_flow_teacher_pixel_units
