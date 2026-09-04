@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import filecmp
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from itertools import groupby
+import multiprocessing
 import json
 import os
 from pathlib import Path
@@ -172,6 +174,90 @@ def _write_episode(root: Path, prepared: object) -> dict[str, object]:
     }
 
 
+
+def _completed_episode(root: Path, task: object) -> dict[str, object] | None:
+    """Reuse an atomically published task, retaining the existing file contract."""
+    final = root / "tasks" / task.task_id[:2] / task.task_id
+    if not final.exists():
+        return None
+    if final.is_symlink() or not final.is_dir():
+        raise StreamingMetadataError("existing metadata task is not a directory")
+    manifest_path = final / "manifest.json"
+    if manifest_path.is_symlink():
+        raise StreamingMetadataError("existing metadata manifest is a symlink")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema") != STREAMING_METADATA_SEAL_SCHEMA
+        or manifest.get("task") != task.as_dict()
+        or int(manifest.get("frame_count", 0)) <= 0
+        or len(manifest.get("selected_source_rows", [])) != manifest["frame_count"]
+    ):
+        raise StreamingMetadataError("existing metadata task contract differs")
+    files = manifest["files"]
+    for name in ("boundaries.safetensors", "robot.safetensors", "visuals.streaming"):
+        path = final / name
+        if path.is_symlink() or sha256_file(path) != files[name]:
+            raise StreamingMetadataError("existing metadata file differs: " + name)
+    relative = final.relative_to(root).as_posix()
+    return {
+        "schema": CACHE_EPISODE_INDEX_SCHEMA,
+        "episode_id": task.episode_id, "source": task.source, "split": task.split,
+        "embodiment": task.embodiment,
+        "feature_shard": f"{relative}/boundaries.safetensors",
+        "feature_sha256": files["boundaries.safetensors"],
+        "robot_shard": f"{relative}/robot.safetensors",
+        "robot_sha256": files["robot.safetensors"],
+        "rgb_pack": f"{relative}/visuals.streaming",
+        "rgb_pack_sha256": files["visuals.streaming"],
+        "frame_count": int(manifest["frame_count"]),
+    }
+
+
+_METADATA_CONTEXT = None
+
+
+def _metadata_worker_init(profile, adapters, store_config, root, encoder_input_size):
+    global _METADATA_CONTEXT
+    # CPU metadata preparation only; each process owns its reader and locks.
+    torch.set_num_threads(1)
+    _METADATA_CONTEXT = {
+        "profile": profile, "adapters": adapters,
+        "sources": {source.name: source for source in profile.sources},
+        "store": TaskEmbeddingStore(**store_config),
+        "verifier": VerifiedAssetStore(parquet_cache_bytes=1024**3),
+        "root": root,
+        "encoder_input_size": encoder_input_size,
+        "task_bank_index_sha256": store_config["index_sha256"],
+    }
+
+
+def _metadata_worker_prepare(task):
+    context = _METADATA_CONTEXT
+    if context is None:
+        raise StreamingMetadataError("metadata worker was not initialized")
+    source = context["sources"].get(task.source)
+    if source is None or source.embodiment != task.embodiment:
+        raise StreamingMetadataError("task source/embodiment differs from profile")
+    completed = _completed_episode(context["root"], task)
+    if completed is not None:
+        return completed
+    prepared = _prepare_task(
+        task=task, source=source, adapter=context["adapters"][task.source],
+        profile=context["profile"], task_store=context["store"],
+        asset_verifier=context["verifier"],
+        encoder_input_size=context["encoder_input_size"],
+        task_bank_index_sha256=context["task_bank_index_sha256"],
+        decode_workers=1, decode_visuals=False,
+    )
+    return _write_episode(context["root"], prepared)
+
+
+def _metadata_worker_group(tasks):
+    # Keep one payload on one worker: verify/read its shard without multiplying
+    # the same I/O across processes. Final episode/window ordering is unchanged.
+    return [_metadata_worker_prepare(task) for task in tasks]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-manifest", type=Path, required=True)
@@ -186,10 +272,11 @@ def main() -> None:
     parser.add_argument("--grouped-normalization", type=Path, required=True)
     parser.add_argument("--output-seal", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--processes", type=int, default=1)
     parser.add_argument("--minimum-scale", type=float, default=1.0e-6)
     args = parser.parse_args()
-    if args.workers <= 0:
-        raise StreamingMetadataError("workers must be positive")
+    if args.workers <= 0 or args.processes <= 0:
+        raise StreamingMetadataError("workers and processes must be positive")
     profile = load_data_profile(args.data_profile, verify_source_manifests=True)
     model_path = args.model_profile.resolve(strict=True)
     model = yaml.safe_load(model_path.read_text(encoding="utf-8"))
@@ -240,7 +327,7 @@ def main() -> None:
     task_encoder_digests = {task.task_encoder_contract_sha256 for task in tasks}
     if len(task_encoder_digests) != 1:
         raise StreamingMetadataError("task manifest mixes task encoders")
-    task_store = TaskEmbeddingStore(
+    store_config = dict(
         root=args.task_bank_root,
         index_sha256=args.task_bank_index_sha256,
         expected_data_profile_sha256=profile.profile_sha256,
@@ -249,32 +336,37 @@ def main() -> None:
         },
         expected_encoder_contract_sha256=next(iter(task_encoder_digests)),
     )
-    verifier = VerifiedAssetStore()
     root = args.output_root.absolute()
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink():
         raise StreamingMetadataError("metadata output root cannot be a symlink")
 
-    def prepare(task: object) -> dict[str, object]:
-        source = sources.get(task.source)
-        if source is None or source.embodiment != task.embodiment:
-            raise StreamingMetadataError("task source/embodiment differs from profile")
-        prepared = _prepare_task(
-            task=task,
-            source=source,
-            adapter=adapters[task.source],
-            profile=profile,
-            task_store=task_store,
-            asset_verifier=verifier,
-            encoder_input_size=int(encoder_config.input_rgb_size),
-            task_bank_index_sha256=args.task_bank_index_sha256,
-            decode_workers=1,
-            decode_visuals=False,
+    # Only work dispatch changes; published rows retain the original final sort.
+    ordered_tasks = sorted(tasks, key=lambda task: (
+        task.source, task.payload, task.payload_row_start, task.task_id))
+    initargs = (profile, adapters, store_config, root, int(encoder_config.input_rgb_size))
+    if args.processes > 1:
+        pool = ProcessPoolExecutor(
+            max_workers=args.processes, mp_context=multiprocessing.get_context("spawn"),
+            initializer=_metadata_worker_init, initargs=initargs,
         )
-        return _write_episode(root, prepared)
-
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        rows = list(pool.map(prepare, tasks))
+    else:
+        _metadata_worker_init(*initargs)
+        pool = ThreadPoolExecutor(max_workers=args.workers)
+    rows = []
+    with pool:
+        if args.processes > 1:
+            groups = [list(group) for _key, group in groupby(
+                ordered_tasks, key=lambda task: (task.source, task.payload))]
+            grouped_results = pool.map(_metadata_worker_group, groups, chunksize=1)
+            results = (row for group in grouped_results for row in group)
+        else:
+            results = pool.map(_metadata_worker_prepare, ordered_tasks)
+        for row in results:
+            rows.append(row)
+            if len(rows) % 5000 == 0:
+                print(json.dumps({"event": "metadata_episodes", "completed": len(rows),
+                                  "total": len(tasks), "processes": args.processes}), flush=True)
     rows.sort(key=lambda row: (str(row["source"]), str(row["episode_id"])))
     _publish_jsonl(args.episode_index.absolute(), rows)
     del rows

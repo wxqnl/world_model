@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 import threading
@@ -29,6 +30,42 @@ class _VerifiedAsset:
     ctime_ns: int
 
 
+class _ParquetColumnCache:
+    """Bounded, immutable row-group columns shared by one metadata worker."""
+
+    def __init__(self, maximum_bytes: int):
+        self.maximum_bytes = maximum_bytes
+        self.bytes = 0
+        self.entries = OrderedDict()
+        self.lock = threading.RLock()
+
+    @staticmethod
+    def _identity(path: Path):
+        stat = path.stat()
+        return (str(path), stat.st_dev, stat.st_ino, stat.st_size,
+                stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def read(self, path: Path, parquet, row_group: int, column: str):
+        with self.lock:
+            identity = self._identity(path)
+            key = (identity, row_group, column)
+            cached = self.entries.get(key)
+            if cached is not None:
+                self.entries.move_to_end(key)
+                return cached
+            value = parquet.read_row_group(row_group, columns=[column]).column(0)
+            if self._identity(path) != identity:
+                raise EpisodeIOError("Parquet payload changed while being read")
+            size = int(value.nbytes)
+            if size <= self.maximum_bytes:
+                while self.entries and self.bytes + size > self.maximum_bytes:
+                    _old_key, old = self.entries.popitem(last=False)
+                    self.bytes -= int(old.nbytes)
+                self.entries[key] = value
+                self.bytes += size
+            return value
+
+
 class VerifiedAssetStore:
     """Verify a raw immutable asset once per long-lived cache worker.
 
@@ -41,7 +78,11 @@ class VerifiedAssetStore:
     sealed in the source manifest.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, parquet_cache_bytes: int = 0) -> None:
+        if parquet_cache_bytes < 0:
+            raise ValueError("Parquet cache budget must be nonnegative")
+        self.parquet_columns = (
+            _ParquetColumnCache(parquet_cache_bytes) if parquet_cache_bytes else None)
         self._verified: dict[Path, _VerifiedAsset] = {}
         self._lock = threading.RLock()
 
@@ -153,11 +194,13 @@ def _safe_asset(
 class ParquetEpisodeAccessor(EpisodeAccessor):
     """Read only row groups intersecting a SHA-bound episode slice."""
 
-    def __init__(self, path: Path, *, row_start: int, row_stop: int):
+    def __init__(self, path: Path, *, row_start: int, row_stop: int,
+                 column_cache: _ParquetColumnCache | None = None):
         import pyarrow.parquet as pq
 
         self.path = Path(path)
         self.parquet = pq.ParquetFile(self.path)
+        self.column_cache = column_cache
         self.start = int(row_start)
         self.stop = int(row_stop)
         if (
@@ -184,7 +227,11 @@ class ParquetEpisodeAccessor(EpisodeAccessor):
             left = max(self.start, row_group_start)
             right = min(self.stop, row_group_stop)
             if left < right:
-                column = self.parquet.read_row_group(row_group, columns=[key]).column(0)
+                column = (
+                    self.parquet.read_row_group(row_group, columns=[key]).column(0)
+                    if self.column_cache is None else
+                    self.column_cache.read(self.path, self.parquet, row_group, key)
+                )
                 values.extend(
                     column.slice(left - row_group_start, right - left).to_pylist()
                 )
@@ -234,7 +281,9 @@ def open_episode_accessor(
     )
     kwargs = {"row_start": task.payload_row_start, "row_stop": task.payload_row_stop}
     if adapter.raw_format in {"lerobot_parquet_video", "agibot_parquet_video"}:
-        return ParquetEpisodeAccessor(path, **kwargs)
+        return ParquetEpisodeAccessor(
+            path, **kwargs,
+            column_cache=asset_verifier.parquet_columns if asset_verifier else None)
     if adapter.raw_format == "npz":
         return NpzEpisodeAccessor(path, **kwargs)
     raise EpisodeIOError(f"unsupported episode format {adapter.raw_format!r}")

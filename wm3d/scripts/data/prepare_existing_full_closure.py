@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--model-profile",type=Path,required=True)
     parser.add_argument("--workers",type=int,default=4)
     parser.add_argument("--metadata-workers",type=int,default=16)
+    parser.add_argument("--metadata-processes",type=int,default=1)
     parser.add_argument("--device",default="cuda:0")
     args=parser.parse_args()
     code=Path(__file__).resolve().parents[2]
@@ -145,7 +146,8 @@ def main():
             "--task-bank-index-sha256",sha256_file(task_bank/"index.jsonl"),
             "--output-root",root/"metadata","--episode-index",root/"episode_index.jsonl",
             "--window-index",root/"window_index.jsonl","--grouped-normalization",root/"grouped_normalization.json",
-            "--output-seal",seal,"--workers",args.metadata_workers],"full_streaming_metadata")
+            "--output-seal",seal,"--workers",args.metadata_workers,
+            "--processes",args.metadata_processes],"full_streaming_metadata")
     result=json.loads(seal.read_text())
     print(json.dumps({"event":"full_closure_ready","data_profile":str(profile),"seal":str(seal),
         "sources":len(value["sources"]),"episodes":result["episode_count"],"windows":result["window_count"],
