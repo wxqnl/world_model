@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import filecmp
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -30,7 +31,7 @@ from wm3d.data.manifest_contract import (
 from wm3d.data.source_adapters import load_adapter_contract
 from wm3d.data.streaming_raw import STREAMING_METADATA_SEAL_SCHEMA
 from wm3d.data.task_embedding_store import TaskEmbeddingStore
-from wm3d.data.window_index import plan_window_index
+from wm3d.data.window_index import iter_window_index
 from wm3d.models.model_factory import validate_model_data_compatibility
 
 
@@ -60,6 +61,30 @@ def _publish(path: Path, payload: bytes) -> None:
             raise FileExistsError(f"refusing to overwrite non-identical {path}")
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _publish_jsonl(path: Path, rows) -> int:
+    """Atomically publish the existing row encoding without a giant payload."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    count = 0
+    try:
+        with temporary.open("xb") as handle:
+            for row in rows:
+                handle.write((json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode())
+                count += 1
+                if count % 100_000 == 0:
+                    print(json.dumps({"event": "index_rows", "index": path.name, "rows": count}), flush=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink() or not filecmp.cmp(temporary, path, shallow=False):
+                raise FileExistsError(f"refusing to overwrite non-identical {path}")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return count
 
 
 def _write_episode(root: Path, prepared: object) -> dict[str, object]:
@@ -251,26 +276,20 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         rows = list(pool.map(prepare, tasks))
     rows.sort(key=lambda row: (str(row["source"]), str(row["episode_id"])))
-    episode_payload = "".join(
-        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
-    ).encode()
-    _publish(args.episode_index.absolute(), episode_payload)
+    _publish_jsonl(args.episode_index.absolute(), rows)
+    del rows
     episodes = load_cache_episode_index(
         args.episode_index.absolute(),
         expected_sha256=sha256_file(args.episode_index.absolute()),
     )
-    window_rows = plan_window_index(
+    window_rows = iter_window_index(
         episodes=episodes,
         cache_root=root,
         model_profile=model,
         model_profile_sha256=model_sha,
         data_profile=profile,
     )
-    window_payload = "".join(
-        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
-        for row in window_rows
-    ).encode()
-    _publish(args.window_index.absolute(), window_payload)
+    window_count = _publish_jsonl(args.window_index.absolute(), window_rows)
     window_sha = sha256_file(args.window_index.absolute())
     normalization = build_grouped_normalization_artifact(
         data_profile=profile,
@@ -300,7 +319,7 @@ def main() -> None:
         "episode_count": len(episodes),
         "window_index_path": str(args.window_index.absolute()),
         "window_index_sha256": window_sha,
-        "window_count": len(window_rows),
+        "window_count": window_count,
         "grouped_normalization_path": str(args.grouped_normalization.absolute()),
         "grouped_normalization_sha256": sha256_file(
             args.grouped_normalization.absolute()

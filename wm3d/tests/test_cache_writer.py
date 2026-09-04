@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 import wm3d.data.grouped_normalization as grouped_normalization_module
+from scripts.data.materialize_streaming_metadata import _publish_jsonl
 
 from wm3d.data.cache_tasks import plan_tasks
 from wm3d.data.cache_writer import UnifiedFrameCache, write_cache_task
@@ -38,7 +39,28 @@ from wm3d.data.unified_cache_dataset import (
     UnifiedCacheDataset,
     _fuse_target_tokens,
 )
-from wm3d.data.window_index import plan_window_index
+from wm3d.data.window_index import iter_window_index, plan_window_index
+
+
+def test_streamed_index_preserves_bytes_and_never_publishes_partial_rows(tmp_path: Path) -> None:
+    rows = [{"source": "桥", "sample": 1}, {"source": "droid", "sample": 2}]
+    path = tmp_path / "index.jsonl"
+    expected = "".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    ).encode()
+    assert _publish_jsonl(path, iter(rows)) == 2
+    assert path.read_bytes() == expected
+    assert _publish_jsonl(path, iter(rows)) == 2
+
+    def broken_rows():
+        yield rows[0]
+        raise RuntimeError("source read failed")
+
+    incomplete = tmp_path / "incomplete.jsonl"
+    with pytest.raises(RuntimeError, match="source read failed"):
+        _publish_jsonl(incomplete, broken_rows())
+    assert not incomplete.exists()
+    assert not list(tmp_path.glob(".incomplete.jsonl.tmp.*"))
 
 
 def _clock() -> np.ndarray:
@@ -324,6 +346,13 @@ def test_episode_cache_is_shared_and_window_index_assembles_real_robot_times(
         model_profile_sha256=canonical_sha256(_model_profile()),
         data_profile=_profile(tmp_path),
     )
+    assert tuple(iter_window_index(
+        episodes=episodes,
+        cache_root=tmp_path,
+        model_profile=_model_profile(),
+        model_profile_sha256=canonical_sha256(_model_profile()),
+        data_profile=_profile(tmp_path),
+    )) == rows
     assert len(rows) > 2
     window_index = tmp_path / "window_index.jsonl"
     window_index.write_text(

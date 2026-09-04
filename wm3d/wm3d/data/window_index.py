@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from safetensors import safe_open
 import numpy as np
@@ -157,6 +157,33 @@ def plan_episode_windows(
     return tuple(rows)
 
 
+def iter_window_index(
+    *,
+    episodes: Sequence[CacheEpisodeEntry],
+    cache_root: Path,
+    model_profile: Mapping[str, Any],
+    model_profile_sha256: str,
+    data_profile: DataProfile,
+) -> Iterable[dict[str, Any]]:
+    """Keep episode/sample order while retaining only the current episode."""
+    identities: set[str] = set()
+    for episode in sorted(episodes, key=lambda item: (item.source, item.episode_id)):
+        for row in plan_episode_windows(
+            episode=episode,
+            cache_root=cache_root,
+            model_profile=model_profile,
+            model_profile_sha256=model_profile_sha256,
+            data_profile=data_profile,
+        ):
+            identity = str(row["sample_id"])
+            if identity in identities:
+                raise WindowIndexError("window index produced duplicate sample identities")
+            identities.add(identity)
+            yield row
+    if not identities:
+        raise WindowIndexError("model sampling profile produced no valid cache windows")
+
+
 def plan_window_index(
     *,
     episodes: Sequence[CacheEpisodeEntry],
@@ -165,20 +192,10 @@ def plan_window_index(
     model_profile_sha256: str,
     data_profile: DataProfile,
 ) -> tuple[dict[str, Any], ...]:
-    rows: list[dict[str, Any]] = []
-    for episode in sorted(episodes, key=lambda item: (item.source, item.episode_id)):
-        rows.extend(
-            plan_episode_windows(
-                episode=episode,
-                cache_root=cache_root,
-                model_profile=model_profile,
-                model_profile_sha256=model_profile_sha256,
-                data_profile=data_profile,
-            )
-        )
-    if not rows:
-        raise WindowIndexError("model sampling profile produced no valid cache windows")
-    identities = [str(row["sample_id"]) for row in rows]
-    if len(identities) != len(set(identities)):
-        raise WindowIndexError("window index produced duplicate sample identities")
-    return tuple(rows)
+    return tuple(iter_window_index(
+        episodes=episodes,
+        cache_root=cache_root,
+        model_profile=model_profile,
+        model_profile_sha256=model_profile_sha256,
+        data_profile=data_profile,
+    ))

@@ -41,6 +41,10 @@ class NativeObjectiveConfig:
     rgb_motion_threshold: float = 0.03
     rgb_motion_gain: float = 3.0
     rgb_flow_teacher: float = 0.0
+    # Old sealed runtimes retain their loss exactly. New transport profiles
+    # explicitly supervise the predicted full-image pixel displacement in
+    # pixels; head parameterization is not a second loss normalizer.
+    rgb_flow_teacher_pixel_units: bool = False
     rgb_disocclusion_bce: float = 0.0
     rgb_disocclusion_dice: float = 0.0
     rgb_disocclusion_pos_weight: float = 1.0
@@ -77,7 +81,12 @@ class NativeObjectiveConfig:
 
     def validate(self) -> None:
         for name, value in self.__dict__.items():
-            if name in {"epsilon", "rgb_charbonnier_epsilon", "huber_delta"}:
+            if name == "rgb_flow_teacher_pixel_units":
+                if not isinstance(value, bool):
+                    raise NativeObjectiveError(
+                        "rgb_flow_teacher_pixel_units must be a boolean"
+                    )
+            elif name in {"epsilon", "rgb_charbonnier_epsilon", "huber_delta"}:
                 if value <= 0:
                     raise NativeObjectiveError(f"{name} must be positive")
             elif value < 0:
@@ -1486,13 +1495,17 @@ def compute_native_objective(
                     dim=3, keepdim=True
                 ).sqrt()
                 moving = target_flow_magnitude >= 1.0
-                # Pair normalized head displacement with a dimensionless
-                # teacher loss so its raw-logit gradient is resolution stable.
-                # Moving pixels are sparse, so static and moving visible
-                # regions receive equal per-sample mass instead of allowing
-                # zero-flow background to dominate a global mean.
-                flow_range_pixels = 0.5 * float(max(target_rgb.shape[-2:]))
-                normalized_flow_epe = flow_epe_map / flow_range_pixels
+                # Both tensors already represent full-image pixels. Dividing
+                # by the head's output range would silently shrink the motion
+                # supervision relative to RGB losses (128x at 256px). Keep
+                # that historical behavior only for old sealed runtimes.
+                flow_loss_divisor = (
+                    1.0
+                    if config.rgb_flow_teacher_pixel_units
+                    else 0.5 * float(max(target_rgb.shape[-2:]))
+                )
+                supervised_flow_epe = flow_epe_map / flow_loss_divisor
+                # Preserve equal per-sample moving/static mass and validity.
                 moving_visible = visible & moving
                 static_visible = visible & ~moving
                 rgb_flow_moving_epe = _masked_mean(
@@ -1502,10 +1515,10 @@ def compute_native_objective(
                     flow_epe_map, static_visible, epsilon=epsilon
                 )
                 moving_loss = _masked_per_sample_mean(
-                    normalized_flow_epe, moving_visible, epsilon=epsilon
+                    supervised_flow_epe, moving_visible, epsilon=epsilon
                 )
                 static_loss = _masked_per_sample_mean(
-                    normalized_flow_epe, static_visible, epsilon=epsilon
+                    supervised_flow_epe, static_visible, epsilon=epsilon
                 )
                 has_moving = moving_visible.flatten(1).any(dim=1).to(
                     dtype=flow_epe_map.dtype

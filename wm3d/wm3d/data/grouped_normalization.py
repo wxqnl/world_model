@@ -32,7 +32,7 @@ from .manifest_contract import (
     DataProfile,
     SHA256_RE,
     canonical_sha256,
-    load_cache_index,
+    iter_cache_index,
     sha256_file,
 )
 from wm3d.models.native_world_model import native_config_from_mapping
@@ -201,10 +201,8 @@ def build_grouped_normalization_artifact(
         raise GroupedNormalizationError("model profile digest does not match content")
     index_path = Path(window_index_path).resolve(strict=True)
     root = Path(cache_root).resolve(strict=True)
-    entries = load_cache_index(index_path, expected_sha256=window_index_sha256)
-    train = tuple(entry for entry in entries if entry.split == "train")
-    if not train:
-        raise GroupedNormalizationError("window index contains no train windows")
+    entries = iter_cache_index(index_path, expected_sha256=window_index_sha256)
+    train = (entry for entry in entries if entry.split == "train")
     native = native_config_from_mapping(model_profile["model"])
     sampling = model_profile["sampling"]
     limits = GroupedRobotLimits(

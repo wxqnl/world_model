@@ -903,13 +903,13 @@ def validate_source_manifest(
     }
 
 
-def load_cache_index(path: Path, *, expected_sha256: str) -> tuple[CacheIndexEntry, ...]:
+def iter_cache_index(path: Path, *, expected_sha256: str) -> Iterable[CacheIndexEntry]:
+    """Validate and yield rows without retaining the complete parsed index."""
     path = resolve_regular_file(path)
     expected_sha256 = _require_sha(expected_sha256, field="cache index SHA")
     observed = sha256_file(path)
     if observed != expected_sha256:
         raise ManifestContractError(f"cache index SHA mismatch: {observed} != {expected_sha256}")
-    entries: list[CacheIndexEntry] = []
     identities: set[str] = set()
     for line_number, row in iter_jsonl(path):
         if row.get("schema") != CACHE_INDEX_SCHEMA:
@@ -967,7 +967,7 @@ def load_cache_index(path: Path, *, expected_sha256: str) -> tuple[CacheIndexEnt
                 f"{path}:{line_number}: leading/context/future feature rows must "
                 "be non-empty, unique, non-negative and strictly increasing"
             )
-        entries.append(
+        yield (
             CacheIndexEntry(
                 sample_id=identity,
                 source=str(row["source"]),
@@ -984,6 +984,10 @@ def load_cache_index(path: Path, *, expected_sha256: str) -> tuple[CacheIndexEnt
                 future_feature_rows=future_rows,
             )
         )
-    if not entries:
+    if not identities:
         raise ManifestContractError("cache index contains no entries")
-    return tuple(entries)
+
+
+def load_cache_index(path: Path, *, expected_sha256: str) -> tuple[CacheIndexEntry, ...]:
+    """Retain the eager API for training callers that need random access."""
+    return tuple(iter_cache_index(path, expected_sha256=expected_sha256))

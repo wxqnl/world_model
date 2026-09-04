@@ -462,8 +462,12 @@ def test_original_v7_rgb_action_rank_trains_factual_and_wrong_graphs(
         assert wrong.grad.count_nonzero() == 0
 
 
-def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None:
-    rgb = torch.zeros(1, 1, 1, 3, 4, 4)
+@pytest.mark.parametrize("pixel_units", [False, True])
+@pytest.mark.parametrize("rgb_size", [4, 256])
+def test_rgb_transport_objective_supervises_actual_flow_and_visibility(
+    pixel_units: bool, rgb_size: int
+) -> None:
+    rgb = torch.zeros(1, 1, 1, 3, rgb_size, rgb_size)
     flow = torch.zeros(1, 1, 1, 2, 4, 4, requires_grad=True)
     disocclusion_logit = torch.zeros(
         1, 1, 1, 1, 4, 4, requires_grad=True
@@ -493,7 +497,7 @@ def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None
         "target_tokens": torch.zeros(1, 1, 1, 2),
         "target_rgb": torch.zeros_like(rgb),
         "target_rgb_mask": torch.ones(1, 1, 1, 1, 1, 1, dtype=torch.bool),
-        "context_rgb": torch.zeros(1, 1, 3, 4, 4),
+        "context_rgb": torch.zeros(1, 1, 3, rgb_size, rgb_size),
         "context_rgb_mask": torch.ones(1, 1, dtype=torch.bool),
         "rgb_flow_target_pixels": flow_target,
         "rgb_disocclusion_target": disocclusion_target,
@@ -518,6 +522,7 @@ def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None
             rgb_charbonnier=0.0,
             rgb_gradient=0.0,
             rgb_flow_teacher=1.0,
+            rgb_flow_teacher_pixel_units=pixel_units,
             rgb_disocclusion_bce=1.0,
             rgb_disocclusion_dice=1.0,
             depth_log=0.0,
@@ -529,7 +534,10 @@ def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None
     )
 
     assert losses["rgb_flow_epe"].item() == pytest.approx(4.0, rel=1.0e-5)
-    assert losses["rgb_flow_teacher"].item() == pytest.approx(2.0, rel=1.0e-5)
+    divisor = 1.0 if pixel_units else rgb_size / 2.0
+    assert losses["rgb_flow_teacher"].item() == pytest.approx(
+        4.0 / divisor, rel=1.0e-5
+    )
     assert losses["rgb_flow_prediction_magnitude"].item() == pytest.approx(0.0)
     assert losses["rgb_flow_target_magnitude"].item() == pytest.approx(4.0)
     assert losses["rgb_flow_moving_epe"].item() == pytest.approx(4.0, rel=1.0e-5)
@@ -542,6 +550,11 @@ def test_rgb_transport_objective_supervises_actual_flow_and_visibility() -> None
     assert losses["rgb_disocclusion_fraction"].item() == pytest.approx(0.25)
     losses["total"].backward()
     assert flow.grad is not None and flow.grad.abs().sum() > 0
+    # The same 4px error gives the same pixel-space gradient at both image
+    # sizes. Invalid/occluded teacher locations cannot contribute.
+    assert float(flow.grad[:, :, :, 0].sum()) == pytest.approx(
+        -1.0 / divisor, rel=1.0e-5
+    )
     assert (
         disocclusion_logit.grad is not None
         and disocclusion_logit.grad.abs().sum() > 0

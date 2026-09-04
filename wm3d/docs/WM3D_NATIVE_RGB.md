@@ -1,116 +1,66 @@
-# WM3D 原生 RGB 解码器
+# WM3D 原生 RGB 训练
 
-WM3D 的正式 RGB 路径不依赖 Wan 或其他外部视频生成器。模型保留原生 3D
-世界状态作为动力学主干，同时使用一条逐视角 appearance 通路保存渲染所需的高频信息。
-两条通路来自同一次冻结 VGGT encoder 前向，不会重复执行视觉编码。
+本文对应 `native_1b_v8_action_owned_transport.yaml` 与
+`stage0_v8_action_owned_transport.yaml`。旧 P256 dual-path、appearance teacher/AR
+说明不再描述这条路径。当前修改仍需全量数据与分布式资格验证，本文不构成放行凭据。
 
-## 当前正式结构
+## 当前计算路径
 
-| 项目 | 1B dual path | 5B dual path |
-|---|---:|---:|
-| 3D geometry grid | 8×8（P64） | 12×12（P144） |
-| per-view appearance grid | 16×16（P256） | 16×16（P256） |
-| appearance context | 最近 4 帧 | 最近 6 帧 |
-| appearance dynamics | 2 层、hidden 512 | 4 层、hidden 768 |
-| 输出分辨率 | 256×256 | 384×384 |
-| decoder hidden | 1280 | 1536 |
-| 每个上采样层 residual blocks | 2 | 2 |
-| 监督未来帧 | 全部 8 帧 | 全部 16 帧 |
+未来 physical action 只进入独立 factual pass。每个 future state slot 在 state block 0
+之前读取同 horizon 命令，后续 block 保留按 horizon 的 action modulation。
+RGB 和 token/geometry 监督读取同一 factual P64 输出。policy/action-free pass 不读取
+future candidate，换候选动作时其输出必须逐元素不变。
 
-3D 主干仍只消费融合后的 geometry tokens，继续负责几何、动作、状态和世界动力学。
-appearance tokens 不在相机之间提前融合；appearance dynamics 分别预测每个视角的未来
-P256 latent，并接受 3D future state 作为条件。RGB decoder 同时读取对应视角的 appearance
-latent 和 3D 条件，因此纹理不会被迫先穿过 P64/P144 的融合瓶颈，几何一致性也没有被绕开。
-最后观测 RGB 只负责静态高频载体；`future P256 - last-context P256` 通过轻量残差
-金字塔在 decoder 的每个分辨率持续注入。这样保留 context U-Net 的清晰纹理，同时不允许
-full-resolution skip 完全绕过未来 appearance dynamics。
+原生 transport decoder 读取 factual tokens、task 与 view embedding，预测 32×32
+backward flow，再上采样为完整图像的像素位移。最后观测 RGB 仅通过此 flow 搬运到
+未来位置。motion head 是辅助监督，不能乘到 flow 上把运动压回零。晚期有界高通
+refiner 只补细节，没有完整频率的重绘分支。
 
-1B 在原有主干上只增加约 850 万参数；总参数量约 13.28 亿。5B 仍保持原有 P144
-几何容量，appearance 通路固定为 P256，避免为了 RGB 纹理把整个 3D 主干扩大四倍。
+当前 1B 使用 P64、完整 K8、256×256 RGB、decoder hidden 1024；
+不提取绝对 P256，不使用 appearance 自回归、future target latent 或外部视频生成器。
+RAFT 只在数据准备侧生成训练监督，不是可训练 decoder，也不进入 serving。
 
-## 数据表示
+纯搬运不能生成最后观测中未出现的新内容。必须单独报告遮挡/新显露区域的质量；
+flow oracle 有效不等于所有未来图像均能精确重建。
 
-冻结 VGGT 的一次 forward 同时产出：
+## 训练目标与单位
 
-- `view_tokens`：取最深的第 23 层特征，逐视角池化到 geometry grid，随后进入原有多视角融合与 3D 主干；
-- `appearance_tokens`：取较浅且仍保持 2048 维 ABI 的第 4 层特征，保持逐视角 P256，不做 PCA、不做跨视角平均，只供 appearance
-  dynamics、appearance loss 和 RGB decoder 使用。
+RGB 使用现有 L1 1.2、perceptual 0.55、gradient 0.08、motion-reweighted L1 1.0
+及 motion BCE/Dice 各 0.03。flow teacher 权重 0.20，移动/静态有效区域按样本均衡。
 
-浅层 appearance 保留更多颜色、边缘和局部纹理；深层 geometry 仍保留 VGGT 的完整几何推理。两者来自同一次 forward，不会增加第二次 VGGT 编码。
+预测和标签已是完整图像的像素位移。默认目标将 EPE 除以半图像尺寸；这属于损失
+归一化，不是输出 flow 单位错误。诊断开关 `rgb_flow_teacher_pixel_units: true` 可取消
+这项归一化，旧 runtime 默认语义不变。256px 下它会把该项的有效权重放大 128 倍，
+不能只凭单位测试或运动幅度增长将它当作已验证修复。
 
-当前正式 `direct_raw` 路径只为当前 `T+K` window 在线生成两组 token，不量化、不落盘，
-也没有 episode LRU 或 sidecar。`streaming_raw` 仅作为兼容旧运行的可选路径；它会将两组
-token 量化后写入有容量上限的 episode LRU。若显式使用完整 episode cache，则必须使用
-双通路 encoder 合同：
+默认动作对照仍保留 no-op token 项，并按每 8 步、1000 步 ramp 启用现有 compatible
+real-action negative 排序；正误分支的行为遵循各自目标定义。每步真实负例替代 no-op
+的方案仅在诊断命令中启用，尚未发布为默认训练方案。候选负例须保持同物理 layout/
+normalization，并满足最小动作距离。全量数据的 source 权重不因诊断对照而改变。
 
-- 1B：`configs/encoder/vggt_native_p64_appearance_p256.yaml`；
-- 5B：`configs/encoder/vggt_native_p144_appearance_p256.yaml`。
+2026-09-04 的完整 1B 同样本 384 步对照发现：取消 flow 归一化并同时替换动作排序后，
+运动幅度及部分方向指标提高，但三个 source 的 motion/static RGB 与 flow EPE 都比
+原配置差，且位移过冲。因此该组合未通过；默认配置已撤回这两项实验改动。需要区分
+动作分离、正确位移、重建误差，不能用错误动作分数变差冒充正确动作预测变好。
 
-旧的 geometry-only cache 没有 P256 appearance latent，不能直接用于 dual-path 正式训练；此前从 VGGT 最深层生成的 P256 appearance cache 也不能与新的第 4 层 appearance 合同混用。它们仍可用于旧结构 A/B，不会被删除或伪装成新 cache。
+拆开后的 384 步对照中，只改变真实动作排序、保持 flow 原权重的一路改善了三个 source
+的 RGB 帧间方向一致性；Droid、RoboCasa 的运动区 L1 分别下降约 12% 和 27%，Bridge
+基本持平。只放大 flow 项主要改善 flow EPE，但 RGB 运动区质量并不一致改善。
+因此下一步资格使用 `stage0_v8_real_action_rank_qualification.yaml`，不包含 flow 放大。
+它仍需实际分布式资格；同样本拟合不能保证长训或未见数据有效。5B 默认配置未更新。
+全量索引按原顺序流式写入与读取，窗口选择和逐窗口归一化累积顺序不变。
 
-## Teacher 到预测 latent 的切换
+## 快速检查的用途
 
-训练开始时，RGB decoder 主要读取真值 future appearance latent，先学会稳定的
-appearance-to-RGB 重建；随后按照 runtime 中的
-`appearance_teacher_start_ratio`、`appearance_teacher_end_ratio` 和
-`appearance_teacher_decay_steps` 线性切换到模型预测 latent。无论 teacher ratio 是多少，
-appearance dynamics 都持续接受 MSE 与 cosine 监督，不会因为 teacher forcing 而没有梯度。
-此外，正式目标在由真值 RGB 变化得到的运动 patch 上监督 P256 的未来残差。由于
-`prediction - target` 等于
-`(prediction - last_context) - (target - last_context)`，运动区 residual MSE 已在同一
-平方误差尺度上同时约束幅值和方向。单独的 delta cosine 在残差尚未成形的早期产生了远大于
-其余 appearance 项的角度梯度，并诱导 decoder 转向 context shortcut，因此正式目标不再
-叠加该角度项。全局 MSE/cosine 继续保存静态纹理与绝对外观。
-验证在同一批固定样本上同时记录 teacher0、当前线性 schedule 和 teacher1，直接量化
-appearance inference gap。step5000 的同样本探针没有支持“latent lerp 导致模糊”的假设：
-ratio=0.5 的结果优于按样本随机选两个 endpoint 的期望，因此正式 schedule 保留 lerp。
-但 step5000 warm-start 探针不能决定从零训练的退火长度。从零 step500 对照中，500 步内
-退火到 teacher0 使同 seed validation 的 RGB L1 比 10,000 步退火差 11.2%，appearance
-MSE 约为 2.5 倍。因此 1B 正式 profile、5B validation 与 5B 正式 profile 均恢复在前
-10,000 step 完成 teacher1 到 teacher0 的切换；短 canary 仍用自己的显式短退火合同。
+`scripts/tools/run_factual_motion_microprobe.py` 保留，用于发现断路、mask、梯度和
+隔离错误。小模型在单一重复轨迹上学会运动，不足以放行正式训练。
 
-正式模型与目标配置为：
+`scripts/tools/run_production_flow_loss_ab.py` 使用完整 1B、K8、256px、真实多 source
+已物化 batch 与生产 optimizer/LR，比较旧目标和修正目标。它输出 normal、
+physical-noop、real-mismatch 的 motion/static RGB、flow、时序变化与隔离指标。
+重复同一批样本的结果仍属于优化诊断，不能称为独立泛化或 VLA 成功率。
 
-- `configs/model/native_1b_dual_path.yaml`；
-- `configs/model/native_5b_dual_path.yaml`；
-- `configs/objective/stage0_native_dual_path.yaml`。
-
-旧 `native_1b.yaml` / `native_5b.yaml` 保留为 geometry-only 对照，不是新训练的默认选择。
-
-## RGB 目标
-
-正式目标包含：
-
-- L1（权重 0.5）：直接约束颜色和绝对像素结构；
-- Charbonnier（权重 1.0、epsilon 1e-6）：提供稳定的鲁棒像素锚点；
-- spatial gradient：约束边缘；
-- VGG LPIPS：约束人眼感知的纹理与结构清晰度。
-
-从零 conditioning canary 没有提供同时改写像素目标的独立证据，因此正式配置保留已验证的
-`0.5*L1 + 1.0*Charbonnier`，避免把 RGB 目标变化与 action 因果干预混为一个实验变量。
-
-LPIPS 网络被冻结，不属于世界模型参数，也不进入 optimizer 或 checkpoint；梯度只从
-LPIPS 输入传回 native RGB decoder 与 token 输出层。LPIPS 必须来自封存的运行环境，
-缺少依赖时训练直接失败，不能静默退回纯像素损失。
-
-图像按 runtime 的固定小块执行 decoder（当前 1B H100 正式配置每次 16 张、5B H200
-配置每次 2 张）；冻结感知网络的输入单独按每次 8 张分块。两种分块都只调整执行粒度和
-峰值显存，不改变数学结果。训练只解码实际带 RGB 监督的相机，推理可以显式请求全部
-可用相机。
-
-## 已完成的真实链路验证
-
-`direct_raw` 已在真实 RoboCasa 与 OXE 视频上验证：RoboCasa 的 direct/full decode RGB
-逐像素一致；OXE 的大 PTS offset 半开区间与旧 sealed decoder 选择完全相同；AV1 长 episode
-会走有界 PyAV keyframe fallback。真实 VGGT 输出的 P64 geometry、P256 appearance、RGB、
-depth、point 和 camera 全部有限。node42 的两卡 1.327B FSDP2 pilot 已完成完整 objective、
-backward、optimizer、两分片 COMMITTED checkpoint 和独立 exact-resume 读取。该短跑验证实现、
-分布式保存与恢复链路，不用于宣称最终图像质量；清晰度结论必须来自相同
-数据预算下 geometry-only 与 dual-path 的固定样本对比。
-
-## 验收原则
-
-旧结构 checkpoint 只能作为显式转换后的 backbone 初始化来源，不能作为 dual-path exact
-resume。正式训练前先跑小规模 canary；质量评估必须同时报告 RGB L1、LPIPS、PSNR、边缘
-保持率、时序变化保持率，以及同一批固定样本上的真值、teacher-latent 重建和 predicted-latent
-预测。仅有 finite loss 或 loss 下降不能证明图像质量达标。
+正式启动前还要验证相同代码与目标的真实分布式前后向、checkpoint 保存/读取和完整
+数据闭包。不能把 182 episode 的资格数据标为全量。训练后继续在固定且跨 episode 的
+样本上跟踪运动方向、误差、清晰度与 action 对照；总 loss 下降或单独变“更动”
+都不能替代这些检查。

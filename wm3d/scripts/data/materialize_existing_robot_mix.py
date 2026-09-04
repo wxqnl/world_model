@@ -29,6 +29,9 @@ from wm3d.data.source_inventory import (
     _existing_relative,
     _format,
     _normalize_episode_ranges,
+    SourceInventoryError,
+    _task_lookup,
+    _task_text,
     _path_values,
     deterministic_split,
 )
@@ -1072,6 +1075,8 @@ def _selected_indices(
         split: [] for split in ("train", "val", "test")
     }
     file_origins: dict[tuple[int, int, str], int] = {}
+    tasks = _task_lookup(root)
+    missing_task_by_split = {split: [] for split in ("train", "val", "test")}
     for row in _episode_candidates(root):
         index = int(row["episode_index"])
         length = int(row.get("length", row.get("episode_length", 0)))
@@ -1097,6 +1102,11 @@ def _selected_indices(
             train_fraction=0.8,
             validation_fraction=0.1,
         )
+        try:
+            _task_text(row, tasks, "")
+        except SourceInventoryError:
+            missing_task_by_split[split].append(index)
+            continue
         selection_length = (
             length if ranges is None else sum(stop - start for start, stop in ranges)
         )
@@ -1104,7 +1114,6 @@ def _selected_indices(
 
     selected: dict[str, list[int]] = {}
     evidence: dict[str, dict] = {}
-    parquet_cache: dict[Path, pq.ParquetFile] = {}
     timestamp_cache: dict[Path, np.ndarray] = {}
     video_bounds_cache: dict[Path, tuple[float, float, int | None] | None] = {}
     for split in ("train", "val", "test"):
@@ -1155,14 +1164,19 @@ def _selected_indices(
             if row_start < 0 or row_stop - row_start != length:
                 continue
             payload = root / relative
-            parquet = parquet_cache.setdefault(payload, pq.ParquetFile(payload))
             try:
                 all_timestamps = timestamp_cache.get(payload)
                 if all_timestamps is None:
-                    timestamp_column = parquet.read(columns=["timestamp"])[
-                        "timestamp"
-                    ].combine_chunks()
+                    # Full-corpus preparation visits many independent shards.
+                    # Close handles immediately and bound cached clocks without
+                    # changing episode eligibility or window selection.
+                    with pq.ParquetFile(payload) as parquet:
+                        timestamp_column = parquet.read(columns=["timestamp"])[
+                            "timestamp"
+                        ].combine_chunks()
                     all_timestamps = timestamp_column.to_numpy(zero_copy_only=False)
+                    if len(timestamp_cache) >= 32:
+                        timestamp_cache.pop(next(iter(timestamp_cache)))
                     timestamp_cache[payload] = all_timestamps
                 if row_stop > len(all_timestamps):
                     continue
@@ -1237,6 +1251,7 @@ def _selected_indices(
             ),
             "required_valid_window_count": target,
             "selected_episode_count": len(selected[split]),
+            "excluded_missing_task_episode_indices": missing_task_by_split[split],
         }
         evidence[split][
             (

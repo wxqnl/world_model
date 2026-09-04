@@ -1,73 +1,42 @@
-# Factual motion qualification ladder
+# Factual motion 快速验证
 
-This ladder prevents a structural RGB/action regression from consuming a
-500-step or 2500-step 1B run before it is detected.
+保留 `scripts/tools/run_factual_motion_microprobe.py`。它适合查 action 接线、mask、
+future/policy 隔离与梯度问题；其小模型、单轨迹重复拟合不能决定正式 1B 是否能长训。
 
-## Gate A: implementation and gradient invariant
+## 结构检查
 
-Run one micro-probe optimizer step. It uses the production NativeWorldModel
-implementation with reduced width/depth and checks:
+用 micro-probe 的 structural 模式跑一次真实样本前后向，确认 factual/RGB 路径有
+有限非零梯度，换 future candidate 不改变 policy/action-free 输出。
+这只验证计算接通，不验证运动泛化。
 
-- future factual action changes factual P64 and RGB;
-- the action-free native prior and policy are bitwise invariant;
-- the centered grouped-action encoder, initial group-preserving conditioner,
-  persistent per-horizon frame gate, factual state trunk, and RGB decoder all
-  receive finite non-zero gradients;
-- factual and zero branches use the same differentiable encoder contract.
+## 生产尺寸对照
 
-Any failure is a code failure. Do not start a distributed qualification.
+`scripts/tools/run_production_flow_loss_ab.py` 使用实际 1B/K8/256px 模型，fresh 初始化，
+读取生产数据准备器保存的真实 batch。每 source 至少两个样本才能构造兼容错配动作。
+不读 checkpoint，不缩模型，不改标签、时间戳和采样权重。
 
-Run Gate A with:
+例如在服务器项目目录内，用同一 runtime 与同一批真实输入分别运行：
 
-    PYTHONPATH=wm3d \
-    python wm3d/scripts/tools/run_factual_motion_microprobe.py \
-      --mode structural --steps 1 \
-      --output /data/Minko/wm3d_factual_motion_microprobe_runs/structural_001
+```bash
+python scripts/tools/run_production_flow_loss_ab.py \
+  --runtime /path/to/runtime.yaml --batches /path/to/real_batches \
+  --output /path/to/baseline.json --steps 384
 
-## Gate B: real high-motion learnability
+python scripts/tools/run_production_flow_loss_ab.py \
+  --runtime /path/to/runtime.yaml --batches /path/to/real_batches \
+  --output /path/to/corrected.json --steps 384 \
+  --pixel-units --real-negative-every-step
+```
 
-The fixed seed-7340 high-motion window remains one real T16+K8 trajectory with
-its original timestamps, grouped physical commands, masks and normalization.
-The probe trains the small production model class with the existing token,
-RGB, perceptual, gradient, motion and flow objectives. It never converts K8 to
-independent K1 examples and introduces no new loss.
+对照保持相同初始化、生产 LR/warmup、optimizer 和梯度裁剪。报告各 source 的
+normal/no-op/mismatch、motion/static 误差、flow 方向/幅值、帧间变化和隔离不变量。
+样本在训练与检查中重复使用，因此结果只能说明局部可学习性与修改方向。
 
-The receipt compares factual action against both zero action and a horizon-
-shuffled physical action. It also reports temporal delta direction, amplitude,
-and error for P64 and RGB. Passing requires:
+## 分布式资格与长训
 
-- loss reduction within the wall-time budget;
-- factual target error below zero and shuffled controls;
-- P64 and RGB temporal direction improving;
-- policy/action-free bitwise invariance;
-- every required factual/RGB gradient remaining finite and non-zero.
+生产尺寸诊断没有结构失败后，用同一代码和目标运行真实 16-rank 短资格，检查资源、
+梯度所有权、完整 COMMITTED checkpoint 与跨机读取。资格所用数据范围应明确标注。
+正式训练只允许使用已完成的全量可用数据闭包，不能自动沿用资格子集。
 
-This catches a disconnected action path, a late homogeneous action bias, a
-copy-last shortcut, and a model that learns time while ignoring action.
-
-Example:
-
-    cd /data/Minko/wm3d_v8_frame_action_conditioning_20260903
-    PYTHONPATH=wm3d \
-    /data/Minko/.venvs/wm3d_direct_v8_20260821/bin/python \
-      wm3d/scripts/tools/run_factual_motion_microprobe.py \
-      --output /data/Minko/wm3d_factual_motion_microprobe_runs/run_001 \
-      --steps 200
-
-The expected runtime is minutes on one H100. receipt.json, before.gif, and
-after.gif make the result machine-checkable and visually inspectable.
-
-## Gate C: short full-scale qualification
-
-Only after A and B pass, run the unchanged 1B model for 20 to 100 fresh steps:
-
-- step 1 proves distributed gradient ownership and FSDP materialization;
-- step 20 checks finite learning trends and throughput;
-- step 100 runs the fixed-seed high-motion audit.
-
-Gate C validates scale/distribution behavior. It is not used to rediscover
-basic action conditioning errors that Gate A/B can expose in minutes.
-
-Passing this ladder proves implementation connectivity and short-horizon
-learnability. It does not replace later checkpoints or downstream robot-task
-evaluation as evidence of final model quality.
+长期效果仍需跨 episode、跨 source checkpoint 评估。policy/VLA action 与
+world candidate action 必须分开报告，token gain 不能替代可执行动作质量。

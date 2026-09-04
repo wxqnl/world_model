@@ -147,7 +147,9 @@ def _task_lookup(root: Path) -> dict[int, str]:
     for row in rows:
         index = int(row.get("task_index", row.get("index", len(result))))
         text = _normalize_task_text(
-            row.get("task", row.get("language_instruction", row.get("name")))
+            row.get("task", row.get("language_instruction", row.get(
+                "name", row.get("__index_level_0__")
+            )))
         )
         if text:
             result[index] = text

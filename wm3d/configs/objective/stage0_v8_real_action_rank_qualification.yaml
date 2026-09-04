@@ -1,0 +1,66 @@
+schema: wm3d_v8_objective_profile_v1
+name: stage0_v8_real_action_rank_qualification
+objective:
+  # Keep the proven V7 pixel objective.  Every RGB term supervises the one
+  # action-owned transport output; no appearance/copy branch has a loss.
+  rgb_l1: 1.2
+  rgb_perceptual: 0.55
+  token_mse: 1.0
+  token_cosine: 0.1
+  appearance_l1: 0.0
+  appearance_teacher_l1: 0.0
+  appearance_autoregressive_l1: 0.0
+  appearance_motion_l1: 0.0
+  appearance_mse: 0.0
+  appearance_cosine: 0.0
+  appearance_motion_mse: 0.0
+  appearance_delta_cosine: 0.0
+  rgb_charbonnier: 0.0
+  rgb_charbonnier_epsilon: 0.000001
+  rgb_gradient: 0.08
+  rgb_motion_l1: 1.0
+  rgb_motion_bce: 0.03
+  rgb_motion_dice: 0.03
+  rgb_motion_pos_weight: 2.0
+  rgb_motion_threshold: 0.03
+  rgb_motion_gain: 3.0
+
+  # RAFT supervises the same backward-flow field used by the renderer.  It is
+  # training-only supervision, not a second motion owner.  Keep enough vector
+  # signal after pixel-range normalization for the head to learn transport.
+  rgb_flow_teacher: 0.20
+
+  # The current disocclusion value is a deterministic warp-validity metric,
+  # not a learnable head.  Keep its losses disabled.
+  rgb_disocclusion_bce: 0.0
+  rgb_disocclusion_dice: 0.0
+  rgb_disocclusion_pos_weight: 1.0
+
+  depth_log: 1.5
+  point: 0.5
+  camera_pose: 0.1
+  action_fine: 2.0
+  action_coarse: 1.0
+  action_counterfactual_token_advantage: 0.0
+  action_counterfactual_token_margin: 0.005
+  action_counterfactual_rgb_advantage: 0.0
+  action_counterfactual_rgb_margin: 0.002
+
+  # Qualification candidate only: reuse one compatible real-action negative
+  # per rank each step, with both sides differentiable. The former one-sided
+  # no-op term is disabled. Pixel loss normalization and reconstruction stay
+  # unchanged. A favorable same-batch probe is not formal release approval.
+  context_pixel_action_rank_weight: 2.0
+  context_pixel_action_separation_weight: 0.0
+  context_pixel_action_rank_start_step: 0
+  context_pixel_action_rank_ramp_steps: 0
+  context_pixel_action_rank_every: 1
+  context_pixel_action_rank_batch_size: 1
+  context_pixel_action_rank_margin: 0.003
+  context_pixel_action_separation_margin: 0.006
+  context_pixel_action_motion_threshold: 0.03
+  context_pixel_action_motion_gain: 4.0
+  context_pixel_action_negative_min_distance: 0.05
+  action_velocity: 0.0
+  epsilon: 0.000001
+  huber_delta: 0.05

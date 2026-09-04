@@ -15,6 +15,7 @@ from wm3d.data.source_adapters import load_adapter_contract
 from wm3d.data.source_inventory import (
     SourceInventoryError,
     _task_text,
+    _task_lookup,
     scan_lerobot_source,
 )
 
@@ -132,6 +133,20 @@ def test_inventory_preserves_both_arms_and_recorded_irregular_clock(
     assert rows[0]["task_text"] == "insert with both arms"
     assert rows[0]["views"][0]["segment_kind"] == "entire_file"
     assert receipt["episode_count"] == 1
+
+
+def test_lerobot_task_table_uses_pandas_text_index(tmp_path: Path) -> None:
+    (tmp_path / "meta").mkdir()
+    pq.write_table(pa.table({
+        "task_index": [3, 4],
+        "__index_level_0__": ["put the cup on the tray", ""],
+    }), tmp_path / "meta/tasks.parquet")
+    tasks = _task_lookup(tmp_path)
+    assert tasks == {3: "put the cup on the tray"}
+    assert _task_text({"task_index": 3}, tasks, "") == "put the cup on the tray"
+    # A blank raw annotation is not permission to fabricate a task.
+    with pytest.raises(SourceInventoryError, match="unavailable"):
+        _task_text({"task_index": 4, "tasks": [""]}, tasks, "")
 
 
 def test_blank_inline_task_falls_back_to_explicit_default() -> None:
