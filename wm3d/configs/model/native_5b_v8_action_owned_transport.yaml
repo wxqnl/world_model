@@ -43,6 +43,8 @@ model:
   # has no effect on parameters or execution.
   dynamics_layers: 2
   factual_dynamics_repeats: 1
+  # Restore source-normalized tensors to physical units, then add the centered
+  # physical action effect before state block zero. This is shared with 1B.
   factual_action_residual_scale: 1.0
   factual_v7_early_action_conditioning: false
   factual_v7_early_action_scale: 0.0

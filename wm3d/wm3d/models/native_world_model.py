@@ -959,6 +959,12 @@ class GroupedSignalEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.condition_on_normalization = bool(condition_on_normalization)
+        # The factual direct route has one coordinate system across every
+        # source and model scale. Expose the contract so deployment gates can
+        # reject stale 5B checkouts before allocating a large job.
+        self.direct_action_space = (
+            "physical" if self.condition_on_normalization else None
+        )
         self.fine_value = nn.Linear(cfg.max_action_dim * 2, output_dim, bias=False)
         # Preserve the information V7 obtained by flattening every fixed-rate
         # substep while still supporting V8's variable-rate windows.  Mean
@@ -1144,7 +1150,7 @@ class GroupedSignalEncoder(nn.Module):
             ),
             dim=-1,
         )
-        # Preserve a source-normalized, linear physical-action feature before
+        # Preserve a de-normalized, linear physical-action feature before
         # time/identity mixing, nonlinearities, and RMS normalization.  The
         # factual branch centers this feature against physical zero and uses
         # it as the V7-compatible same-horizon block-0 anchor.

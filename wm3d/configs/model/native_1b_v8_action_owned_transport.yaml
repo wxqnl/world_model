@@ -42,8 +42,8 @@ model:
   # has no effect on parameters or execution.
   dynamics_layers: 2
   factual_dynamics_repeats: 1
-  # Add the centered source-normalized action effect to its future state slot
-  # before state block zero, matching the verified V7/OXE ordering.
+  # Restore source-normalized tensors to physical units, then add the centered
+  # physical action effect before state block zero.
   factual_action_residual_scale: 1.0
   factual_v7_early_action_conditioning: false
   factual_v7_early_action_scale: 0.0

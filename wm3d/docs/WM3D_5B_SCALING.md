@@ -13,6 +13,8 @@
 - 先运行独立 1K 资格训练，再 fresh 启动 600K 正式训练。资格权重不能用于正式初始化。
 
 与当前 1B 共用物理 factual pass、Action/Policy、原生直接 RGB 和数据 ABI。
+Source-normalized action 按封存的 offset/scale 还原为物理单位，再进入 block-0 投影；
+同 mask 的 physical no-op 经共享编码相减后更新严格为零。
 直接 RGB、context residual、blend/motion 能生成新露出区域；高频 refiner 只补晚期细节。
 不加载 P256 appearance、自回归外观、RAFT/flow teacher 或预训练视频 decoder。
 Future candidate 不得影响 policy/action-free 输出。
@@ -106,7 +108,8 @@ SITE=/data/wm3d/control/5b_canary1k.env
 
 恢复入口会校验完整 checkpoint。资格需要 64 个 rank、真实梯度、保存/恢复/评测全部通过，
 并确认 future action 不泄漏到 policy/action-free。固定多来源样本还要检查运动方向、
-静态/运动区误差和真实/错配 action 对照；总 loss 有限不等于图像和 VLA 质量已通过。
+静态/运动区误差和真实/错配 action 对照，并核实同一物理 action 在不同 source normalization
+下的 direct conditioning 一致。总 loss 有限不等于图像和 VLA 质量已通过。
 
 ## 5. Fresh 启动正式训练
 

@@ -66,6 +66,15 @@ def validate_sealed_recipe(
             raise ValueError(f"sealed {key} differs from the selected 5B recipe; materialize a fresh runtime, do not edit or reuse an old run")
 
 
+def validate_built_model(built: torch.nn.Module) -> None:
+    factual_action = getattr(built, "factual_action", None)
+    if factual_action is None or factual_action.direct_action_space != "physical":
+        raise ValueError("5B factual direct action must use physical units")
+    for name in ("direct_fine_value", "direct_fine_aggregate", "direct_coarse_value"):
+        if type(getattr(factual_action, name, None)) is not torch.nn.Linear:
+            raise ValueError(f"5B {name} must be a live Linear projection")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -85,6 +94,7 @@ def main() -> None:
     # Construction is metadata-only. It is deliberately not labelled a GPU test.
     with torch.device("meta"):
         built = build_world_model(model)
+    validate_built_model(built)
     print(json.dumps({
         "recipe": "native_direct_5b",
         "parameters": sum(p.numel() for p in built.parameters()),
