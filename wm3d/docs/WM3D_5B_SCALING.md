@@ -1,43 +1,33 @@
-# WM3D V8 5B 训练交付
+# WM3D V8 5B 训练
 
-这份文档只保留当前主推流程：检查本地模型和数据，准备训练 metadata，完成 64 卡
-1K canary，再 fresh 启动正式 600K。数据从魔搭、Hugging Face 或内部存储取得均可，
-训练只检查本地文件内容与 WM3D 数据合同，不依赖下载来源。
+使用本次交付代码包。不要沿用旧 checkout 生成的 site 或 runtime。
+当前入口是原生直接 RGB；`5b doctor` 必须输出 `native_direct_5b` 和
+`5,245,128,313` 参数。本文不表示 64 卡新配方已经完成实机资格。
 
-## 1. 当前训练合同
+## 1. 当前配方
 
-- GitHub 分支：`v8`
-- 模型配置：`configs/model/native_5b_v8_action_owned_transport.yaml`
-- objective：`configs/objective/stage0_v8_action_owned_transport.yaml`
-- 参数量：`5,087,822,644`
-- 数据模式：`direct_raw`
-- 集群：8 个节点，每节点 8 张 H200
-- micro batch：每卡 4
-- global batch：256
-- canary：1,000 steps
-- 正式训练：600,000 steps，从正式 run 的 step 0 开始
+- 模型：`configs/model/native_5b_v8_native_direct_rgb.yaml`
+- 目标：`configs/objective/stage0_v8_native_direct_rgb.yaml`
+- 8 节点 × 8 H200，FSDP2，节点内 8 卡分片；每卡 batch 4，总 batch 256。
+- T24、P144、K16、384×384 RGB，监督全部 K16，保留真实时间戳和 grouped action。
+- 先运行独立 1K 资格训练，再 fresh 启动 600K 正式训练。资格权重不能用于正式初始化。
 
-V8 使用 source-normalized、group-preserving 的 factual action conditioner 学习未来状态。
-factual P144 是唯一运动所有者，并预测 renderer 实际应用的 backward flow；最后观测 RGB
-只能通过该 flow 传输到未来帧，motion head 不会衰减它。高频 refiner 只补充有界高通细节，
-不能改变低频位置或运动。future candidate 不进入 policy/action-free trunk。
+与当前 1B 共用物理 factual pass、Action/Policy、原生直接 RGB 和数据 ABI。
+直接 RGB、context residual、blend/motion 能生成新露出区域；高频 refiner 只补晚期细节。
+不加载 P256 appearance、自回归外观、RAFT/flow teacher 或预训练视频 decoder。
+Future candidate 不得影响 policy/action-free 输出。
 
-当前正式配置不使用 absolute future P256、P256 自回归、teacher forcing、unwarped copy 或
-full-frequency redraw。RAFT 只在训练时生成 backward-flow 监督 target，不属于模型或 serving。
+RGB 与 Action objective 使用当前 1B 同一份文件。AdamW 从 1e-6 warmup 到 1e-5，
+warmup 500 步、weight decay 0.02；没有按参数量或卡数自动放大学习率。
+保留 5B 的序列、分辨率和宽度，实际显存与吞吐必须由 H200 资格训练确认。
 
-## 2. 只填写模型和数据目录
+## 2. 填写本地模型和数据路径
 
-先拉取代码：
+把交付代码放到 `/data/world_model`，所有节点使用同一份代码和共享路径：
 
 ```bash
-cd /data
-git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
 cd /data/world_model/wm3d
-```
 
-只需要确认两个路径：
-
-```bash
 MODEL_ROOT=/共享目录/模型
 DATA_ROOT=/共享目录/已下载数据
 
@@ -45,26 +35,26 @@ DATA_ROOT=/共享目录/已下载数据
 SITE=/data/wm3d/control/5b_canary1k.env
 ```
 
-`MODEL_ROOT` 应同时包含 VGGT 源码、VGGT-1B 权重和
-Qwen3-VL-Embedding-2B 权重。目录层级可以不同，脚本会自动寻找并写入 site。
+模型目录需包含合同要求的 VGGT 源码、VGGT-1B 权重及 Qwen3-VL-Embedding-2B 权重。
+数据可以来自魔搭、Hugging Face 或内部存储；不要求重新下载。
 
-`DATA_ROOT` 可以直接指向魔搭下载目录，也可以指向已经整理好的 WM3D 数据目录。
-脚本会向下寻找 AgiBotWorld2026 的三个正式子集，并同时支持压缩包和已经解压的
-LeRobot 目录。它只做有界抽查，不复制或改写原始数据。
+`configure` 只检查本地输入并生成 site，不申请 GPU、不启动训练：
 
-检查结果中的 `data_state` 有四种：
+- `RAW_COMPATIBLE`：能识别原始数据，但缺已审计 data profile，不能直接训练。
+- `PROFILE_PATH_MISMATCH`：control 包里的路径在当前机器不存在，需要按当前路径重新物化。
+- `PROFILE_READY`：可以准备任务编码、窗口和归一化统计。
+- `TRAIN_METADATA_READY`：所需 metadata 文件齐全，还需 runtime 和集群 preflight 验证。
 
-- `RAW_COMPATIBLE`：下载内容和目录可识别，但还缺已审计 data profile，不能启动训练。
-- `PROFILE_PATH_MISMATCH`：control 包来自另一台机器，里面的原始数据或 manifest 路径在
-  当前机器不存在，需要先按当前共享目录重新物化 control 包。
-- `PROFILE_READY`：data profile 已就绪，可以生成 task bank 和训练 metadata。
-- `TRAIN_METADATA_READY`：数据 metadata 已封存，可以生成 runtime。
+只有原始 AGI 2026 下载目录时，仍需与该目录匹配的已审计 adapter、manifest 和
+data profile。目录识别不能证明动作单位、坐标系、夹爪极性或训练划分正确。
+不能自行猜测这些定义，也不能用空文件绕过检查。
 
-`ready_to_train` 只有在模型、data profile、训练 metadata、环境和 runtime 全部就绪时才会
-变为 `true`。如果结果是 `RAW_COMPATIBLE`，把项目随数据交付的 `control` 目录放到
-`/data/wm3d/control`，然后重新执行同一条 `configure` 命令；不需要改下载脚本或数据适配器。
+1B 的原始数据和经过审计的 adapter 可以复用。5B 的 T24/P144/K16 与 1B 不同，
+必须生成对应的窗口、统计和 runtime，不能直接复制 1B 的 metadata seal。
 
-## 3. 创建环境和训练 metadata
+## 3. 准备环境与 metadata
+
+在每个节点创建同一环境；下面的数据准备命令只在一个节点执行：
 
 ```bash
 cd /data/world_model/wm3d
@@ -76,98 +66,76 @@ SITE=/data/wm3d/control/5b_canary1k.env
 ./run_wm3d.sh 5b cache-plan "$SITE"
 ./run_wm3d.sh 5b streaming-prepare "$SITE"
 ./run_wm3d.sh 5b runtime "$SITE"
-./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b status "$SITE"
-```
-
-已有文件会按原合同验证并复用。使用本地现成数据时不需要 Hugging Face token；只有主动
-执行 `lock` 或 `download` 时才需要配置 token。
-
-最后重新检查一次：
-
-```bash
 ./run_wm3d.sh 5b configure "$MODEL_ROOT" "$DATA_ROOT"
 ```
 
-确认输出包含：
+这是 direct_raw 路径，只生成任务编码、索引和统计，不预先缓存全部 RGB/VGGT 特征。
+metadata 按确定顺序并行生成；不改变来源权重、episode split 或物理转换。
+现成数据不需要 Hugging Face token。
 
-```text
-"input_check": "PASS"
-"data_state": "TRAIN_METADATA_READY"
-"ready_to_train": true
-```
+最后一次检查应显示 `ready_for_preflight: true`。
+`ready_to_train` 不再因文件存在就变为 true；输入扫描不能替代真实集群 preflight。
+遇到 `runtime_issues`，先修复环境或重新生成匹配的新 runtime，不能手改封存文件。
 
-## 4. 运行 64 卡 1K canary
+## 4. 运行 64 卡资格训练
 
-申请 8 个完整 H200 节点并进入 Slurm allocation。启动脚本会自动取得 master 节点，
-不需要手动填写地址、端口、节点编号或 torchrun 参数。
+申请 8 个完整 H200 节点，进入 Slurm allocation。脚本自动取 master 节点和 rank。
+当前 H200 配方要求 NVLink、400Gb/s InfiniBand 和相应资源检查；不能拿当前
+1B 的双节点 TCP 测试冒充这一拓扑已经通过。
 
 ```bash
 cd /data/world_model/wm3d
 SITE=/data/wm3d/control/5b_canary1k.env
 
 ./run_wm3d.sh 5b slurm "$SITE" preflight
-./run_wm3d.sh 5b slurm "$SITE" train 100
+./run_wm3d.sh 5b slurm "$SITE" train 20
+```
 
-./run_wm3d.sh 5b slurm "$SITE" preflight
-./run_wm3d.sh 5b slurm "$SITE" resume 100 500
+先检查这 20 步：真实前后向正常、必要梯度有限非零、没有 CUDA/NCCL/ECC 错误，
+进程在提交 step20 checkpoint 后正常结束。然后验证独立进程恢复并完成 1K：
 
+```bash
 ./run_wm3d.sh 5b slurm "$SITE" preflight
-./run_wm3d.sh 5b slurm "$SITE" resume 500 1000
+./run_wm3d.sh 5b slurm "$SITE" resume 20
 
 ./run_wm3d.sh 5b slurm "$SITE" preflight
 ./run_wm3d.sh 5b slurm "$SITE" eval 1000
 ./run_wm3d.sh 5b verify "$SITE" 1000
 ```
 
-canary 通过需要满足：
+恢复入口会校验完整 checkpoint。资格需要 64 个 rank、真实梯度、保存/恢复/评测全部通过，
+并确认 future action 不泄漏到 policy/action-free。固定多来源样本还要检查运动方向、
+静态/运动区误差和真实/错配 action 对照；总 loss 有限不等于图像和 VLA 质量已通过。
 
-- 64 个 rank、H200、NVLink、IB 和 ECC preflight 正常；
-- loss、grad norm 和梯度所有权指标全部有限；
-- factual decoder、RGB decoder、action head 和 policy 都有非零梯度；
-- future action 对 policy/action-free 输出的差异严格为 0；
-- step100、step500、step1000 checkpoint 完整，resume、eval 和 verify 均通过。
+## 5. Fresh 启动正式训练
 
-任一项失败时保留日志和 checkpoint，不启动正式训练。
-
-## 5. Fresh 启动正式 600K
-
-canary 通过后复制 site，只把 preset 改为正式训练：
+资格通过后创建独立正式 site：
 
 ```bash
 cd /data/world_model/wm3d
 CANARY_SITE=/data/wm3d/control/5b_canary1k.env
 SITE=/data/wm3d/control/5b_formal600k.env
 
+test ! -e "$SITE"
 install -m 600 "$CANARY_SITE" "$SITE"
 sed -i 's/^WM3D_5B_PRESET=canary1k$/WM3D_5B_PRESET=formal600k/' "$SITE"
+sed -i 's/^WM3D_5B_RUN_ID=.*/WM3D_5B_RUN_ID=formal_native_direct/' "$SITE"
 
 ./run_wm3d.sh 5b doctor "$SITE"
 ./run_wm3d.sh 5b runtime "$SITE"
-```
-
-进入正式训练的 8 节点 Slurm allocation 后执行：
-
-```bash
 ./run_wm3d.sh 5b slurm "$SITE" preflight
 ./run_wm3d.sh 5b slurm "$SITE" train
 ```
 
-正式训练不得从 canary、旧 V8、旧 5B 或 1B checkpoint 初始化。中断后只从本次正式 run
-最新的完整 checkpoint 恢复：
+不得从资格、旧 5B、1B 或其他版本初始化。正式训练中断后，只恢复本次正式 run
+最新的完整 checkpoint：
 
 ```bash
 ./run_wm3d.sh 5b slurm "$SITE" preflight
 ./run_wm3d.sh 5b slurm "$SITE" resume 完整checkpoint的step号
 ```
 
-## 6. 需要立即停止的情况
-
-- rank 丢失，或出现 NCCL、IB、NVLink、ECC 错误；
-- loss、梯度或模型输出出现 NaN/Inf；
-- 数据、normalization、runtime 或 environment receipt 不一致；
-- checkpoint 不完整；
-- future action 泄漏到 policy/action-free trunk；
-- RGB 单色塌缩，或 factual action/RGB 路径没有梯度。
-
-不要通过改模型、改 loss、减少 RGB horizon 或跳过 preflight 来绕过错误。
+不修改运行中的代码、runtime、数据权重和归一化统计。若出现非有限、future 泄漏、
+缺失梯度、明确通信/存储错误，保留证据并修复首个根因，不通过降分辨率、减少 K16
+或换旧 checkpoint 绕过资格。

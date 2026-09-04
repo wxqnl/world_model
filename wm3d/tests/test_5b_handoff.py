@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize(
     "profile,total_steps,checkpoint_steps,checkpoint_interval",
     [
-        ("h200_64_fsdp2_canary1k.yaml", 1_000, [100, 500], 1_000),
+        ("h200_64_fsdp2_canary1k.yaml", 1_000, [20, 100, 500], 1_000),
         ("h200_64_fsdp2_validation100k.yaml", 100_000, [], 1_000),
         (
             "h200_64_fsdp2.yaml",
@@ -36,15 +36,15 @@ def test_5b_presets_match_action_owned_5b_and_64_h200(
     checkpoint_interval: int,
 ) -> None:
     model = yaml.safe_load(
-        (ROOT / "configs/model/native_5b_v8_action_owned_transport.yaml").read_text()
+        (ROOT / "configs/model/native_5b_v8_native_direct_rgb.yaml").read_text()
     )
     objective = yaml.safe_load(
-        (ROOT / "configs/objective/stage0_v8_action_owned_transport.yaml").read_text()
+        (ROOT / "configs/objective/stage0_v8_native_direct_rgb.yaml").read_text()
     )
     runtime = yaml.safe_load((ROOT / "configs/runtime" / profile).read_text())
     validate_model_profile(model)
     validate_runtime_profile(runtime)
-    assert model["expected_parameter_count"] == 5_082_186_548
+    assert model["expected_parameter_count"] == 5_245_128_313
     assert model["model"]["schema"] == "wm3d_native_world_model_v2"
     assert model["model"]["P"] == 144
     assert model["model"]["appearance_enabled"] is False
@@ -63,18 +63,19 @@ def test_5b_presets_match_action_owned_5b_and_64_h200(
     assert model["model"]["appearance_action_residual_scale"] == 0.0
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_original_v7_context"] is False
-    assert model["model"]["rgb_action_owned_transport"] is True
+    assert model["model"]["rgb_action_owned_transport"] is False
+    assert model["model"]["rgb_action_owned_direct"] is True
     assert model["model"]["rgb_v7_high_frequency_refiner"] is True
     assert model["model"]["rgb_v7_high_frequency_scale"] == 0.0625
     assert model["model"]["rgb_context_residual_scale"] == 0.75
-    assert model["model"]["rgb_context_motion_blend_gain"] == 0.0
-    assert model["model"]["rgb_context_action_scale"] == 0.0
+    assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
+    assert model["model"]["rgb_context_action_scale"] == 1.0
     assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
     assert objective["objective"]["rgb_l1"] == 1.2
     assert objective["objective"]["rgb_charbonnier"] == 0.0
     assert objective["objective"]["rgb_charbonnier_epsilon"] == 0.000001
-    assert objective["objective"]["action_counterfactual_token_advantage"] == 1.0
-    assert objective["objective"]["rgb_flow_teacher"] == 0.20
+    assert objective["objective"]["action_counterfactual_token_advantage"] == 0.0
+    assert objective["objective"]["rgb_flow_teacher"] == 0.0
     assert objective["objective"]["rgb_disocclusion_bce"] == 0.0
     assert objective["objective"]["rgb_disocclusion_dice"] == 0.0
     assert objective["objective"]["action_counterfactual_token_margin"] == 0.005
@@ -83,8 +84,8 @@ def test_5b_presets_match_action_owned_5b_and_64_h200(
     assert objective["objective"]["context_pixel_action_rank_weight"] == 2.0
     assert objective["objective"]["context_pixel_action_separation_weight"] == 0.0
     assert objective["objective"]["context_pixel_action_rank_start_step"] == 0
-    assert objective["objective"]["context_pixel_action_rank_ramp_steps"] == 1000
-    assert objective["objective"]["context_pixel_action_rank_every"] == 8
+    assert objective["objective"]["context_pixel_action_rank_ramp_steps"] == 0
+    assert objective["objective"]["context_pixel_action_rank_every"] == 1
     assert objective["objective"]["context_pixel_action_rank_batch_size"] == 1
     assert objective["objective"]["context_pixel_action_rank_margin"] == 0.003
     assert objective["objective"]["context_pixel_action_separation_margin"] == 0.006
@@ -104,6 +105,10 @@ def test_5b_presets_match_action_owned_5b_and_64_h200(
     assert objective["objective"]["appearance_cosine"] == 0.0
     assert objective["objective"]["appearance_motion_mse"] == 0.0
     assert objective["objective"]["appearance_delta_cosine"] == 0.0
+    assert runtime["optimizer"]["start_lr"] == 1.0e-6
+    assert runtime["optimizer"]["peak_lr"] == 1.0e-5
+    assert runtime["optimizer"]["weight_decay"] == 0.02
+    assert runtime["schedule"]["warmup_steps"] == 500
     assert runtime["expected_world_size"] == 64
     assert runtime["distributed"]["shard_degree"] == 8
     assert runtime["resources"]["gpu_name_substring"] == "H200"
@@ -191,7 +196,7 @@ def test_5b_init_selects_data_mode(tmp_path: Path, data_mode: str, detail: str) 
     assert detail in plan.stdout
     if data_mode == "direct_raw":
         assert "batch-coalesced decode" in plan.stdout
-        assert "prefetch workers=1" in plan.stdout
+        assert "prefetch workers=4" in plan.stdout
 
 
 @pytest.mark.parametrize(
@@ -287,7 +292,7 @@ def test_5b_lock_passes_exact_license_confirmation() -> None:
 
 
 def test_5b_site_defaults_to_oxe_and_direct_v8_p144() -> None:
-    site = (ROOT / "configs/cluster/h200_5b.env.example").read_text()
+    site = (ROOT / "configs/cluster/h200_5b_direct.env.example").read_text()
     assert "NNODES=8" in site
     assert "GPUS_PER_NODE=8" in site
     assert "CACHE_WORKER_COUNT=64" in site
@@ -299,18 +304,18 @@ def test_5b_site_defaults_to_oxe_and_direct_v8_p144() -> None:
     assert "WM3D_DATA_MODE=direct_raw" in site
     assert "DIRECT_INPUT_RGB_SIZE=518" in site
     assert "DIRECT_DECODE_WORKERS=1" in site
-    assert "DIRECT_PREFETCH_WORKERS=1" in site
-    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
-    assert "DIRECT_PREFETCH_WINDOWS=8" in site
+    assert "DIRECT_PREFETCH_WORKERS=4" in site
+    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=8" in site
+    assert "DIRECT_PREFETCH_WINDOWS=32" in site
     assert "DIRECT_VIDEO_INDEX_CACHE_ASSETS=128" in site
     assert "DIRECT_ENCODE_CHUNK_ROWS=32" in site
     assert "DIRECT_MINIMUM_CHUNK_ROWS=4" in site
     assert "DIRECT_APPEARANCE_FEATURE_LAYER=-1" in site
     assert "STREAMING_LRU_ROOT=" not in site
     assert "STREAMING_LRU_GIB_PER_RANK=" not in site
-    assert "MODEL_PROFILE=configs/model/native_5b_v8_action_owned_transport.yaml" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_v8_native_direct_rgb.yaml" in site
     assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144.yaml" in site
-    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_action_owned_transport.yaml" in site
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_native_direct_rgb.yaml" in site
     assert "SOURCE_TEMPLATE=${CONTROL_ROOT}/public_sources_oxe.template.yaml" in site
     assert "DATA_TEMPLATE=${CONTROL_ROOT}/public_robot_oxe.template.yaml" in site
 
@@ -319,9 +324,9 @@ def test_5b_direct_template_has_optimized_runtime_defaults() -> None:
     site = (ROOT / "configs/cluster/h200_5b_direct.env.example").read_text()
     assert "WM3D_DATA_MODE=direct_raw" in site
     assert "DIRECT_DECODE_WORKERS=1" in site
-    assert "DIRECT_PREFETCH_WORKERS=1" in site
-    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in site
-    assert "MODEL_PROFILE=configs/model/native_5b_v8_action_owned_transport.yaml" in site
+    assert "DIRECT_PREFETCH_WORKERS=4" in site
+    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=8" in site
+    assert "MODEL_PROFILE=configs/model/native_5b_v8_native_direct_rgb.yaml" in site
     assert "ENCODER_CONTRACT=configs/encoder/vggt_native_p144.yaml" in site
 
 
@@ -343,7 +348,7 @@ def test_5b_rejects_more_prefetch_workers_than_windows(tmp_path: Path) -> None:
     )
     assert init.returncode == 0, init.stderr
     payload = site.read_text().replace(
-        "DIRECT_PREFETCH_WORKERS=1", "DIRECT_PREFETCH_WORKERS=9"
+        "DIRECT_PREFETCH_WORKERS=4", "DIRECT_PREFETCH_WORKERS=33"
     )
     site.write_text(payload)
     plan = subprocess.run(
@@ -640,3 +645,50 @@ def _canonical_sha(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def test_5b_launcher_checks_actual_sealed_recipe_before_execution() -> None:
+    wrapper = (ROOT / "scripts/cluster/wm3d_5b.sh").read_text()
+    for action in ("preflight", "train", "resume", "eval"):
+        case = wrapper.split(f"  {action})\n", 1)[1].split("\n    ;;", 1)[0]
+        assert "validate_5b_sealed_contract" in case
+
+
+def test_5b_contract_rejects_old_model_objective_and_stale_runtime() -> None:
+    from copy import deepcopy
+    from scripts.cluster.check_5b_contract import (
+        validate_contract, validate_sealed_recipe,
+    )
+    model = yaml.safe_load((ROOT / "configs/model/native_5b_v8_native_direct_rgb.yaml").read_text())
+    encoder = yaml.safe_load((ROOT / "configs/encoder/vggt_native_p144.yaml").read_text())
+    objective = yaml.safe_load((ROOT / "configs/objective/stage0_v8_native_direct_rgb.yaml").read_text())
+    profile = yaml.safe_load((ROOT / "configs/runtime/h200_64_fsdp2_canary1k.yaml").read_text())
+    validate_contract(model, encoder, objective, profile)
+    stale_model = yaml.safe_load((ROOT / "configs/model/native_5b_v8_action_owned_transport.yaml").read_text())
+    with pytest.raises(ValueError, match="current native-direct model"):
+        validate_contract(stale_model, encoder, objective, profile)
+    stale_objective = deepcopy(objective)
+    stale_objective["objective"]["rgb_flow_teacher"] = 0.2
+    with pytest.raises(ValueError, match="objective differs"):
+        validate_contract(model, encoder, stale_objective, profile)
+    sealed = {"model_profile": model, "objective_profile": objective, "runtime_profile": profile}
+    validate_sealed_recipe(sealed, model, objective, profile)
+    with pytest.raises(ValueError, match="sealed model_profile"):
+        validate_sealed_recipe({**sealed, "model_profile": stale_model}, model, objective, profile)
+    with pytest.raises(ValueError, match="sealed runtime_profile"):
+        validate_sealed_recipe({**sealed, "runtime_profile": {}}, model, objective, profile)
+
+
+def test_5b_keeps_current_1b_action_rgb_semantics_and_distinct_capacity() -> None:
+    one = yaml.safe_load((ROOT / "configs/model/native_1b_v8_native_direct_rgb.yaml").read_text())["model"]
+    five = yaml.safe_load((ROOT / "configs/model/native_5b_v8_native_direct_rgb.yaml").read_text())["model"]
+    for key in (
+        "policy_task_modulation", "policy_calibration_conditioning",
+        "dynamics_layers", "factual_dynamics_repeats", "factual_action_residual_scale",
+        "rgb_action_owned_direct", "rgb_action_owned_transport", "rgb_render_action_free_prior",
+        "rgb_context_motion_blend_gain", "rgb_context_action_scale",
+        "rgb_v7_high_frequency_refiner", "rgb_v7_high_frequency_scale", "appearance_enabled",
+    ):
+        assert five[key] == one[key], key
+    assert (five["T"], five["P"], five["K"], five["rgb_size"]) == (24, 144, 16, 384)
+    assert five["rgb_decode_indices"] == list(range(16))

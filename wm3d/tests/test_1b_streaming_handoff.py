@@ -31,24 +31,25 @@ def _oxe_info(action_dim: int = 7, state_dim: int = 7) -> dict:
     }
 
 
-def test_1b_streaming_presets_use_action_owned_1b_and_saturating_batch() -> None:
+def test_1b_streaming_presets_use_native_direct_1b_and_saturating_batch() -> None:
     model = yaml.safe_load(
-        (ROOT / "configs/model/native_1b_v8_action_owned_transport.yaml").read_text()
+        (ROOT / "configs/model/native_1b_v8_native_direct_rgb.yaml").read_text()
     )
     validate_model_profile(model)
-    assert model["expected_parameter_count"] == 1_190_516_916
+    assert model["expected_parameter_count"] == 1_262_837_817
     assert model["model"]["P"] == 64
     assert model["model"]["appearance_P"] == 256
     assert model["model"]["appearance_enabled"] is False
-    assert model["model"]["rgb_action_owned_transport"] is True
+    assert model["model"]["rgb_action_owned_transport"] is False
+    assert model["model"]["rgb_action_owned_direct"] is True
     assert model["model"]["factual_v7_early_action_conditioning"] is False
     assert model["model"]["factual_v7_early_action_scale"] == 0.0
     assert model["model"]["factual_v7_bridge_layers_state"] == []
     assert model["model"]["rgb_decode_indices"] == list(range(8))
     assert model["model"]["rgb_context_enabled"] is True
     assert model["model"]["rgb_context_residual_scale"] == 0.75
-    assert model["model"]["rgb_context_motion_blend_gain"] == 0.0
-    assert model["model"]["rgb_context_action_scale"] == 0.0
+    assert model["model"]["rgb_context_motion_blend_gain"] == 0.5
+    assert model["model"]["rgb_context_action_scale"] == 1.0
     assert model["model"]["rgb_context_appearance_delta_scale"] == 0.0
 
     expected = {
@@ -85,19 +86,19 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
     assert init.returncode == 0, init.stderr
     payload = site.read_text()
     assert "WM3D_1B_PRESET=formal100k" in payload
-    assert "MODEL_PROFILE=configs/model/native_1b_v8_action_owned_transport.yaml" in payload
+    assert "MODEL_PROFILE=configs/model/native_1b_v8_native_direct_rgb.yaml" in payload
     assert (
         "ENCODER_CONTRACT=configs/encoder/vggt_native_p64.yaml"
         in payload
     )
-    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_action_owned_transport.yaml" in payload
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_native_direct_rgb.yaml" in payload
     assert "DIRECT_APPEARANCE_FEATURE_LAYER=-1" in payload
     assert "WM3D_DATA_MODE=direct_raw" in payload
     assert "MINIMUM_RAW_FILESYSTEM_BYTES=0" in payload
-    assert "DIRECT_PREFETCH_WINDOWS=16" in payload
-    assert "DIRECT_PREFETCH_WORKERS=1" in payload
+    assert "DIRECT_PREFETCH_WINDOWS=32" in payload
+    assert "DIRECT_PREFETCH_WORKERS=4" in payload
     assert "DIRECT_DECODE_WORKERS=1" in payload
-    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=1" in payload
+    assert "DIRECT_PREPARED_ROW_CACHE_GIB_PER_RANK=8" in payload
     assert "STREAMING_LRU_ROOT=" not in payload
     site.write_text(
         payload.replace(
@@ -122,7 +123,7 @@ def test_1b_site_init_and_plan_are_scale_specific(tmp_path: Path) -> None:
     assert "final step: 100000" in plan.stdout
     assert "runs/1b_formal100k" in plan.stdout
     assert "batch-coalesced decode" in plan.stdout
-    assert "prefetch workers=1" in plan.stdout
+    assert "prefetch workers=4" in plan.stdout
 
 
 def test_1b_rejects_5b_only_preset(tmp_path: Path) -> None:
@@ -152,7 +153,7 @@ def test_1b_oxe_mix_is_60_sources_without_agibot_or_pca() -> None:
     )
     representation = _representation_from_profiles(
         base=base_data["cache_representation"],
-        model_path=ROOT / "configs/model/native_1b_v8_action_owned_transport.yaml",
+        model_path=ROOT / "configs/model/native_1b_v8_native_direct_rgb.yaml",
         encoder_path=ROOT / "configs/encoder/vggt_native_p64.yaml",
     )
     repos = ("lerobot/droid_1.0.1",) + tuple(

@@ -1,3 +1,5 @@
+> 历史诊断，不是当前训练或发布门槛。当前入口：../NATIVE_DIRECT_RGB.md。
+
 # Exact V7 Full-Sequence Runtime Gate
 
 `run_exact_v7_fullsequence_gate.py` is a fail-closed, no-training topology

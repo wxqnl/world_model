@@ -13,7 +13,7 @@ flowchart LR
   C --> F
   S["current state + embodiment"] --> H["统一 action policy"]
   F --> W["未来 depth / point / pose"]
-  F --> R["V7 motion decoder + bounded detail refiner"]
+  F --> R["原生直接 RGB + bounded detail refiner"]
   C --> H
   W --> P["Stage1 action-blind planner"]
 ```
@@ -25,9 +25,9 @@ flowchart LR
   state 分离，避免未来动作泄漏。
 - grouped action/current-state ABI 表达单臂、双臂、底盘、腰部、头部和可变维度。
 - 3D 主干使用融合后的 geometry tokens；future physical action 在 state encoder 前进入独立
-  factual pass，并在 factual decoder 再次注入。RGB 由 factual future state 直接驱动原始 V7
-  motion decoder，受限高频 refiner 只补晚期细节，不使用 absolute future P256、copy-last 或
-  future target。RGB、depth、point、pose 都是显式监督和显式输出。
+  factual pass，并在 factual decoder 再次注入。RGB 由 factual future state、当前 RGB 金字塔和同一物理 action 驱动原生直接
+  decoder；有界高频 refiner 只补晚期细节。未来真值只用于监督，不使用 absolute future
+  P256、appearance AR/teacher forcing 或 RAFT 训练。RGB、depth、point、pose 都是显式监督和显式输出。
 - Stage0 是联合世界动力学与 action policy 预训练；Stage1 冻结 Stage0，用真实 simulator
   candidates 和 native 3D future evidence 学习候选排序。
 - DDP/FSDP2 共用训练入口；DCP 支持完整编号 checkpoint、独立进程 exact resume 和受控
@@ -59,11 +59,11 @@ Python 包、脚本和文档统一使用 `WM3D` / `wm3d`。
 ## 环境
 
 推荐 Linux x86_64、Python 3.10、PyTorch 2.7.1 和 CUDA 12.8。正式多机运行要求各节点能够
-访问配置的数据和输出路径，并具备节点内 NVLink、节点间 InfiniBand 和足够的磁盘空间。
+访问配置的数据和输出路径，并满足所选 runtime 的 NVLink、网络和存储要求。当前本地 1B 使用 TCP；5B H200 配方
+要求独立验证的 InfiniBand 集群。
 
 ```bash
-git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
-cd world_model/wm3d
+cd /data/world_model/wm3d
 ./run_wm3d.sh env
 source .venv/bin/activate
 PYTHON_BIN=.venv/bin/python ./run_wm3d.sh check
@@ -82,7 +82,7 @@ source revision/file list lock
 → schema inspection + 人工确认 adapter 语义
 → source inventory + sealed data profile
 → task embedding bank
-→ episode cache plan / workers / seal
+→ direct_raw task plan + streaming metadata
 → window index + grouped normalization
 → sealed runtime
 ```
@@ -103,9 +103,10 @@ AgiBotWorld2026。AgiBotWorld Beta 默认关闭，可在生成 5B 数据模板�
 单机 8×H100 的 1B 新训练可使用全 OXE 按需缓存路径：保留 DROID、Bridge 和三类
 RoboCasa，加入去重后的 55 个 OXE source，不使用旧 PCA token cache。数据容量、1K canary、
 100K 正式训练与结果检查见
-[WM3D 1B 全 OXE 按需缓存训练](docs/WM3D_1B_STREAMING.md)。
-默认站点配置已经选择 V8 Core：P64 factual future state 驱动原始 V7 RGB motion decoder，
-高频 refiner 只补受限细节；无需操作者再手工替换 RGB 配置。
+[WM3D 1B direct_raw 站点模板](docs/WM3D_1B_STREAMING.md)。
+当前站点配置选择 native direct RGB：1B P64/K8，5B P144/K16，均保留物理 factual pass
+与 Action/Policy 隔离。当前 16 卡 1B 正式使用的 18 个已适配来源不能与全 OXE 模板的
+来源数量混为一谈；实际训练范围由封存 data profile 决定。
 
 ## 真实小样本验收
 
@@ -148,8 +149,7 @@ preflight，之后使用相同 rendezvous 参数启动训练：
   --output "$RUN_ROOT/eval_step_XXXXXXXX.json"
 ```
 
-恢复必须指向含 `COMMITTED.json` 的完整编号 DCP，不接受 `latest`。默认 64×H200 正式训练按
-canary → validation → formal 逐级提升。第一次接手集群运行时直接使用
+恢复必须指向含 `COMMITTED.json` 的完整编号 DCP，不接受 `latest`。默认 64×H200 先做独立资格训练，通过后 fresh 正式训练。第一次接手集群运行时直接使用
 [5B 从数据到正式训练](docs/WM3D_5B_SCALING.md)；模型规模和分布式设计见
 [统一训练与扩展](docs/WM3D_SCALING.md)，原生图像输出结构与验收指标见
 [原生 RGB 解码器](docs/WM3D_NATIVE_RGB.md)。
@@ -180,3 +180,10 @@ PYTHON_BIN=.venv/bin/python ./run_wm3d.sh check
 
 发布提交必须在 clean tree 上无筛选通过静态检查和全部测试。真实训练证据、能力结论边界
 以及 1B/5B 资源验收见 [发布验收](docs/WM3D_RELEASE_VALIDATION.md)。
+
+## 当前维护边界
+
+当前架构看 [Native direct RGB](docs/NATIVE_DIRECT_RGB.md)。5B 只维护一份
+[操作手册](docs/WM3D_5B_SCALING.md)，本地文件识别和 meta 构建均不代表实机资格。
+历史诊断已移到 docs/archive；轻量 RGB 预实验和完整生产 RGB/Action A/B 保留在
+[scripts/tools](scripts/tools/README.md)。旧 profile 为 checkpoint/对照兼容保留，非新训练入口。

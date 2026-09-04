@@ -20,7 +20,7 @@ from typing import Iterable
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL_PROFILE = ROOT / "configs/model/native_5b_v8_action_owned_transport.yaml"
+MODEL_PROFILE = ROOT / "configs/model/native_5b_v8_native_direct_rgb.yaml"
 VGGT_PROFILE = ROOT / "configs/encoder/vggt_native_p144.yaml"
 TASK_PROFILE = ROOT / "configs/encoder/task_qwen3_vl_embedding_2b.yaml"
 SITE_TEMPLATE = ROOT / "configs/cluster/h200_5b_direct.env.example"
@@ -346,10 +346,34 @@ def main() -> None:
     )
     environment = work_root / "envs/wm3d-cu128/environment_receipt.json"
     runtime = work_root / "control/runtime_5b_canary1k.yaml"
-    ready_to_train = (
+    environment_python = work_root / "envs/wm3d-cu128/bin/python"
+    runtime_recipe_matches = False
+    runtime_issues: list[str] = []
+    if runtime.is_file():
+        if not environment_python.is_file():
+            runtime_issues.append("training environment Python is missing")
+        else:
+            checked = subprocess.run(
+                [
+                    str(environment_python),
+                    str(ROOT / "scripts/cluster/check_5b_contract.py"),
+                    "--model", str(MODEL_PROFILE),
+                    "--encoder", str(VGGT_PROFILE),
+                    "--objective", str(ROOT / "configs/objective/stage0_v8_native_direct_rgb.yaml"),
+                    "--runtime-profile", str(ROOT / "configs/runtime/h200_64_fsdp2_canary1k.yaml"),
+                    "--runtime", str(runtime),
+                ],
+                cwd=ROOT,
+                env={**os.environ, "PYTHONPATH": str(ROOT) + os.pathsep + os.environ.get("PYTHONPATH", "")},
+                text=True, capture_output=True, check=False,
+            )
+            runtime_recipe_matches = checked.returncode == 0
+            if not runtime_recipe_matches:
+                runtime_issues.append((checked.stderr or checked.stdout).strip()[-1200:])
+    ready_for_preflight = (
         data_state == "TRAIN_METADATA_READY"
         and environment.is_file()
-        and runtime.is_file()
+        and runtime_recipe_matches
     )
     print(
         json.dumps(
@@ -366,8 +390,12 @@ def main() -> None:
                 "data_state": data_state,
                 "missing_training_metadata": missing_metadata,
                 "environment_ready": environment.is_file(),
-                "runtime_ready": runtime.is_file(),
-                "ready_to_train": ready_to_train,
+                "runtime_ready": runtime_recipe_matches,
+                "runtime_present": runtime.is_file(),
+                "runtime_issues": runtime_issues,
+                "ready_for_preflight": ready_for_preflight,
+                "ready_to_train": False,
+                "readiness_scope": "local_inputs_only; cluster preflight is required",
                 "site": str(site_output.absolute()),
                 "site_status": site_status,
             },

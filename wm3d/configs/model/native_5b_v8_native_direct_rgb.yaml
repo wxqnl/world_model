@@ -74,7 +74,7 @@ model:
   rgb_render_action_free_prior: false
   rgb_context_residual_scale: 0.75
   rgb_context_motion_blend_gain: 0.5
-  # The same centered physical command conditions P64 and the native renderer.
+  # The same centered physical command conditions P144 and the native renderer.
   rgb_context_action_scale: 1.0
   rgb_context_appearance_delta_scale: 0.0
   rgb_detail_residual_scale: 0.0

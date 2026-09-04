@@ -110,11 +110,13 @@ def test_5b_configure_accepts_nested_modelscope_archives_and_writes_site(
     assert f"WM3D_VGGT_MODEL_SNAPSHOT={paths['vggt']}" in payload
     assert f"QWEN3_VL_EMBEDDING_PATH={paths['task']}" in payload
     assert "__SET_BY_5B_CONFIGURE__" not in payload
+    assert "MODEL_PROFILE=configs/model/native_5b_v8_native_direct_rgb.yaml" in payload
+    assert "OBJECTIVE_PROFILE=configs/objective/stage0_v8_native_direct_rgb.yaml" in payload
     assert "MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}" in payload
     assert site.stat().st_mode & 0o777 == 0o600
 
 
-def test_5b_configure_reports_training_ready_for_complete_local_bundle(
+def test_5b_configure_does_not_treat_empty_files_as_training_ready(
     tmp_path: Path,
 ) -> None:
     models = tmp_path / "models"
@@ -144,8 +146,11 @@ def test_5b_configure_reports_training_ready_for_complete_local_bundle(
     report = json.loads(result.stdout)
     assert report["data_state"] == "TRAIN_METADATA_READY"
     assert report["environment_ready"] is True
-    assert report["runtime_ready"] is True
-    assert report["ready_to_train"] is True
+    assert report["runtime_present"] is True
+    assert report["runtime_ready"] is False
+    assert report["ready_for_preflight"] is False
+    assert report["ready_to_train"] is False
+    assert report["runtime_issues"]
 
 
 def test_5b_configure_reports_control_pack_paths_from_another_machine(
@@ -183,4 +188,4 @@ def test_5b_delivery_doc_uses_two_paths_without_internal_revision_directories() 
     assert "DATA_ROOT=/共享目录/已下载数据" in document
     assert './run_wm3d.sh 5b configure "$MODEL_ROOT" "$DATA_ROOT"' in document
     assert "魔搭" in document
-    assert './run_wm3d.sh 5b slurm "$SITE" train 100' in document
+    assert './run_wm3d.sh 5b slurm "$SITE" train 20' in document

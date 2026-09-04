@@ -38,7 +38,7 @@ loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，�
   calibration profile，并同时应用 action 与 current-state normalization。
 - grouped action owner、mask、time、semantic/group id 均不改变。
 - future factual/zero candidate 对 policy 和 action-free state 的输出差异必须逐元素为零。
-- RGB/P256、world dynamics、数据闭包、batch、teacher schedule 和所有 objective 权重不改变。
+- task/calibration 改动不改变 world/RGB、数据闭包、batch 或已有 Action objective；当前 RGB 路径见 [Native RGB](WM3D_NATIVE_RGB.md)。
 - 不启用随机 history 截短。当前 history/state bridge 与 world/RGB 共享，在没有联合实证前
   截短会重新耦合 action 修复与 RGB 路径；history 依赖只作为评测消融观察。
 
@@ -60,7 +60,7 @@ loss 的权重。现有 fine/coarse action supervision 是唯一训练信号，�
 - 正确 observation 相对 mismatched/neutral observation 的改善；
 - state/history 消融有意义，但不能成为唯一有效条件；
 - baseline action 优于 neutral，token/action gain 正向；
-- policy/action-free 不变量逐元素成立，RGB/P256 指标不退化。
+- policy/action-free 不变量逐元素成立，RGB 指标不退化。
 
 最终能力仍以独立 action regression 和多种闭环机器人/模拟器任务成功率为准；LIBERO 只是
 其中一个可选下游验收器，不能反向定义统一 action head、group 布局或训练目标。

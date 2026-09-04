@@ -8,7 +8,7 @@ V8 的物理 action、task、state、history 和 policy 主链不变。Future ca
 
 参照的是 [V5 实际训练调用](https://github.com/wxqnl/world_model/blob/wm3d-v5-626/wm3d_v5/wm3d_v3/models/joint_model.py)，不是仓库中的其他同名历史目录。V5 在 native 路径上把 **预测的** future tokens 和同一 action 传给 context pixel decoder，不用 future target 代替模型预测。这里恢复的是 RGB 生成能力，并非宣称 V8 整个 StateStream 已逐行复制 V5。
 
-保留现有 33,280 参数的晚期有界高通 refiner。关闭绝对 P256、P256 AR / teacher forcing、flow / RAFT 训练和 disocclusion loss。不加载预训练视频模型。所有 K8 RGB horizon 都用实际预测路径训练。
+保留晚期有界高通 refiner：1B 为 33,280 参数，5B 为 33,344 参数。关闭绝对 P256、P256 AR / teacher forcing、flow / RAFT 训练和 disocclusion loss。不加载预训练视频模型。1B 全 K8、5B 全 K16 RGB horizon 都用实际预测路径训练。
 
 ## 配置
 
@@ -40,3 +40,7 @@ RGB L1、perceptual、gradient、motion 权重以及 policy action loss 保持�
 上述诊断覆盖来源的 future-candidate / policy 隔离均通过。早期画质与最终质量应分开报告，不因某一个阈值未达到就无证据增加新的结构、loss 或改动数据分布。
 
 `scripts/tools/export_production_rgb_ab.py` 可对诊断快照导出按真实 K8 时间排序的 target / direct / transport / copy-last / no-op / wrong-action 面板与 GIF。诊断快照只用于评估，不能作为正式初始化。
+
+## 5B 交付状态
+
+5B 的模型、共享 objective、启动检查和文档已同步 native direct。启动脚本会检查实际 sealed runtime，拒绝旧 transport 配方。5B 保留 T24/P144/K16/384px，不能复用 1B metadata。操作只看 [5B 训练](WM3D_5B_SCALING.md)。当前参数/meta 构建不等于 64×H200 真机资格；未取得空闲目标集群前，不宣布 5B 正式训练已获验证。

@@ -90,97 +90,15 @@ require_file() {
 
 validate_5b_v8_contract() {
   [[ "${SCALE}" == 5b ]] || return 0
-  "${PYTHON_BIN}" - "${MODEL_PROFILE}" "${ENCODER_CONTRACT}" "${OBJECTIVE_PROFILE}" <<'PY'
-from pathlib import Path
-import sys
+  "${PYTHON_BIN}" "${ROOT}/scripts/cluster/check_5b_contract.py" \
+    --model "${MODEL_PROFILE}" --encoder "${ENCODER_CONTRACT}" \
+    --objective "${OBJECTIVE_PROFILE}" --runtime-profile "${RUNTIME_PROFILE}" "$@"
+}
 
-import torch
-import yaml
-
-from wm3d.models.model_factory import build_world_model, validate_model_profile
-
-model = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
-encoder = yaml.safe_load(Path(sys.argv[2]).read_text(encoding="utf-8"))
-objective = yaml.safe_load(Path(sys.argv[3]).read_text(encoding="utf-8"))
-validate_model_profile(model)
-cfg = model["model"]
-required = {
-    "T": 24,
-    "P": 144,
-    "K": 16,
-    "policy_task_modulation": True,
-    "policy_calibration_conditioning": True,
-    "dynamics_layers": 2,
-    "factual_dynamics_repeats": 1,
-    "factual_action_residual_scale": 1.0,
-    "factual_v7_early_action_conditioning": False,
-    "factual_v7_early_action_scale": 0.0,
-    "factual_v7_bridge_layers_state": [],
-    "appearance_enabled": False,
-    "rgb_context_enabled": True,
-    "rgb_original_v7_context": False,
-    "rgb_action_owned_transport": True,
-    "rgb_v7_high_frequency_refiner": True,
-    "rgb_v7_high_frequency_scale": 0.0625,
-    "rgb_context_alignment_enabled": False,
-    "rgb_render_action_free_prior": False,
-    "rgb_context_motion_blend_gain": 0.0,
-    "rgb_context_action_scale": 1.0,
-    "rgb_context_appearance_delta_scale": 0.0,
-    "rgb_detail_residual_scale": 0.0,
-}
-wrong = {
-    key: (cfg.get(key), expected)
-    for key, expected in required.items()
-    if cfg.get(key) != expected
-}
-if wrong:
-    raise SystemExit(f"5B V8 model contract mismatch: {wrong}")
-if encoder.get("token_grid") != 12 or encoder.get("target_rgb_size") != 384:
-    raise SystemExit("5B V8 encoder must be P144/384px")
-if "appearance_token_grid" in encoder or "appearance_feature_layer" in encoder:
-    raise SystemExit("5B V8 production encoder must not extract absolute P256")
-weights = objective.get("objective", {})
-required_weights = {
-    "rgb_l1": 1.2,
-    "rgb_perceptual": 0.55,
-    "rgb_gradient": 0.08,
-    "rgb_charbonnier": 0.0,
-    "rgb_motion_l1": 1.0,
-    "rgb_flow_teacher": 0.20,
-    "rgb_disocclusion_bce": 0.0,
-    "rgb_disocclusion_dice": 0.0,
-    "appearance_l1": 0.0,
-    "appearance_teacher_l1": 0.0,
-    "appearance_autoregressive_l1": 0.0,
-    "action_counterfactual_token_advantage": 1.0,
-    "action_counterfactual_token_margin": 0.005,
-    "context_pixel_action_rank_weight": 2.0,
-    "context_pixel_action_separation_weight": 0.5,
-    "context_pixel_action_rank_start_step": 30000,
-    "context_pixel_action_rank_ramp_steps": 10000,
-    "context_pixel_action_rank_every": 8,
-    "context_pixel_action_rank_batch_size": 1,
-    "context_pixel_action_rank_margin": 0.003,
-    "context_pixel_action_separation_margin": 0.006,
-    "context_pixel_action_motion_threshold": 0.03,
-    "context_pixel_action_motion_gain": 4.0,
-    "context_pixel_action_negative_min_distance": 0.05,
-}
-wrong_weights = {
-    key: (weights.get(key), expected)
-    for key, expected in required_weights.items()
-    if weights.get(key) != expected
-}
-if wrong_weights:
-    raise SystemExit(f"5B V8 objective mismatch: {wrong_weights}")
-with torch.device("meta"):
-    built = build_world_model(model)
-print(
-    "5B V8 contract passed: "
-    f"parameters={sum(parameter.numel() for parameter in built.parameters()):,}"
-)
-PY
+validate_5b_sealed_contract() {
+  [[ "${SCALE}" == 5b ]] || return 0
+  require_file "sealed runtime" "${RUNTIME_YAML}"
+  validate_5b_v8_contract --runtime "${RUNTIME_YAML}"
 }
 
 validate_preset() {
@@ -213,7 +131,7 @@ apply_preset() {
     5b:canary1k)
       RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_canary1k.yaml
       TOTAL_STEPS=1000
-      MILESTONES="100 -> 500 -> 1000"
+      MILESTONES="20 -> 100 -> 500 -> 1000"
       ;;
     5b:validation100k)
       RUNTIME_PROFILE=configs/runtime/h200_64_fsdp2_validation100k.yaml
@@ -253,6 +171,7 @@ load_site() {
   STREAMING_LRU_ROOT=${STREAMING_LRU_ROOT:-${WORK_ROOT}/streaming_lru}
   STREAMING_LRU_GIB_PER_RANK=${STREAMING_LRU_GIB_PER_RANK:-64}
   STREAMING_METADATA_WORKERS=${STREAMING_METADATA_WORKERS:-32}
+  STREAMING_METADATA_PROCESSES=${STREAMING_METADATA_PROCESSES:-8}
   STREAMING_ENCODE_BATCH_FRAMES=${STREAMING_ENCODE_BATCH_FRAMES:-16}
   STREAMING_DECODE_WORKERS=${STREAMING_DECODE_WORKERS:-4}
   DIRECT_INPUT_RGB_SIZE=${DIRECT_INPUT_RGB_SIZE:-518}
@@ -638,7 +557,8 @@ EOF
       --episode-index "${EPISODE_INDEX}" --window-index "${WINDOW_INDEX}" \
       --grouped-normalization "${GROUPED_NORMALIZATION}" \
       --output-seal "${STREAMING_METADATA_SEAL}" \
-      --workers "${STREAMING_METADATA_WORKERS}"
+      --workers "${STREAMING_METADATA_WORKERS}" \
+      --processes "${STREAMING_METADATA_PROCESSES}"
     ;;
   window)
     [[ $# -eq 0 ]] || { usage; exit 2; }
@@ -698,11 +618,13 @@ EOF
     ;;
   preflight)
     [[ $# -eq 0 ]] || { usage; exit 2; }
+    validate_5b_sealed_contract
     mapfile -t distributed < <(torch_args "${PREFLIGHT_PORT}")
     "${ENTRY}" preflight "${distributed[@]}" -- --runtime "${RUNTIME_YAML}"
     ;;
   train)
     [[ $# -le 1 ]] || { usage; exit 2; }
+    validate_5b_sealed_contract
     mapfile -t distributed < <(torch_args "${TRAIN_PORT}")
     app=(--runtime "${RUNTIME_YAML}")
     [[ $# -eq 0 ]] || app+=(--stop-after-step "$1")
@@ -710,6 +632,7 @@ EOF
     ;;
   resume)
     [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 2; }
+    validate_5b_sealed_contract
     checkpoint=$(resolve_checkpoint "$1")
     mapfile -t distributed < <(torch_args "${TRAIN_PORT}")
     app=(--runtime "${RUNTIME_YAML}" --resume "${checkpoint}")
@@ -718,6 +641,7 @@ EOF
     ;;
   eval)
     [[ $# -le 2 ]] || { usage; exit 2; }
+    validate_5b_sealed_contract
     checkpoint=$(resolve_checkpoint "${1:-${TOTAL_STEPS}}")
     checkpoint_step=$(step_from_checkpoint "${checkpoint}")
     output=${2:-$(eval_output_for_step "${checkpoint_step}")}

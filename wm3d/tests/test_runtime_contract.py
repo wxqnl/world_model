@@ -253,9 +253,11 @@ def test_h200_64_formal_profile_preserves_scaling_budget() -> None:
     assert train["validation_steps"] == 100
     assert train["checkpoint_steps"] == [1000, 5000, 20000]
     assert train["checkpoint_interval"] == 20000
-    assert optimizer["peak_lr"] == pytest.approx(0.00012)
-    assert optimizer["min_lr"] == pytest.approx(0.00001)
-    assert schedule["warmup_steps"] == 2000
+    assert optimizer["start_lr"] == pytest.approx(0.000001)
+    assert optimizer["peak_lr"] == pytest.approx(0.00001)
+    assert optimizer["weight_decay"] == pytest.approx(0.02)
+    assert optimizer["min_lr"] == pytest.approx(0.000001)
+    assert schedule["warmup_steps"] == 500
     assert schedule["stable_fraction"] == pytest.approx(0.8)
     resources = value["resources"]
     assert resources["gpu_name_substring"] == "H200"
@@ -280,9 +282,9 @@ def test_h200_64_canary1k_uses_the_same_cluster_gate() -> None:
     assert train["validation_seed"] == 314159
     assert train["validate_every"] == 250
     assert train["validation_steps"] == 20
-    assert train["checkpoint_steps"] == [100, 500]
+    assert train["checkpoint_steps"] == [20, 100, 500]
     assert train["checkpoint_interval"] == 1000
-    assert value["schedule"]["warmup_steps"] == 100
+    assert value["schedule"]["warmup_steps"] == 500
     assert value["schedule"]["stable_fraction"] == pytest.approx(0.8)
 
 

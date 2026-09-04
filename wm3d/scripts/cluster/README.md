@@ -1,10 +1,11 @@
-# Cluster helpers
+# 集群入口
 
-`wm3d_1b.sh` and `wm3d_5b.sh` read one site-local environment file and compose the existing
-WM3D commands. The 1B wrapper selects the same implementation with the 1B model/runtime defaults;
-it does not create a second trainer.
-It handles source download, task/cache preparation, runtime materialization, distributed launch,
-status, and final verification. It does not bypass the human adapter audit.
+wm3d_1b.sh 和 wm3d_5b.sh 组合现有生产命令，不维护第二套模型或训练器。
+5B 操作只看 ../../docs/WM3D_5B_SCALING.md。
 
-Run `./run_wm3d.sh 1b help` or `./run_wm3d.sh 5b help`. The ordered procedures are in
-`docs/WM3D_1B_STREAMING.md` and `docs/WM3D_5B_SCALING.md`.
+configure_5b_inputs.py 负责本地输入识别、路径检查和 site 生成。
+check_5b_contract.py 检查当前 5B 模型/目标及实际 sealed runtime 是否一致，
+doctor、runtime 和启动前均使用同一个检查。Meta 参数构建不是 GPU 资格。
+
+输入检查只报告 ready_for_preflight。真实集群 preflight、模型前后向、
+checkpoint 和离线评测决定后续资格；不能用文件存在或空 receipt 宣布可以训练。
