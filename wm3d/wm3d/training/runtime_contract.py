@@ -67,6 +67,7 @@ _STREAMING_MODEL_DATA_NON_BINDING_FIELDS = {
     "rgb_context_enabled",
     "rgb_original_v7_context",
     "rgb_action_owned_transport",
+    "rgb_action_owned_direct",
     "rgb_v7_high_frequency_refiner",
     "rgb_v7_high_frequency_channels",
     "rgb_v7_high_frequency_scale",

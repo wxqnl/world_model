@@ -20,10 +20,14 @@ def main():
     p.add_argument("--pixel-units",action="store_true")
     p.add_argument("--real-negative-every-step",action="store_true")
     p.add_argument("--occlusion-completion", action="store_true")
+    p.add_argument("--direct-rgb", action="store_true")
     p.add_argument("--steps",type=int,default=96)
     p.add_argument("--seed",type=int,default=7340)
+    p.add_argument("--save-checkpoint",type=Path)
     args=p.parse_args()
     if args.output.exists(): raise FileExistsError(args.output)
+    if args.save_checkpoint is not None and args.save_checkpoint.exists():
+        raise FileExistsError(args.save_checkpoint)
     config,_=load_materialized_runtime(args.runtime)
     device=torch.device("cuda:0")
     audit._configure_reproducibility(args.seed)
@@ -32,6 +36,12 @@ def main():
     body["activation_checkpointing"]=runtime["train"].get("activation_checkpointing",body["activation_checkpointing"])
     body["rgb_decode_chunk_size"]=runtime["train"].get("rgb_decode_chunk_size",body["rgb_decode_chunk_size"])
     profile["model"]=body
+    if args.direct_rgb:
+        if args.occlusion_completion or args.pixel_units:
+            raise ValueError("direct RGB has no transport completion or flow loss")
+        body.update(rgb_action_owned_transport=False, rgb_action_owned_direct=True,
+                    rgb_context_action_scale=1.0, rgb_context_motion_blend_gain=0.5)
+        profile.pop("expected_parameter_count", None)
     if args.occlusion_completion:
         body["rgb_transport_occlusion_completion"] = True
         final_channels = max(32, int(body["rgb_hidden"]) // 8)
@@ -47,6 +57,9 @@ def main():
     if args.real_negative_every_step:
         objective=replace(objective,action_counterfactual_token_advantage=0.0,
             context_pixel_action_rank_every=1,context_pixel_action_rank_ramp_steps=0)
+    if args.direct_rgb:
+        objective = replace(objective, rgb_flow_teacher=0.0,
+                            rgb_disocclusion_bce=0.0, rgb_disocclusion_dice=0.0)
     objective.validate()
     if args.occlusion_completion:
         objective = replace(objective, rgb_disocclusion_bce=0.03,
@@ -86,8 +99,9 @@ def main():
             weights = torch.broadcast_to(mask, error.shape)
             values[name + "_l1"] = float((error * weights).sum() / weights.sum().clamp_min(1))
         values["disocclusion_target_fraction"] = float(audit._masked_mean(occ.float(), valid))
-        values["disocclusion_prediction_fraction"] = float(audit._masked_mean(
-            torch.sigmoid(output["rgb_disocclusion_logit"].float()), valid))
+        if "rgb_disocclusion_logit" in output:
+            values["disocclusion_prediction_fraction"] = float(audit._masked_mean(
+                torch.sigmoid(output["rgb_disocclusion_logit"].float()), valid))
         return values
     def evaluate(step):
         model.eval(); records=[]
@@ -130,7 +144,7 @@ def main():
         if not bool(torch.isfinite(norm)): raise RuntimeError("Nonfinite gradient")
         if step==0:
             owners={}
-            for prefix in ("factual_action","factual_token_output","rgb_head.image_decoder.flow_head","rgb_head.image_decoder.occlusion_head","rgb_head.image_decoder.occlusion_completion","action_head"):
+            for prefix in ("factual_action","factual_token_output","rgb_head.image_decoder.token_proj","rgb_head.image_decoder.action_proj","rgb_head.image_decoder.head","rgb_head.image_decoder.flow_head","rgb_head.image_decoder.occlusion_head","rgb_head.image_decoder.occlusion_completion","action_head"):
                 parameters=[p for name,p in model.named_parameters() if name.replace("_checkpoint_wrapped_module.","").startswith(prefix) and p.grad is not None]
                 owners[prefix]={"tensors":len(parameters),"norm":float(torch.stack([p.grad.float().square().sum() for p in parameters]).sum().sqrt()) if parameters else None}
             print(json.dumps({"event":"gradient_owners","owners":owners}),flush=True)
@@ -145,10 +159,14 @@ def main():
         "fresh_initialization":True,"checkpoint_loaded":False,"parameter_count":count,
         "pixel_units":args.pixel_units,"seed":args.seed,"steps":args.steps,
         "real_negative_every_step":args.real_negative_every_step,
-        "occlusion_completion":args.occlusion_completion,
+        "occlusion_completion":args.occlusion_completion,"direct_rgb":args.direct_rgb,
         "batch_size":int(batches[0]["source_id"].shape[0]),"source_balanced_diagnostic":True,
         "production_lr_schedule":True,"elapsed_seconds":time.monotonic()-start,
         "evaluations":reports,"training":training}
     args.output.parent.mkdir(parents=True,exist_ok=True)
     with args.output.open("x") as f: json.dump(payload,f,indent=2)
+    if args.save_checkpoint is not None:
+        args.save_checkpoint.parent.mkdir(parents=True,exist_ok=True)
+        torch.save({"diagnostic_only": True, "step": args.steps, "model_profile": profile,
+                    "model": model.state_dict()}, args.save_checkpoint)
 if __name__=="__main__": main()

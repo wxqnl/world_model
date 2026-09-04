@@ -145,6 +145,10 @@ class NativeWorldModelConfig:
     # may reach a future frame only through that predicted transport; it is
     # never exposed as an unwarped U-Net skip or an unconditional copy path.
     rgb_action_owned_transport: bool = False
+    # Reuse the native V5/V7 RGB synthesis path with the same modern physical
+    # factual pass. Renderer selection must not change policy or world dynamics.
+    # Unlike transport, this can generate newly exposed surfaces and colors.
+    rgb_action_owned_direct: bool = False
     # Backward-compatible completion of appearance that flow cannot carry.
     rgb_transport_occlusion_completion: bool = False
     # Optional V8 clarity head on top of the proven V7 renderer. It consumes
@@ -204,6 +208,10 @@ class NativeWorldModelConfig:
 
     dropout: float = 0.0
     activation_checkpointing: bool = True
+
+    @property
+    def physical_factual_pass(self) -> bool:
+        return self.rgb_action_owned_transport or self.rgb_action_owned_direct
 
     def validate(self) -> None:
         if self.schema != NATIVE_WORLD_MODEL_SCHEMA:
@@ -325,6 +333,14 @@ class NativeWorldModelConfig:
             raise ValueError("rgb_original_v7_context must be boolean")
         if not isinstance(self.rgb_action_owned_transport, bool):
             raise ValueError("rgb_action_owned_transport must be boolean")
+        if not isinstance(self.rgb_action_owned_direct, bool):
+            raise ValueError("rgb_action_owned_direct must be boolean")
+        if self.rgb_action_owned_direct and (
+            self.rgb_action_owned_transport or self.rgb_original_v7_context
+        ):
+            raise ValueError(
+                "action-owned direct RGB selects one renderer, not legacy factual dynamics"
+            )
         if not isinstance(self.rgb_transport_occlusion_completion, bool):
             raise ValueError("rgb_transport_occlusion_completion must be boolean")
         if self.rgb_transport_occlusion_completion and not self.rgb_action_owned_transport:
@@ -347,7 +363,7 @@ class NativeWorldModelConfig:
             )
         if self.rgb_v7_high_frequency_refiner:
             if not (
-                self.rgb_original_v7_context or self.rgb_action_owned_transport
+                self.rgb_original_v7_context or self.physical_factual_pass
             ):
                 raise ValueError(
                     "bounded high-frequency refinement requires a factual P64 RGB path"
@@ -410,7 +426,7 @@ class NativeWorldModelConfig:
                 raise ValueError(
                     "original V7 RGB cannot split token and render dynamics"
                 )
-        if self.rgb_action_owned_transport:
+        if self.physical_factual_pass:
             if not self.rgb_context_enabled:
                 raise ValueError("action-owned RGB transport requires context RGB")
             if self.rgb_context_alignment_enabled:
@@ -425,7 +441,7 @@ class NativeWorldModelConfig:
                 raise ValueError(
                     "action-owned RGB transport has no independent appearance lane"
                 )
-            if self.rgb_context_action_scale != 0.0:
+            if self.rgb_action_owned_transport and self.rgb_context_action_scale != 0.0:
                 raise ValueError(
                     "action-owned RGB transport must receive future action only through factual P64"
                 )
@@ -776,7 +792,7 @@ class MultiViewTokenFuser(nn.Module):
         super().__init__()
         self.num_views = cfg.num_views
         self.original_v7_anchor = (
-            cfg.rgb_original_v7_context or cfg.rgb_action_owned_transport
+            cfg.rgb_original_v7_context or cfg.physical_factual_pass
         )
         if self.original_v7_anchor:
             # Preserve the canonical V7 anchor path exactly: the head-camera
@@ -3580,7 +3596,8 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
     original V7 60K checkpoint: a full-resolution observed RGB pyramid, P64
     factual tokens interpolated into the 16x16 bottleneck, direct RGB plus a
     bounded residual, and learned blend/motion maps. Its renderer input remains
-    the exact canonical seven-dimensional physical action used by V7.
+    the canonical seven-dimensional physical action on the legacy path, or the
+    centered grouped physical projection on the current V8 factual path.
     """
 
     def __init__(self, cfg: NativeWorldModelConfig):
@@ -3606,7 +3623,7 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
             _RGBConvBlock(hidden, hidden),
         )
         self.action_proj = nn.Sequential(
-            nn.Linear(7, hidden),
+            nn.Linear(cfg.state_hidden if cfg.rgb_action_owned_direct else 7, hidden),
             nn.SiLU(inplace=True),
             nn.Linear(hidden, hidden),
         )
@@ -3700,7 +3717,7 @@ class NativeOriginalV7ContextRGBImageDecoder(nn.Module):
         if self.cfg.rgb_context_action_scale > 0.0:
             if factual_action_summary is None or factual_action_summary.shape != (
                 tokens.shape[0],
-                7,
+                self.cfg.state_hidden if self.cfg.rgb_action_owned_direct else 7,
             ):
                 raise ValueError(
                     "canonical physical action must align to original V7 RGB slots"
@@ -4352,7 +4369,7 @@ class NativeRGBDecoder(nn.Module):
         image_decoder: nn.Module
         if cfg.rgb_action_owned_transport:
             image_decoder = NativeActionOwnedTransportRGBImageDecoder(cfg)
-        elif cfg.rgb_original_v7_context:
+        elif cfg.rgb_original_v7_context or cfg.rgb_action_owned_direct:
             image_decoder = NativeOriginalV7ContextRGBImageDecoder(cfg)
         elif cfg.rgb_context_enabled:
             image_decoder = NativeContextRGBImageDecoder(cfg)
@@ -4786,7 +4803,7 @@ class NativeWorldModel(nn.Module):
         # normalized future commands condition the future StateStream before
         # the first shared state block.  It therefore needs no second decoder
         # or another learned future prior.
-        if cfg.rgb_action_owned_transport:
+        if cfg.physical_factual_pass:
             self.factual_decoder_queries = None
             self.factual_decoder_space = None
             self.factual_decoder_time = None
@@ -4816,7 +4833,7 @@ class NativeWorldModel(nn.Module):
         self.task_state = nn.Linear(cfg.task_dim, cfg.state_hidden, bias=False)
         self.factual_task: Optional[nn.Linear] = (
             None
-            if cfg.rgb_action_owned_transport
+            if cfg.physical_factual_pass
             else nn.Linear(cfg.task_dim, cfg.state_hidden, bias=True)
         )
         self.task_action = nn.Linear(cfg.task_dim, cfg.action_hidden, bias=False)
@@ -4827,11 +4844,11 @@ class NativeWorldModel(nn.Module):
             GroupedSignalEncoder(
                 cfg.state_hidden,
                 cfg,
-                condition_on_normalization=cfg.rgb_action_owned_transport,
+                condition_on_normalization=cfg.physical_factual_pass,
             )
         )
         self.factual_state_action_query_norm: Optional[RMSNorm] = (
-            RMSNorm(cfg.state_hidden) if cfg.rgb_action_owned_transport else None
+            RMSNorm(cfg.state_hidden) if cfg.physical_factual_pass else None
         )
         # Do not normalize the centered action context here.  Its norm carries
         # the physical command magnitude (after source calibration); an
@@ -4844,12 +4861,12 @@ class NativeWorldModel(nn.Module):
                 cfg.state_heads,
                 cfg.dropout,
             )
-            if cfg.rgb_action_owned_transport
+            if cfg.physical_factual_pass
             else None
         )
         legacy_v7_factual = (
             cfg.factual_v7_early_action_conditioning
-            and not cfg.rgb_action_owned_transport
+            and not cfg.physical_factual_pass
         )
         self.factual_v7_query_action: Optional[CanonicalV7ActionTokenEncoder] = (
             CanonicalV7ActionTokenEncoder(cfg.state_hidden, cfg.K)
@@ -4925,7 +4942,7 @@ class NativeWorldModel(nn.Module):
             (
                 OriginalV7FactualDecoderLayer(cfg)
                 for _ in (
-                    () if cfg.rgb_action_owned_transport else range(cfg.dynamics_layers)
+                    () if cfg.physical_factual_pass else range(cfg.dynamics_layers)
                 )
             ),
             enabled=cfg.activation_checkpointing,
@@ -5414,7 +5431,7 @@ class NativeWorldModel(nn.Module):
         factual_query: Optional[torch.Tensor] = None
         task_memory: Optional[torch.Tensor] = None
         decoder_prefix_valid: Optional[torch.Tensor] = None
-        if not cfg.rgb_action_owned_transport:
+        if not cfg.physical_factual_pass:
             if (
                 self.factual_decoder_queries is None
                 or self.factual_decoder_space is None
@@ -5469,10 +5486,10 @@ class NativeWorldModel(nn.Module):
                     if self.factual_action.condition_on_normalization
                     else None
                 ),
-                include_direct_physical=cfg.rgb_action_owned_transport,
+                include_direct_physical=cfg.physical_factual_pass,
             )
             direct: Optional[torch.Tensor] = None
-            if cfg.rgb_action_owned_transport:
+            if cfg.physical_factual_pass:
                 encoded, encoded_mask, direct = encoded_result
             else:
                 encoded, encoded_mask = encoded_result
@@ -5505,7 +5522,7 @@ class NativeWorldModel(nn.Module):
                 raise ValueError("factual action memory must align to [B,K,G]")
             if tuple(encoded_mask.shape) != tuple(encoded.shape[:3]):
                 raise ValueError("factual action mask must align to action memory")
-            if cfg.rgb_action_owned_transport:
+            if cfg.physical_factual_pass:
                 if repeats != 1:
                     raise ValueError(
                         "causal factual StateStream is executed exactly once"
@@ -5737,7 +5754,7 @@ class NativeWorldModel(nn.Module):
                 zero_summary_anchor = zero_summary
                 centered_summary = factual_summary - zero_summary_anchor
                 noop_centered_summary = noop_summary - zero_summary_anchor
-            if cfg.rgb_action_owned_transport:
+            if cfg.physical_factual_pass:
                 if factual_direct is None or zero_direct is None or noop_direct is None:
                     raise RuntimeError("direct physical action features are unavailable")
                 direct_anchor = zero_direct
@@ -5762,7 +5779,7 @@ class NativeWorldModel(nn.Module):
         canonical_noop_grouped_action: Optional[torch.Tensor] = None
         legacy_v7_factual = (
             cfg.factual_v7_early_action_conditioning
-            and not cfg.rgb_action_owned_transport
+            and not cfg.physical_factual_pass
         )
         if legacy_v7_factual or (
             cfg.rgb_original_v7_context and cfg.rgb_context_action_scale > 0.0
@@ -6084,7 +6101,7 @@ class NativeWorldModel(nn.Module):
         def encode_v7_factual_state(
             action_summary: Optional[torch.Tensor],
         ) -> torch.Tensor:
-            if cfg.rgb_action_owned_transport:
+            if cfg.physical_factual_pass:
                 return factual_state_input[:, : cfg.T]
             if not cfg.factual_v7_early_action_conditioning:
                 return prior_state[:, : cfg.T]
@@ -6224,7 +6241,11 @@ class NativeWorldModel(nn.Module):
         zero_action_pred_tokens: Optional[torch.Tensor] = None
         rgb_action_summary: Optional[torch.Tensor] = None
         if cfg.rgb_context_action_scale > 0.0:
-            if cfg.rgb_action_owned_transport:
+            if cfg.rgb_action_owned_direct:
+                if centered_direct_summary is None:
+                    raise RuntimeError("direct physical RGB action is unavailable")
+                rgb_action_summary = centered_direct_summary
+            elif cfg.rgb_action_owned_transport:
                 if centered_summary is None:
                     raise RuntimeError(
                         "normalized factual RGB action effect is unavailable"

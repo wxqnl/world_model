@@ -262,7 +262,6 @@ def variant_metrics(
     required_output = (
         "pred_tokens",
         "rgb",
-        "rgb_flow_pixels",
         "policy_action_raw",
         "action_free_pred_tokens",
     )
@@ -311,24 +310,6 @@ def variant_metrics(
         batch["context_rgb_mask"],
     )
 
-    flow_target = batch["rgb_flow_target_pixels"].float()
-    flow_prediction = _flow_at_teacher_grid(
-        output["rgb_flow_pixels"], flow_target
-    )
-    slot_valid = rgb_valid[..., 0, 0, 0]
-    flow_valid = torch.broadcast_to(
-        slot_valid[..., None, None, None],
-        batch["rgb_disocclusion_target"].shape,
-    )
-    flow_valid = (
-        flow_valid
-        & torch.isfinite(flow_target).all(dim=3, keepdim=True)
-        & torch.isfinite(batch["rgb_disocclusion_target"])
-        & (batch["rgb_disocclusion_target"] < 0.5)
-    )
-    flow_vector_valid = torch.broadcast_to(flow_valid, flow_target.shape)
-    flow_error = flow_prediction - flow_target
-
     values = {
         "p64_error_rms": _masked_rms(
             prediction_tokens - target_tokens, token_valid
@@ -356,20 +337,64 @@ def variant_metrics(
             prediction_rgb - context, rgb_valid
         ),
         "rgb_copy_last_l1": _masked_mean((context - target_rgb).abs(), rgb_valid),
-        "flow_epe_pixels": _masked_mean(
-            flow_error.square().sum(dim=3, keepdim=True).sqrt(), flow_valid
-        ),
-        "flow_prediction_magnitude_pixels": _masked_mean(
-            flow_prediction.square().sum(dim=3, keepdim=True).sqrt(), flow_valid
-        ),
-        "flow_target_magnitude_pixels": _masked_mean(
-            flow_target.square().sum(dim=3, keepdim=True).sqrt(), flow_valid
-        ),
-        "flow_direction_cosine": _masked_cosine(
-            flow_prediction, flow_target, flow_vector_valid
-        ),
         "rgb_motion_fraction": _masked_mean(target_motion.float(), rgb_valid),
     }
+    # Separate forecast-to-forecast motion from the context-to-first jump.
+    # A constant but wrong forecast can score nonzero on the latter alone.
+    future_pred = prediction_delta[:, 1:]
+    future_target = target_delta[:, 1:]
+    future_valid = delta_valid[:, 1:]
+    values.update({
+        "rgb_future_frame_delta_rms": _masked_rms(future_pred, future_valid),
+        "rgb_target_future_frame_delta_rms": _masked_rms(future_target, future_valid),
+        "rgb_future_frame_delta_error_rms": _masked_rms(
+            future_pred - future_target, future_valid),
+        "rgb_future_frame_delta_direction_cosine": _masked_cosine(
+            future_pred, future_target, future_valid),
+    })
+    for horizon in range(prediction_rgb.shape[1]):
+        valid_h = delta_valid[:, horizon]
+        values[f"rgb_h{horizon + 1}_l1"] = _masked_mean(
+            (prediction_rgb[:, horizon] - target_rgb[:, horizon]).abs(),
+            rgb_valid[:, horizon])
+        values[f"rgb_h{horizon + 1}_delta_rms"] = _masked_rms(
+            prediction_delta[:, horizon], valid_h)
+        values[f"rgb_h{horizon + 1}_target_delta_rms"] = _masked_rms(
+            target_delta[:, horizon], valid_h)
+        values[f"rgb_h{horizon + 1}_delta_direction_cosine"] = _masked_cosine(
+            prediction_delta[:, horizon], target_delta[:, horizon], valid_h)
+    if "rgb_flow_pixels" in output:
+        flow_target = batch["rgb_flow_target_pixels"].float()
+        flow_prediction = _flow_at_teacher_grid(
+            output["rgb_flow_pixels"], flow_target
+        )
+        slot_valid = rgb_valid[..., 0, 0, 0]
+        flow_valid = torch.broadcast_to(
+            slot_valid[..., None, None, None],
+            batch["rgb_disocclusion_target"].shape,
+        )
+        flow_valid = (
+            flow_valid
+            & torch.isfinite(flow_target).all(dim=3, keepdim=True)
+            & torch.isfinite(batch["rgb_disocclusion_target"])
+            & (batch["rgb_disocclusion_target"] < 0.5)
+        )
+        flow_vector_valid = torch.broadcast_to(flow_valid, flow_target.shape)
+        flow_error = flow_prediction - flow_target
+        values.update({
+            "flow_epe_pixels": _masked_mean(
+                flow_error.square().sum(dim=3, keepdim=True).sqrt(), flow_valid
+            ),
+            "flow_prediction_magnitude_pixels": _masked_mean(
+                flow_prediction.square().sum(dim=3, keepdim=True).sqrt(), flow_valid
+            ),
+            "flow_target_magnitude_pixels": _masked_mean(
+                flow_target.square().sum(dim=3, keepdim=True).sqrt(), flow_valid
+            ),
+            "flow_direction_cosine": _masked_cosine(
+                flow_prediction, flow_target, flow_vector_valid
+            ),
+        })
     result = {name: float(value) for name, value in values.items()}
     if not all(math.isfinite(value) for value in result.values()):
         raise AuditError("paired audit produced a non-finite metric")
@@ -390,12 +415,15 @@ def _response_rms(
         "rgb_response_rms": _masked_rms(
             factual["rgb"].float() - control["rgb"].float(), rgb_mask
         ),
-        "flow_response_rms_pixels": _masked_rms(
-            factual["rgb_flow_pixels"].float()
-            - control["rgb_flow_pixels"].float(),
-            rgb_mask,
-        ),
     }
+    if "rgb_flow_pixels" in factual and "rgb_flow_pixels" in control:
+        values.update({
+            "flow_response_rms_pixels": _masked_rms(
+                factual["rgb_flow_pixels"].float()
+                - control["rgb_flow_pixels"].float(),
+                rgb_mask,
+            ),
+        })
     return {name: float(value) for name, value in values.items()}
 
 

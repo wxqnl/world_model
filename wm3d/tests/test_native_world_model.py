@@ -1524,6 +1524,54 @@ def test_original_v7_rgb_future_action_changes_rgb_not_policy_or_action_free() -
     assert not torch.allclose(factual["rgb"], zero["rgb"])
 
 
+def test_native_direct_rgb_preserves_physical_factual_and_policy_path() -> None:
+    transport_cfg = _tiny_action_owned_transport_config()
+    direct_cfg = replace(
+        transport_cfg, rgb_action_owned_transport=False,
+        rgb_action_owned_direct=True, rgb_context_action_scale=1.0,
+        rgb_context_motion_blend_gain=0.5,
+    )
+    torch.manual_seed(813)
+    transport = NativeWorldModel(transport_cfg).eval()
+    direct = NativeWorldModel(direct_cfg).eval()
+    shared = {
+        key: value for key, value in transport.state_dict().items()
+        if not key.startswith("rgb_head.")
+    }
+    result = direct.load_state_dict(shared, strict=False)
+    assert not result.unexpected_keys
+    assert all(key.startswith("rgb_head.") for key in result.missing_keys)
+    batch = _original_v7_batch(direct_cfg)
+    batch["context_rgb"] = torch.rand(
+        2, direct_cfg.num_views, 3, direct_cfg.rgb_size, direct_cfg.rgb_size
+    )
+    batch["context_rgb_mask"] = torch.ones(2, direct_cfg.num_views, dtype=torch.bool)
+    actual = direct(**batch)
+    reference = transport(**batch)
+    for key in ("pred_tokens", "action_free_pred_tokens", "policy_action_raw"):
+        torch.testing.assert_close(actual[key], reference[key], rtol=0, atol=0)
+    assert isinstance(direct.rgb_head.image_decoder, NativeOriginalV7ContextRGBImageDecoder)
+    assert "rgb_flow_pixels" not in actual
+    zero_batch = dict(batch)
+    for key in ("future_factual_fine_action_values", "future_factual_coarse_action_values"):
+        zero_batch[key] = torch.zeros_like(batch[key])
+    zero = direct(**zero_batch)
+    for key in ("action_free_pred_tokens", "policy_action_raw"):
+        torch.testing.assert_close(actual[key], zero[key], rtol=0, atol=0)
+    assert not torch.allclose(actual["rgb"], zero["rgb"])
+    actual["rgb"].square().mean().backward()
+    for module in (
+        direct.factual_action,
+        direct.factual_token_output,
+        direct.rgb_head.image_decoder.token_proj,
+        direct.rgb_head.image_decoder.action_proj,
+        direct.rgb_head.image_decoder.head,
+    ):
+        gradients = [p.grad for p in module.parameters() if p.grad is not None]
+        assert gradients and all(torch.isfinite(g).all() for g in gradients)
+        assert sum(float(g.abs().sum()) for g in gradients) > 0
+
+
 def _tiny_action_owned_transport_config() -> NativeWorldModelConfig:
     return replace(
         _tiny_original_v7_rgb_config(),
