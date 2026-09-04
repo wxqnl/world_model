@@ -37,6 +37,6 @@ RGB L1、perceptual、gradient、motion 权重以及 policy action loss 保持�
 
 全量离线数据准备支持有界、多进程的窗口生成与统计：窗口记录、顺序、计数、source 权重和物理转换不变；总体矩的合并使用原 float64 均值/方差公式，存在机器精度级舍入差异。18 个来源的真实数据对照已验证窗口逐项相同，11,682 个训练窗口的统计最大相对差异约 2e-15。训练和 serving 仍读取同一份封存统计，不存在两套归一化坐标。
 
-所有来源的 future-candidate / policy 隔离均通过。早期画质与最终质量应分开报告，不因某一个阈值未达到就无证据增加新的结构、loss 或改动数据分布。
+上述诊断覆盖来源的 future-candidate / policy 隔离均通过。早期画质与最终质量应分开报告，不因某一个阈值未达到就无证据增加新的结构、loss 或改动数据分布。
 
 `scripts/tools/export_production_rgb_ab.py` 可对诊断快照导出按真实 K8 时间排序的 target / direct / transport / copy-last / no-op / wrong-action 面板与 GIF。诊断快照只用于评估，不能作为正式初始化。
