@@ -341,45 +341,60 @@ def main() -> None:
     if root.is_symlink():
         raise StreamingMetadataError("metadata output root cannot be a symlink")
 
-    # Only work dispatch changes; published rows retain the original final sort.
-    ordered_tasks = sorted(tasks, key=lambda task: (
-        task.source, task.payload, task.payload_row_start, task.task_id))
-    initargs = (profile, adapters, store_config, root, int(encoder_config.input_rgb_size))
-    if args.processes > 1:
-        pool = ProcessPoolExecutor(
-            max_workers=args.processes, mp_context=multiprocessing.get_context("spawn"),
-            initializer=_metadata_worker_init, initargs=initargs,
-        )
-    else:
-        _metadata_worker_init(*initargs)
-        pool = ThreadPoolExecutor(max_workers=args.workers)
-    rows = []
-    with pool:
+    if not args.episode_index.exists():
+        # Only work dispatch changes; published rows retain the original final sort.
+        ordered_tasks = sorted(tasks, key=lambda task: (
+            task.source, task.payload, task.payload_row_start, task.task_id))
+        initargs = (profile, adapters, store_config, root, int(encoder_config.input_rgb_size))
         if args.processes > 1:
-            groups = [list(group) for _key, group in groupby(
-                ordered_tasks, key=lambda task: (task.source, task.payload))]
-            grouped_results = pool.map(_metadata_worker_group, groups, chunksize=1)
-            results = (row for group in grouped_results for row in group)
+            pool = ProcessPoolExecutor(
+                max_workers=args.processes, mp_context=multiprocessing.get_context("spawn"),
+                initializer=_metadata_worker_init, initargs=initargs,
+            )
         else:
-            results = pool.map(_metadata_worker_prepare, ordered_tasks)
-        for row in results:
-            rows.append(row)
-            if len(rows) % 5000 == 0:
-                print(json.dumps({"event": "metadata_episodes", "completed": len(rows),
-                                  "total": len(tasks), "processes": args.processes}), flush=True)
-    rows.sort(key=lambda row: (str(row["source"]), str(row["episode_id"])))
-    _publish_jsonl(args.episode_index.absolute(), rows)
-    del rows
+            _metadata_worker_init(*initargs)
+            pool = ThreadPoolExecutor(max_workers=args.workers)
+        rows = []
+        with pool:
+            if args.processes > 1:
+                groups = [list(group) for _key, group in groupby(
+                    ordered_tasks, key=lambda task: (task.source, task.payload))]
+                grouped_results = pool.map(_metadata_worker_group, groups, chunksize=1)
+                results = (row for group in grouped_results for row in group)
+            else:
+                results = pool.map(_metadata_worker_prepare, ordered_tasks)
+            for row in results:
+                rows.append(row)
+                if len(rows) % 5000 == 0:
+                    print(json.dumps({"event": "metadata_episodes", "completed": len(rows),
+                                      "total": len(tasks), "processes": args.processes}), flush=True)
+        rows.sort(key=lambda row: (str(row["source"]), str(row["episode_id"])))
+        _publish_jsonl(args.episode_index.absolute(), rows)
+        del rows
     episodes = load_cache_episode_index(
         args.episode_index.absolute(),
         expected_sha256=sha256_file(args.episode_index.absolute()),
     )
+    expected_episodes = {
+        (task.source, task.episode_id): (
+            task.split, task.embodiment,
+            f"tasks/{task.task_id[:2]}/{task.task_id}/boundaries.safetensors",
+        ) for task in tasks
+    }
+    if len(episodes) != len(tasks) or len(expected_episodes) != len(tasks):
+        raise StreamingMetadataError("published episode index has different task coverage")
+    for episode in episodes:
+        if expected_episodes.get((episode.source, episode.episode_id)) != (
+            episode.split, episode.embodiment, episode.feature_shard
+        ):
+            raise StreamingMetadataError("published episode index task binding differs")
     window_rows = iter_window_index(
         episodes=episodes,
         cache_root=root,
         model_profile=model,
         model_profile_sha256=model_sha,
         data_profile=profile,
+        workers=args.processes,
     )
     window_count = _publish_jsonl(args.window_index.absolute(), window_rows)
     window_sha = sha256_file(args.window_index.absolute())
@@ -391,6 +406,7 @@ def main() -> None:
         window_index_sha256=window_sha,
         cache_root=root,
         minimum_scale=float(args.minimum_scale),
+        workers=args.processes,
     )
     _publish(
         args.grouped_normalization.absolute(),
@@ -435,7 +451,8 @@ def main() -> None:
         args.output_seal.absolute(),
         (json.dumps(seal, sort_keys=True, indent=2) + "\n").encode(),
     )
-    print(json.dumps(seal, sort_keys=True))
+    print(json.dumps({"event": "metadata_complete", "episodes": len(episodes),
+                      "windows": window_count, "seal": str(args.output_seal)}), flush=True)
 
 
 if __name__ == "__main__":

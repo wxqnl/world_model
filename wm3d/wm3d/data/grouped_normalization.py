@@ -8,6 +8,8 @@ data-profile source, embodiment, physical group, semantic and dimension.
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 from dataclasses import dataclass
 import json
 import math
@@ -18,6 +20,7 @@ import numpy as np
 from safetensors import safe_open
 import torch
 
+from .offline_parallel import iter_chunks, ordered_results
 from .episode_robot import (
     assemble_robot_window_from_prepared_episode,
     prepare_episode_robot_tensors,
@@ -140,6 +143,21 @@ class _RunningMoments:
         self.minimum = min(self.minimum, float(sample.min()))
         self.maximum = max(self.maximum, float(sample.max()))
 
+    def merge(self, other: "_RunningMoments") -> None:
+        """Population-moment merge; counts and observed values are unchanged."""
+        if other.count <= 0:
+            return
+        if self.count == 0:
+            self.count, self.mean, self.m2 = other.count, other.mean, other.m2
+        else:
+            total = self.count + other.count
+            delta = other.mean - self.mean
+            self.m2 += other.m2 + delta * delta * self.count * other.count / total
+            self.mean += delta * other.count / total
+            self.count = total
+        self.minimum = min(self.minimum, other.minimum)
+        self.maximum = max(self.maximum, other.maximum)
+
     @property
     def std(self) -> float:
         if self.count <= 0:
@@ -175,34 +193,7 @@ def _scale_floor(statistic: _RunningMoments, minimum_scale: float) -> float:
     return max(statistic.std, minimum_scale * reference)
 
 
-def build_grouped_normalization_artifact(
-    *,
-    data_profile: DataProfile,
-    model_profile: Mapping[str, Any],
-    model_profile_sha256: str,
-    window_index_path: Path,
-    window_index_sha256: str,
-    cache_root: Path,
-    minimum_scale: float = 1.0e-6,
-) -> dict[str, Any]:
-    """Compute mask-aware moments from exactly the sampled train windows.
-
-    Each source/group contributes only its declared supervision lane.  A
-    fine-command group is never used to invent coarse-effect statistics and a
-    coarse-effect group never invents fine-command statistics.  The artifact
-    is model-profile/window bound because the selected train windows and their
-    exact current-state/policy boundaries define the sampled distribution,
-    while the episode cache itself remains model independent.
-    """
-
-    if not np.isfinite(minimum_scale) or minimum_scale <= 0:
-        raise GroupedNormalizationError("minimum_scale must be finite and positive")
-    if canonical_sha256(model_profile) != model_profile_sha256:
-        raise GroupedNormalizationError("model profile digest does not match content")
-    index_path = Path(window_index_path).resolve(strict=True)
-    root = Path(cache_root).resolve(strict=True)
-    entries = iter_cache_index(index_path, expected_sha256=window_index_sha256)
-    train = (entry for entry in entries if entry.split == "train")
+def _accumulate_normalization(train, data_profile, model_profile, root):
     native = native_config_from_mapping(model_profile["model"])
     sampling = model_profile["sampling"]
     limits = GroupedRobotLimits(
@@ -412,6 +403,95 @@ def build_grouped_normalization_artifact(
                     moments.setdefault(key, _RunningMoments()).update(
                         state[state_mask[:, dimension], dimension]
                     )
+
+    return counts, moments, lane_by_group
+
+
+_NORMALIZATION_CONTEXT = None
+
+
+def _normalization_worker_init(data_profile, model_profile, root):
+    global _NORMALIZATION_CONTEXT
+    torch.set_num_threads(1)
+    _NORMALIZATION_CONTEXT = (data_profile, model_profile, root)
+
+
+def _normalization_worker_chunk(entries):
+    if _NORMALIZATION_CONTEXT is None:
+        raise GroupedNormalizationError("normalization worker is not initialized")
+    return _accumulate_normalization(entries, *_NORMALIZATION_CONTEXT)
+
+
+def _parallel_normalization(train, data_profile, model_profile, root, workers):
+    counts = {name: 0 for name in data_profile.source_order}
+    moments = {}
+    lanes = {}
+    next_log = 100000
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+        initializer=_normalization_worker_init,
+        initargs=(data_profile, model_profile, root),
+    ) as pool:
+        results = ordered_results(
+            pool, _normalization_worker_chunk, iter_chunks(train, 1024),
+            max_pending=workers * 2,
+        )
+        # Fixed chunk order makes the reduction independent of worker timing.
+        for chunk_counts, chunk_moments, chunk_lanes in results:
+            for source, count in chunk_counts.items():
+                counts[source] += count
+            for key, value in chunk_moments.items():
+                moments.setdefault(key, _RunningMoments()).merge(value)
+            for key, lane in chunk_lanes.items():
+                if lanes.setdefault(key, lane) != lane:
+                    raise GroupedNormalizationError("source/group supervision lane changed")
+            completed = sum(counts.values())
+            if completed >= next_log:
+                print(json.dumps({"event": "normalization_train_windows",
+                                  "completed": completed, "processes": workers}), flush=True)
+                next_log = (completed // 100000 + 1) * 100000
+    return counts, moments, lanes
+
+
+def build_grouped_normalization_artifact(
+    *,
+    data_profile: DataProfile,
+    model_profile: Mapping[str, Any],
+    model_profile_sha256: str,
+    window_index_path: Path,
+    window_index_sha256: str,
+    cache_root: Path,
+    minimum_scale: float = 1.0e-6,
+    workers: int = 1,
+) -> dict[str, Any]:
+    """Compute mask-aware moments from exactly the sampled train windows.
+
+    Each source/group contributes only its declared supervision lane.  A
+    fine-command group is never used to invent coarse-effect statistics and a
+    coarse-effect group never invents fine-command statistics.  The artifact
+    is model-profile/window bound because the selected train windows and their
+    exact current-state/policy boundaries define the sampled distribution,
+    while the episode cache itself remains model independent.
+    """
+
+    if not np.isfinite(minimum_scale) or minimum_scale <= 0:
+        raise GroupedNormalizationError("minimum_scale must be finite and positive")
+    if canonical_sha256(model_profile) != model_profile_sha256:
+        raise GroupedNormalizationError("model profile digest does not match content")
+    index_path = Path(window_index_path).resolve(strict=True)
+    root = Path(cache_root).resolve(strict=True)
+    entries = iter_cache_index(index_path, expected_sha256=window_index_sha256)
+    train = (entry for entry in entries if entry.split == "train")
+    if workers < 1:
+        raise GroupedNormalizationError("normalization workers must be positive")
+    if workers == 1:
+        counts, moments, lane_by_group = _accumulate_normalization(
+            train, data_profile, model_profile, root)
+    else:
+        counts, moments, lane_by_group = _parallel_normalization(
+            train, data_profile, model_profile, root, workers)
+    source_specs = _source_by_name(data_profile)
+    source_ids = {name: index for index, name in enumerate(data_profile.source_order)}
 
     missing_sources = sorted(name for name, count in counts.items() if count <= 0)
     if missing_sources:

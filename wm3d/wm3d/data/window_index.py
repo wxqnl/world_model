@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from .offline_parallel import iter_chunks, ordered_results
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -157,6 +160,26 @@ def plan_episode_windows(
     return tuple(rows)
 
 
+_WINDOW_CONTEXT = None
+
+
+def _window_worker_init(cache_root, model_profile, model_profile_sha256, data_profile):
+    global _WINDOW_CONTEXT
+    import torch
+    torch.set_num_threads(1)
+    _WINDOW_CONTEXT = dict(
+        cache_root=cache_root, model_profile=model_profile,
+        model_profile_sha256=model_profile_sha256, data_profile=data_profile,
+    )
+
+
+def _window_worker_chunk(episodes):
+    if _WINDOW_CONTEXT is None:
+        raise WindowIndexError("window worker is not initialized")
+    return [row for episode in episodes
+            for row in plan_episode_windows(episode=episode, **_WINDOW_CONTEXT)]
+
+
 def iter_window_index(
     *,
     episodes: Sequence[CacheEpisodeEntry],
@@ -164,24 +187,40 @@ def iter_window_index(
     model_profile: Mapping[str, Any],
     model_profile_sha256: str,
     data_profile: DataProfile,
+    workers: int = 1,
 ) -> Iterable[dict[str, Any]]:
-    """Keep episode/sample order while retaining only the current episode."""
+    """Preserve every episode/window decision and output order across workers."""
+    if workers < 1:
+        raise WindowIndexError("window workers must be positive")
+    ordered = sorted(episodes, key=lambda item: (item.source, item.episode_id))
     identities: set[str] = set()
-    for episode in sorted(episodes, key=lambda item: (item.source, item.episode_id)):
-        for row in plan_episode_windows(
-            episode=episode,
-            cache_root=cache_root,
-            model_profile=model_profile,
-            model_profile_sha256=model_profile_sha256,
-            data_profile=data_profile,
-        ):
+    def checked(rows):
+        for row in rows:
             identity = str(row["sample_id"])
             if identity in identities:
                 raise WindowIndexError("window index produced duplicate sample identities")
             identities.add(identity)
             yield row
+    if workers == 1:
+        for episode in ordered:
+            yield from checked(plan_episode_windows(
+                episode=episode, cache_root=cache_root, model_profile=model_profile,
+                model_profile_sha256=model_profile_sha256, data_profile=data_profile,
+            ))
+    else:
+        with ProcessPoolExecutor(
+            max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+            initializer=_window_worker_init,
+            initargs=(cache_root, model_profile, model_profile_sha256, data_profile),
+        ) as pool:
+            for rows in ordered_results(
+                pool, _window_worker_chunk, iter_chunks(ordered, 8),
+                max_pending=workers * 2,
+            ):
+                yield from checked(rows)
     if not identities:
         raise WindowIndexError("model sampling profile produced no valid cache windows")
+
 
 
 def plan_window_index(

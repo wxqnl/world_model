@@ -33,6 +33,10 @@ RGB L1、perceptual、gradient、motion 权重以及 policy action loss 保持�
 
 384 次全尺寸真实批次拟合中，Bridge 的未来帧间变化保持率从 transport 的 18.4% 提高到 direct 的 51.7%，方向余弦从 0.091 提高到 0.510，运动区 L1 从 0.1773 降到 0.0704。Droid 的运动区误差和方向也改善，但变化幅度仍弱；MG 的 direct 结果仍不如 transport。不能只选 Bridge 宣布所有来源通过，更不能将拟合样本当作 held-out 泛化结果。
 
+生产双机资格已 fresh 完成 20 步，全部关键梯度有限非零，16 个模型分片与 16 个 rank state 完整且双机读取通过；最后 10 步约 16.8 秒/步。这个检查证明生产调用和运行合同成立，不是最终画质验收。
+
+全量离线数据准备支持有界、多进程的窗口生成与统计：窗口记录、顺序、计数、source 权重和物理转换不变；总体矩的合并使用原 float64 均值/方差公式，存在机器精度级舍入差异。18 个来源的真实数据对照已验证窗口逐项相同，11,682 个训练窗口的统计最大相对差异约 2e-15。训练和 serving 仍读取同一份封存统计，不存在两套归一化坐标。
+
 所有来源的 future-candidate / policy 隔离均通过。早期画质与最终质量应分开报告，不因某一个阈值未达到就无证据增加新的结构、loss 或改动数据分布。
 
 `scripts/tools/export_production_rgb_ab.py` 可对诊断快照导出按真实 K8 时间排序的 target / direct / transport / copy-last / no-op / wrong-action 面板与 GIF。诊断快照只用于评估，不能作为正式初始化。
