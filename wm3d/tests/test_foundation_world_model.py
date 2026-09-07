@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 from torch import nn
 
@@ -12,6 +13,7 @@ from wm3d.models.foundation_world_model import (
     Native3DRolloutHead,
     Native3DStateConditioner,
     ResidualContextFusion,
+    WSABackendAdapter,
 )
 
 
@@ -174,6 +176,76 @@ def test_native_3d_rollout_decodes_all_horizons_with_one_sampled_target() -> Non
     assert bool((shared.grad != 0).any())
     assert action.grad is not None
     assert bool((action.grad != 0).any())
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_world_sampler_keeps_known_action_clean_and_restores_backend(fail: bool) -> None:
+    # A protocol spy checks the production adapter, not learned video quality.
+    # Real checkpoint/sample quality is measured by foundation-demo separately.
+    seen = []
+
+    class Sampler(nn.Module):
+        def _predict_joint_noise(self, **kwargs):
+            seen.append(kwargs)
+            if fail:
+                raise RuntimeError("sampling failure")
+            return torch.zeros(1), torch.zeros(1)
+
+        def infer_joint(self, **kwargs):
+            assert kwargs["action"] is None
+            assert kwargs["test_action_with_infer_action"] is False
+            for time in (1000.0, 500.0, 50.0):
+                self._predict_joint_noise(
+                    latents_action=torch.randn(1, 4, 6),
+                    timestep_action=torch.tensor([time]),
+                    timestep_video=torch.tensor([time]),
+                    gt_action=None,
+                )
+            return {"video": ["frame"], "action": torch.ones(4, 6)}
+
+    adapter = WSABackendAdapter.__new__(WSABackendAdapter)
+    nn.Module.__init__(adapter)
+    adapter.wsa_model = Sampler()
+    adapter.action_time = ActionTimeConditioner(hidden_dim=12, fourier_dim=8)
+    adapter.native_3d_state = Native3DStateConditioner(
+        token_dim=8, hidden_dim=12, num_views=3, tokens_per_view=4
+    )
+    adapter._active_time_update = None
+    adapter._active_native_3d_update = None
+    candidate = torch.arange(24, dtype=torch.float32).reshape(1, 4, 6)
+    mask = torch.ones_like(candidate, dtype=torch.bool)
+    mask[..., -1] = False
+    args = dict(
+        input_image=torch.zeros(1, 3, 32, 32),
+        context=torch.zeros(1, 2, 32),
+        context_mask=torch.ones(1, 2, dtype=torch.bool),
+        proprio=torch.zeros(1, 4),
+        current_native_3d=torch.zeros(1, 3, 4, 8),
+        current_native_3d_view_mask=torch.ones(1, 3, dtype=torch.bool),
+        factual_action=candidate,
+        action_time_s=torch.arange(4, dtype=torch.float32)[None, :, None]
+        .mul(0.05).expand_as(candidate),
+        action_element_mask=mask,
+        num_video_frames=9,
+        num_inference_steps=3,
+        seed=7,
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="sampling failure"):
+            adapter.infer_world(**args)
+    else:
+        result = adapter.infer_world(**args)
+        assert "action" not in result
+        assert result["conditioning"]["mode"] == "action_dit_clean_candidate_t0"
+        assert result["conditioning"]["conditioned_steps"] == 3
+    assert len(seen) == (1 if fail else 3)
+    for call in seen:
+        assert torch.equal(call["latents_action"], candidate.masked_fill(~mask, 0))
+        assert torch.equal(call["timestep_action"], torch.zeros(1))
+        assert call["gt_action"] is None
+    assert "_predict_joint_noise" not in vars(adapter.wsa_model)
+    assert adapter._active_time_update is None
+    assert adapter._active_native_3d_update is None
 
 
 class _Backend(nn.Module):

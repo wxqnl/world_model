@@ -973,9 +973,10 @@ class WSABackendAdapter(nn.Module):
         """Sample video conditional on a candidate, not a new policy action.
 
         Released WSA-Large ignores video_expert's optional clean action input.
-        Clamp its actual ActionDiT input to the candidate's flow-matching
-        trajectory instead. Reuse the official video sampler and shared noise.
-        The clamped branch is world inference only; infer_action stays untouched.
+        Keep the actual ActionDiT input clean at action timestep zero throughout
+        video denoising. Known-action forward dynamics is not joint action/video
+        sampling: noising the known candidate weakens its early conditioning.
+        Reuse the official video sampler; infer_action stays untouched.
         """
 
         if (
@@ -1009,19 +1010,19 @@ class WSABackendAdapter(nn.Module):
         )
         original_predict = self.wsa_model._predict_joint_noise
         had_override = "_predict_joint_noise" in vars(self.wsa_model)
-        candidate_noise = None
         conditioned_steps = 0
 
         def predict_candidate(**kwargs: Any) -> Any:
-            nonlocal candidate_noise, conditioned_steps
+            nonlocal conditioned_steps
             latents = kwargs["latents_action"]
-            if candidate_noise is None:
-                candidate_noise = latents.detach().clone()
-            candidate = factual_action.to(device=latents.device, dtype=latents.dtype)
-            # Preserve noise on padded coordinates, as in upstream training.
-            kwargs["latents_action"] = self.wsa_model.infer_action_scheduler.add_noise(
-                candidate, candidate_noise, kwargs["timestep_action"]
+            # WSA trains video/action noise levels independently. Conditional
+            # forward dynamics fixes the known modality at noise level zero;
+            # only the unknown future video is denoised. Padded coordinates
+            # are also clean zeros, matching the masked training action at t=0.
+            kwargs["latents_action"] = factual_action.to(
+                device=latents.device, dtype=latents.dtype
             )
+            kwargs["timestep_action"] = torch.zeros_like(kwargs["timestep_action"])
             kwargs["gt_action"] = None
             conditioned_steps += 1
             return original_predict(**kwargs)
@@ -1057,7 +1058,7 @@ class WSABackendAdapter(nn.Module):
         return {
             "video": result["video"],
             "conditioning": {
-                "mode": "action_dit_flow_matching_clamp",
+                "mode": "action_dit_clean_candidate_t0",
                 "conditioned_steps": conditioned_steps,
             },
         }

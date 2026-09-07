@@ -42,8 +42,9 @@ rollout A/B，不能在首个版本里盲目扩大。
 - 视频沿用 WSA-Large 的三视角画布和完整 K8 未来监督；不引入 copy-last、P256 teacher forcing
   或另一套 RGB decoder。
 - 最后观测三视角只作为 `P144` current native state，经 zero-gated、逐视角 projection 注入
-  Future3D query。gate 初始严格为零，因此加载发布权重时 WSA 原行为逐元素不变；缺失视角始终
-  mask 为零，视角之间不池化。
+  Future3D query。gate 初始严格为零，只保证这个新增支路初始不扰动 Future3D 输入；动作和
+  状态边界投影因尺寸变化而重置，整模不能宣称与原 WSA 等价。缺失视角始终 mask 为零，
+  视角之间不池化。
 - native-3D rollout 是单一轻量 causal recurrence。它读取 shared Future3D、当前 P144 状态和
   同一个 source-native future action/time/mask；每个 world interval 内的 fine command 不插值，
   按真实时间编码后聚合。rollout 只能写 world 分支，不能写回 ActionDiT policy。
@@ -188,8 +189,11 @@ FOUNDATION_PYTHON_BIN=.venv-foundation/bin/python \
 torchrun 可执行文件。
 
 predict_action 只根据观测、任务、状态和历史预测动作。predict_world 则根据给定候选动作
-预测视频：每个采样步使用 WSA 原 action scheduler，将候选动作与同一份固定噪声混合后送入
-ActionDiT，视频仍走原 WSA sampler。该分支的 action 输出不是 policy 预测，不对外返回。
+预测视频：每个采样步始终把 clean、masked 候选送入 ActionDiT，并固定 action noise timestep
+为 0；仅未知的未来视频走原 WSA sampler。已知动作不能再随视频加噪。WSA 的训练本来就
+独立采样两个噪声级别；这种条件推理与 [UWM 的 forward-dynamics 定义](https://arxiv.org/html/2504.02792v1#S3.SS2)
+一致。这里的噪声 timestep 不是机器人真实 action timestamp。该分支的 action 输出不作为
+policy 预测返回。
 两路调用结束后会恢复原采样函数，导出器另验 policy 输出逐元素不变。
 
 发布的 WSA-Large 关闭了 VideoDiT 的 action_conditioned 选项。旧导出器仅向那个未启用的
@@ -201,10 +205,24 @@ ActionDiT，视频仍走原 WSA sampler。该分支的 action 输出不是 polic
 预测运动。所有 GIF 共用同一调色板，各帧另存为无损 PNG；定量分析应使用 PNG 或
 receipt 中量化前的指标。GIF 播放速度只用于展示，真实动作时间仍由原数据时间戳决定。
 
-本次 q20 实测（seed 7340、sample 139、20 次采样、两个有效视角）：修正后的候选动作
-RGB 响应 RMS 为 0.00217，旧调用为 0；独立 policy 前后差异严格为 0。未来帧运动幅度保持率
-约 50.1%，方向一致性约 0.017，仍不足以证明动作方向或任务能力。修复没有改变参数量或训练
-objective。全仓检查 608 项通过、4 项按环境条件跳过。
+此前 q20 的逐步加噪候选对照（seed 7340、sample 139、20 次采样、两个有效视角）：
+RGB 响应 RMS 为 0.00217，未启用入口的旧调用为 0；独立 policy 前后差异为 0。未来帧运动
+幅度保持率约 50.1%，方向一致性约 0.017。这些是旧采样方式的结果，不是 clean-action
+修复后的成绩，也不足以证明动作方向或任务能力。此次仅修正推理条件，不改参数或训练
+objective。全仓检查 610 项通过、4 项按环境条件跳过。
+
+q20 的 global batch 为 1、累积为 1，合计仅 20 次训练样本曝光。实际加载审计确认视频、
+ActionDiT、Future3D 主干没有遗漏；尺寸不兼容而重置的张量仅有 action_encoder.weight、
+action head.weight/bias 和 proprio_encoder.weight。它们与新增机器人条件模块需要在当前
+物理语义和归一化坐标上适配。不能把 q20 等同于已适配好的 WSA 官方模型；也不能仅凭训练步数
+就排除残余实现问题。是否学到动作跟随，应分别检查条件视频和独立 policy 的真实样本结果。
+
+同 q20、同 sample 139/seed 7340 的 clean-action 对照已完成：视频 factual/zero 响应 RMS
+从 0.00217 升至 0.02303，但方向一致性从 0.0171 变为 0.0121，帧间变化保持率从 50.1%
+变为 48.0%。factual L1 为 0.119612，zero L1 为 0.119583，没有正确动作优于 zero 的证据。
+独立 policy MAE 为 0.82532，而该样本的归一化常量零基线为 0.63345；candidate 对 policy
+差异仍为 0。这里只确认已知动作条件不再被采样器人为加噪削弱，不能宣称动作预测质量已经解决。
+单个高运动样本不代表全部 source；正式长训之前仍需短适配与多样本动作/视频趋势验收。
 
 ## 已完成的实现证据
 
