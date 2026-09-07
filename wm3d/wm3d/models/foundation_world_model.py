@@ -286,7 +286,8 @@ class GroupedRobotConditioner(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         count = element_mask.sum(dim=-1)
         valid = count > 0
-        mean = (time_s.float() * element_mask).sum(dim=-1) / count.clamp_min(1)
+        masked_time = time_s.float().masked_fill(~element_mask, 0.0)
+        mean = masked_time.sum(dim=-1) / count.clamp_min(1)
         spread = torch.where(
             element_mask,
             (time_s.float() - mean[..., None]).abs(),
@@ -414,13 +415,13 @@ class ActionTimeConditioner(nn.Module):
         command_time, valid = GroupedRobotConditioner._valid_command_time(
             time_s, mask
         )
-        if not bool(valid.all()):
-            raise FoundationModelError("WSA action horizon cannot contain padded commands")
-        if not bool((command_time >= 0).all()):
+        if not bool(valid.any(dim=-1).all()):
+            raise FoundationModelError("WSA action horizon needs a valid command per sample")
+        if not bool((command_time[valid] >= 0).all()):
             raise FoundationModelError("future action command time must be non-negative")
         phase = command_time[..., None].float() * self.frequencies.float()
         features = torch.cat((phase.sin(), phase.cos()), dim=-1)
-        return self.mlp(features)
+        return self.mlp(features).masked_fill(~valid[..., None], 0.0)
 
 
 class BoundVGGTTeacher(nn.Module):
@@ -1444,7 +1445,12 @@ def _load_upstream_symbols(source_root: Path | str) -> tuple[Any, Any]:
     )
     from lerobot.policies.WSA_Large.configuration_wsa_large import WSALargeConfig
     from lerobot.policies.WSA_Large.modeling_wsa_large import WSALargePolicy
+    from lerobot.policies.WSA_Large.core.models.wan22 import wsa_large
 
+    if not callable(getattr(wsa_large, "masked_action_time_mean", None)):
+        raise FoundationModelError(
+            "WSA action time-padding loss fix is missing; run foundation-env"
+        )
     return WSALargeConfig, WSALargePolicy
 
 

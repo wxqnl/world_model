@@ -140,6 +140,16 @@ def test_foundation_bridge_keeps_sparse_commands_in_their_world_intervals() -> N
     # The command immediately after a hole still belongs to the next interval.
     assert result["action_time_s"][0, 3 * 4, 0] == expected_time[0, 3 * 4, 0]
 
+    # Exercise the next production boundary, not only the packing helper.
+    from wm3d.models.foundation_world_model import ActionTimeConditioner
+
+    conditioner = ActionTimeConditioner(hidden_dim=12, fourier_dim=8)
+    conditioner.mlp[-1].weight.data.fill_(0.1)
+    update = conditioner(result["action_time_s"], result["action_element_mask"])
+    assert torch.isfinite(update).all()
+    assert update[result["action_is_pad"]].count_nonzero() == 0
+    assert update[~result["action_is_pad"]].count_nonzero() > 0
+
 
 def test_foundation_bridge_rejects_cross_source_microbatch() -> None:
     batch = _batch()

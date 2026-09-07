@@ -26,6 +26,18 @@ WSA_SOURCE_ROOT=${WM3D_WSA_SOURCE_ROOT:-/data/Minko/third_party/WSA}
   exit 2
 }
 
+# Preserve sparse source-native command slots without supervising padding.
+# Keep this small upstream correction in the WM3D delivery, not as a local edit.
+WSA_PATCH="${ROOT}/environments/wsa_action_time_padding.patch"
+if git -C "${WSA_SOURCE_ROOT}" apply --unidiff-zero --reverse --check "${WSA_PATCH}" 2>/dev/null; then
+  :
+elif git -C "${WSA_SOURCE_ROOT}" apply --unidiff-zero --check "${WSA_PATCH}"; then
+  git -C "${WSA_SOURCE_ROOT}" apply --unidiff-zero "${WSA_PATCH}"
+else
+  echo "WSA action time-padding fix does not match this upstream source" >&2
+  exit 2
+fi
+
 VERIFY_ONLY=0
 if [[ -e "${RECEIPT}" || -L "${RECEIPT}" ]]; then
   [[ -f "${RECEIPT}" && ! -L "${RECEIPT}" ]] || {

@@ -71,7 +71,7 @@ rollout A/B，不能在首个版本里盲目扩大。
   由 mask 排除。有效动作值、真实时间戳、所属区间和数据权重不变，不插值、不补造命令。
   WSA action loss 忽略空槽；K8 rollout 按每个区间的有效命令数聚合，空槽不稀释动作更新。
 - action 时间等于 world interval 起点加该 interval 内的真实 fine-command offset。训练和推理
-  使用同一个 `ActionTimeConditioner`。
+  使用同一个 `ActionTimeConditioner`；时间空槽的编码输出与梯度严格为零。
 - 当前状态为 3 组 × 10 维；offset、scale、semantic、embodiment 与 action history 通过
   zero-gated 条件融合进入 WSA 文本上下文，不传 source ID。
 - WSA-Large 发布权重的 action 输入/输出和 proprio 边界原为 24 维。V10 改为 42/30 维，因此
@@ -110,7 +110,10 @@ WM3D_WSA_SOURCE_ROOT="$WSA_SOURCE" ./run_wm3d.sh foundation-env
 ```
 
 `foundation-env` 会复用已验证的 CUDA/PyTorch 基础环境，只在 `.venv-foundation` 安装固定的
-WSA 增量依赖。第一次执行创建 receipt，之后执行只验证，不覆盖已有 receipt。完成后可运行：
+WSA 增量依赖，并应用仓库内的动作时间空槽修正：原上游只在 action MSE 中屏蔽维度，
+此修正让时间空槽也不参与 loss 分子、分母和分维统计，不改变已有损失系数。
+模型加载会拒绝未应用该修正的上游源码。环境 receipt 首次创建后只验证、不覆盖；
+环境准备必须在训练启动前执行。完成后可运行：
 
 ```bash
 FOUNDATION_PYTHON_BIN=.venv-foundation/bin/python \

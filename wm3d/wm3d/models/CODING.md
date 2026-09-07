@@ -6,6 +6,10 @@
   per-view P144 state into Future3D and causally read K8xP64 state deltas from the shared tokens;
   it must not expand or replace the MoT owners.
 - WSA-Large does not use Qwen3-VL. Do not add WSA-Base/Qwen components to the foundation profile.
+- Source-native future commands keep their K-interval slots and masks. ActionTimeConditioner
+  must return exact zero on empty slots, including after training; masked time values cannot
+  affect the command mean. The delivered WSA action MSE averages only valid times/dimensions.
+  Native3D rollout likewise divides by the valid command count within each interval.
 - Keep the foundation token hierarchy explicit: P144 joint current state, K8xP64 temporal rollout,
   and the released WSA P1296 final output. Do not globally increase `P` without an isolated
   quality/throughput comparison.

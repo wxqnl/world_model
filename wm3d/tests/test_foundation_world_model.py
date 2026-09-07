@@ -58,6 +58,53 @@ def test_action_time_conditioner_preserves_zero_init_and_receives_gradient() -> 
     assert bool((conditioner.mlp[-1].weight.grad != 0).any())
 
 
+def test_action_time_conditioner_ignores_masked_slots_after_learning() -> None:
+    conditioner = ActionTimeConditioner(hidden_dim=12, fourier_dim=8)
+    conditioner.mlp[-1].weight.data.fill_(0.1)
+    times = torch.arange(4, dtype=torch.float32)[None, :, None].mul(0.05)
+    times = times.expand(1, -1, 3).clone().requires_grad_()
+    mask = torch.ones_like(times, dtype=torch.bool)
+    mask[:, 1] = False
+    mask[..., -1] = False
+    poisoned = times.masked_fill(~mask, float("nan"))
+    update = conditioner(poisoned, mask)
+    valid = mask.any(dim=-1)
+    expected = conditioner(times[:, valid[0]], mask[:, valid[0]])
+    torch.testing.assert_close(update[:, valid[0]], expected)
+    assert update[~valid].count_nonzero() == 0
+    update.square().sum().backward()
+    assert torch.isfinite(times.grad).all()
+    assert times.grad[~mask].count_nonzero() == 0
+    assert times.grad[mask].count_nonzero() > 0
+
+
+def test_upstream_action_loss_excludes_time_padding_without_rescaling_samples() -> None:
+    import os
+    from pathlib import Path
+
+    from wm3d.models.foundation_world_model import _load_upstream_symbols
+
+    source = Path(os.environ.get("WM3D_WSA_SOURCE_ROOT", "/data/Minko/third_party/WSA"))
+    if not source.is_dir():
+        pytest.skip("official WSA source is not installed")
+    _load_upstream_symbols(source)
+    from lerobot.policies.WSA_Large.core.models.wan22.wsa_large import (
+        masked_action_time_mean,
+    )
+
+    prediction = torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+    prediction = prediction.clone().requires_grad_()
+    token_loss = prediction.square().mean(dim=-1)
+    pad = torch.tensor([[False, True, False, False], [True, False, True, False]])
+    actual = masked_action_time_mean(token_loss, pad)
+    expected = torch.stack([token_loss[i, ~pad[i]].mean() for i in range(2)])
+    torch.testing.assert_close(actual, expected)
+    assert torch.equal(masked_action_time_mean(token_loss, None), token_loss.mean(dim=1))
+    actual.mean().backward()
+    assert prediction.grad[pad].count_nonzero() == 0
+    assert prediction.grad[~pad].count_nonzero() > 0
+
+
 def test_grouped_robot_conditioner_preserves_semantics_and_history_mask() -> None:
     config = _config()
     module = GroupedRobotConditioner(config)

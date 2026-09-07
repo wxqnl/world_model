@@ -1,0 +1,23 @@
+diff --git a/src/lerobot/policies/WSA_Large/core/models/wan22/wsa_large.py b/src/lerobot/policies/WSA_Large/core/models/wan22/wsa_large.py
+--- a/src/lerobot/policies/WSA_Large/core/models/wan22/wsa_large.py
++++ b/src/lerobot/policies/WSA_Large/core/models/wan22/wsa_large.py
+@@ -21,0 +22,11 @@ logger = get_logger(__name__)
++def masked_action_time_mean(
++    loss_token: torch.Tensor, action_is_pad: torch.Tensor | None
++) -> torch.Tensor:
++    """Average only real command slots, without changing sample weighting."""
++    if action_is_pad is None:
++        return loss_token.mean(dim=1)
++    pad = action_is_pad.to(device=loss_token.device, dtype=torch.bool)
++    valid_count = (~pad).sum(dim=1).clamp_min(1).to(loss_token.dtype)
++    return loss_token.masked_fill(pad, 0.0).sum(dim=1) / valid_count
++
++
+@@ -975,0 +987 @@ class WSALarge(torch.nn.Module):
++        action_is_pad = inputs.get("action_is_pad", None)
+@@ -1126 +1138 @@ class WSALarge(torch.nn.Module):
+-        action_loss_per_sample = action_loss_token.mean(dim=1)
++        action_loss_per_sample = masked_action_time_mean(action_loss_token, action_is_pad)
+@@ -1178,0 +1191,2 @@ class WSALarge(torch.nn.Module):
++        if action_is_pad is not None:
++            dim_weight = dim_weight.masked_fill(action_is_pad, 0.0)
