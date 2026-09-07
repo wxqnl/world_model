@@ -16,8 +16,12 @@
   do not progressively noise a known command or return it as policy output. WSA trains the
   two noise levels independently. Its released VideoDiT ignores the optional clean action
   argument; passing that argument alone is not conditioning.
-- Keep policy prediction in predict_action, independent of predict_world. Never expose the
-  action result from a candidate-clamped world pass as a policy prediction.
+- The current foundation phase trains video/action/3D jointly. Default evaluation uses
+  predict_joint from observation, without future labels, and separately measures predict_action.
+  Candidate intervention is an optional later-phase diagnostic, not the primary quality gate.
+- Keep policy prediction in predict_action, independent of predict_world. Joint generation may
+  return its generated action, explicitly distinguished from the independent policy. Never expose
+  the action result from a candidate-clamped world pass as a policy prediction.
 - Keep policy state action-free and factual world refinement explicitly action-conditioned.
 - Preserve continuous time, masks, grouped embodiment identity, and explicit RGB/depth/point/pose
   heads.

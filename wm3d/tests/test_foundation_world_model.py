@@ -179,7 +179,10 @@ def test_native_3d_rollout_decodes_all_horizons_with_one_sampled_target() -> Non
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_world_sampler_keeps_known_action_clean_and_restores_backend(fail: bool) -> None:
+@pytest.mark.parametrize("known", [False, True])
+def test_world_sampler_distinguishes_joint_and_known_action(
+    fail: bool, known: bool
+) -> None:
     # A protocol spy checks the production adapter, not learned video quality.
     # Real checkpoint/sample quality is measured by foundation-demo separately.
     seen = []
@@ -222,7 +225,7 @@ def test_world_sampler_keeps_known_action_clean_and_restores_backend(fail: bool)
         proprio=torch.zeros(1, 4),
         current_native_3d=torch.zeros(1, 3, 4, 8),
         current_native_3d_view_mask=torch.ones(1, 3, dtype=torch.bool),
-        factual_action=candidate,
+        factual_action=candidate if known else None,
         action_time_s=torch.arange(4, dtype=torch.float32)[None, :, None]
         .mul(0.05).expand_as(candidate),
         action_element_mask=mask,
@@ -236,12 +239,21 @@ def test_world_sampler_keeps_known_action_clean_and_restores_backend(fail: bool)
     else:
         result = adapter.infer_world(**args)
         assert "action" not in result
-        assert result["conditioning"]["mode"] == "action_dit_clean_candidate_t0"
-        assert result["conditioning"]["conditioned_steps"] == 3
+        if known:
+            assert "action_normalized" not in result
+            assert result["conditioning"]["mode"] == "action_dit_clean_candidate_t0"
+            assert result["conditioning"]["conditioned_steps"] == 3
+        else:
+            assert result["conditioning"]["mode"] == "joint_from_observation_no_candidate"
+            assert torch.equal(result["action_normalized"], torch.ones(1, 4, 6))
     assert len(seen) == (1 if fail else 3)
     for call in seen:
-        assert torch.equal(call["latents_action"], candidate.masked_fill(~mask, 0))
-        assert torch.equal(call["timestep_action"], torch.zeros(1))
+        if known:
+            assert torch.equal(call["latents_action"], candidate.masked_fill(~mask, 0))
+            assert torch.equal(call["timestep_action"], torch.zeros(1))
+        else:
+            assert call["timestep_action"].item() > 0
+            assert not torch.equal(call["latents_action"], candidate.masked_fill(~mask, 0))
         assert call["gt_action"] is None
     assert "_predict_joint_noise" not in vars(adapter.wsa_model)
     assert adapter._active_time_update is None
@@ -286,12 +298,13 @@ class _Backend(nn.Module):
 
     def infer_world(self, **kwargs):
         self.sample = kwargs
-        return {
+        result = {
             "video": [torch.tensor(index) for index in range(kwargs["num_video_frames"])],
-            "action": torch.zeros(
-                kwargs["action_time_s"].shape[1:], dtype=torch.float32
-            ),
+            "conditioning": {"mode": "joint" if kwargs["factual_action"] is None else "candidate"},
         }
+        if kwargs["factual_action"] is None:
+            result["action_normalized"] = torch.full(kwargs["action_time_s"].shape, 0.5)
+        return result
 
 
 def test_foundation_model_keeps_wsa_context_and_robot_extensions_bounded() -> None:
@@ -398,6 +411,19 @@ def test_foundation_action_serving_reuses_training_context_and_denormalizes() ->
     assert result["action_physical"].shape == (1, 8, 2, 3)
     assert torch.equal(result["action_physical"][..., 0, :], torch.full((1, 8, 3), 2.0))
     assert torch.equal(result["action_physical"][..., 1, :], torch.zeros(1, 8, 3))
+    # Joint prediction also works with no future action or target video supplied.
+    observed = dict(batch, video=batch["video"][:, :, :1])
+    joint = model.predict_joint(observed, num_inference_steps=4, seed=7)
+    assert backend.sample["factual_action"] is None
+    assert backend.sample["input_image"].shape == (1, 3, 48, 32)
+    assert len(joint["video"]) == config.K + 1
+    assert torch.equal(joint["action_physical"], result["action_physical"])
+    poisoned = dict(batch, action=torch.full((1, 8, 6), float("nan")))
+    poisoned["video"] = batch["video"].clone()
+    poisoned["video"][:, :, 1:] = float("nan")
+    changed = model.predict_joint(poisoned, num_inference_steps=4, seed=7)
+    assert torch.equal(changed["action_normalized"], joint["action_normalized"])
+    assert backend.sample["factual_action"] is None
 
 
 def test_foundation_world_serving_separates_policy_from_candidate() -> None:

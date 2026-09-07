@@ -20,7 +20,7 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
     --output <文本上下文目录>
   ./run_wm3d.sh foundation-preflight <torchrun 参数...> -- --runtime <runtime.yaml>
   ./run_wm3d.sh foundation-train <torchrun 参数...> -- <训练参数...>
-  ./run_wm3d.sh foundation-demo --runtime <runtime.yaml> --checkpoint <step目录> --output <新目录>
+  ./run_wm3d.sh foundation-demo --runtime <runtime.yaml> --checkpoint <step目录> --output <新目录> [--mode joint|candidate]
   ./run_wm3d.sh lock-resolve <resolve_source_lock.py 参数...>
   ./run_wm3d.sh download <download_sources.py 参数...>
   ./run_wm3d.sh agibot-existing-check --snapshot-root <已下载的 AgiBotWorld2026 目录>

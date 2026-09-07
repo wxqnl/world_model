@@ -1,9 +1,50 @@
 """Regression for demo measurements, independent of model quality claims."""
 
+import sys
 import numpy as np
+import torch
 from PIL import Image
 
-from scripts.eval_foundation_joint_demo import _save_outputs, _temporal_metrics
+from scripts.eval_foundation_joint_demo import (
+    _action_metrics, _observation_inputs, _save_outputs, _temporal_metrics, parse_args
+)
+
+
+def test_demo_defaults_to_joint_and_strips_future_labels(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "foundation-demo", "--runtime", "runtime.yaml", "--checkpoint", "step_00000020",
+        "--output", "unused",
+    ])
+    assert parse_args().mode == "joint"
+    batch = {
+        "video": torch.randn(1, 3, 9, 12, 8),
+        "action": torch.full((1, 4, 6), float("nan")),
+        "action_time_s": torch.arange(4)[None, :, None].expand(1, -1, 6),
+        "action_element_mask": torch.ones(1, 4, 6, dtype=torch.bool),
+        "vggt_current_tokens": torch.randn(1, 3, 4, 8),
+        "vggt_future_tokens": torch.tensor(float("nan")),
+        "vggt_rollout_target_tokens": torch.tensor(float("nan")),
+        "future_3d_images": torch.tensor(float("nan")),
+    }
+    inputs = _observation_inputs(batch)
+    assert "action" not in inputs
+    assert inputs["video"].shape[2] == 1
+    assert not any("future" in key or "target" in key for key in inputs)
+    assert inputs["action_time_s"] is batch["action_time_s"]
+
+
+def test_action_metrics_use_masks_and_report_zero_and_physical_errors():
+    batch = {
+        "action": torch.tensor([[[1., 2., 0.], [3., 4., 0.]]]),
+        "action_element_mask": torch.tensor([[[True, True, False], [True, True, False]]]),
+        "action_normalization_scale": torch.tensor([[[.1, .2, 1.]]]),
+    }
+    metrics = _action_metrics("policy", torch.zeros(1, 2, 3), batch)
+    assert metrics["policy_action_normalized_mae"] == 2.5
+    assert metrics["policy_action_zero_baseline_mae"] == 2.5
+    assert metrics["policy_action_query_mae"] == [1.5, 3.5]
+    assert np.allclose(metrics["policy_action_physical_mae_by_dim"][:2], [.2, .6])
+    assert metrics["policy_action_physical_mae_by_dim"][2] is None
 
 
 def test_demo_motion_excludes_observation_reconstruction_jump():

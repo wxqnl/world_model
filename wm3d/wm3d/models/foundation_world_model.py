@@ -963,15 +963,18 @@ class WSABackendAdapter(nn.Module):
         proprio: torch.Tensor,
         current_native_3d: torch.Tensor,
         current_native_3d_view_mask: torch.Tensor,
-        factual_action: torch.Tensor,
+        factual_action: torch.Tensor | None,
         action_time_s: torch.Tensor,
         action_element_mask: torch.Tensor,
         num_video_frames: int,
         num_inference_steps: int,
         seed: int | None,
     ) -> Mapping[str, Any]:
-        """Sample video conditional on a candidate, not a new policy action.
+        """Use official joint sampling, optionally condition on a known candidate.
 
+        With factual_action=None, both video and action are generated from noise.
+        No candidate or future target is supplied. With a known candidate, this
+        is world inference only, and its action output must not be returned.
         Released WSA-Large ignores video_expert's optional clean action input.
         Keep the actual ActionDiT input clean at action timestep zero throughout
         video denoising. Known-action forward dynamics is not joint action/video
@@ -988,8 +991,8 @@ class WSABackendAdapter(nn.Module):
             raise FoundationModelError(
                 "foundation joint inference currently requires batch size one"
             )
-        if factual_action.shape != action_time_s.shape or (
-            action_time_s.shape != action_element_mask.shape
+        if action_time_s.shape != action_element_mask.shape or (
+            factual_action is not None and factual_action.shape != action_time_s.shape
         ):
             raise FoundationModelError(
                 "joint action, time, and element-mask shapes disagree"
@@ -1001,9 +1004,10 @@ class WSABackendAdapter(nn.Module):
         if proprio.ndim != 2 or proprio.shape[0] != 1:
             raise FoundationModelError("joint proprio must resolve to [1,D]")
         mask = action_element_mask.bool()
-        factual_action = factual_action.masked_fill(~mask, 0.0)
-        if not bool(torch.isfinite(factual_action).all()):
-            raise FloatingPointError("world candidate action is non-finite")
+        if factual_action is not None:
+            factual_action = factual_action.masked_fill(~mask, 0.0)
+            if not bool(torch.isfinite(factual_action).all()):
+                raise FloatingPointError("world candidate action is non-finite")
         self._active_time_update = self.action_time(action_time_s, mask)
         self._active_native_3d_update = self.native_3d_state(
             current_native_3d, current_native_3d_view_mask
@@ -1027,7 +1031,8 @@ class WSABackendAdapter(nn.Module):
             conditioned_steps += 1
             return original_predict(**kwargs)
 
-        self.wsa_model._predict_joint_noise = predict_candidate
+        if factual_action is not None:
+            self.wsa_model._predict_joint_noise = predict_candidate
         try:
             result = self.wsa_model.infer_joint(
                 prompt=None,
@@ -1043,14 +1048,28 @@ class WSABackendAdapter(nn.Module):
                 test_action_with_infer_action=False,
             )
         finally:
-            if had_override:
-                self.wsa_model._predict_joint_noise = original_predict
-            else:
-                del self.wsa_model._predict_joint_noise
+            if factual_action is not None:
+                if had_override:
+                    self.wsa_model._predict_joint_noise = original_predict
+                else:
+                    del self.wsa_model._predict_joint_noise
             self._active_time_update = None
             self._active_native_3d_update = None
         if not isinstance(result, Mapping) or "video" not in result:
             raise FoundationModelError("WSA joint inference returned no video")
+        if factual_action is None:
+            action = result.get("action")
+            if not isinstance(action, torch.Tensor) or tuple(action.shape) != tuple(
+                action_time_s.shape[1:]
+            ):
+                raise FoundationModelError("WSA joint sampling returned invalid action shape")
+            if not bool(torch.isfinite(action).all()):
+                raise FloatingPointError("WSA joint sampling returned non-finite action")
+            return {
+                "video": result["video"],
+                "action_normalized": action.unsqueeze(0),
+                "conditioning": {"mode": "joint_from_observation_no_candidate"},
+            }
         if conditioned_steps != int(num_inference_steps):
             raise FoundationModelError("WSA candidate conditioning missed a sampling step")
         # The clamped branch is not a policy prediction. Do not expose its
@@ -1190,6 +1209,13 @@ class FoundationWorldModel(nn.Module):
             num_inference_steps=num_inference_steps,
             seed=seed,
         )
+        return self._action_outputs(normalized, batch)
+
+    def _action_outputs(
+        self, normalized: torch.Tensor, batch: Mapping[str, torch.Tensor]
+    ) -> Mapping[str, torch.Tensor]:
+        element_mask = batch["action_element_mask"].bool()
+        action_time_s = batch["action_time_s"]
         offset = batch["action_normalization_offset"].reshape(
             1, 1, self.cfg.action_width
         )
@@ -1220,6 +1246,52 @@ class FoundationWorldModel(nn.Module):
                 self.cfg.max_action_groups,
                 self.cfg.max_action_dim,
             ),
+        }
+
+    @torch.inference_mode()
+    def predict_joint(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        num_inference_steps: int = 20,
+        seed: int | None = None,
+    ) -> Mapping[str, Any]:
+        """Generate video and action from observation; future labels are not inputs."""
+        video = batch["video"]
+        time_s = batch["action_time_s"]
+        mask = batch["action_element_mask"].bool()
+        if video.ndim != 5 or video.shape[0] != 1 or video.shape[2] < 1:
+            raise FoundationModelError("joint serving requires one observed video frame")
+        if time_s.ndim != 3 or time_s.shape != mask.shape or (
+            time_s.shape[-1] != self.cfg.action_width
+        ):
+            raise FoundationModelError("joint serving action request ABI changed")
+        if num_inference_steps <= 0:
+            raise FoundationModelError("num_inference_steps must be positive")
+        proprio = batch["proprio"]
+        if proprio.ndim == 3 and proprio.shape[1] == 1:
+            proprio = proprio[:, 0]
+        if proprio.shape != (1, self.cfg.state_width):
+            raise FoundationModelError("joint proprio must resolve to [1,D]")
+        context, context_mask = self._fused_context(batch)
+        result = self.backend.infer_world(
+            input_image=video[:, :, 0],
+            context=context,
+            context_mask=context_mask,
+            proprio=proprio,
+            current_native_3d=batch["vggt_current_tokens"],
+            current_native_3d_view_mask=batch["vggt_current_view_mask"],
+            factual_action=None,
+            action_time_s=time_s,
+            action_element_mask=mask,
+            num_video_frames=int(self.cfg.K) + 1,
+            num_inference_steps=num_inference_steps,
+            seed=seed,
+        )
+        return {
+            **self._action_outputs(result["action_normalized"], batch),
+            "video": result["video"],
+            "conditioning": result["conditioning"],
         }
 
     @torch.inference_mode()

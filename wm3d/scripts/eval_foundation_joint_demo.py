@@ -37,12 +37,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--mode", choices=("joint", "candidate"), default="joint",
+        help="joint: generate video/action from observation; candidate: optional intervention audit",
+    )
     parser.add_argument("--seed", type=int, default=7340)
     parser.add_argument("--candidate-count", type=int, default=24)
     parser.add_argument("--num-inference-steps", type=int, default=20)
     parser.add_argument("--duration-ms", type=int, default=350)
     parser.add_argument("--skip-zero-action", action="store_true")
     return parser.parse_args()
+
+
+def _observation_inputs(batch: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the requested time/mask ABI, remove all future target values."""
+    inputs = {
+        key: value for key, value in batch.items()
+        if key != "action" and not key.startswith(
+            ("future_", "vggt_future", "vggt_rollout_target")
+        )
+    }
+    inputs["video"] = batch["video"][:, :, :1]
+    return inputs
+
+
+def _action_metrics(
+    prefix: str, prediction: torch.Tensor, batch: Mapping[str, torch.Tensor]
+) -> dict[str, Any]:
+    predicted = prediction[0].detach().float().cpu()
+    target = batch["action"][0].detach().float().cpu()
+    mask = batch["action_element_mask"][0].detach().bool().cpu()
+    error = (predicted - target).abs()
+    scale = batch["action_normalization_scale"].detach().float().cpu().reshape(1, -1)
+    return {
+        f"{prefix}_action_normalized_mae": float(error[mask].mean()),
+        f"{prefix}_action_zero_baseline_mae": float(target.abs()[mask].mean()),
+        f"{prefix}_action_query_mae": (
+            (error * mask).sum(-1) / mask.sum(-1).clamp_min(1)
+        ).tolist(),
+        f"{prefix}_action_physical_mae_by_dim": [
+            float((error[:, dim] * scale[0, dim])[mask[:, dim]].mean())
+            if bool(mask[:, dim].any()) else None
+            for dim in range(error.shape[-1])
+        ],
+    }
 
 
 def _target_motion_score(batch: Mapping[str, Any], *, context: int, future: int) -> float:
@@ -261,11 +299,12 @@ def _save_outputs(
     factual: Sequence[Image.Image],
     zero: Sequence[Image.Image] | None,
     duration_ms: int,
+    prediction_label: str = "factual action",
 ) -> list[str]:
     output.mkdir(parents=True, exist_ok=False)
     columns: list[tuple[str, Sequence[Image.Image]]] = [
         ("target", target),
-        ("factual action", factual),
+        (prediction_label, factual),
     ]
     if zero is not None:
         columns.append(("normalized zero action", zero))
@@ -337,17 +376,21 @@ def main() -> None:
             expected=expectations,
         )
         raw_model.eval()
+        observed = _observation_inputs(batch)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             policy_result = raw_model.predict_action(
-                batch, num_inference_steps=args.num_inference_steps, seed=args.seed
+                observed, num_inference_steps=args.num_inference_steps, seed=args.seed
             )
-            factual_result = raw_model.predict_world(
-                batch,
-                num_inference_steps=args.num_inference_steps,
-                seed=args.seed,
-            )
+            if args.mode == "joint":
+                factual_result = raw_model.predict_joint(
+                    observed, num_inference_steps=args.num_inference_steps, seed=args.seed
+                )
+            else:
+                factual_result = raw_model.predict_world(
+                    batch, num_inference_steps=args.num_inference_steps, seed=args.seed
+                )
         zero_result = None
-        if not args.skip_zero_action:
+        if args.mode == "candidate" and not args.skip_zero_action:
             torch.cuda.empty_cache()
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 zero_result = raw_model.predict_world(
@@ -357,7 +400,7 @@ def main() -> None:
                     zero_future_action=True,
                 )
         # A world intervention must not persist into a subsequent policy call.
-        policy_changed_batch = dict(batch, action=torch.zeros_like(batch["action"]))
+        policy_changed_batch = dict(observed, action=torch.zeros_like(batch["action"]))
         with torch.autocast("cuda", dtype=torch.bfloat16):
             policy_after = raw_model.predict_action(
                 policy_changed_batch,
@@ -384,6 +427,7 @@ def main() -> None:
             factual=factual,
             zero=zero,
             duration_ms=args.duration_ms,
+            prediction_label="joint prediction" if args.mode == "joint" else "factual action",
         )
         width, height = target[0].size
         top = height - height // 3
@@ -395,20 +439,29 @@ def main() -> None:
             if valid:
                 valid_pixels[upper:lower, left:right] = True
         metrics = _temporal_metrics(target, factual, zero, valid_pixels)
-        metrics["policy_candidate_max_abs_diff"] = policy_difference
-        metrics["candidate_conditioning"] = factual_result["conditioning"]
+        if args.mode == "joint":
+            metrics = {key.replace("factual_", "joint_"): value for key, value in metrics.items()}
+            metrics.update(_action_metrics("joint", factual_result["action_normalized"], batch))
+        copy_last = [target[0]] * len(target)
+        metrics["copy_last_target_l1"] = _temporal_metrics(
+            target, copy_last, None, valid_pixels
+        )["factual_target_l1"]
+        metrics["policy_future_label_max_abs_diff"] = policy_difference
+        metrics["inference_conditioning"] = factual_result["conditioning"]
+        if args.mode == "candidate":
+            # Preserve fields in existing conditional-world receipts.
+            metrics["policy_candidate_max_abs_diff"] = policy_difference
+            metrics["candidate_conditioning"] = factual_result["conditioning"]
         metrics["zero_action_semantics"] = "normalized_zero_equals_source_offset_not_physical_noop"
         metrics["valid_views"] = view_valid.tolist()
-        predicted_action = policy_result["action_normalized"][0]
-        if isinstance(predicted_action, torch.Tensor):
-            predicted_action = predicted_action.detach().float().cpu()
-            target_action = batch["action"][0].detach().float().cpu()
-            mask = batch["action_element_mask"][0].detach().bool().cpu()
-            metrics["policy_action_normalized_mae"] = float(
-                (predicted_action - target_action).abs()[mask].mean().item()
-            )
+        metrics.update(_action_metrics("policy", policy_result["action_normalized"], batch))
         receipt = {
-            "schema": "wm3d_foundation_conditional_world_demo_v1",
+            "schema": (
+                "wm3d_foundation_joint_prediction_demo_v1" if args.mode == "joint"
+                else "wm3d_foundation_conditional_world_demo_v1"
+            ),
+            "mode": args.mode,
+            "supplied_future_action": args.mode == "candidate",
             "checkpoint_step": checkpoint_step,
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,

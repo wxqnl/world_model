@@ -15,6 +15,20 @@ Future3D 主链，而是在同一组 Future3D token 上显式接入当前原生 
 轨迹。替代正式训练前仍需做短程受控训练，同时检查视频、物理 action、K8 轨迹和最终 Future3D；
 不能直接套用 WSA 官方 benchmark 数字。
 
+## 当前训练优先级
+
+当前先训练基础 WM 与可执行 action：从观测、任务、状态和历史，学会生成未来视频、
+原生 3D 状态和动作。保留 WSA 现有 video/action/3D 联合目标；不删除真实动作标签，
+不把 action loss 关闭，也不为候选动作控制新增损失、decoder 或训练分支。
+
+当前验收分别检查视频运动与清晰度、Future3D/K8 预测、独立 policy 的物理误差及
+task/vision/state/history 依赖。主 demo 不提供真实未来 action，而由官方联合 sampler
+自己生成视频与动作。联合样本中的 action 和部署用独立 policy 都要报告，不能互相替代。
+
+给定候选动作的反事实预测、动作可控性与候选排序留待后续专项训练/验收。修好的接口保留，
+但 real/zero 视频响应不再是当前阶段的主要门槛。训练稳定、没有目标泄漏仍是必要条件；
+q20 只证明接口可运行，学习趋势应在短适配中验证，不要求 20 个样本就达到最终质量。
+
 ## 冻结架构
 
 ```text
@@ -174,27 +188,35 @@ PYTHON_BIN=.venv-foundation/bin/python ./run_wm3d.sh runtime \
 
 ## Checkpoint 视频与 Action 对照
 
-用完整 checkpoint 导出同 seed 的候选动作视频，以及独立的 policy 预测：
+默认用完整 checkpoint 导出观测条件下的联合视频/动作，以及独立 policy 预测：
 
 ```bash
 FOUNDATION_PYTHON_BIN=.venv-foundation/bin/python \
   ./run_wm3d.sh foundation-demo \
   --runtime "$RUN_ROOT/runtime.yaml" \
   --checkpoint "$RUN_ROOT/checkpoints/step_00000020" \
-  --output "$RUN_ROOT/eval/candidate_demo" \
+  --output "$RUN_ROOT/eval/joint_demo" \
   --seed 7340 --num-inference-steps 20
 ```
 
 输出目录必须尚不存在。入口使用指定 Python 的 torch.distributed.run，不依赖旁边是否有
 torchrun 可执行文件。
 
+默认 mode 为 joint。导出器先移除未来 action 和 3D 标签，视频输入仅保留观测帧；
+predict_joint 调用官方 WSA 联合 sampler，从随机噪声同时生成未来视频和 action。
+面板标为 joint prediction。报告联合视频相对 copy-last 的误差、逐帧变化，以及联合 action
+和独立 policy 各自相对常量零基线的误差、逐 query 误差和分维度物理误差。
+分维度物理误差必须按 source 语义解释，不能混合米、弧度和夹爪单位当成单一质量分数。
+
+只有传入 --mode candidate 才运行 real/zero 反事实诊断；该模式不是当前默认验收。
 predict_action 只根据观测、任务、状态和历史预测动作。predict_world 则根据给定候选动作
 预测视频：每个采样步始终把 clean、masked 候选送入 ActionDiT，并固定 action noise timestep
 为 0；仅未知的未来视频走原 WSA sampler。已知动作不能再随视频加噪。WSA 的训练本来就
 独立采样两个噪声级别；这种条件推理与 [UWM 的 forward-dynamics 定义](https://arxiv.org/html/2504.02792v1#S3.SS2)
 一致。这里的噪声 timestep 不是机器人真实 action timestamp。该分支的 action 输出不作为
 policy 预测返回。
-两路调用结束后会恢复原采样函数，导出器另验 policy 输出逐元素不变。
+候选对照调用结束后会恢复原采样函数。两个模式都检查真实未来 action 标签不会改变独立
+policy 输出；joint 模式不需要该标签作为输入，也不会启用 candidate clamp。
 
 发布的 WSA-Large 关闭了 VideoDiT 的 action_conditioned 选项。旧导出器仅向那个未启用的
 入口传 real/zero action，实际上生成了两次相同的联合样本；旧对照不能说明模型的动作因果
