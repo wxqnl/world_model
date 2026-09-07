@@ -640,7 +640,12 @@ class Native3DRolloutHead(nn.Module):
         )
         command = self.action_projection(command.to(dtype=spatial.dtype))
         substeps = action.shape[1] // self.horizons
-        command = command.reshape(batch, self.horizons, substeps, -1).mean(dim=2)
+        command = command.reshape(batch, self.horizons, substeps, -1)
+        command_valid = mask.any(dim=-1).reshape(batch, self.horizons, substeps)
+        # Padding is storage, not an extra zero-valued physical command.
+        # A sparse interval must not have its action drive diluted by padding.
+        command = command.masked_fill(~command_valid[..., None], 0.0).sum(dim=2)
+        command = command / command_valid.sum(dim=2, keepdim=True).clamp_min(1)
 
         predictions: list[torch.Tensor] = []
         for index in range(self.horizons):

@@ -8,7 +8,9 @@
 - Missing views, groups, state, or supervision remain explicitly masked; never synthesize them.
 - The foundation bridge may reshape source-native commands but must never interpolate them. Three
   views form one WSA canvas; exact command timestamps, grouped masks and source normalization remain
-  recoverable at serving.
+  recoverable at serving. Future commands retain their original K world intervals: trim only a
+  common unused suffix of per-interval capacity, never globally compact active rows. Irregular
+  command counts remain masked slots; do not shift commands between intervals or synthesize values.
 - The foundation native-3D teacher encodes exactly three timestamps in one frozen VGGT call: last
   observation, one deterministic sampled K8 target, and the final target. The sampled horizon comes
   from the sealed sample index; targets never enter the model input. Spatial resizing is per view and

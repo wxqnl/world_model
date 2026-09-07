@@ -186,21 +186,29 @@ def pack_grouped_future_action(
         raise FoundationBridgeError(
             "future action validity cannot be represented by WSA time/dimension masks"
         )
-    if not torch.equal(time_valid, time_valid[:1].expand_as(time_valid)):
-        raise FoundationBridgeError(
-            "one source-homogeneous micro-batch has inconsistent command slots"
-        )
-    active_time = torch.nonzero(time_valid[0], as_tuple=False).flatten()
-    if active_time.numel() == 0:
+    if not bool(time_valid.any(dim=1).all()):
         raise FoundationBridgeError("foundation sample has no future action")
+    # Keep each command in its original world interval. Compacting all active
+    # rows globally can turn K*4 slots into 31 commands, or silently regroup
+    # commands when the remaining count happens to still be divisible by K.
+    # Only trim a common unused suffix of the per-interval storage capacity.
+    slot_used = time_valid.reshape(batch_size, future, substeps).any(dim=(0, 1))
+    kept_substeps = int(torch.nonzero(slot_used, as_tuple=False)[-1, 0]) + 1
     action_time_by_dim = (
         boundaries[:, :-1, None, None] + dt
     )[..., None].expand_as(values).permute(
         0, 1, 3, 2, 4
     ).reshape_as(action)
-    action = action.index_select(1, active_time)
-    element_mask = element_mask.index_select(1, active_time)
-    action_time_by_dim = action_time_by_dim.index_select(1, active_time)
+    width = groups * action_dim
+    action = action.reshape(batch_size, future, substeps, width)[
+        :, :, :kept_substeps
+    ].reshape(batch_size, future * kept_substeps, width)
+    element_mask = element_mask.reshape(batch_size, future, substeps, width)[
+        :, :, :kept_substeps
+    ].reshape_as(action)
+    action_time_by_dim = action_time_by_dim.reshape(
+        batch_size, future, substeps, width
+    )[:, :, :kept_substeps].reshape_as(action)
     time_valid = element_mask.any(dim=-1)
     dim_valid = element_mask.any(dim=1)
     valid_time = action_time_by_dim[element_mask]

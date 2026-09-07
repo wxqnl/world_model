@@ -178,6 +178,42 @@ def test_native_3d_rollout_decodes_all_horizons_with_one_sampled_target() -> Non
     assert bool((action.grad != 0).any())
 
 
+def test_native_3d_rollout_ignores_extra_masked_command_capacity() -> None:
+    torch.manual_seed(73)
+    head = Native3DRolloutHead(
+        hidden_dim=12, token_dim=8, num_views=3,
+        context_tokens_per_view=4, rollout_tokens_per_view=4,
+        horizons=3, action_dim=6,
+    )
+    with torch.no_grad():
+        head.output.weight.normal_(std=0.1)
+    shared = torch.randn(1, 12, 12)
+    current = torch.randn(1, 3, 4, 8)
+    action = torch.randn(1, 3, 2, 6)
+    time_s = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2, 1).expand_as(action)
+    mask = torch.ones_like(action, dtype=torch.bool)
+    mask[:, 1, 1] = False
+    baseline = head(shared, current, action.flatten(1, 2), time_s.flatten(1, 2), mask.flatten(1, 2))
+
+    padded_action = torch.full((1, 3, 4, 6), 1234.0)
+    padded_time = torch.full_like(padded_action, 9876.0)
+    padded_mask = torch.zeros_like(padded_action, dtype=torch.bool)
+    padded_action[:, :, :2] = action
+    padded_time[:, :, :2] = time_s
+    padded_mask[:, :, :2] = mask
+    padded_action.requires_grad_()
+    prediction = head(
+        shared, current, padded_action.flatten(1, 2),
+        padded_time.flatten(1, 2), padded_mask.flatten(1, 2),
+    )
+    torch.testing.assert_close(prediction, baseline, atol=1e-6, rtol=1e-5)
+    prediction.square().mean().backward()
+    gradient = padded_action.grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert gradient[padded_mask].count_nonzero() > 0
+    assert gradient[~padded_mask].count_nonzero() == 0
+
+
 @pytest.mark.parametrize("fail", [False, True])
 @pytest.mark.parametrize("known", [False, True])
 def test_world_sampler_distinguishes_joint_and_known_action(

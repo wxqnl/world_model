@@ -65,8 +65,11 @@ rollout A/B，不能在首个版本里盲目扩大。
 - rollout 预测相对最后观测状态的 P64 delta，而不是复制绝对未来外观；一次只抽样一个未来
   horizon 作 teacher target，horizon 由封存 sample index 确定，跨样本均匀覆盖 K8。当前、抽样
   horizon 和最终帧在一次 frozen VGGT 调用中编码，future target 从不进入模型输入或 serving。
-- action 保留 WM3D 的 grouped ABI。容量为 3 组 × 14 维，但有效组、有效维和原生命令数都由
-  mask 决定；18 个现有 source 的实际未来命令数为 8、16、24 或 32，不做插值。
+- action 保留 WM3D 的 grouped ABI。维度容量为 3 组 × 14 维；时间轴保留 K 个原始 world
+  interval，每个 interval 使用同一个槽位容量 S。只裁掉所有 interval 都未使用的尾部容量，
+  不压缩中间空槽。例如 8 个区间共 31 条有效命令时，可以保留 32 个槽位，缺失的那个槽位
+  由 mask 排除。有效动作值、真实时间戳、所属区间和数据权重不变，不插值、不补造命令。
+  WSA action loss 忽略空槽；K8 rollout 按每个区间的有效命令数聚合，空槽不稀释动作更新。
 - action 时间等于 world interval 起点加该 interval 内的真实 fine-command offset。训练和推理
   使用同一个 `ActionTimeConditioner`。
 - 当前状态为 3 组 × 10 维；offset、scale、semantic、embodiment 与 action history 通过
@@ -248,7 +251,10 @@ action head.weight/bias 和 proprio_encoder.weight。它们与新增机器人条
 
 ## 已完成的实现证据
 
-- 现有 sealed direct-raw 数据的 18 个 source 均能无插值映射到 WSA action ABI。
+- 现有 sealed direct-raw 数据继续使用 18 个 source 的原始物理值和时间戳。8 卡连续训练
+  暴露了旧 bridge 的边界错误：全局删除空槽后，31 条命令无法分成 K8 区间；即使命令数碰巧
+  可整除，也可能改变原区间归属。bridge 现保留区间内 mask，新增回归覆盖不等命令数、
+  样本间不同空槽位置、物理值/时间戳不变，以及 rollout 对额外空槽的输出和梯度不变。
 - 聚焦测试与全仓检查均通过：606 项通过、1 项因可选依赖跳过。覆盖 P144/P64 形状、逐视角
   隔离、zero-gate 恒等、future target 隔离、action 时间分组和 rollout loss 反向传播。
 - 移除 Qwen 后，带 native-3D causal expert 的模型共有 7,254,131,334 个参数，其中
