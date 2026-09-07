@@ -212,7 +212,7 @@ class _Backend(nn.Module):
             dtype=torch.float32,
         )
 
-    def infer_joint(self, **kwargs):
+    def infer_world(self, **kwargs):
         self.sample = kwargs
         return {
             "video": [torch.tensor(index) for index in range(kwargs["num_video_frames"])],
@@ -328,7 +328,7 @@ def test_foundation_action_serving_reuses_training_context_and_denormalizes() ->
     assert torch.equal(result["action_physical"][..., 1, :], torch.zeros(1, 8, 3))
 
 
-def test_foundation_joint_serving_reuses_training_conditions_and_zero_ablation() -> None:
+def test_foundation_world_serving_separates_policy_from_candidate() -> None:
     config = _config()
     backend = _Backend()
     model = FoundationWorldModel(config, backend=backend)
@@ -364,7 +364,8 @@ def test_foundation_joint_serving_reuses_training_conditions_and_zero_ablation()
         "vggt_current_tokens": torch.randn(1, 3, 4, 8),
         "vggt_current_view_mask": torch.ones(1, 3, dtype=torch.bool),
     }
-    result = model.predict_joint(
+    policy_before = model.predict_action(batch, num_inference_steps=4, seed=11)
+    result = model.predict_world(
         batch, num_inference_steps=4, seed=11, zero_future_action=True
     )
     assert len(result["video"]) == 9
@@ -374,3 +375,13 @@ def test_foundation_joint_serving_reuses_training_conditions_and_zero_ablation()
     assert torch.equal(backend.sample["input_image"], batch["video"][:, :, 0])
     assert torch.equal(backend.sample["factual_action"], torch.zeros_like(action))
     assert torch.equal(result["factual_action_normalized"], torch.zeros_like(action))
+    assert "action_normalized" not in result
+    observed_only = dict(batch, video=batch["video"][:, :, :1])
+    world = model.predict_world(observed_only, num_inference_steps=4, seed=11)
+    assert len(world["video"]) == config.K + 1
+    changed = dict(batch, action=action + 10, video=batch["video"].clone())
+    changed["video"][:, :, 1:] = 0
+    policy_after = model.predict_action(changed, num_inference_steps=4, seed=11)
+    assert torch.equal(
+        policy_before["action_normalized"], policy_after["action_normalized"]
+    )

@@ -11,6 +11,11 @@
   quality/throughput comparison.
 - Clean future action/time/mask may condition video and native-3D world prediction, but never the
   ActionDiT policy output. Future VGGT targets are loss-only and never model inputs.
+- Candidate-conditioned video uses the actual ActionDiT input at each flow-matching step,
+  with a fixed noise trajectory and the upstream action scheduler. The released WSA-Large
+  VideoDiT ignores its optional clean action argument; passing that argument is not conditioning.
+- Keep policy prediction in predict_action, independent of predict_world. Never expose the
+  action result from a candidate-clamped world pass as a policy prediction.
 - Keep policy state action-free and factual world refinement explicitly action-conditioned.
 - Preserve continuous time, masks, grouped embodiment identity, and explicit RGB/depth/point/pose
   heads.

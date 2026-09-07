@@ -20,6 +20,7 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
     --output <文本上下文目录>
   ./run_wm3d.sh foundation-preflight <torchrun 参数...> -- --runtime <runtime.yaml>
   ./run_wm3d.sh foundation-train <torchrun 参数...> -- <训练参数...>
+  ./run_wm3d.sh foundation-demo --runtime <runtime.yaml> --checkpoint <step目录> --output <新目录>
   ./run_wm3d.sh lock-resolve <resolve_source_lock.py 参数...>
   ./run_wm3d.sh download <download_sources.py 参数...>
   ./run_wm3d.sh agibot-existing-check --snapshot-root <已下载的 AgiBotWorld2026 目录>
@@ -170,6 +171,7 @@ need_python_unless_env() {
   [[ "${command}" == env || "${command}" == foundation-env || \
      "${command}" == foundation-fetch || "${command}" == foundation-context || \
      "${command}" == foundation-preflight || "${command}" == foundation-train || \
+     "${command}" == foundation-demo || \
      "${command}" == smoke-real || "${command}" == 1b || \
      "${command}" == 5b || \
      "${command}" == -h || "${command}" == --help || "${command}" == help ]] || need_python
@@ -177,6 +179,12 @@ need_python_unless_env() {
 need_python_unless_env
 
 case "${command}" in
+  foundation-demo)
+    python_bin=${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}
+    [[ -x "${python_bin}" ]] || { echo "找不到 ${python_bin}" >&2; exit 2; }
+    exec "${python_bin}" -m torch.distributed.run --standalone --nproc_per_node=1 \
+      -m scripts.eval_foundation_joint_demo "$@"
+    ;;
   env)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     exec bash environments/bootstrap_environment.sh

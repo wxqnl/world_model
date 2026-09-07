@@ -954,7 +954,7 @@ class WSABackendAdapter(nn.Module):
         return action.unsqueeze(0)
 
     @torch.inference_mode()
-    def infer_joint(
+    def infer_world(
         self,
         *,
         input_image: torch.Tensor,
@@ -970,7 +970,13 @@ class WSABackendAdapter(nn.Module):
         num_inference_steps: int,
         seed: int | None,
     ) -> Mapping[str, Any]:
-        """Run official joint video/action sampling with WM3D conditions bound."""
+        """Sample video conditional on a candidate, not a new policy action.
+
+        Released WSA-Large ignores video_expert's optional clean action input.
+        Clamp its actual ActionDiT input to the candidate's flow-matching
+        trajectory instead. Reuse the official video sampler and shared noise.
+        The clamped branch is world inference only; infer_action stays untouched.
+        """
 
         if (
             self._active_time_update is not None
@@ -995,17 +1001,39 @@ class WSABackendAdapter(nn.Module):
             raise FoundationModelError("joint proprio must resolve to [1,D]")
         mask = action_element_mask.bool()
         factual_action = factual_action.masked_fill(~mask, 0.0)
+        if not bool(torch.isfinite(factual_action).all()):
+            raise FloatingPointError("world candidate action is non-finite")
         self._active_time_update = self.action_time(action_time_s, mask)
         self._active_native_3d_update = self.native_3d_state(
             current_native_3d, current_native_3d_view_mask
         )
+        original_predict = self.wsa_model._predict_joint_noise
+        had_override = "_predict_joint_noise" in vars(self.wsa_model)
+        candidate_noise = None
+        conditioned_steps = 0
+
+        def predict_candidate(**kwargs: Any) -> Any:
+            nonlocal candidate_noise, conditioned_steps
+            latents = kwargs["latents_action"]
+            if candidate_noise is None:
+                candidate_noise = latents.detach().clone()
+            candidate = factual_action.to(device=latents.device, dtype=latents.dtype)
+            # Preserve noise on padded coordinates, as in upstream training.
+            kwargs["latents_action"] = self.wsa_model.infer_action_scheduler.add_noise(
+                candidate, candidate_noise, kwargs["timestep_action"]
+            )
+            kwargs["gt_action"] = None
+            conditioned_steps += 1
+            return original_predict(**kwargs)
+
+        self.wsa_model._predict_joint_noise = predict_candidate
         try:
             result = self.wsa_model.infer_joint(
                 prompt=None,
                 input_image=input_image,
                 num_video_frames=int(num_video_frames),
                 action_horizon=int(action_time_s.shape[1]),
-                action=factual_action,
+                action=None,
                 proprio=proprio,
                 context=context,
                 context_mask=context_mask,
@@ -1014,11 +1042,25 @@ class WSABackendAdapter(nn.Module):
                 test_action_with_infer_action=False,
             )
         finally:
+            if had_override:
+                self.wsa_model._predict_joint_noise = original_predict
+            else:
+                del self.wsa_model._predict_joint_noise
             self._active_time_update = None
             self._active_native_3d_update = None
         if not isinstance(result, Mapping) or "video" not in result:
             raise FoundationModelError("WSA joint inference returned no video")
-        return result
+        if conditioned_steps != int(num_inference_steps):
+            raise FoundationModelError("WSA candidate conditioning missed a sampling step")
+        # The clamped branch is not a policy prediction. Do not expose its
+        # action output; that would confuse conditioning with action ability.
+        return {
+            "video": result["video"],
+            "conditioning": {
+                "mode": "action_dit_flow_matching_clamp",
+                "conditioned_steps": conditioned_steps,
+            },
+        }
 
 
 class FoundationWorldModel(nn.Module):
@@ -1180,7 +1222,7 @@ class FoundationWorldModel(nn.Module):
         }
 
     @torch.inference_mode()
-    def predict_joint(
+    def predict_world(
         self,
         batch: Mapping[str, torch.Tensor],
         *,
@@ -1188,7 +1230,12 @@ class FoundationWorldModel(nn.Module):
         seed: int | None = None,
         zero_future_action: bool = False,
     ) -> Mapping[str, Any]:
-        """Generate K8 video and action with the train-identical WM3D ABI."""
+        """Generate candidate-conditioned K8 video; predict_action owns policy.
+
+        zero_future_action is zero in normalized coordinates: the source
+        profile's offset in physical units, not a physical no-op. Future
+        video/native targets are not read.
+        """
 
         video = batch["video"]
         action = batch["action"]
@@ -1211,7 +1258,7 @@ class FoundationWorldModel(nn.Module):
             raise FoundationModelError("joint proprio must resolve to [1,D]")
         context, context_mask = self._fused_context(batch)
         factual_action = torch.zeros_like(action) if zero_future_action else action
-        result = self.backend.infer_joint(
+        result = self.backend.infer_world(
             input_image=video[:, :, 0],
             context=context,
             context_mask=context_mask,
@@ -1221,13 +1268,13 @@ class FoundationWorldModel(nn.Module):
             factual_action=factual_action,
             action_time_s=action_time_s,
             action_element_mask=element_mask,
-            num_video_frames=int(video.shape[2]),
+            num_video_frames=int(self.cfg.K) + 1,
             num_inference_steps=num_inference_steps,
             seed=seed,
         )
         return {
             "video": result["video"],
-            "action_normalized": result.get("action"),
+            "conditioning": result.get("conditioning"),
             "factual_action_normalized": factual_action,
             "action_element_mask": element_mask,
         }

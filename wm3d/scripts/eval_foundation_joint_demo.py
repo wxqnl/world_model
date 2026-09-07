@@ -118,8 +118,12 @@ def _normalize_images(frames: Sequence[Image.Image], expected: int) -> list[Imag
     return result
 
 
-def _save_gif(path: Path, frames: Sequence[Image.Image], duration_ms: int) -> None:
-    values = list(frames)
+def _save_gif(
+    path: Path, frames: Sequence[Image.Image], duration_ms: int, palette: Image.Image
+) -> None:
+    values = [
+        frame.quantize(palette=palette, dither=Image.Dither.NONE) for frame in frames
+    ]
     values[0].save(
         path,
         save_all=True,
@@ -179,13 +183,20 @@ def _temporal_metrics(
     target: Sequence[Image.Image],
     factual: Sequence[Image.Image],
     zero: Sequence[Image.Image] | None,
+    valid_pixels: np.ndarray | None = None,
 ) -> dict[str, Any]:
     target_array = _video_array(target)
     factual_array = _video_array(factual)
     if target_array.shape != factual_array.shape:
         raise ValueError("target and factual videos have different shapes")
-    target_delta = np.diff(target_array, axis=0)
-    factual_delta = np.diff(factual_array, axis=0)
+    if valid_pixels is not None:
+        if valid_pixels.shape != target_array.shape[1:3] or not valid_pixels.any():
+            raise ValueError("demo requires a nonempty valid-view pixel mask")
+        target_array = target_array[:, valid_pixels]
+        factual_array = factual_array[:, valid_pixels]
+    # Exclude the encoded observation; measure future h1 ... h8 transitions.
+    target_delta = np.diff(target_array[1:], axis=0)
+    factual_delta = np.diff(factual_array[1:], axis=0)
 
     def rms(value: np.ndarray) -> float:
         return float(np.sqrt(np.mean(np.square(value), dtype=np.float64)))
@@ -201,25 +212,37 @@ def _temporal_metrics(
         if denominator <= 1.0e-12
         else float(np.dot(target_delta.reshape(-1), factual_delta.reshape(-1)) / denominator)
     )
-    spatial_std = factual_array[1:].std(axis=(1, 2, 3))
+    spatial_std = (
+        factual_array[1:].reshape(len(factual_array) - 1, -1, 3).std(axis=1).mean(axis=1)
+    )
     metrics: dict[str, Any] = {
         "target_frame_delta_rms": target_delta_rms,
         "factual_frame_delta_rms": factual_delta_rms,
         "factual_frame_delta_retention": factual_delta_rms / max(target_delta_rms, 1.0e-12),
         "factual_temporal_direction_cosine": temporal_direction,
-        "factual_target_l1": float(np.mean(np.abs(factual_array - target_array))),
+        "factual_target_l1": float(np.mean(np.abs(factual_array[1:] - target_array[1:]))),
+        "future_pair_delta_rms": [rms(pair) for pair in factual_delta],
+        "target_future_pair_delta_rms": [rms(pair) for pair in target_delta],
+        "motion_scope": "future_only_h1_to_h8_valid_views",
         "factual_spatial_std_min": float(spatial_std.min()),
         "factual_is_single_color": bool(float(spatial_std.min()) < 0.01),
         "factual_is_temporally_identical": bool(np.max(np.abs(factual_delta)) < (0.5 / 255.0)),
     }
     if zero is not None:
         zero_array = _video_array(zero)
+        if valid_pixels is not None:
+            zero_array = zero_array[:, valid_pixels]
         if zero_array.shape != factual_array.shape:
             raise ValueError("zero-action and factual videos have different shapes")
         metrics.update(
             {
-                "zero_frame_delta_rms": rms(np.diff(zero_array, axis=0)),
+                "zero_frame_delta_rms": rms(np.diff(zero_array[1:], axis=0)),
                 "factual_zero_response_rms": rms(factual_array[1:] - zero_array[1:]),
+                "zero_target_l1": float(np.mean(np.abs(zero_array[1:] - target_array[1:]))),
+                "factual_zero_target_l1_gain": float(
+                    np.mean(np.abs(zero_array[1:] - target_array[1:]))
+                    - np.mean(np.abs(factual_array[1:] - target_array[1:]))
+                ),
             }
         )
     if not all(
@@ -245,20 +268,30 @@ def _save_outputs(
         ("factual action", factual),
     ]
     if zero is not None:
-        columns.append(("zero action", zero))
+        columns.append(("normalized zero action", zero))
+    # All branches and all timesteps share one palette. Independent palettes
+    # can amplify tiny RGB differences or introduce visible temporal flicker.
+    palette = Image.fromarray(np.concatenate([
+        np.asarray(frame) for _name, frames in columns for frame in frames
+    ], axis=0)).quantize(colors=256, method=Image.Quantize.MEDIANCUT)
     paths: list[Path] = []
     for name, frames in columns:
-        path = output / f"{name.replace(' ', '_')}.gif"
-        _save_gif(path, frames, duration_ms)
+        label = name.replace(" ", "_")
+        raw_root = output / "frames" / label
+        raw_root.mkdir(parents=True)
+        for index, frame in enumerate(frames):
+            frame.save(raw_root / f"frame_{index:03d}.png")
+        path = output / f"{label}.gif"
+        _save_gif(path, frames, duration_ms, palette)
         paths.append(path)
     panel = output / "comparison.gif"
-    _save_gif(panel, _labelled_panel(columns), duration_ms)
+    _save_gif(panel, _labelled_panel(columns), duration_ms, palette)
     paths.append(panel)
     split = {name: _split_views(frames) for name, frames in columns}
     for view_name in ("view0", "view1", "view2"):
         view_columns = [(name, value[view_name]) for name, value in split.items()]
         path = output / f"comparison_{view_name}.gif"
-        _save_gif(path, _labelled_panel(view_columns), duration_ms)
+        _save_gif(path, _labelled_panel(view_columns), duration_ms, palette)
         paths.append(path)
     return [str(path) for path in paths]
 
@@ -305,7 +338,10 @@ def main() -> None:
         )
         raw_model.eval()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            factual_result = raw_model.predict_joint(
+            policy_result = raw_model.predict_action(
+                batch, num_inference_steps=args.num_inference_steps, seed=args.seed
+            )
+            factual_result = raw_model.predict_world(
                 batch,
                 num_inference_steps=args.num_inference_steps,
                 seed=args.seed,
@@ -314,12 +350,26 @@ def main() -> None:
         if not args.skip_zero_action:
             torch.cuda.empty_cache()
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                zero_result = raw_model.predict_joint(
+                zero_result = raw_model.predict_world(
                     batch,
                     num_inference_steps=args.num_inference_steps,
                     seed=args.seed,
                     zero_future_action=True,
                 )
+        # A world intervention must not persist into a subsequent policy call.
+        policy_changed_batch = dict(batch, action=torch.zeros_like(batch["action"]))
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            policy_after = raw_model.predict_action(
+                policy_changed_batch,
+                num_inference_steps=args.num_inference_steps,
+                seed=args.seed,
+            )
+        policy_difference = float(
+            (policy_result["action_normalized"] - policy_after["action_normalized"])
+            .abs().max().item()
+        )
+        if policy_difference != 0.0:
+            raise RuntimeError(f"candidate leaked into independent policy: {policy_difference}")
         frame_count = int(batch["video"].shape[2])
         target = _tensor_video_to_images(batch["video"])
         factual = _normalize_images(factual_result["video"], frame_count)
@@ -335,17 +385,30 @@ def main() -> None:
             zero=zero,
             duration_ms=args.duration_ms,
         )
-        metrics = _temporal_metrics(target, factual, zero)
-        predicted_action = factual_result.get("action_normalized")
+        width, height = target[0].size
+        top = height - height // 3
+        boxes = ((0, 0, width, top), (0, top, width // 2, height),
+                 (width // 2, top, width, height))
+        view_valid = cpu_batch["direct_view_mask"][0, -frame_count:].bool().all(dim=0)
+        valid_pixels = np.zeros((height, width), dtype=bool)
+        for valid, (left, upper, right, lower) in zip(view_valid.tolist(), boxes):
+            if valid:
+                valid_pixels[upper:lower, left:right] = True
+        metrics = _temporal_metrics(target, factual, zero, valid_pixels)
+        metrics["policy_candidate_max_abs_diff"] = policy_difference
+        metrics["candidate_conditioning"] = factual_result["conditioning"]
+        metrics["zero_action_semantics"] = "normalized_zero_equals_source_offset_not_physical_noop"
+        metrics["valid_views"] = view_valid.tolist()
+        predicted_action = policy_result["action_normalized"][0]
         if isinstance(predicted_action, torch.Tensor):
             predicted_action = predicted_action.detach().float().cpu()
             target_action = batch["action"][0].detach().float().cpu()
             mask = batch["action_element_mask"][0].detach().bool().cpu()
-            metrics["joint_action_normalized_mae"] = float(
+            metrics["policy_action_normalized_mae"] = float(
                 (predicted_action - target_action).abs()[mask].mean().item()
             )
         receipt = {
-            "schema": "wm3d_foundation_joint_demo_v1",
+            "schema": "wm3d_foundation_conditional_world_demo_v1",
             "checkpoint_step": checkpoint_step,
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
@@ -353,6 +416,7 @@ def main() -> None:
             "selection": selection,
             "metrics": metrics,
             "files": paths,
+            "raw_frames_root": str(args.output / "frames"),
         }
         receipt_path = args.output / "receipt.json"
         receipt_path.write_text(

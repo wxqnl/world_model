@@ -171,6 +171,41 @@ PYTHON_BIN=.venv-foundation/bin/python ./run_wm3d.sh runtime \
 不要直接从 20 步跳到正式长训。至少继续验证 step100/500 的视频运动、清晰度、ActionDiT
 物理误差、task/state/history 消融与 Future3D 指标；只有三条能力同时向好才扩大训练。
 
+## Checkpoint 视频与 Action 对照
+
+用完整 checkpoint 导出同 seed 的候选动作视频，以及独立的 policy 预测：
+
+```bash
+FOUNDATION_PYTHON_BIN=.venv-foundation/bin/python \
+  ./run_wm3d.sh foundation-demo \
+  --runtime "$RUN_ROOT/runtime.yaml" \
+  --checkpoint "$RUN_ROOT/checkpoints/step_00000020" \
+  --output "$RUN_ROOT/eval/candidate_demo" \
+  --seed 7340 --num-inference-steps 20
+```
+
+输出目录必须尚不存在。入口使用指定 Python 的 torch.distributed.run，不依赖旁边是否有
+torchrun 可执行文件。
+
+predict_action 只根据观测、任务、状态和历史预测动作。predict_world 则根据给定候选动作
+预测视频：每个采样步使用 WSA 原 action scheduler，将候选动作与同一份固定噪声混合后送入
+ActionDiT，视频仍走原 WSA sampler。该分支的 action 输出不是 policy 预测，不对外返回。
+两路调用结束后会恢复原采样函数，导出器另验 policy 输出逐元素不变。
+
+发布的 WSA-Large 关闭了 VideoDiT 的 action_conditioned 选项。旧导出器仅向那个未启用的
+入口传 real/zero action，实际上生成了两次相同的联合样本；旧对照不能说明模型的动作因果
+能力。修正后的真实响应仍需用 checkpoint 测量，不能凭接口修复认定方向或任务能力已经正确。
+
+面板中的 normalized zero action 指归一化坐标零值，即物理坐标中的 source offset，
+不等于机械臂不动。时序指标仅统计 h1 至 h8 的有效视角，不把输入首帧的 VAE 重建差计作
+预测运动。所有 GIF 共用同一调色板，各帧另存为无损 PNG；定量分析应使用 PNG 或
+receipt 中量化前的指标。GIF 播放速度只用于展示，真实动作时间仍由原数据时间戳决定。
+
+本次 q20 实测（seed 7340、sample 139、20 次采样、两个有效视角）：修正后的候选动作
+RGB 响应 RMS 为 0.00217，旧调用为 0；独立 policy 前后差异严格为 0。未来帧运动幅度保持率
+约 50.1%，方向一致性约 0.017，仍不足以证明动作方向或任务能力。修复没有改变参数量或训练
+objective。全仓检查 608 项通过、4 项按环境条件跳过。
+
 ## 已完成的实现证据
 
 - 现有 sealed direct-raw 数据的 18 个 source 均能无插值映射到 WSA action ABI。
