@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -271,6 +273,8 @@ def test_world_sampler_distinguishes_joint_and_known_action(
     seen = []
 
     class Sampler(nn.Module):
+        train_action_scheduler = SimpleNamespace(num_train_timesteps=1000)
+
         def _predict_joint_noise(self, **kwargs):
             seen.append(kwargs)
             if fail:
@@ -328,7 +332,9 @@ def test_world_sampler_distinguishes_joint_and_known_action(
             assert result["conditioning"]["conditioned_steps"] == 3
         else:
             assert result["conditioning"]["mode"] == "joint_from_observation_no_candidate"
-            assert torch.equal(result["action_normalized"], torch.ones(1, 4, 6))
+            assert torch.equal(
+                result["action_normalized"], torch.ones(1, 4, 6).masked_fill(~mask, 0)
+            )
     assert len(seen) == (1 if fail else 3)
     for call in seen:
         if known:
@@ -341,6 +347,81 @@ def test_world_sampler_distinguishes_joint_and_known_action(
     assert "_predict_joint_noise" not in vars(adapter.wsa_model)
     assert adapter._active_time_update is None
     assert adapter._active_native_3d_update is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("joint", [False, True])
+def test_action_padding_follows_official_training_flow_without_changing_valid_inputs(
+    joint: bool, dtype: torch.dtype,
+) -> None:
+    import os
+    from pathlib import Path
+
+    from wm3d.models.foundation_world_model import _load_upstream_symbols
+
+    source = Path(os.environ.get("WM3D_WSA_SOURCE_ROOT", "/data/Minko/third_party/WSA"))
+    if not source.is_dir():
+        pytest.skip("official WSA source is not installed")
+    _load_upstream_symbols(source)
+    from lerobot.policies.WSA_Large.core.models.wan22.schedulers.scheduler_continuous import (
+        WanContinuousFlowMatchScheduler,
+    )
+
+    scheduler = WanContinuousFlowMatchScheduler()
+    mask = torch.ones(1, 8, 42, dtype=torch.bool)
+    mask[..., 7:] = False
+    mask[:, 3] = False
+    initial_noise = torch.randn(mask.shape).to(dtype=dtype)
+    seen = []
+
+    class Sampler(nn.Module):
+        train_action_scheduler = scheduler
+
+        def _predict_action_noise(self, **kwargs):
+            value = kwargs["latents_action"]
+            seen.append(value.clone())
+            # This protocol test checks sampler wiring, not learned capability.
+            return (value * 0.3).masked_fill(~mask, 1000.0)
+
+        def _predict_joint_noise(self, **kwargs):
+            return torch.tensor([3.0]), self._predict_action_noise(**kwargs)
+
+    adapter = WSABackendAdapter.__new__(WSABackendAdapter)
+    nn.Module.__init__(adapter)
+    adapter.wsa_model = Sampler()
+    name = "_predict_joint_noise" if joint else "_predict_action_noise"
+    times, deltas = scheduler.build_inference_schedule(
+        20, torch.device("cpu"), dtype
+    )
+    rng_before = torch.get_rng_state()
+    latent = initial_noise.clone()
+    with adapter._masked_action_sampling(mask, joint=joint):
+        for t, delta in zip(times, deltas):
+            # Arbitrary feedback in padding must never reach the expert.
+            if len(seen):
+                latent = latent.masked_fill(~mask, -1234.0)
+            before = latent.clone()
+            result = getattr(adapter.wsa_model, name)(
+                latents_action=latent, timestep_action=t[None]
+            )
+            velocity = result[1] if joint else result
+            expected = scheduler.add_noise(
+                torch.zeros_like(latent), initial_noise, t[None]
+            )
+            assert torch.equal(seen[-1][mask], before[mask])
+            assert torch.equal(seen[-1][~mask], expected[~mask])
+            assert torch.equal(velocity[mask], (before * 0.3)[mask])
+            assert torch.equal(velocity[~mask], initial_noise[~mask])
+            if joint:
+                assert torch.equal(result[0], torch.tensor([3.0]))
+            latent = scheduler.step(velocity, delta, latent)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert name not in vars(adapter.wsa_model)
+    # All-valid WSA requests bypass the adapter bit-for-bit.
+    original = getattr(adapter.wsa_model, name)
+    with adapter._masked_action_sampling(torch.ones_like(mask), joint=joint):
+        assert getattr(adapter.wsa_model, name) == original
+    assert name not in vars(adapter.wsa_model)
 
 
 class _Backend(nn.Module):
@@ -491,6 +572,7 @@ def test_foundation_action_serving_reuses_training_context_and_denormalizes() ->
     assert backend.sample["num_inference_steps"] == 4
     assert backend.sample["seed"] == 7
     assert result["action_normalized"].shape == (1, 8, 6)
+    assert result["action_normalized"][..., 3:].count_nonzero() == 0
     assert result["action_physical"].shape == (1, 8, 2, 3)
     assert torch.equal(result["action_physical"][..., 0, :], torch.full((1, 8, 3), 2.0))
     assert torch.equal(result["action_physical"][..., 1, :], torch.zeros(1, 8, 3))

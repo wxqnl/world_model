@@ -70,6 +70,9 @@ rollout A/B，不能在首个版本里盲目扩大。
   不压缩中间空槽。例如 8 个区间共 31 条有效命令时，可以保留 32 个槽位，缺失的那个槽位
   由 mask 排除。有效动作值、真实时间戳、所属区间和数据权重不变，不插值、不补造命令。
   WSA action loss 忽略空槽；K8 rollout 按每个区间的有效命令数聚合，空槽不稀释动作更新。
+  独立 action 与联合 video/action 采样都约束填充位：每轮输入为原始噪声乘当前 sigma，
+  对应已知零标签的 flow 轨迹；填充位速度为同一原始噪声，最终输出为零。有效坐标仍由
+  官方模型和 sampler 更新。不额外抽噪声，不改变训练 loss，也不改真实动作标签。
 - action 时间等于 world interval 起点加该 interval 内的真实 fine-command offset。训练和推理
   使用同一个 `ActionTimeConditioner`；时间空槽的编码输出与梯度严格为零。
 - 当前状态为 3 组 × 10 维；offset、scale、semantic、embodiment 与 action history 通过
@@ -82,6 +85,23 @@ rollout A/B，不能在首个版本里盲目扩大。
   与幅值比仅作验收指标，不作为第二项竞争 loss，也不增加第二套 3D owner。
 - 物理反归一化严格使用同一 source/group profile：`physical = normalized * scale + offset`，
   padded 维保持零。
+
+## 动作填充位修正与验收状态
+
+WSA-Large 默认对填充维度也计算 action denoising loss。WM3D 的 grouped-action 接入改为
+只监督有效维度，但此前继续让 sampler 自由更新全部 42 维。因此，未受监督的填充输出
+会作为下一轮 ActionDiT 输入；训练中的填充输入却是 `sigma * initial_noise`。这是适配层
+的训练/采样失配。已有 18-source 审计样本每条动作只有 2–12 个有效维度，不能忽略其余容量。
+
+现在的修正只约束上述已知零值的填充坐标。Wan、ActionDiT、MoT、VGGT/K8 结构和权重不变，
+不新增参数或 loss；训练前向及数据比例不变。无填充的请求逐元素保持上游行为。旧 step500
+可直接做只读修正前后对照，无须先重新训练 500 步。
+
+代码回归只证明采样约束与接口正确，不能证明 action 能力达标。现有 step500 的修正前验收
+中，独立 action MAE 尚未优于 neutral，视觉条件收益弱；必须在同 checkpoint、同真实样本、
+同 seed 下复测。分别报告 16 个 validation 窗口与 18 sources 的 36 个已见训练诊断窗口，
+不得混报为泛化结果。当前封存 validation 只包含一个 source 的一个 episode。
+联合 RGB demo 同时检查动作误差、运动方向和图像结构，不用“会动”代替预测正确。
 
 ## 目录与模型资产
 

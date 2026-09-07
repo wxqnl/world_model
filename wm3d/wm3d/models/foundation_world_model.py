@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 import importlib
 import importlib.machinery
@@ -822,6 +823,64 @@ class WSABackendAdapter(nn.Module):
             raise FoundationModelError("ActionDiT time update shape changed")
         return output + self._active_time_update.to(dtype=output.dtype)
 
+    @contextmanager
+    def _masked_action_sampling(self, element_mask: torch.Tensor, *, joint: bool):
+        """Keep known-zero padding on the same flow path used in training.
+
+        WM3D masks padded coordinates out of WSA's action loss. Their unconstrained
+        head outputs must not feed back as inputs on later sampling steps.
+        Training uses x_sigma = sigma * epsilon there because x_clean is zero.
+        Reuse the original sampling noise (no new RNG draw) and its known
+        velocity epsilon. Valid coordinates and the official sampler are
+        unchanged; this wrapper is never used by training.
+        """
+        if bool(element_mask.all()):
+            yield
+            return
+        method_name = "_predict_joint_noise" if joint else "_predict_action_noise"
+        original = getattr(self.wsa_model, method_name)
+        had_override = method_name in vars(self.wsa_model)
+        initial_noise = None
+        num_timesteps = float(
+            self.wsa_model.train_action_scheduler.num_train_timesteps
+        )
+
+        def predict(**kwargs: Any) -> Any:
+            nonlocal initial_noise
+            latent = kwargs["latents_action"]
+            timestep = kwargs["timestep_action"]
+            if latent.shape != element_mask.shape:
+                raise FoundationModelError("sampling action padding shape changed")
+            mask = element_mask.to(device=latent.device, dtype=torch.bool)
+            if initial_noise is None:
+                if not bool((timestep == num_timesteps).all()):
+                    raise FoundationModelError(
+                        "masked action sampling must start from full noise"
+                    )
+                initial_noise = latent.detach().clone()
+            sigma = (timestep / num_timesteps).to(
+                device=latent.device, dtype=latent.dtype
+            ).reshape(-1, 1, 1)
+            kwargs["latents_action"] = torch.where(
+                mask, latent, sigma * initial_noise
+            )
+            result = original(**kwargs)
+            if joint:
+                video_velocity, action_velocity = result
+                return video_velocity, torch.where(
+                    mask, action_velocity, initial_noise
+                )
+            return torch.where(mask, result, initial_noise)
+
+        setattr(self.wsa_model, method_name, predict)
+        try:
+            yield
+        finally:
+            if had_override:
+                setattr(self.wsa_model, method_name, original)
+            else:
+                delattr(self.wsa_model, method_name)
+
     def forward(
         self,
         sample: Mapping[str, torch.Tensor],
@@ -936,16 +995,17 @@ class WSABackendAdapter(nn.Module):
             current_native_3d, current_native_3d_view_mask
         )
         try:
-            result = self.wsa_model.infer_action(
-                prompt=None,
-                input_image=input_image,
-                action_horizon=int(action_time_s.shape[1]),
-                proprio=proprio,
-                context=context,
-                context_mask=context_mask,
-                num_inference_steps=int(num_inference_steps),
-                seed=seed,
-            )
+            with self._masked_action_sampling(action_element_mask, joint=False):
+                result = self.wsa_model.infer_action(
+                    prompt=None,
+                    input_image=input_image,
+                    action_horizon=int(action_time_s.shape[1]),
+                    proprio=proprio,
+                    context=context,
+                    context_mask=context_mask,
+                    num_inference_steps=int(num_inference_steps),
+                    seed=seed,
+                )
         finally:
             self._active_time_update = None
             self._active_native_3d_update = None
@@ -957,7 +1017,9 @@ class WSABackendAdapter(nn.Module):
             )
         if not bool(torch.isfinite(action).all()):
             raise FloatingPointError("foundation action inference is non-finite")
-        return action.unsqueeze(0)
+        return action.unsqueeze(0).masked_fill(
+            ~action_element_mask.to(device=action.device, dtype=torch.bool), 0.0
+        )
 
     @torch.inference_mode()
     def infer_world(
@@ -1040,19 +1102,24 @@ class WSABackendAdapter(nn.Module):
         if factual_action is not None:
             self.wsa_model._predict_joint_noise = predict_candidate
         try:
-            result = self.wsa_model.infer_joint(
-                prompt=None,
-                input_image=input_image,
-                num_video_frames=int(num_video_frames),
-                action_horizon=int(action_time_s.shape[1]),
-                action=None,
-                proprio=proprio,
-                context=context,
-                context_mask=context_mask,
-                num_inference_steps=int(num_inference_steps),
-                seed=seed,
-                test_action_with_infer_action=False,
+            sampling = (
+                self._masked_action_sampling(mask, joint=True)
+                if factual_action is None else nullcontext()
             )
+            with sampling:
+                result = self.wsa_model.infer_joint(
+                    prompt=None,
+                    input_image=input_image,
+                    num_video_frames=int(num_video_frames),
+                    action_horizon=int(action_time_s.shape[1]),
+                    action=None,
+                    proprio=proprio,
+                    context=context,
+                    context_mask=context_mask,
+                    num_inference_steps=int(num_inference_steps),
+                    seed=seed,
+                    test_action_with_infer_action=False,
+                )
         finally:
             if factual_action is not None:
                 if had_override:
@@ -1073,7 +1140,9 @@ class WSABackendAdapter(nn.Module):
                 raise FloatingPointError("WSA joint sampling returned non-finite action")
             return {
                 "video": result["video"],
-                "action_normalized": action.unsqueeze(0),
+                "action_normalized": action.unsqueeze(0).masked_fill(
+                    ~mask.to(device=action.device), 0.0
+                ),
                 "conditioning": {"mode": "joint_from_observation_no_candidate"},
             }
         if conditioned_steps != int(num_inference_steps):
@@ -1231,6 +1300,7 @@ class FoundationWorldModel(nn.Module):
         offset = offset.to(device=normalized.device, dtype=normalized.dtype)
         scale = scale.to(device=normalized.device, dtype=normalized.dtype)
         mask = element_mask.to(device=normalized.device)
+        normalized = normalized.masked_fill(~mask, 0.0)
         physical = torch.where(mask, normalized * scale + offset, 0.0)
         return {
             "action_normalized": normalized,
