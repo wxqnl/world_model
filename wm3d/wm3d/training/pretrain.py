@@ -14,6 +14,7 @@ import random
 import re
 import stat
 import time
+import traceback
 from typing import Any, Mapping
 
 import numpy as np
@@ -2094,6 +2095,11 @@ def main() -> None:
             ):
                 async_pipeline.submit()
         dist.barrier()
+    except BaseException:
+        # NCCL teardown can wait for peers still in backward. Preserve the
+        # original rank-local error before entering that cleanup.
+        traceback.print_exc()
+        raise
     finally:
         if async_pipeline is not None:
             async_pipeline.close()
