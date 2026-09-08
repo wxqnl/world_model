@@ -126,14 +126,30 @@ RGB L1 变差，后段仍有形变和轨迹偏离。运动增加不等于预测�
 79 条适配集任务，现通过冻结 UMT5 补齐全部 56,400 条不同文本。context builder 支持
 `--task-bank-index` 和单机 torchrun 分片，输出同一只读格式。
 
-继承适配 step500 的全部模型张量，显式设置 `model_warmstart_new_parameter_prefixes: []`。
-加载器不允许缺键、额外旧模块或重新初始化部分权重。DDP 加载底层 module，保持 WSA 共享
-专家别名；同一处理用于后续精确续训。全量阶段重建 optimizer、schedule 和 sampler，
-这是 model-only warmstart，不是适配 run 的 exact resume。
+2026-09-08 用户改为从新阶段 step0 开始：只加载官方 WSA-Large/Wan 基座，不读取旧
+WM3D step500，也不恢复旧 optimizer、schedule 或 sampler。预训练基座不做随机重置。
+之前 global64/model-only warmstart 的配置仅保留记录，不能用作当前启动入口。
 
-全量运行计划上限 50K、单机 8 H100、global64，先 `--stop-after-step 200` 保存并停止。
-学习率从 1e-5 起步，peak6e-5、weight decay0.01、warmup2000；峰值、衰减和 warmup 参考
-上游微调脚本，起步值衔接适配末段。与适配实验的 1e-4/0.1 不同，须作为新阶段明确记录。
+单机 8 H100，micro2 × accumulation8 = global128，验证 micro-batch 保持 1。
+上限 50K，先 `--stop-after-step 200` 保存并停止。50K 对应 640 万次样本使用，
+不保证遍历约 1,251 万个训练窗口。学习率 start1e-5、peak6e-5、weight decay0.01、
+warmup2000，不因 batch 扩大而自动翻倍。
+
+主体约 98.7% 参数为 BF16，约 1.3% 新增模块参数保留 FP32。此次效率改动只在
+foundation 输入适配器中跳过未被使用的冻结 VGGT depth/point/camera 输出头；
+current、抽样 horizon、final 的 native-3D token 监督不变。八卡、16 个真实 DROID
+三视角样本的六项输入/target 张量前后逐元素相同，624 项测试通过、4 项跳过。
+
+完整模型、真实数据、AdamW 与八次累积的容量测试：原 micro1 平均 12.64 秒/步、
+5.06 样本/秒；优化后 micro2 独立冷启动平均 16.90 秒/步、7.57 样本/秒，
+峰值分配 75.56 GiB。每次配置完成 8 个更新，统计排除前两步。micro4 会 OOM，不采用。
+顺序测试的 micro2 曾达 11.62 样本/秒，但有数据缓存复用，不能把它当作冷启动或
+全量训练速度。短测的八步权重全部丢弃，不用于正式初始化。
+
+启动使用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 减少显存碎片，
+这是 [PyTorch 2.7 提供的分配器选项](https://docs.pytorch.org/docs/2.7/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)，
+不更改模型或目标。micro2 的显存余量仍有限，正式训练需继续观察不同 source 和保存窗口。
+
 200 步后必须复查多个 source 的留出视频和独立 policy，尤其视觉依赖及视频后段形变，
 再决定是否在本根继续。当前没有“全部问题已解决”的结论。
 
