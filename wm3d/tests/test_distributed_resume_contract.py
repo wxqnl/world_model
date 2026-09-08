@@ -274,6 +274,67 @@ def test_model_warmstart_loads_shared_tensors_and_preserves_declared_new_ones(
             dist.destroy_process_group()
 
 
+def test_full_model_warmstart_preserves_shared_ddp_parameter_aliases(
+    tmp_path: Path,
+) -> None:
+    from torch.nn.parallel import DistributedDataParallel
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'alias-group'}", rank=0, world_size=1
+    )
+    try:
+        class SharedExperts(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.video = torch.nn.Linear(2, 2)
+                self.mot = self.video
+
+        source = DistributedDataParallel(SharedExperts())
+        with torch.no_grad():
+            source.module.video.weight.fill_(3.0)
+            source.module.video.bias.fill_(2.0)
+        source_optimizer = torch.optim.AdamW(source.parameters(), lr=0.01)
+        source.module.video(torch.ones(1, 2)).sum().backward()
+        source_optimizer.step()
+        source_optimizer.zero_grad(set_to_none=True)
+        manager = DistributedCheckpointManager(tmp_path / "checkpoints")
+        checkpoint = manager.save(
+            step=1,
+            model=source,
+            optimizer=source_optimizer,
+            metadata=_small_dcp_metadata(progress=1),
+            rank_state={"next_optimizer_step": 1},
+        )
+        target = DistributedDataParallel(SharedExperts())
+        receipt = manager.load_model_warmstart(
+            path=checkpoint, model=target.module, new_parameter_prefixes=()
+        )
+        assert target.module.video.weight is target.module.mot.weight
+        for name, value in target.module.state_dict().items():
+            torch.testing.assert_close(
+                value, source.module.state_dict()[name], rtol=0, atol=0
+            )
+        assert receipt["new_tensors"] == []
+        assert receipt["optimizer_rng_sampler_restored"] is False
+        target_optimizer = torch.optim.AdamW(target.parameters(), lr=0.01)
+        _, progress = manager.load(
+            path=checkpoint, model=target.module, optimizer=target_optimizer,
+            expected=_small_dcp_expected(),
+        )
+        assert progress["next_optimizer_step"] == 1
+        for wrapped, optimizer in (
+            (source, source_optimizer), (target, target_optimizer)
+        ):
+            wrapped.module.video(torch.ones(1, 2)).sum().backward()
+            optimizer.step()
+        for name, value in target.module.state_dict().items():
+            torch.testing.assert_close(
+                value, source.module.state_dict()[name], rtol=0, atol=0
+            )
+    finally:
+        dist.destroy_process_group()
+
+
 def _replace_regular_file(source: Path, destination: Path) -> None:
     temporary = destination.with_name(destination.name + ".attacker")
     shutil.copyfile(source, temporary)

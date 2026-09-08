@@ -446,7 +446,6 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             )
         if (
             not isinstance(warmstart_prefixes, list)
-            or not warmstart_prefixes
             or any(
                 not isinstance(prefix, str)
                 or not prefix
@@ -455,7 +454,8 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             )
         ):
             raise RuntimeContractError(
-                "model warmstart new parameter prefixes must be explicit names"
+                "model warmstart new parameter prefixes must be explicit names; "
+                "an empty list requires loading the entire model"
             )
         if len(set(warmstart_prefixes)) != len(warmstart_prefixes):
             raise RuntimeContractError(

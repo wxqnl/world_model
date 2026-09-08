@@ -1697,7 +1697,10 @@ def main() -> None:
             )
             warmstart_model = source_manager.load_model_warmstart(
                 path=source_path,
-                model=model,
+                # DDP state-dict restore can lose aliases in shared WSA experts.
+                # Load its module; FSDP2 wraps this same object in place.
+                # Every rank loads before optimizer creation.
+                model=raw_model,
                 new_parameter_prefixes=prefixes,
             )
         optimizer_cfg = runtime["optimizer"]
@@ -1825,7 +1828,7 @@ def main() -> None:
             assert expectations is not None
             metadata, progress = manager.load(
                 path=args.resume,
-                model=model,
+                model=raw_model,
                 optimizer=optimizer,
                 expected=expectations,
             )

@@ -88,20 +88,54 @@ rollout A/B，不能在首个版本里盲目扩大。
 
 ## 动作填充位修正与验收状态
 
-WSA-Large 默认对填充维度也计算 action denoising loss。WM3D 的 grouped-action 接入改为
-只监督有效维度，但此前继续让 sampler 自由更新全部 42 维。因此，未受监督的填充输出
-会作为下一轮 ActionDiT 输入；训练中的填充输入却是 `sigma * initial_noise`。这是适配层
-的训练/采样失配。已有 18-source 审计样本每条动作只有 2–12 个有效维度，不能忽略其余容量。
+WSA-Large 的类默认配置对填充维度计算 action denoising loss，但官方 RoboTwin 微调脚本也
+启用了 padding mask；不能把这个风险说成 WM3D 独有。WM3D grouped-action 只监督有效维度，
+此前 sampler 却自由更新全部 42 维。未受监督的填充输出会作为下一轮 ActionDiT 输入，
+训练中的填充输入则是 `sigma * initial_noise`，形成训练/采样失配。已有 18-source 审计样本
+每条动作只有 2–12 个有效维度。修正后，填充坐标沿已知加噪轨迹更新，最终严格为零。
 
 现在的修正只约束上述已知零值的填充坐标。Wan、ActionDiT、MoT、VGGT/K8 结构和权重不变，
 不新增参数或 loss；训练前向及数据比例不变。无填充的请求逐元素保持上游行为。旧 step500
 可直接做只读修正前后对照，无须先重新训练 500 步。
 
-代码回归只证明采样约束与接口正确，不能证明 action 能力达标。现有 step500 的修正前验收
-中，独立 action MAE 尚未优于 neutral，视觉条件收益弱；必须在同 checkpoint、同真实样本、
-同 seed 下复测。分别报告 16 个 validation 窗口与 18 sources 的 36 个已见训练诊断窗口，
-不得混报为泛化结果。当前封存 validation 只包含一个 source 的一个 episode。
-联合 RGB demo 同时检查动作误差、运动方向和图像结构，不用“会动”代替预测正确。
+2026-09-08 已完成同 checkpoint 的修正前后 A/B，以及修正后 step100/500 的同样本、
+同噪声对比。独立 action 的完整序列归一化 MAE：
+
+| 样本集合 | step100 | step500 | neutral |
+| --- | ---: | ---: | ---: |
+| 16 个留出窗口 | 0.85739 | 0.69970 | 0.58052 |
+| 18 sources、36 个已见训练诊断窗口 | 0.90235 | 0.72442 | 0.45917 |
+
+step500 相对 step100 分别有 14/16、27/36 样本改善，18 个 source 均值中 16 个改善。
+H1 归一化 MAE 从 0.65232/0.85656 降至 0.35804/0.47377；对应 neutral 为
+0.51113/0.47223。H1 先在单样本内平均有效 group，再跨样本平均，不能与混池口径混用。
+这些指标证明继续适配能学到动作；完整序列仍未稳定超过 neutral，不能声称 VLA 已验收。
+
+视觉消融在已见诊断集的误差增量为 -0.00747，尚未证明正确视觉依赖。history/state 依赖较强。
+policy future-label 差异、反归一化差异和 padding 轨迹误差均为零。16 个 validation 窗口仍只
+来自同一 source 的一个 episode，不代表全量数据泛化；真实夹爪切换样本覆盖也不足。
+
+三组视频的帧间幅值保持率从 47.0%/46.4%/23.1% 升至 73.2%/51.0%/75.5%，但其中两组的
+RGB L1 变差，后段仍有形变和轨迹偏离。运动增加不等于预测正确。完整结果位于
+`wm3d_v10_joint_adaptation_8h100_g64_20260907_r4/eval/checkpoint_trend_20260908`。
+
+### 全量训练准备与阶段边界
+
+后续沿用已准备的 `wm3d_full_robot_data_20260904`：18 sources、670,760 episodes、
+12,765,292 总窗口；不改 source 权重、原始任务、归一化或 split。原 Wan 缓存只包含
+79 条适配集任务，现通过冻结 UMT5 补齐全部 56,400 条不同文本。context builder 支持
+`--task-bank-index` 和单机 torchrun 分片，输出同一只读格式。
+
+继承适配 step500 的全部模型张量，显式设置 `model_warmstart_new_parameter_prefixes: []`。
+加载器不允许缺键、额外旧模块或重新初始化部分权重。DDP 加载底层 module，保持 WSA 共享
+专家别名；同一处理用于后续精确续训。全量阶段重建 optimizer、schedule 和 sampler，
+这是 model-only warmstart，不是适配 run 的 exact resume。
+
+全量运行计划上限 50K、单机 8 H100、global64，先 `--stop-after-step 200` 保存并停止。
+学习率从 1e-5 起步，peak6e-5、weight decay0.01、warmup2000；峰值、衰减和 warmup 参考
+上游微调脚本，起步值衔接适配末段。与适配实验的 1e-4/0.1 不同，须作为新阶段明确记录。
+200 步后必须复查多个 source 的留出视频和独立 policy，尤其视觉依赖及视频后段形变，
+再决定是否在本根继续。当前没有“全部问题已解决”的结论。
 
 ## 目录与模型资产
 

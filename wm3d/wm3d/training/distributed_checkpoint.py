@@ -1188,7 +1188,7 @@ class DistributedCheckpointManager:
             options = StateDictOptions(
                 full_state_dict=False,
                 cpu_offload=False,
-                strict=False,
+                strict=not new_parameter_prefixes,
             )
             error: Optional[Exception] = None
             model_state: dict[str, Any] = {}
@@ -1221,6 +1221,11 @@ class DistributedCheckpointManager:
                 raise CheckpointIntegrityError(
                     "warmstart source is missing non-new model tensors: "
                     + ", ".join(missing_required[:16])
+                )
+            if not new_parameter_prefixes and source_model_names != current_names:
+                raise CheckpointIntegrityError(
+                    "full-model warmstart source contains unexpected model tensors: "
+                    + ", ".join(sorted(source_model_names - current_names)[:16])
                 )
             matched = required_names & source_model_names
             if not matched:

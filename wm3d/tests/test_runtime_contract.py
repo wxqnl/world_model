@@ -212,6 +212,12 @@ def test_v7_aligned_rgb_warmstart_is_explicit_and_model_only() -> None:
         validate_runtime_profile(duplicate)
 
 
+def test_full_model_warmstart_requires_explicit_empty_new_prefixes() -> None:
+    value = _load("h100_16_fsdp2_v7_aligned_rgb500.yaml")
+    value["train"]["model_warmstart_new_parameter_prefixes"] = []
+    validate_runtime_profile(value)
+
+
 def test_nonzero_start_lr_survives_formal_warmup() -> None:
     value = _load("h100_16_fsdp2_dual_path_mb16_50k.yaml")
     validate_runtime_profile(value)
