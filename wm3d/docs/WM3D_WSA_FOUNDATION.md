@@ -119,7 +119,32 @@ policy future-label 差异、反归一化差异和 padding 轨迹误差均为零
 RGB L1 变差，后段仍有形变和轨迹偏离。运动增加不等于预测正确。完整结果位于
 `wm3d_v10_joint_adaptation_8h100_g64_20260907_r4/eval/checkpoint_trend_20260908`。
 
-### 全量训练准备与阶段边界
+### 当前阶段：先训练适配模块
+
+2026-09-08 用户确认先冻结 WSA 主体，训练 WM3D 新接口。当前模型 profile 显式设为
+`finetune_mode: adapters`；旧 runtime 未写此项时仍按原来的 full 模式解释，不能混用恢复。
+
+冻结 released video、ActionDiT、Future3D 的 Transformer 主体及 Wan VAE。训练已有
+robot/context fusion、action-time、native-3D state/rollout，以及 ActionDiT action_encoder/head、
+proprio_encoder、Future3D output_decoder 的最终 output_norm/output_proj。最后一项负责
+DA3 到 VGGT 输出表示的适配，不解冻 3D attention/FFN。没有新增模块或 loss。
+
+冻结仅排除参数梯度与 optimizer 状态，不包裹整个 WSA 为 no_grad：输入适配模块仍须
+通过冻结主干反传。保留 activation checkpointing、BF16、完整视频和真实 action/3D 目标。
+冻结不保证视频输出完全不变，因为新条件仍会改变主干输入；必须做真实样本质量对照。
+
+首轮短对照复用已验证的 18-source 小集：182 episodes、11,682 train windows、
+292 validation windows。保留该小集原有 split、封存归一化和 source 权重，不修改全量数据。
+这个小集的归一化统计不等同全量闭包，故比较冻结/全量策略时必须使用同一小集。
+小集只做接口适配与方向验证，不能据此宣布对全部任务泛化，也不预设必须用全部数据长训。
+后续数据规模依据独立 episode/多 source 验证是否饱和决定，不只按训练 loss 决定。
+
+之前 full/global128 从 WSA fresh 的任务已在 step20 保存失败后退出，没有完整 COMMITTED；
+最后一次训练 loss/gradient 有限，错误出现在 DCP/collective 保存阶段。现场保留，禁止
+把它当作成功的 200-step 验收或恢复来源。本阶段资格必须包含真实保存与 exact resume，
+不能只以八步容量 benchmark 代替。新的本地错误日志保留原始 DCP 异常。
+
+### 历史记录：全量训练准备
 
 后续沿用已准备的 `wm3d_full_robot_data_20260904`：18 sources、670,760 episodes、
 12,765,292 总窗口；不改 source 权重、原始任务、归一化或 split。原 Wan 缓存只包含

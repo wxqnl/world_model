@@ -58,3 +58,6 @@ model:
   native_3d_rollout_loss_weight: 0.05
   activation_checkpointing: true
   dtype: bf16
+  # Keep released video/action/3D Transformer bodies frozen; train WM3D
+  # adapters and the action/native-3D/proprio interfaces only.
+  finetune_mode: adapters

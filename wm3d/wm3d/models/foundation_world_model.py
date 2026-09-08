@@ -91,6 +91,9 @@ class FoundationWorldModelConfig:
     native_3d_rollout_loss_weight: float = 0.05
     activation_checkpointing: bool = True
     dtype: str = "bf16"
+    # Explicit stage contract; loading an old profile preserves its behavior.
+    # adapters freezes the released experts, not the gradient path through them.
+    finetune_mode: str = "full"
 
     @property
     def action_width(self) -> int:
@@ -181,6 +184,8 @@ class FoundationWorldModelConfig:
                 raise FoundationModelError(f"{name} must be positive")
         if self.dtype != "bf16":
             raise FoundationModelError("the WSA foundation profile requires bf16")
+        if self.finetune_mode not in {"full", "adapters"}:
+            raise FoundationModelError("finetune_mode must be full or adapters")
         if require_paths:
             for name in (
                 "upstream_source_root",
@@ -1177,6 +1182,29 @@ class FoundationWorldModel(nn.Module):
             config.wsa_text_dim,
             config.context_fusion_heads,
         )
+        if config.finetune_mode == "adapters":
+            # No no_grad/detach: new input adapters still learn through the
+            # frozen experts. Keep all pretrained values exactly as loaded.
+            self.backend.wsa_model.requires_grad_(False)
+            for modules in self._pretrained_interface_modules().values():
+                for module in modules:
+                    module.requires_grad_(True)
+
+    def _pretrained_interface_modules(self) -> Mapping[str, tuple[nn.Module, ...]]:
+        wsa = self.backend.wsa_model
+        return {
+            "foundation_action_interface": (
+                wsa.action_expert.action_encoder,
+                wsa.action_expert.head,
+            ),
+            # The released readout predicted DA3; our teacher supplies VGGT.
+            # Adapt only its final mapping, not its attention/FFN backbone.
+            "foundation_native_3d_interface": (
+                wsa.future_3d_expert.output_decoder.output_norm,
+                wsa.future_3d_expert.output_decoder.output_proj,
+            ),
+            "foundation_proprio": (wsa.proprio_encoder,),
+        }
 
     def train(self, mode: bool = True) -> "FoundationWorldModel":
         """Preserve WSA's official DiT-only fine-tuning boundary."""
@@ -1450,7 +1478,6 @@ class FoundationWorldModel(nn.Module):
 
         wsa_model = self.backend.wsa_model
         owners: dict[str, tuple[nn.Module, ...]] = {
-            "foundation_mixture_of_transformers": (wsa_model.dit,),
             "foundation_action_time": (self.backend.action_time,),
             "foundation_robot_conditioning": (
                 self.robot_conditioner,
@@ -1459,6 +1486,10 @@ class FoundationWorldModel(nn.Module):
             "foundation_native_3d_state": (self.backend.native_3d_state,),
             "foundation_native_3d_rollout": (self.backend.native_3d_rollout,),
         }
+        if self.cfg.finetune_mode == "adapters":
+            owners.update(self._pretrained_interface_modules())
+            return owners
+        owners["foundation_mixture_of_transformers"] = (wsa_model.dit,)
         proprio = getattr(wsa_model, "proprio_encoder", None)
         if proprio is not None and any(p.requires_grad for p in proprio.parameters()):
             owners["foundation_proprio"] = (proprio,)

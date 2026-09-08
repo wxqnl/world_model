@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import random
@@ -694,6 +695,9 @@ class DistributedCheckpointManager:
                 checkpoint_id=temporary / "distcp",
             )
         except Exception as exc:
+            # Preserve the originating error even if the process group's
+            # subsequent collective error reporting also fails.
+            logging.exception("DCP save failed locally on rank %s", rank)
             error = exc
         _collective_error("DCP save", error)
 
