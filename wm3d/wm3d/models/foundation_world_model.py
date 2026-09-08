@@ -94,6 +94,8 @@ class FoundationWorldModelConfig:
     # Explicit stage contract; loading an old profile preserves its behavior.
     # adapters freezes the released experts, not the gradient path through them.
     finetune_mode: str = "full"
+    # Explicit fresh-start policy; old sealed profiles remain reproducible.
+    pretrained_interface_init: str = "legacy_skip"
 
     @property
     def action_width(self) -> int:
@@ -186,6 +188,10 @@ class FoundationWorldModelConfig:
             raise FoundationModelError("the WSA foundation profile requires bf16")
         if self.finetune_mode not in {"full", "adapters"}:
             raise FoundationModelError("finetune_mode must be full or adapters")
+        if self.pretrained_interface_init not in {
+            "legacy_skip", "pretrained_action_prefix",
+        }:
+            raise FoundationModelError("unsupported pretrained interface initialization")
         if require_paths:
             for name in (
                 "upstream_source_root",
@@ -1555,6 +1561,57 @@ def _load_upstream_symbols(source_root: Path | str) -> tuple[Any, Any]:
     return WSALargeConfig, WSALargePolicy
 
 
+def _retain_expanded_wsa_action_prior(
+    policy: nn.Module, pretrained_root: Path | str,
+) -> list[dict[str, object]]:
+    """Preserve released action coordinates when extending storage capacity.
+
+    This is a parameter prior, not a remapping of robot physical semantics.
+    Existing rows/columns keep their released values; new coordinates start
+    at zero and remain trainable through the existing action objective.
+    Proprio is deliberately not copied: its new physical-state layout is
+    independently adapted. Old materialized runtimes retain legacy loading.
+    """
+    from safetensors import safe_open
+
+    expert = policy.model.action_expert
+    targets = {
+        "model.mot.mixtures.action.action_encoder.weight": expert.action_encoder.weight,
+        "model.mot.mixtures.action.action_encoder.bias": expert.action_encoder.bias,
+        "model.mot.mixtures.action.head.weight": expert.head.weight,
+        "model.mot.mixtures.action.head.bias": expert.head.bias,
+    }
+    receipt: list[dict[str, object]] = []
+    path = Path(pretrained_root) / "model.safetensors"
+    with safe_open(str(path), framework="pt", device="cpu") as source:
+        # Validate all shapes before touching any parameter.
+        values = {}
+        for name, target in targets.items():
+            value = source.get_tensor(name)
+            if target is None or value.ndim != target.ndim or any(
+                old > new for old, new in zip(value.shape, target.shape, strict=True)
+            ):
+                raise FoundationModelError(
+                    f"pretrained action prior requires expansion, not truncation: {name}"
+                )
+            if not bool(torch.isfinite(value).all()):
+                raise FoundationModelError(f"non-finite pretrained action prior: {name}")
+            values[name] = value
+        with torch.no_grad():
+            for name, target in targets.items():
+                value = values[name]
+                overlap = tuple(slice(0, int(size)) for size in value.shape)
+                target.zero_()
+                target[overlap].copy_(value)
+                receipt.append({
+                    "name": name,
+                    "released_shape": list(value.shape),
+                    "model_shape": list(target.shape),
+                    "new_coordinates": "zero_initialized_trainable",
+                })
+    return receipt
+
+
 def build_foundation_world_model(
     config: FoundationWorldModelConfig,
     *,
@@ -1626,6 +1683,10 @@ def build_foundation_world_model(
         local_files_only=True,
         strict=False,
     )
+    if config.pretrained_interface_init == "pretrained_action_prefix":
+        policy._wm3d_action_prior_receipt = _retain_expanded_wsa_action_prior(
+            policy, config.wsa_pretrained_path
+        )
     # Follow the official fine-tuning boundary: train the MoT experts and
     # proprio projection, while keeping Wan VAE and other fixed components
     # frozen. The WM3D robot/time adapters added below remain trainable.

@@ -61,3 +61,6 @@ model:
   # Keep released video/action/3D Transformer bodies frozen; train WM3D
   # adapters and the action/native-3D/proprio interfaces only.
   finetune_mode: adapters
+  # Retain the released 24-D action prior; only added capacity starts at zero.
+  # The physical state layout is adapted independently, not copied by index.
+  pretrained_interface_init: pretrained_action_prefix
