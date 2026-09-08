@@ -38,7 +38,8 @@ trainable_interface_dtype: fp32
 - 连续低于BF16量化单位的Adam更新可以在FP32参数中累积；
   旧BF16参数在该数值回归中不变。
 - optimizer保存/恢复保持FP32状态。
-- CUDA生产设备验证须在当前GPU作业结束后运行，不能用CPU单测替代。
+- 已在 H100 上通过 CUDA BF16 前向、activation-checkpoint 梯度和完整 native readout 对照；相关回归 83 项通过。
+- LayerNorm 内部可用 FP32 计算，但显式恢复原输入激活 dtype，避免独立 serving 与训练输出类型不一致。
 
 后续使用完整原索引、原采样、micro16/accum1/global128、原1000步日程，
 fresh到100停止，与conservative-conditioning step100直接比较。

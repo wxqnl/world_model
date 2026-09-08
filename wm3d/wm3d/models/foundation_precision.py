@@ -26,7 +26,12 @@ class FP32TrainableInterface(nn.Module):
         # small FP32 parameters accumulate updates instead of discarding each
         # sub-ULP step. The original action-time hook remains on the inner layer.
         with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16):
-            return self.layer(x)
+            result = self.layer(x)
+        # CUDA autocast promotes LayerNorm to FP32. Preserve the original
+        # activation dtype before the unchanged BF16 output projection.
+        if isinstance(self.layer, nn.LayerNorm):
+            return result.to(x.dtype)
+        return result
 
 
 def promote_trainable_interfaces(wsa: nn.Module) -> None:

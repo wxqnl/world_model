@@ -63,3 +63,16 @@ def test_sub_ulp_updates_accumulate_and_adam_resume_keeps_fp32_moments():
     restored=torch.optim.AdamW(fixed.parameters(),lr=1e-5)
     restored.load_state_dict(new.state_dict())
     assert restored.state[fixed.weight]["exp_avg"].dtype==torch.float32
+
+def test_full_native_readout_has_identical_training_and_serving_outputs():
+    original=nn.Sequential(nn.LayerNorm(1024),nn.Linear(1024,2048)).bfloat16().to(DEVICE)
+    wrapped=nn.Sequential(*(FP32TrainableInterface(deepcopy(layer)) for layer in original))
+    x=torch.randn(2,4,1024,dtype=torch.bfloat16,device=DEVICE)
+    with torch.autocast(DEVICE.type,dtype=torch.bfloat16):
+        expected_train=original(x)
+        actual_train=wrapped(x)
+    expected_serve=original(x)
+    actual_serve=wrapped(x)
+    assert torch.equal(expected_train,expected_serve)
+    assert torch.equal(expected_train,actual_train)
+    assert torch.equal(expected_serve,actual_serve)
