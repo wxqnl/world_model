@@ -410,6 +410,39 @@ def _learning_rate(step: int, runtime: Mapping[str, Any]) -> float:
     return minimum + (peak - minimum) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _optimizer_parameter_groups(
+    raw_model: torch.nn.Module,
+    parameters: list[torch.nn.Parameter],
+    config: Mapping[str, Any],
+) -> list[Any]:
+    """Keep the old optimizer layout unless a conservative owner LR is requested."""
+    scale = float(config.get("robot_conditioning_lr_scale", 1.0))
+    if not 0.0 < scale <= 1.0:
+        raise PretrainError("robot_conditioning_lr_scale must be in (0, 1]")
+    if scale == 1.0:
+        return parameters
+    owners = getattr(raw_model, "gradient_owner_modules", None)
+    modules = () if owners is None else owners().get("foundation_robot_conditioning", ())
+    protected = {id(p) for module in modules for p in module.parameters() if p.requires_grad}
+    all_ids = {id(p) for p in parameters}
+    if not protected or not protected.issubset(all_ids):
+        raise PretrainError("conditioning LR requires its materialized trainable owner")
+    ordinary = [p for p in parameters if id(p) not in protected]
+    conditioned = [p for p in parameters if id(p) in protected]
+    if not ordinary:
+        raise PretrainError("conditioning LR must not replace the entire optimizer")
+    peak = float(config["peak_lr"])
+    return [
+        {"params": ordinary, "lr": peak, "lr_scale": 1.0},
+        {"params": conditioned, "lr": peak * scale, "lr_scale": scale},
+    ]
+
+
+def _set_learning_rate(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr * float(group.get("lr_scale", 1.0))
+
+
 _RGB_OBJECTIVE_WEIGHTS = (
     "rgb_l1",
     "rgb_charbonnier",
@@ -1709,8 +1742,11 @@ def main() -> None:
         ]
         if not trainable_parameters:
             raise PretrainError("model exposes no trainable parameters")
+        parameter_groups = _optimizer_parameter_groups(
+            raw_model, trainable_parameters, optimizer_cfg
+        )
         optimizer = torch.optim.AdamW(
-            trainable_parameters,
+            parameter_groups,
             lr=float(optimizer_cfg["peak_lr"]),
             betas=tuple(float(value) for value in optimizer_cfg["betas"]),
             eps=float(optimizer_cfg["eps"]),
@@ -1893,8 +1929,7 @@ def main() -> None:
                 if foundation_mode
                 else _rgb_decoder_forward_enabled(step, runtime)
             )
-            for group in optimizer.param_groups:
-                group["lr"] = lr
+            _set_learning_rate(optimizer, lr)
             accumulated: dict[str, torch.Tensor] = {}
             source_id: int | None = None
             completed_candidate = step + 1

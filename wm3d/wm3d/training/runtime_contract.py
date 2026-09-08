@@ -470,6 +470,9 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError(
             "optimizer learning rates must satisfy 0 <= start <= peak and 0 < min <= peak"
         )
+    conditioning_scale = float(optimizer.get("robot_conditioning_lr_scale", 1.0))
+    if not 0.0 < conditioning_scale <= 1.0:
+        raise RuntimeContractError("robot_conditioning_lr_scale must be in (0, 1]")
     if schedule.get("name") != "warmup_stable_cosine":
         raise RuntimeContractError("schedule.name must be warmup_stable_cosine")
     total_steps = int(train["total_steps"])
