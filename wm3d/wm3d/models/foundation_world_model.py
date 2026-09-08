@@ -96,6 +96,8 @@ class FoundationWorldModelConfig:
     finetune_mode: str = "full"
     # Explicit fresh-start policy; old sealed profiles remain reproducible.
     pretrained_interface_init: str = "legacy_skip"
+    # Preserve old runtimes; fp32 only promotes the small trainable interfaces.
+    trainable_interface_dtype: str = "model"
 
     @property
     def action_width(self) -> int:
@@ -188,6 +190,10 @@ class FoundationWorldModelConfig:
             raise FoundationModelError("the WSA foundation profile requires bf16")
         if self.finetune_mode not in {"full", "adapters"}:
             raise FoundationModelError("finetune_mode must be full or adapters")
+        if self.trainable_interface_dtype not in {"model", "fp32"}:
+            raise FoundationModelError("unsupported trainable interface precision")
+        if self.trainable_interface_dtype == "fp32" and self.finetune_mode != "adapters":
+            raise FoundationModelError("FP32 interfaces require adapters mode")
         if self.pretrained_interface_init not in {
             "legacy_skip", "pretrained_action_prefix",
         }:
@@ -1192,6 +1198,9 @@ class FoundationWorldModel(nn.Module):
             # No no_grad/detach: new input adapters still learn through the
             # frozen experts. Keep all pretrained values exactly as loaded.
             self.backend.wsa_model.requires_grad_(False)
+            if config.trainable_interface_dtype == "fp32":
+                from .foundation_precision import promote_trainable_interfaces
+                promote_trainable_interfaces(self.backend.wsa_model)
             for modules in self._pretrained_interface_modules().values():
                 for module in modules:
                     module.requires_grad_(True)
