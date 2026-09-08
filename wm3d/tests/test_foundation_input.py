@@ -115,3 +115,57 @@ def test_input_adapter_binds_current_sampled_k8_and_final_vggt() -> None:
     )
     assert adapter.metrics["calls"] == 1
     assert adapter.metrics["vggt_frames"] == 6
+
+
+class _IndependentVGGT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rows = 0
+
+    def forward(self, images, view_mask, **kwargs):
+        self.rows += images.shape[0] * images.shape[1]
+        value = images.mean(dim=(-1, -2, -3)).masked_fill(~view_mask, 0.0)
+        # Cross-view dependence must be kept in each cache entry.
+        value = value + value.mean(dim=-1, keepdim=True)
+        return {"view_tokens": value[..., None, None].expand(*value.shape, 144, 2048).clone()}
+
+
+def test_frozen_native_cache_preserves_values_masks_and_bounded_storage() -> None:
+    bridge = FoundationBridgeConfig(
+        context_frames=2, future_frames=4, video_height=48, video_width=32,
+        max_action_groups=2, max_action_dim=3, max_state_dim=2,
+    )
+    store = FoundationContextStore(["pick", "place"], torch.randn(2, 5, 32),
+                                   torch.ones(2, 5, dtype=torch.bool))
+    encoder = _IndependentVGGT()
+    adapter = FoundationInputAdapter(bridge, context_store=store, vggt_encoder=encoder,
+                                    device="cpu", vggt_cache_bytes=64 * 1024**2)
+    batch = _batch()
+    batch["direct_frame_keys"] = torch.arange(12).reshape(2, 6)
+    adapter.vggt_cache_limit = 0
+    reference = adapter.materialize(batch)
+    adapter.vggt_cache_limit = 64 * 1024**2
+    first = adapter.materialize(batch)
+    computed = encoder.rows
+    hit = adapter.materialize(batch)
+    assert encoder.rows == computed
+    assert adapter.vggt_cache_hits > 0
+    for key, expected in reference.items():
+        if isinstance(expected, torch.Tensor):
+            assert torch.equal(first[key], expected), key
+            assert torch.equal(hit[key], expected), key
+    assert not torch.is_inference(hit["vggt_current_tokens"])
+    # The same physical frame with a different camera subset is not a cache hit.
+    batch["direct_view_mask"][0, :, 2] = False
+    changed = adapter.materialize(batch)
+    assert encoder.rows > computed
+    adapter.vggt_cache_limit = 0
+    changed_reference = adapter.materialize(batch)
+    assert torch.equal(changed["vggt_current_tokens"], changed_reference["vggt_current_tokens"])
+    adapter._vggt_cache.clear()
+    adapter.vggt_cache_bytes = 0
+    adapter.vggt_cache_limit = 1
+    uncached = adapter.materialize(batch)
+    assert adapter.vggt_cache_bytes == 0
+    assert not adapter._vggt_cache
+    assert torch.equal(uncached["vggt_future_tokens"], changed_reference["vggt_future_tokens"])

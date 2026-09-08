@@ -144,6 +144,25 @@ DA3 到 VGGT 输出表示的适配，不解冻 3D attention/FFN。没有新增�
 把它当作成功的 200-step 验收或恢复来源。本阶段资格必须包含真实保存与 exact resume，
 不能只以八步容量 benchmark 代替。新的本地错误日志保留原始 DCP 异常。
 
+### 适配训练的数据与计算缓存
+
+当前短资格之后的适配训练使用既有完整索引，限定 1000 个 optimizer 更新。
+source 权重、split、动作标签、时间戳和归一化沿用全量数据，不反复训练 182-episode 小集。
+仍从官方 WSA-Large/Wan 权重开始，只训练上述适配接口；不恢复资格或旧 WM3D checkpoint。
+用户最新要求 gradient accumulation 为 1，micro-batch 按真实八卡容量与吞吐测试选取。
+1000 步使用 100 步 warmup；start/peak/min LR 保持 1e-5/6e-5/6e-6，不按 batch 倍增 LR。
+
+可选环境变量 `WM3D_FOUNDATION_VGGT_CACHE_BYTES_PER_RANK` 给每个 rank 的冻结 VGGT
+CPU 特征缓存设定字节上限，默认 0 关闭。缓存键包含封存 episode/物理帧身份和完整视角 mask；
+保留同时刻多视角编码，不缓存跨时间 teacher，不将 future target 传给模型或 serving。
+缓存输出保持原 FP32 token 精度；同批重复物理帧只编码一次。没有可靠帧身份的调用走原路径。
+该缓存仅复用固定预处理、固定冻结 encoder 的结果，不能用于训练中的随机图像增强。
+启用前须通过真实多视角 VGGT 输入/target 张量对照及实际 optimizer 前后向。
+
+raw-frame prepared cache 与此特征缓存相互独立，均属于 host 内存预算。
+冻结主干仍需前向和输入梯度反传，activation checkpointing 也仍会重算；因此不能按
+可训练参数减少比例推算加速。吞吐报告按 samples/s，同时标注 batch、冷缓存与数据来源。
+
 ### 历史记录：全量训练准备
 
 后续沿用已准备的 `wm3d_full_robot_data_20260904`：18 sources、670,760 episodes、

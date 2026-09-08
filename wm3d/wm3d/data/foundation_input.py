@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import replace
 import json
+import os
 from math import isqrt
 from pathlib import Path
 import time
@@ -120,6 +122,7 @@ class FoundationInputAdapter(torch.nn.Module):
         native_3d_context_tokens: int = 144,
         native_3d_rollout_tokens: int = 64,
         native_3d_target_tokens: int = 144,
+        vggt_cache_bytes: int = 0,
     ) -> None:
         super().__init__()
         bridge.validate()
@@ -140,17 +143,92 @@ class FoundationInputAdapter(torch.nn.Module):
         self.samples = 0
         self.vggt_frames = 0
         self.vggt_seconds = 0.0
+        self.vggt_cache_limit = int(vggt_cache_bytes)
+        if self.vggt_cache_limit < 0:
+            raise FoundationInputError("VGGT cache budget must be non-negative")
+        # Instance-local: one frozen encoder, preprocessing contract and data
+        # namespace. A frame key includes its episode; the mask preserves the
+        # simultaneous-camera context. No temporal teacher features are cached.
+        self._vggt_cache: OrderedDict[tuple[int, tuple[bool, ...]], torch.Tensor] = OrderedDict()
+        self.vggt_cache_bytes = 0
+        self.vggt_cache_hits = 0
+        self.vggt_cache_misses = 0
+        self.vggt_cache_evictions = 0
+        self.vggt_coalesced_rows = 0
+        self.vggt_encoded_rows = 0
 
     def train(self, mode: bool = True) -> "FoundationInputAdapter":
         super().train(mode)
         self.vggt_encoder.eval()
         return self
 
+    def _encode_native_rows(
+        self, images: torch.Tensor, view_mask: torch.Tensor
+    ) -> torch.Tensor:
+        selected = images.to(self.device, non_blocking=True).float().div_(255.0)
+        selected_mask = view_mask.to(self.device, non_blocking=True)
+        with torch.inference_mode():
+            output = self.vggt_encoder(
+                selected,
+                selected_mask,
+                geometry_row_mask=torch.zeros(selected.shape[:2], dtype=torch.bool, device=self.device),
+                appearance_row_mask=torch.zeros(selected.shape[:2], dtype=torch.bool, device=self.device),
+                rgb_row_mask=torch.zeros(selected.shape[:2], dtype=torch.bool, device=self.device),
+            )
+        self.vggt_encoded_rows += int(images.shape[0] * images.shape[1])
+        # Differentiable consumers must receive ordinary, not inference tensors.
+        return output["view_tokens"].clone()
+
+    def _cached_native_rows(
+        self, images: torch.Tensor, view_mask: torch.Tensor, frame_keys: torch.Tensor
+    ) -> torch.Tensor:
+        flat_images = images.flatten(0, 1)
+        flat_mask = view_mask.flatten(0, 1)
+        keys = [
+            (int(key), tuple(bool(v) for v in mask))
+            for key, mask in zip(frame_keys.flatten().cpu().tolist(), flat_mask.cpu().tolist(), strict=True)
+        ]
+        rows: dict[tuple[int, tuple[bool, ...]], torch.Tensor] = {}
+        missing: dict[tuple[int, tuple[bool, ...]], int] = {}
+        for index, key in enumerate(keys):
+            if key in rows or key in missing:
+                self.vggt_coalesced_rows += 1
+            elif key in self._vggt_cache:
+                rows[key] = self._vggt_cache[key]
+                self._vggt_cache.move_to_end(key)
+                self.vggt_cache_hits += 1
+            else:
+                missing[key] = index
+                self.vggt_cache_misses += 1
+        if missing:
+            indices = torch.tensor(list(missing.values()), device=images.device)
+            encoded = self._encode_native_rows(
+                flat_images.index_select(0, indices).unsqueeze(1),
+                flat_mask.index_select(0, indices.to(flat_mask.device)).unsqueeze(1),
+            )[:, 0].detach().cpu()
+            for (key, _index), value in zip(missing.items(), encoded, strict=True):
+                # Clone each row so retaining one entry never retains a batch's storage.
+                value = value.clone()
+                rows[key] = value
+                size = value.numel() * value.element_size()
+                if size > self.vggt_cache_limit:
+                    continue
+                while self.vggt_cache_bytes + size > self.vggt_cache_limit:
+                    _old_key, old = self._vggt_cache.popitem(last=False)
+                    self.vggt_cache_bytes -= old.numel() * old.element_size()
+                    self.vggt_cache_evictions += 1
+                self._vggt_cache[key] = value
+                self.vggt_cache_bytes += size
+        return torch.stack([rows[key] for key in keys]).reshape(
+            *images.shape[:3], self.native_3d_context_tokens, 2048
+        ).to(self.device, non_blocking=True)
+
     def _native_3d_targets(
         self,
         images: torch.Tensor,
         view_mask: torch.Tensor,
         sample_index: torch.Tensor,
+        frame_keys: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch = images.shape[0]
         if sample_index.shape != (batch,) or sample_index.dtype != torch.long:
@@ -167,7 +245,7 @@ class FoundationInputAdapter(torch.nn.Module):
                 images[:, final_index],
             ),
             dim=1,
-        ).to(self.device, non_blocking=True).float().div_(255.0)
+        )
         selected_mask = torch.stack(
             (
                 view_mask[:, current_index],
@@ -176,27 +254,20 @@ class FoundationInputAdapter(torch.nn.Module):
             ),
             dim=1,
         ).to(self.device, non_blocking=True)
-        with torch.inference_mode():
-            output = self.vggt_encoder(
-                selected,
-                selected_mask,
-                # Foundation supervision consumes pooled aggregator tokens only.
-                # Pixel depth/point/camera heads do not feed those tokens or any
-                # foundation objective, and their FP32 activations waste memory.
-                geometry_row_mask=torch.zeros(
-                    selected.shape[:2], dtype=torch.bool, device=self.device
-                ),
-                appearance_row_mask=torch.zeros(
-                    selected.shape[:2], dtype=torch.bool, device=self.device
-                ),
-                rgb_row_mask=torch.zeros(
-                    selected.shape[:2], dtype=torch.bool, device=self.device
-                ),
-            )
-        # Frozen teachers must not create an autograd graph, but their outputs
-        # are consumed by differentiable rollout losses. Clone after leaving
-        # inference mode so PyTorch may safely save them for backward.
-        tokens = output["view_tokens"].clone()
+        if self.vggt_cache_limit and frame_keys is not None:
+            if frame_keys.shape != images.shape[:2] or frame_keys.dtype != torch.long:
+                raise FoundationInputError("direct frame keys must be int64 [B,T+K]")
+            key_rows = torch.arange(batch, device=frame_keys.device)
+            selected_keys = torch.stack((
+                frame_keys[:, current_index],
+                frame_keys[key_rows, sampled_index.to(frame_keys.device)],
+                frame_keys[:, final_index],
+            ), dim=1)
+            tokens = self._cached_native_rows(selected, selected_mask, selected_keys)
+        else:
+            # Serving/legacy callers without sealed physical-frame identities
+            # take the original path; sample_index alone is not a cache key.
+            tokens = self._encode_native_rows(selected, selected_mask)
         expected = (
             images.shape[0],
             3,
@@ -234,7 +305,7 @@ class FoundationInputAdapter(torch.nn.Module):
                 "foundation data must preserve sample_index for deterministic K8 supervision"
             )
         native_3d = self._native_3d_targets(
-            images, view_mask.bool(), sample_index.long()
+            images, view_mask.bool(), sample_index.long(), batch.get("direct_frame_keys")
         )
         self.vggt_seconds += time.perf_counter() - started
         sample["wan_context"] = wan_context
@@ -252,6 +323,12 @@ class FoundationInputAdapter(torch.nn.Module):
             "samples": self.samples,
             "vggt_frames": self.vggt_frames,
             "vggt_seconds": self.vggt_seconds,
+            "vggt_encoded_rows": self.vggt_encoded_rows,
+            "vggt_cache_bytes": self.vggt_cache_bytes,
+            "vggt_cache_hits": self.vggt_cache_hits,
+            "vggt_cache_misses": self.vggt_cache_misses,
+            "vggt_cache_evictions": self.vggt_cache_evictions,
+            "vggt_coalesced_rows": self.vggt_coalesced_rows,
         }
 
 
@@ -294,4 +371,5 @@ def build_foundation_input_adapter(
         native_3d_context_tokens=model.native_3d_context_tokens,
         native_3d_rollout_tokens=model.native_3d_rollout_tokens,
         native_3d_target_tokens=model.native_3d_target_tokens,
+        vggt_cache_bytes=int(os.environ.get("WM3D_FOUNDATION_VGGT_CACHE_BYTES_PER_RANK", "0")),
     )
