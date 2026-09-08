@@ -11,9 +11,13 @@ from wm3d.data.foundation_input import (
 
 
 class _VGGT(nn.Module):
-    def forward(self, images, view_mask, **_kwargs):
+    def forward(self, images, view_mask, **kwargs):
         assert images.shape[:3] == (2, 3, 3)
         assert view_mask.shape == (2, 3, 3)
+        for name in ("geometry_row_mask", "appearance_row_mask", "rgb_row_mask"):
+            assert kwargs[name].shape == (2, 3)
+            assert kwargs[name].dtype == torch.bool
+            assert not kwargs[name].any()
         tokens = torch.ones(2, 3, 3, 144, 2048)
         tokens[:, 1].mul_(2)
         tokens[:, 2].mul_(3)

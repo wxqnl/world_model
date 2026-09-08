@@ -180,7 +180,10 @@ class FoundationInputAdapter(torch.nn.Module):
             output = self.vggt_encoder(
                 selected,
                 selected_mask,
-                geometry_row_mask=torch.ones(
+                # Foundation supervision consumes pooled aggregator tokens only.
+                # Pixel depth/point/camera heads do not feed those tokens or any
+                # foundation objective, and their FP32 activations waste memory.
+                geometry_row_mask=torch.zeros(
                     selected.shape[:2], dtype=torch.bool, device=self.device
                 ),
                 appearance_row_mask=torch.zeros(
