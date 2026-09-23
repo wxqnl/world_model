@@ -168,8 +168,25 @@ RGB L1 均差于 copy-last，action MAE 均高于归一化零值基线。不能�
 双机资格于 2026-09-24 00:25 正常完成 100 步，step100 COMMITTED、16 distcp、
 16 rank_state、梯度所有权和双机读取均通过。step100 total 1.103271、video 0.246033、
 action 0.775513、3D 0.816650、grad norm 3.969389。末尾 step82–100 为 14.67 秒/步、
-1.09 samples/s。独立同拓扑 joint 生成正在读回 checkpoint；与 q20 比较须按 source/sample
-对齐，不能把不同样本冒充配对，也不把训练 flow loss 当作 RGB/action 质量。
+1.09 samples/s。同 16 卡拓扑独立读回与 joint 生成已正常完成，16 份 receipt 的
+future-label policy 差异均严格为 0，没有单色或逐帧完全相同。
+
+固定 seed7340 与 q20 对齐了 8 组 source/sample，配对均值如下：
+
+| 生成诊断 | q20 | q100 | 参考基线 |
+| --- | ---: | ---: | ---: |
+| Action 归一化 MAE | 1.09212 | 0.82993 | 归一化零值 0.69487 |
+| 3D 第八时刻 delta error | 1.22391 | 0.71420 | copy-last 0.71763 |
+| 3D 第八时刻方向余弦 | 0.19513 | 0.30589 | — |
+| RGB 帧间变化保持率 | 23.91% | 65.58% | — |
+| RGB 时序方向余弦 | 0.02557 | 0.01842 | — |
+| RGB L1 | 0.09392 | 0.09606 | copy-last 0.06447 |
+
+Action/3D 有学习趋势，但 RGB 变化增加不等于运动正确。完整 9 帧检查显示姿态偏差、
+重影和尾部模糊；16 个 q100 样本中 RGB 没有优于 copy-last，policy 仅 1 个优于归一化零值。
+归一化零值对应 source offset，不是物理 no-op。样本仅覆盖 Hydra/RoboCasa composite；
+两轮训练曝光量和调度不同，不是只改变步数的严格消融，更不能据此证明成熟质量。
+报告位于 q100 根的 `eval/qualification_report_20260924.md` 和 `eval/q20_q100_comparison.json`。
 
 正式启动须等待完整数据恢复、必要验收与拓扑确认。“双卡”指两台 16 卡还是两张卡
 尚待用户确认；当前仅继续已批准的 43/44 资格和准备，不擅自启动 32 卡。
@@ -190,12 +207,32 @@ loss、学习率及原数据采样语义不变。每次新建资格根，不复�
 不能只看加载期或 nvidia-smi 瞬时值。OOM 只允许发生在独立短资格进程，立即停止该组，
 不影响其他任务。完成后仍需完整数据预检和真实读取，五源小集不代表全量就绪。
 
+2026-09-24 的同模型短程容量结果（step12–20，排除冷启动及验证计时窗口）：
+
+| train micro / global | 秒/步 | samples/s | 前后向峰值 allocated / reserved GiB | 阶段末最少空闲 GiB |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / 16 | 14.82 | 1.079 | 51.27 / 76.83 | 3.22 |
+| 2 / 32 | 14.96 | 2.138 | 51.88 / 77.39 | 3.32 |
+| 4 / 64 | 15.76 | 4.061 | 62.10 / 70.47 | 8.78 |
+
+三档均为 fresh Wan、20 次真实更新和两次验证，无 OOM 或非有限值，owner 梯度有限非零。
+验证 batch 保持 micro1/global16：小集 mutex 验证只有 21 个窗口，不能无放回组成 global32。
+第一次 micro2 在此容量检查退出，未训练、未 OOM；未通过复制窗口或删除 source 绕过检查。
+micro4 验证峰值 allocated 42.56 GiB，吞吐约为 micro1 的 3.76 倍。
+reserved 包含可回收缓存，不能等同活跃张量；不同 batch 的缓存布局也不同。
+目前 micro4 是五源小集已测的候选，不是完整 1000h 的最大安全 batch：
+小集最小 train 容量 70，不支持更大的 global batch；全量恢复后须检查真实最大样本形状，
+再测可容纳的更大 micro。实际配置、逐 rank 显存和日志分别保留在
+`/data/Minko/wm3d_native_capacity_micro1_2node16_20260924`、
+`/data/Minko/wm3d_native_capacity_micro2_2node16_20260924_attempt2`、
+`/data/Minko/wm3d_native_capacity_micro4_2node16_20260924`。
+
 ## 验收与当前证据
 
-截至 2026-09-23，全仓检查为 652 passed、1 skipped。真实 Wan 权重的 CPU 建模已完成，
+截至 2026-09-24，含默认关闭的显存测量改动，全仓检查为 652 passed、1 skipped。真实 Wan 权重的 CPU 建模已完成，
 未加载 WSA checkpoint；总参数约 7.247B、可训练参数约 6.542B，包含约 5.000B 视频骨干、
 1.021B action、0.433B 3D。参数注册已去重，避免重复保存同一 MoT 权重。
-真实 8 卡训练、保存、同拓扑独立读回及无标签生成均已运行；16 卡 q100 训练与保存也已通过，生成质量仍待独立验收。
+真实 8/16 卡训练、保存、同拓扑独立读回和无未来标签生成均已运行；生成质量尚未达标。
 不能表述为 WM3D 已收敛或优于 WSA。
 
 试训先确认真实数据能读、各训练 owner 梯度有限非零、优化器确实更新参数、训练/推理边界
@@ -228,7 +265,7 @@ v3.0；恢复约 412 GiB 的原文件，不更换索引、adapter 或采样比�
 
 本计划使用 academic-research-suite 的 experiment-agent / code experiment plan 工作流，
 形成于 2026-09-23。材料来源：本机实际代码/资产、既定 1000h receipt、官方仓库；
-验证状态为代码、8 卡训练/保存/独立读回/推理工程检查已验；双机试训与质量验收继续。本文不证明生成质量。
+验证状态为代码、8/16 卡训练/保存/独立读回/推理工程检查已验；已有部分学习趋势，但本文不证明生成质量。
 
 - [WSA 官方实现](https://github.com/zaleni/WSA)：MoT、WSALarge mask、flow training 和 sampler。
 - [WSA 预训练入口](https://github.com/zaleni/WSA/blob/main/launch/wsa_large_pretrain.sh)：
