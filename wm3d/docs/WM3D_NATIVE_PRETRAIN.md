@@ -118,6 +118,22 @@ export WM3D_DIRECT_PREFETCH_WORKERS=2 WM3D_DIRECT_ASYNC_PIPELINE=0
   --master_addr=172.27.0.6 --master_port=29983 -- --runtime "$RUN/runtime.yaml"
 ```
 
+## 下载期间先用可读数据测试
+
+用户于 2026-09-23 要求不等待全部下载，先测已有数据。44 已空闲，43 仍有其他任务，
+因此先用 `h100_8_native_qualification.yaml` 在 44 做完整模型 8 卡、20 步资格测试。
+这不是缩小模型的模拟实验：模型、RGB 分辨率、K8、三视角、action 与 3D loss 均不变；
+仅 batch 为 8，资格调度为 20 步，第 20 步保存，以验证真实前后向与 checkpoint。
+
+资格数据位于 `/data/Minko/wm3d_native_available_qualification_data_20260923`。
+使用三个已存在的 RoboCasa source 及已恢复的 OXE mutex/hydra：每源取既定 1000h
+清单中前 8 个训练 episode、原 split 的前 2 个验证 episode，不按动作或预测质量挑选。
+继承原数据的物理标签、camera 绑定、数值归一化和文本向量，不改正式数据文件。
+小集只判断工程是否跑通，不证明 1000h 收敛或跨 source 能力。
+
+输出根为 44 的 `/data/Minko/wm3d_native_available_q20_8gpu_20260923`。通过单机测试后，
+补真实双机分片/同步验证；完整数据恢复和必要验收通过后再进入正式训练。
+
 ## 验收与当前证据
 
 截至 2026-09-23，全仓检查为 647 passed、4 skipped。真实 Wan 权重的 CPU 建模已完成，
