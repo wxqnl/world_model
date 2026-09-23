@@ -137,6 +137,40 @@ def _environment_flag(name: str) -> bool:
     return value == "1"
 
 
+def _record_gpu_memory(
+    path: Path | None, device: torch.device, *, step: int, phase: str,
+    batch: Mapping[str, Any] | None = None,
+) -> None:
+    """Opt-in rank-local capacity measurements; never change training tensors."""
+    if path is None:
+        return
+    torch.cuda.synchronize(device)
+    free, total = torch.cuda.mem_get_info(device)
+    shapes: dict[str, list[int]] = {}
+
+    def collect(value: Any, prefix: str) -> None:
+        if isinstance(value, torch.Tensor):
+            shapes[prefix] = list(value.shape)
+        elif isinstance(value, Mapping):
+            for key, child in value.items():
+                collect(child, f"{prefix}.{key}" if prefix else str(key))
+
+    if batch is not None:
+        collect(batch, "")
+    _append_jsonl(path, {
+        "step": step,
+        "phase": phase,
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "allocated_bytes": torch.cuda.memory_allocated(device),
+        "reserved_bytes": torch.cuda.memory_reserved(device),
+        "device_free_bytes": free,
+        "device_total_bytes": total,
+        "tensor_shapes": shapes,
+    })
+    torch.cuda.reset_peak_memory_stats(device)
+
+
 def _configure_reproducibility(
     seed: int, *, cudnn_benchmark: bool = False
 ) -> None:
@@ -1264,6 +1298,7 @@ def _validate(
     rgb_flow_teacher: FrozenBidirectionalRAFTRuntime | None = None,
     training_step: int = 0,
     foundation_mode: bool = False,
+    memory_log: Path | None = None,
 ) -> dict[str, Any]:
     count = int(runtime_profile["train"]["validation_steps"])
     loader = _make_loader(
@@ -1295,7 +1330,7 @@ def _validate(
         label: {} for label, _ratio in settings
     }
     model.eval()
-    for cpu_batch in loader:
+    for validation_index, cpu_batch in enumerate(loader):
         if input_adapter is not None:
             cpu_batch = input_adapter.materialize(cpu_batch)
         batch = _batch_to_device(cpu_batch, context.device)
@@ -1326,6 +1361,10 @@ def _validate(
                 totals[label][name] = (
                     totals[label].get(name, torch.zeros_like(value)) + value
                 )
+        _record_gpu_memory(
+            memory_log, context.device, step=training_step,
+            phase=f"validation_{validation_index}", batch=batch,
+        )
     model.train()
     reduced = {
         label: reduce_metrics(
@@ -1935,6 +1974,13 @@ def main() -> None:
                 "stopped run is exactly resumable"
             )
         log_path = output_root / "train_metrics.jsonl"
+        memory_log = (
+            output_root / f"gpu_memory_rank_{context.rank:05d}.jsonl"
+            if _environment_flag("WM3D_PROFILE_GPU_MEMORY") else None
+        )
+        _record_gpu_memory(
+            memory_log, context.device, step=start_step, phase="initialized",
+        )
         accumulation = int(runtime["train"]["gradient_accumulation"])
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -2058,8 +2104,15 @@ def main() -> None:
             grad_norm_value = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
             if not bool(torch.isfinite(grad_norm_value).all()):
                 raise FloatingPointError(f"non-finite gradient norm at step {step}")
+            _record_gpu_memory(
+                memory_log, context.device, step=completed,
+                phase="forward_backward", batch=batch,
+            )
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            _record_gpu_memory(
+                memory_log, context.device, step=completed, phase="optimizer",
+            )
             if completed % int(runtime["train"]["log_every"]) == 0 or completed == stop_after_step:
                 metrics = reduce_metrics(accumulated)
                 grad_tensor = grad_norm_value.detach().float().reshape(-1).mean()
@@ -2115,6 +2168,7 @@ def main() -> None:
                     rgb_flow_teacher=rgb_flow_teacher,
                     training_step=completed,
                     foundation_mode=foundation_mode,
+                    memory_log=memory_log,
                 )
                 if context.is_rank0:
                     record = {"step": completed, "validation": validation}
