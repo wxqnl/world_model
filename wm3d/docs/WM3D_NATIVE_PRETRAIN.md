@@ -137,8 +137,18 @@ export WM3D_DIRECT_PREFETCH_WORKERS=2 WM3D_DIRECT_ASYNC_PIPELINE=0
 - 保存完整 step100 后做独立进程读回。有限的 100 步只资格验证和测速，不证明最终 VLA
   或约 1000h 的充分收敛；闭环任务留给后续阶段，不能只用 LIBERO 下结论。
 
-当前阻塞：43/44 有其他评测任务，按用户要求等待；清单引用的 `/shared/Minko` 下
-OXE/DROID 原始路径暂不可见，需要恢复原挂载或确认迁移路径。不得绕过缺失 source 开训。
+原始数据恢复正在进行：43/44/42 未找到可直接替换的完整 OXE/DROID 文件，RoboCasa
+原文件仍在。已按原清单逐文件核对公开资产，14 个 OXE source 对应 main，DROID 对应
+v3.0；恢复约 412 GiB 的原文件，不更换索引、adapter 或采样比例，不使用 41。
+下载服务 `wm3d-native-raw-recovery-20260923` 在 43 运行，数据写入 44 的
+`/data/Minko/raw_recovery_20260923`，43 通过 NFS 访问同一路径。
+进度、日志与完成记录在 `/data/Minko/wm3d_native_pretrain_checks_20260923`，分别为
+`raw_recovery_progress.json`、`raw_recovery.log`、`RAW_RECOVERY_COMPLETE.json`。
+只有完成记录生成并确认完整文件可读后，才把恢复目录只读挂到双方原来的
+`/shared/Minko/datasets`，保持既有数据路径。开训前还需核对 NFS 和磁盘空间。
+
+43/44 现有任务按用户要求等待，不停止或共享其 GPU。两机空闲且数据恢复完成后，
+继续执行真实 16 卡 preflight 和 100 步试训；不得绕过缺失 source 开训。
 
 ## 来源与实验材料说明
 
