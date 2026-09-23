@@ -19,3 +19,6 @@
   unchanged and preserve the saved source-window proportions. Never count overlapping windows
   as hours or replace the source mixture with a motion-selected/equal-source subset.
   Missing raw mounts are an infrastructure error, not permission to silently drop sources.
+- Episode selection supplies integer window counts to the exact source sampler, not fractional
+  probabilities. Keep the selected-window ratios exact. Cached schedules must reproduce the
+  original per-cycle shuffle and per-source occurrence for arbitrary optimizer-step access.

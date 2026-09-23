@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from wm3d.data.episode_selection import select_training_entries
+from wm3d.data.step_sampler import StepAddressedBatchSampler
 from wm3d.models.foundation_native import TrajectoryReadout, TrajectoryStateConditioner, trajectory_loss, _tensor_loss_metrics
 from wm3d.models.foundation_world_model import FoundationModelError, foundation_config_from_mapping
 from wm3d.training.runtime_contract import validate_runtime_profile
@@ -121,7 +122,15 @@ def test_reuse_saved_selection_preserves_sources_and_window_proportions(tmp_path
     identity = {"a": ("oxe_a", "a"), "b": ("robocasa_b", "b"), "c": ("robocasa_b", "c")}
     selected, weights = select_training_entries(rows, identity, path, metadata)
     assert len(selected) == 3
-    assert weights == {"oxe_a": 1 / 3, "robocasa_b": 2 / 3}
+    assert weights == {"oxe_a": 1, "robocasa_b": 2}
+    sampler = StepAddressedBatchSampler(
+        source_spans={"oxe_a": (0, 1), "robocasa_b": (1, 3)},
+        source_order=["oxe_a", "robocasa_b"], source_weights=weights,
+        world_size=1, rank=0, micro_batch_size=1, gradient_accumulation=1,
+        start_optimizer_step=0, num_optimizer_steps=3, seed=3407,
+    )
+    assert sampler.schedule.fractions == {"oxe_a": 1 / 3, "robocasa_b": 2 / 3}
+    assert sorted(batch[0] for batch in sampler) == [0, 1, 2]
     with pytest.raises(ValueError, match="another data root"):
         select_training_entries(rows, identity, path, tmp_path / "other" / "metadata")
 

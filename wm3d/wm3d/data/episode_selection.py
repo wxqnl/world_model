@@ -38,4 +38,6 @@ def select_training_entries(entries, identities, selection_path, metadata_root):
             raise ValueError(f"{name}: the saved selection must retain all OXE windows")
     # Exactly the existing project's rule: count selected source windows,
     # without equalizing sources or selecting for motion/model quality.
-    return tuple(selected), {name: count / len(selected) for name, count in counts.items()}
+    # ExactSourceSchedule consumes integer weights, not normalized fractions.
+    # Counts preserve the same ratios without rounding any source to zero.
+    return tuple(selected), dict(counts)

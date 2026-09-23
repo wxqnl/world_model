@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from collections import Counter
+from unittest.mock import patch
 
-from wm3d.data.step_sampler import ExactSourceSchedule, StepAddressedBatchSampler
+import pytest
+
+from wm3d.data.step_sampler import (
+    ExactSourceSchedule, SamplingContractError, StepAddress,
+    StepAddressedBatchSampler, _cycle_permutation,
+)
 
 
 def test_source_schedule_matches_integer_weights_exactly_per_cycle() -> None:
@@ -99,3 +105,33 @@ def test_topology_change_preserves_exact_global_sample_sequence() -> None:
     )
     assert two_rank == four_rank == eight_rank
     assert len(two_rank) == len(set(two_rank)) == 8
+
+
+@pytest.mark.parametrize("weight", [0.5, 1.5, True, "2", 0, -1])
+def test_source_schedule_rejects_weights_that_would_be_truncated(weight):
+    with pytest.raises(SamplingContractError, match="positive integers"):
+        ExactSourceSchedule(["a"], {"a": weight}, seed=19)
+
+
+def test_cached_schedule_preserves_shuffle_occurrences_and_random_access():
+    schedule = ExactSourceSchedule(["a", "b", "c"], {"a": 7, "b": 3, "c": 2}, seed=3407)
+    with patch("wm3d.data.step_sampler._cycle_permutation", wraps=_cycle_permutation) as shuffle:
+        for step in [0, 9, 1, 11, 4, 8, 2]:
+            address = schedule.address(step)
+            order = _cycle_permutation(schedule.cycle_length, schedule.seed, 0)
+            ids = tuple(schedule.expanded_source_ids[index] for index in order)
+            source_id = ids[step]
+            expected = StepAddress(step, schedule.source_order[source_id],
+                                   ids[:step].count(source_id), 0, step)
+            assert address == expected
+        assert shuffle.call_count == 1
+    for step in [12, 35, 13, 4, 24, 36]:
+        cycle, position = divmod(step, schedule.cycle_length)
+        order = _cycle_permutation(schedule.cycle_length, schedule.seed, cycle)
+        ids = tuple(schedule.expanded_source_ids[index] for index in order)
+        source_id = ids[position]
+        source = schedule.source_order[source_id]
+        expected = StepAddress(step, source,
+                               cycle * schedule.weights[source] + ids[:position].count(source_id),
+                               cycle, position)
+        assert schedule.address(step) == expected

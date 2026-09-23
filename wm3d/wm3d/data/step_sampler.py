@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 import hashlib
 from math import gcd
+from numbers import Integral
 
 from torch.utils.data import Sampler
 
@@ -72,6 +73,11 @@ class ExactSourceSchedule:
             raise SamplingContractError("source_order must be non-empty and unique")
         if set(self.source_order) != set(source_weights):
             raise SamplingContractError("source weights must exactly match source_order")
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral)
+            for value in source_weights.values()
+        ):
+            raise SamplingContractError("all source weights must be positive integers")
         self.weights = {name: int(source_weights[name]) for name in self.source_order}
         if any(value <= 0 for value in self.weights.values()):
             raise SamplingContractError("all source weights must be positive integers")
@@ -81,6 +87,9 @@ class ExactSourceSchedule:
             expanded.extend([source_id] * self.weights[source_name])
         self.expanded_source_ids = tuple(expanded)
         self.cycle_length = len(expanded)
+        self._cached_cycle: int | None = None
+        self._cached_source_ids: tuple[int, ...] = ()
+        self._cached_source_positions: tuple[list[int], ...] = ()
 
     @property
     def fractions(self) -> dict[str, float]:
@@ -93,12 +102,22 @@ class ExactSourceSchedule:
         if step < 0:
             raise SamplingContractError("optimizer step must be non-negative")
         cycle, position = divmod(step, self.cycle_length)
-        order = _cycle_permutation(self.cycle_length, self.seed, cycle)
-        source_ids = tuple(self.expanded_source_ids[index] for index in order)
-        source_id = source_ids[position]
+        if self._cached_cycle != cycle:
+            # Reuse the exact existing shuffle. Whole-episode selections can
+            # have millions of count-weighted positions in one source cycle.
+            order = _cycle_permutation(self.cycle_length, self.seed, cycle)
+            self._cached_source_ids = tuple(
+                self.expanded_source_ids[index] for index in order
+            )
+            positions: list[list[int]] = [[] for _ in self.source_order]
+            for offset, source_id in enumerate(self._cached_source_ids):
+                positions[source_id].append(offset)
+            self._cached_source_positions = tuple(positions)
+            self._cached_cycle = cycle
+        source_id = self._cached_source_ids[position]
         source_name = self.source_order[source_id]
-        occurrence = cycle * self.weights[source_name] + sum(
-            earlier == source_id for earlier in source_ids[:position]
+        occurrence = cycle * self.weights[source_name] + bisect_left(
+            self._cached_source_positions[source_id], position
         )
         return StepAddress(step, source_name, occurrence, cycle, position)
 
