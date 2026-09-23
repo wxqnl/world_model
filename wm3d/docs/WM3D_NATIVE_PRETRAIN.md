@@ -165,16 +165,37 @@ RGB L1 均差于 copy-last，action MAE 均高于归一化零值基线。不能�
 运行配置 `/data/Minko/wm3d_native_pretrain_checks_20260923/h100_16_available_qualification.yaml`。
 服务 `wm3d-native-available-q100-n43-20260923` 与 `wm3d-native-available-q100-n44-20260923`；
 日志在运行根 `logs/preflight_n43.log`、`preflight_n44.log`、`train_n43.log`、`train_n44.log`。
-只有 NFS、16 rank preflight 均通过才启动训练；100 步后检查 checkpoint 与同 seed 无目标生成。
-完整数据恢复和必要验收通过后再正式训练。首轮正式更新预算已向用户确认，尚待回复；
-不能把 32 卡规划配置的 100000 步自动当成已批准预算。
+双机资格于 2026-09-24 00:25 正常完成 100 步，step100 COMMITTED、16 distcp、
+16 rank_state、梯度所有权和双机读取均通过。step100 total 1.103271、video 0.246033、
+action 0.775513、3D 0.816650、grad norm 3.969389。末尾 step82–100 为 14.67 秒/步、
+1.09 samples/s。独立同拓扑 joint 生成正在读回 checkpoint；与 q20 比较须按 source/sample
+对齐，不能把不同样本冒充配对，也不把训练 flow loss 当作 RGB/action 质量。
+
+正式启动须等待完整数据恢复、必要验收与拓扑确认。“双卡”指两台 16 卡还是两张卡
+尚待用户确认；当前仅继续已批准的 43/44 资格和准备，不擅自启动 32 卡。
+首轮正式按 2000 更新步的保守分段预算准备，不采用规划文件的 100000 步。
+
+## Micro-batch 容量测量
+
+独立工作树使用同一生产模型、真实数据、实际 AdamW 更新和累积 1，依次测试
+micro1、micro2，后者稳定才测试更大值。保持分辨率、K8、3D/action 条件、
+loss、学习率及原数据采样语义不变。每次新建资格根，不复用资格 checkpoint 初始化。
+
+设置 `WM3D_PROFILE_GPU_MEMORY=1` 后，现有 trainer 会写各 rank 的
+`gpu_memory_rank_00000.jsonl` 等记录，包含初始化、前后向、optimizer、每个验证 batch
+的 allocated/reserved 峰值、设备剩余显存与实际 tensor shapes。默认关闭时不执行 CUDA
+同步或采样。开启后的少量同步/I/O 开销应在吞吐报告中说明。
+
+以所有 rank 的最坏峰值为准，至少保留 4–6 GiB，选择稳定且 samples/s 更好的最大 batch；
+不能只看加载期或 nvidia-smi 瞬时值。OOM 只允许发生在独立短资格进程，立即停止该组，
+不影响其他任务。完成后仍需完整数据预检和真实读取，五源小集不代表全量就绪。
 
 ## 验收与当前证据
 
 截至 2026-09-23，全仓检查为 652 passed、1 skipped。真实 Wan 权重的 CPU 建模已完成，
 未加载 WSA checkpoint；总参数约 7.247B、可训练参数约 6.542B，包含约 5.000B 视频骨干、
 1.021B action、0.433B 3D。参数注册已去重，避免重复保存同一 MoT 权重。
-真实 8 卡训练、checkpoint 保存、同拓扑独立读回及无标签生成均已运行；双机同步与生成质量仍待验收。
+真实 8 卡训练、保存、同拓扑独立读回及无标签生成均已运行；16 卡 q100 训练与保存也已通过，生成质量仍待独立验收。
 不能表述为 WM3D 已收敛或优于 WSA。
 
 试训先确认真实数据能读、各训练 owner 梯度有限非零、优化器确实更新参数、训练/推理边界
@@ -200,8 +221,8 @@ v3.0；恢复约 412 GiB 的原文件，不更换索引、adapter 或采样比�
 只有全部完成且文件可读后，才能使用完整 1000h 清单。开训前核对 NFS 和磁盘空间。
 
 43 的其他任务和 44 单机资格读回均已结束。每次启动前仍需查占用，
-不得停止或共享其他项目 GPU。两机空闲且数据恢复完成后，
-继续执行真实 16 卡 preflight 和 100 步试训；不得绕过缺失 source 开训。
+不得停止或共享其他项目 GPU。全量恢复后使用完整索引执行预检与真实读取；q100 已完成，不机械重复相同资格。
+正式启动仍需拓扑确认，且不得绕过缺失 source 开训。
 
 ## 来源与实验材料说明
 
