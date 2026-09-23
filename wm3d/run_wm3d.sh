@@ -21,7 +21,8 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
     --output <文本上下文目录>
   ./run_wm3d.sh foundation-preflight <torchrun 参数...> -- --runtime <runtime.yaml>
   ./run_wm3d.sh foundation-train <torchrun 参数...> -- <训练参数...>
-  ./run_wm3d.sh foundation-demo --runtime <runtime.yaml> --checkpoint <step目录> --output <新目录> [--mode joint|candidate]
+  ./run_wm3d.sh foundation-demo <与 checkpoint 相同的 torchrun 拓扑参数...> -- \
+    --runtime <runtime.yaml> --checkpoint <step目录> --output <新目录> [--mode joint|candidate]
   ./run_wm3d.sh lock-resolve <resolve_source_lock.py 参数...>
   ./run_wm3d.sh download <download_sources.py 参数...>
   ./run_wm3d.sh agibot-existing-check --snapshot-root <已下载的 AgiBotWorld2026 目录>
@@ -147,8 +148,13 @@ foundation_torchrun_split() {
       app_args+=("${argument}")
     fi
   done
+  if [[ "${preflight}" == demo && ${seen} -eq 0 ]]; then
+    app_args=("${torch_args[@]}")
+    torch_args=(--standalone --nproc_per_node=1)
+    seen=1
+  fi
   [[ ${seen} -eq 1 && ${#app_args[@]} -gt 0 ]] || {
-    echo "foundation train/preflight: 必须用 -- 分隔 torchrun 和应用参数。" >&2
+    echo "foundation: 必须用 -- 分隔 torchrun 和应用参数。" >&2
     exit 2
   }
   local python_bin=${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}
@@ -159,6 +165,9 @@ foundation_torchrun_split() {
   if [[ "${preflight}" == 1 ]]; then
     "${python_bin}" -m torch.distributed.run "${torch_args[@]}" \
       -m wm3d.training.pretrain "${app_args[@]}" --preflight-only
+  elif [[ "${preflight}" == demo ]]; then
+    "${python_bin}" -m torch.distributed.run "${torch_args[@]}" \
+      -m scripts.eval_foundation_joint_demo "${app_args[@]}"
   else
     "${python_bin}" -m torch.distributed.run "${torch_args[@]}" \
       -m wm3d.training.pretrain "${app_args[@]}"
@@ -181,12 +190,7 @@ need_python_unless_env() {
 need_python_unless_env
 
 case "${command}" in
-  foundation-demo)
-    python_bin=${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}
-    [[ -x "${python_bin}" ]] || { echo "找不到 ${python_bin}" >&2; exit 2; }
-    exec "${python_bin}" -m torch.distributed.run --standalone --nproc_per_node=1 \
-      -m scripts.eval_foundation_joint_demo "$@"
-    ;;
+  foundation-demo) foundation_torchrun_split demo "$@" ;;
   env)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     exec bash environments/bootstrap_environment.sh
