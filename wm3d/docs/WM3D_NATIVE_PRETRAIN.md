@@ -131,12 +131,21 @@ export WM3D_DIRECT_PREFETCH_WORKERS=2 WM3D_DIRECT_ASYNC_PIPELINE=0
 继承原数据的物理标签、camera 绑定、数值归一化和文本向量，不改正式数据文件。
 小集只判断工程是否跑通，不证明 1000h 收敛或跨 source 能力。
 
-输出根为 44 的 `/data/Minko/wm3d_native_available_q20_8gpu_20260923`。通过单机测试后，
+首次资格根 `/data/Minko/wm3d_native_available_q20_8gpu_20260923` 已保留：8 卡预检通过，
+首个真实前后向完成，但指标累积时发现 upstream 部分日志为 Python float，训练器要求
+Tensor，尚未完成优化器更新。现仅把日志统一转成 Tensor，total 的反传图保持原样。
+修复后 fresh 重测使用 44 的
+`/data/Minko/wm3d_native_available_q20_8gpu_20260923_attempt2`，不复用失败运行。
+
+Demo 导出也已补齐 native FSDP 路径：按保存时的 8/16 卡拓扑严格读回 checkpoint，
+各 rank 显式 unshard 后独立采样并分目录输出，不伪装单卡同拓扑；生成输入去除未来
+3D 标签，逐 horizon 3D 指标仅在预测完成后计算。实际 checkpoint 读回仍待资格结束。
+通过单机测试后，
 补真实双机分片/同步验证；完整数据恢复和必要验收通过后再进入正式训练。
 
 ## 验收与当前证据
 
-截至 2026-09-23，全仓检查为 647 passed、4 skipped。真实 Wan 权重的 CPU 建模已完成，
+截至 2026-09-23，全仓检查为 652 passed、1 skipped。真实 Wan 权重的 CPU 建模已完成，
 未加载 WSA checkpoint；总参数约 7.247B、可训练参数约 6.542B，包含约 5.000B 视频骨干、
 1.021B action、0.433B 3D。参数注册已去重，避免重复保存同一 MoT 权重。
 这些证据只说明配置、代码路径和 CPU 建模可用。GPU 前后向、FSDP2 checkpoint、真实吞吐

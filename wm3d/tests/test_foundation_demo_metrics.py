@@ -1,12 +1,15 @@
 """Regression for demo measurements, independent of model quality claims."""
 
 import sys
+from pathlib import Path
+import pytest
 import numpy as np
 import torch
 from PIL import Image
 
 from scripts.eval_foundation_joint_demo import (
-    _action_metrics, _observation_inputs, _save_outputs, _temporal_metrics, parse_args
+    _action_metrics, _observation_inputs, _save_outputs, _temporal_metrics, parse_args,
+    _evaluation_output_directory,
 )
 
 
@@ -25,6 +28,8 @@ def test_demo_defaults_to_joint_and_strips_future_labels(monkeypatch):
         "vggt_future_tokens": torch.tensor(float("nan")),
         "vggt_rollout_target_tokens": torch.tensor(float("nan")),
         "future_3d_images": torch.tensor(float("nan")),
+        "native_3d_trajectory_target": torch.tensor(float("nan")),
+        "native_3d_trajectory_mask": torch.tensor(False),
     }
     inputs = _observation_inputs(batch)
     assert "action" not in inputs
@@ -93,3 +98,14 @@ def test_demo_motion_ignores_missing_views():
     assert metrics["factual_frame_delta_rms"] == 0
     assert metrics["factual_target_l1"] == 0
     assert metrics["factual_zero_response_rms"] == 0
+
+
+def test_native_demo_preserves_checkpoint_topology_and_rank_output_paths():
+    root = Path("demo")
+    assert _evaluation_output_directory(root, native_sharded=True,
+        expected_world_size=8, world_size=8, rank=3) == root / "rank_00003"
+    with pytest.raises(RuntimeError, match="training topology"):
+        _evaluation_output_directory(root, native_sharded=True,
+            expected_world_size=8, world_size=1, rank=0)
+    assert _evaluation_output_directory(root, native_sharded=False,
+        expected_world_size=8, world_size=1, rank=0) == root

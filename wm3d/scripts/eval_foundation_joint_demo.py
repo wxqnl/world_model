@@ -1,4 +1,4 @@
-"""Export deterministic WSA-backed WM3D video demos from a committed checkpoint."""
+"""Export observation-only WM3D demos using the checkpoint's real topology."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import torch
 
 from wm3d.data.foundation_input import build_foundation_input_adapter
 from wm3d.models.foundation_world_model import FoundationWorldModel
+from wm3d.models.foundation_native import trajectory_loss
 from wm3d.models.model_factory import build_world_model
 from wm3d.training.distributed_checkpoint import DistributedCheckpointManager
 from wm3d.training.distributed_runtime import (
@@ -54,7 +55,7 @@ def _observation_inputs(batch: Mapping[str, Any]) -> dict[str, Any]:
     inputs = {
         key: value for key, value in batch.items()
         if key != "action" and not key.startswith(
-            ("future_", "vggt_future", "vggt_rollout_target")
+            ("future_", "vggt_future", "vggt_rollout_target", "native_3d_trajectory_")
         )
     }
     inputs["video"] = batch["video"][:, :, :1]
@@ -335,15 +336,33 @@ def _save_outputs(
     return [str(path) for path in paths]
 
 
+def _evaluation_output_directory(output: Path, *, native_sharded: bool,
+                                 expected_world_size: int, world_size: int,
+                                 rank: int) -> Path:
+    if native_sharded:
+        if world_size != expected_world_size:
+            raise RuntimeError("native FSDP evaluation must use the saved training topology")
+        return output / f"rank_{rank:05d}"
+    if world_size != 1 or rank != 0:
+        raise RuntimeError("legacy foundation demo export requires exactly one rank")
+    return output
+
+
 def main() -> None:
     args = parse_args()
     config, config_digest = load_materialized_runtime(args.runtime)
     runtime = config["runtime_profile"]
     strategy = strategy_from_mapping(runtime["distributed"])
+    native_sharded = (strategy.strategy == "fsdp2" and
+                      config["model_profile"]["model"].get("initialization") == "wan_video")
+    unsharded_model = None
     context = initialize_distributed(strategy)
     try:
-        if context.world_size != 1 or context.rank != 0:
-            raise RuntimeError("foundation demo export requires exactly one rank")
+        args.output = _evaluation_output_directory(
+            args.output, native_sharded=native_sharded,
+            expected_world_size=int(runtime["expected_world_size"]),
+            world_size=context.world_size, rank=context.rank,
+        )
         if args.candidate_count <= 0 or args.num_inference_steps <= 0:
             raise ValueError("candidate count and inference steps must be positive")
         _configure_reproducibility(args.seed)
@@ -375,6 +394,11 @@ def main() -> None:
             model=wrapped.model,
             expected=expectations,
         )
+        if native_sharded:
+            # predict_* bypasses root.forward. All ranks gather root parameters
+            # before per-rank sampling; restore above still enforces topology.
+            wrapped.model.unshard()
+            unsharded_model = wrapped.model
         raw_model.eval()
         observed = _observation_inputs(batch)
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -455,6 +479,16 @@ def main() -> None:
         metrics["zero_action_semantics"] = "normalized_zero_equals_source_offset_not_physical_noop"
         metrics["valid_views"] = view_valid.tolist()
         metrics.update(_action_metrics("policy", policy_result["action_normalized"], batch))
+        if "native_3d_future_tokens" in factual_result:
+            with torch.no_grad():
+                _, native_metrics = trajectory_loss(
+                    [factual_result["native_3d_future_tokens"]],
+                    batch["native_3d_trajectory_target"],
+                    batch["native_3d_trajectory_mask"],
+                    batch["vggt_current_tokens"],
+                )
+            metrics.update({name: float(value.detach().cpu())
+                            for name, value in native_metrics.items()})
         receipt = {
             "schema": (
                 "wm3d_foundation_joint_prediction_demo_v1" if args.mode == "joint"
@@ -463,6 +497,8 @@ def main() -> None:
             "mode": args.mode,
             "supplied_future_action": args.mode == "candidate",
             "checkpoint_step": checkpoint_step,
+            "evaluation_rank": context.rank,
+            "evaluation_world_size": context.world_size,
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "frame_count": frame_count,
@@ -477,6 +513,8 @@ def main() -> None:
         )
         print(json.dumps(receipt, sort_keys=True), flush=True)
     finally:
+        if unsharded_model is not None:
+            unsharded_model.reshard()
         destroy_distributed()
 
 

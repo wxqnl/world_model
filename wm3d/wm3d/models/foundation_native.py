@@ -20,6 +20,18 @@ from .foundation_world_model import (
 )
 
 
+def _tensor_loss_metrics(total, metrics):
+    # Upstream detailed diagnostics can remain Python floats even when its
+    # primary loss metrics request tensors. Preserve total's autograd graph.
+    result = {
+        str(name): value if isinstance(value, torch.Tensor)
+        else total.detach().new_tensor(float(value))
+        for name, value in metrics.items()
+    }
+    result["total"] = total
+    return result
+
+
 class TrajectoryStateConditioner(Native3DStateConditioner):
     """Expand observed spatial states to view-major [view, horizon, patch]."""
 
@@ -200,7 +212,7 @@ class NativeTrajectoryBackend(WSABackendAdapter):
             total, metrics = self.wsa_model.training_loss(
                 sample, collect_loss_dict=True, collect_detailed_loss_dict=True,
                 loss_dict_as_tensors=True)
-            return {"total": total, **metrics}
+            return _tensor_loss_metrics(total, metrics)
         finally:
             self._targets = None
             self._active_time_update = None

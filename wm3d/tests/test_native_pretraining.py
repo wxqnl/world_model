@@ -9,7 +9,7 @@ import torch
 import yaml
 
 from wm3d.data.episode_selection import select_training_entries
-from wm3d.models.foundation_native import TrajectoryReadout, TrajectoryStateConditioner, trajectory_loss
+from wm3d.models.foundation_native import TrajectoryReadout, TrajectoryStateConditioner, trajectory_loss, _tensor_loss_metrics
 from wm3d.models.foundation_world_model import FoundationModelError, foundation_config_from_mapping
 from wm3d.training.runtime_contract import validate_runtime_profile
 
@@ -17,6 +17,18 @@ from wm3d.training.runtime_contract import validate_runtime_profile
 def config():
     root = Path(__file__).resolve().parents[1]
     return foundation_config_from_mapping(yaml.safe_load((root / "configs/model/native_wan.yaml").read_text())["model"])
+
+
+def test_upstream_float_diagnostics_do_not_break_loss_accumulation():
+    parameter = torch.tensor(2.0, requires_grad=True)
+    total = parameter.square()
+    result = _tensor_loss_metrics(total, {"loss_video": total.detach(), "padding_fraction": 0.25})
+    assert result["total"] is total
+    for value in result.values():
+        assert value.ndim == 0 and torch.isfinite(value)
+        torch.zeros_like(value).add_(value.detach())
+    result["total"].backward()
+    assert parameter.grad.item() == 4.0
 
 
 def test_native_pretraining_rejects_wsa_checkpoint_and_frozen_new_experts():
