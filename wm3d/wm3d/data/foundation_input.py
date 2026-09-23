@@ -123,6 +123,7 @@ class FoundationInputAdapter(torch.nn.Module):
         native_3d_rollout_tokens: int = 64,
         native_3d_target_tokens: int = 144,
         vggt_cache_bytes: int = 0,
+        native_3d_mode: str = "legacy_readout",
     ) -> None:
         super().__init__()
         bridge.validate()
@@ -132,6 +133,9 @@ class FoundationInputAdapter(torch.nn.Module):
         self.vggt_encoder.requires_grad_(False)
         self.vggt_encoder.eval()
         self.device = torch.device(device)
+        self.native_3d_mode = native_3d_mode
+        if native_3d_mode not in {"legacy_readout", "trajectory"}:
+            raise FoundationInputError("unsupported native-3D target mode")
         self.native_3d_context_tokens = int(native_3d_context_tokens)
         self.native_3d_rollout_tokens = int(native_3d_rollout_tokens)
         self.native_3d_target_tokens = int(native_3d_target_tokens)
@@ -165,6 +169,14 @@ class FoundationInputAdapter(torch.nn.Module):
     def _encode_native_rows(
         self, images: torch.Tensor, view_mask: torch.Tensor
     ) -> torch.Tensor:
+        if self.native_3d_mode == "trajectory" and images.shape[0] * images.shape[1] > 2:
+            # VGGT is frozen: bound teacher memory without altering targets or
+            # accumulating nine future frames' activations on the GPU.
+            b, t = images.shape[:2]
+            flat, mask = images.flatten(0, 1), view_mask.flatten(0, 1)
+            encoded = [self._encode_native_rows(flat[i:i + 2, None], mask[i:i + 2, None])[:, 0]
+                       for i in range(0, len(flat), 2)]
+            return torch.cat(encoded).reshape(b, t, *encoded[0].shape[1:])
         selected = images.to(self.device, non_blocking=True).float().div_(255.0)
         selected_mask = view_mask.to(self.device, non_blocking=True)
         with torch.inference_mode():
@@ -231,6 +243,36 @@ class FoundationInputAdapter(torch.nn.Module):
         frame_keys: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch = images.shape[0]
+        if self.native_3d_mode == "trajectory":
+            first = self.bridge.context_frames - 1
+            selected = images[:, first:first + self.bridge.future_frames + 1]
+            masks = view_mask[:, first:first + self.bridge.future_frames + 1].bool()
+            if selected.shape[1] != self.bridge.future_frames + 1:
+                raise FoundationInputError("native trajectory is missing future frames")
+            if self.vggt_cache_limit and frame_keys is not None:
+                if frame_keys.shape != images.shape[:2] or frame_keys.dtype != torch.long:
+                    raise FoundationInputError("native trajectory frame identities changed")
+                tokens = self._cached_native_rows(selected, masks, frame_keys[:, first:first + selected.shape[1]])
+            else:
+                tokens = self._encode_native_rows(selected, masks)
+            expected = (batch, self.bridge.future_frames + 1, self.bridge.num_views,
+                        self.native_3d_context_tokens, 2048)
+            if tokens.shape != expected or not bool(torch.isfinite(tokens).all()):
+                raise FoundationInputError("native trajectory VGGT shape/value changed")
+            masks = masks.to(tokens.device)
+            # View-major ordering is shared with the WSA attention mask.
+            target = tokens[:, 1:].permute(0, 2, 1, 3, 4).contiguous()
+            valid = masks[:, 1:].permute(0, 2, 1).contiguous()
+            return {
+                "vggt_current_tokens": tokens[:, 0],
+                "vggt_current_view_mask": masks[:, 0],
+                "vggt_future_tokens": tokens[:, -1],
+                "vggt_rollout_target_tokens": tokens[:, -1],
+                "vggt_rollout_target_horizon": torch.full((batch,), self.bridge.future_frames - 1, device=tokens.device, dtype=torch.long),
+                "vggt_rollout_target_view_mask": masks[:, -1],
+                "native_3d_trajectory_target": target,
+                "native_3d_trajectory_mask": valid,
+            }
         if sample_index.shape != (batch,) or sample_index.dtype != torch.long:
             raise FoundationInputError("sample_index must be int64 [B]")
         current_index = self.bridge.context_frames - 1
@@ -313,7 +355,7 @@ class FoundationInputAdapter(torch.nn.Module):
         sample.update(native_3d)
         self.calls += 1
         self.samples += int(images.shape[0])
-        self.vggt_frames += int(images.shape[0]) * 3
+        self.vggt_frames += int(images.shape[0]) * (self.bridge.future_frames + 1 if self.native_3d_mode == "trajectory" else 3)
         return sample
 
     @property
@@ -371,5 +413,6 @@ def build_foundation_input_adapter(
         native_3d_context_tokens=model.native_3d_context_tokens,
         native_3d_rollout_tokens=model.native_3d_rollout_tokens,
         native_3d_target_tokens=model.native_3d_target_tokens,
+        native_3d_mode=model.native_3d_mode,
         vggt_cache_bytes=int(os.environ.get("WM3D_FOUNDATION_VGGT_CACHE_BYTES_PER_RANK", "0")),
     )

@@ -13,3 +13,6 @@
 - Commands must match `run_wm3d.sh --help`; paths and filenames must exist in the repository.
 - Use `WM3D` for the current project. Mention an older release only when explaining an audited
   migration or immutable legacy asset.
+- `WM3D_NATIVE_PRETRAIN.md` owns the current Wan-only initialization, WSA pipeline reuse,
+  native trajectory contract and 1000-hour pilot. The released-WSA adapter remains a historical
+  comparison, not the initialization or launch instructions for this route.

@@ -1,0 +1,5 @@
+schema: wm3d_v8_objective_profile_v1
+name: native_3d_video_action_joint
+objective:
+  schema: wm3d_foundation_joint_objective_v1
+  owner: wm3d_native_joint_training_loss

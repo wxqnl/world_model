@@ -416,6 +416,25 @@ def _optimizer_parameter_groups(
     config: Mapping[str, Any],
 ) -> list[Any]:
     """Keep the old optimizer layout unless a conservative owner LR is requested."""
+    video_scale = float(config.get("video_backbone_lr_scale", 1.0))
+    if not 0.0 < video_scale <= 1.0:
+        raise PretrainError("video_backbone_lr_scale must be in (0, 1]")
+    if video_scale != 1.0:
+        if not isinstance(raw_model, FoundationWorldModel) or raw_model.cfg.initialization != "wan_video":
+            raise PretrainError("video backbone LR scaling requires native Wan pretraining")
+        video_ids = {id(p) for p in raw_model.backend.wsa_model.video_expert.parameters() if p.requires_grad}
+        protected = [p for p in parameters if id(p) in video_ids]
+        ordinary = [p for p in parameters if id(p) not in video_ids]
+        if not protected or not ordinary or len(protected) != len(video_ids):
+            raise PretrainError("video LR owner must be materialized, trainable and disjoint")
+        groups = _optimizer_parameter_groups(raw_model, ordinary, {
+            **config, "video_backbone_lr_scale": 1.0,
+        })
+        if groups and isinstance(groups[0], torch.nn.Parameter):
+            groups = [{"params": groups, "lr": float(config["peak_lr"]), "lr_scale": 1.0}]
+        return [*groups, {"params": protected,
+                          "lr": float(config["peak_lr"]) * video_scale,
+                          "lr_scale": video_scale}]
     scale = float(config.get("robot_conditioning_lr_scale", 1.0))
     if not 0.0 < scale <= 1.0:
         raise PretrainError("robot_conditioning_lr_scale must be in (0, 1]")
@@ -1029,6 +1048,7 @@ def _build_mixed_dataset(
             split=split,
             grouped_normalizer=normalizer,
             rank=rank,
+            train_episode_allowlist=runtime["runtime_profile"]["train"].get("train_episode_allowlist"),
         )
         return dataset, profile
     if closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
@@ -1162,7 +1182,7 @@ def _make_loader(
         dataset.source_spans,
         dataset.source_names,
         {
-            name: profile.source_weights[name]
+            name: getattr(dataset, "source_sampling_weights", profile.source_weights)[name]
             for name in dataset.source_names
         },
         world_size=world_size,
@@ -1674,10 +1694,12 @@ def main() -> None:
         )
         effective_model_profile["model"] = effective_model
         if foundation_mode:
-            if strategy.strategy != "ddp" or strategy.initialization != "direct":
+            native_pretrain = effective_model.get("initialization") == "wan_video"
+            allowed_init = {"direct", "pretrained_root"} if native_pretrain else {"direct"}
+            if strategy.initialization not in allowed_init or (strategy.strategy != "ddp" and not native_pretrain):
                 raise PretrainError(
-                    "the first foundation release requires direct DDP pretrained "
-                    "loading; FSDP2 needs a separate sharded weight loader"
+                    "foundation loading requires direct initialization; "
+                    "root FSDP2 is supported only for native Wan pretraining"
                 )
             model = build_world_model(
                 effective_model_profile, device=context.device

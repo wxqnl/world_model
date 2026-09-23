@@ -13,6 +13,7 @@ WM3D 从零入口（1B/5B 与数据源均由 profile 决定）：
 
   ./run_wm3d.sh env
   ./run_wm3d.sh foundation-env
+  ./run_wm3d.sh native-backbones --model configs/model/native_wan.yaml
   ./run_wm3d.sh foundation-fetch --output <WSA-Large目录> \
     --wan-output <Wan2.2-TI2V-5B目录> [--endpoint <镜像>]
   ./run_wm3d.sh foundation-context --metadata-root <streaming_metadata目录> \
@@ -172,6 +173,7 @@ need_python_unless_env() {
      "${command}" == foundation-fetch || "${command}" == foundation-context || \
      "${command}" == foundation-preflight || "${command}" == foundation-train || \
      "${command}" == foundation-demo || \
+     "${command}" == native-backbones || \
      "${command}" == smoke-real || "${command}" == 1b || \
      "${command}" == 5b || \
      "${command}" == -h || "${command}" == --help || "${command}" == help ]] || need_python
@@ -188,6 +190,10 @@ case "${command}" in
   env)
     [[ $# -eq 0 ]] || { usage; exit 2; }
     exec bash environments/bootstrap_environment.sh
+    ;;
+  native-backbones)
+    exec "${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}" \
+      -m scripts.prepare_wan_backbones "$@"
     ;;
   foundation-env)
     [[ $# -eq 0 ]] || { usage; exit 2; }

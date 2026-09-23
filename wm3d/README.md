@@ -1,5 +1,15 @@
 # WM3D
 
+## 当前路线：自己的 native 3D world model
+
+本次重启保留通用 Wan2.2 视频先验，不加载 WSA 训练完成的 checkpoint。
+复用 WSA 的 MoT、video/action flow 训练和采样 pipeline；用 WM3D 的多视角
+K8×P64 native 3D 轨迹替换其 3D 状态接口，并保留 grouped robot、真实时间戳和归一化。
+先复用已有约 1000h episode 清单做 43/44 双机试训，再按实测决定 32 卡长训配置。
+实现边界、单一路径启动命令和待完成验收见 [Native 预训练](docs/WM3D_NATIVE_PRETRAIN.md)。
+
+## 保留的旧路线与对照
+
 `v10` 分支新增一条 WSA-Large foundation 路线：以 Wan2.2 视频专家、ActionDiT、Future3D
 和 Mixture-of-Transformers 为基座，接入 WM3D 的 grouped robot、真实时间戳、source-specific
 归一化和 frozen VGGT 监督。WSA-Large 本身不使用 Qwen3-VL，因此 V10 也不引入 Qwen。

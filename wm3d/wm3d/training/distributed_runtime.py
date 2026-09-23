@@ -58,9 +58,9 @@ class DistributedStrategyConfig:
                 )
         if self.timeout_minutes <= 0:
             raise DistributedRuntimeError("timeout_minutes must be positive")
-        if self.initialization not in {"direct", "meta_sharded"}:
+        if self.initialization not in {"direct", "meta_sharded", "pretrained_root"}:
             raise DistributedRuntimeError(
-                "distributed.initialization must be direct or meta_sharded"
+                "distributed.initialization must be direct, meta_sharded or pretrained_root"
             )
         if self.strategy == "ddp":
             if self.initialization != "direct":
@@ -74,10 +74,10 @@ class DistributedStrategyConfig:
                 raise DistributedRuntimeError(
                     f"world_size={world_size} is not divisible by shard_degree={self.shard_degree}"
                 )
-            if self.initialization != "meta_sharded":
+            if self.initialization not in {"meta_sharded", "pretrained_root"}:
                 raise DistributedRuntimeError(
-                    "FSDP2 requires meta_sharded initialization to avoid a full-model "
-                    "replica on every rank"
+                    "FSDP2 requires meta_sharded or the explicitly supported "
+                    "pretrained_root initialization"
                 )
 
 
@@ -223,6 +223,13 @@ def wrap_model(
         return WrappedModel(model=model, strategy="ddp", mesh=None)
 
     is_meta = any(parameter.is_meta for parameter in model.parameters())
+    if config.initialization == "pretrained_root":
+        if not bool(getattr(model, "fsdp_root_only", False)) or is_meta:
+            raise DistributedRuntimeError("pretrained_root requires a materialized root-only model")
+        if any(p.dtype != torch.float32 for p in model.parameters()):
+            raise DistributedRuntimeError("pretrained_root requires FP32 master parameters")
+        if initialization_seed is not None:
+            raise DistributedRuntimeError("pretrained_root must retain loaded/initialized values")
     if config.initialization == "meta_sharded" and not is_meta:
         raise DistributedRuntimeError(
             "FSDP2 meta_sharded runtime received an already materialized model"
@@ -237,7 +244,7 @@ def wrap_model(
             f"{type(model).__name__} does not expose iter_fsdp_units()"
         )
     units = tuple(iterator())
-    if not units:
+    if not units and not bool(getattr(model, "fsdp_root_only", False)):
         raise DistributedRuntimeError("iter_fsdp_units() returned no units")
     if len({id(unit) for unit in units}) != len(units):
         raise DistributedRuntimeError("one module appears more than once in FSDP units")
@@ -275,7 +282,10 @@ def wrap_model(
         param_dtype=_DTYPES[config.param_dtype.lower()],
         reduce_dtype=_DTYPES[config.reduce_dtype.lower()],
         output_dtype=_DTYPES[config.output_dtype.lower()],
-        cast_forward_inputs=True,
+        # Native Wan applies autocast inside the shared trainer. Do not round
+        # real timestamps, calibration or frozen 3D labels to BF16 at the root.
+        # Ordinary native models keep their existing input-casting contract.
+        cast_forward_inputs=not bool(getattr(model, "fsdp_root_only", False)),
     )
     for unit in units:
         fully_shard(

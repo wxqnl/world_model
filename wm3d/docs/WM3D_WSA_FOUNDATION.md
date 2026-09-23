@@ -1,3 +1,8 @@
+> 本文记录使用 WSA 成品 checkpoint 的历史适配路线，保留用于已有实验复现。
+> 当前重启不使用这些权重，入口已改为
+> [WM3D Native 预训练](WM3D_NATIVE_PRETRAIN.md)。不要把本文的 foundation-fetch
+> 或旧 adapter profile 用于新的 1000h 训练。
+
 # WM3D V10：WSA-Large foundation 路线
 
 ## 结论与边界

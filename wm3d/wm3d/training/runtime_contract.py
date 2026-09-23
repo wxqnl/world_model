@@ -224,6 +224,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "checkpoint_steps",
     }
     optional_train = {
+        "train_episode_allowlist",
         "validation_micro_batch_size",
         "activation_checkpointing",
         "cudnn_benchmark",
@@ -245,6 +246,10 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             f"train fields mismatch: missing={sorted(required_train-set(train))} "
             f"unknown={sorted(set(train)-required_train-optional_train)}"
         )
+    if train.get("train_episode_allowlist") is not None:
+        selection = Path(str(train["train_episode_allowlist"]))
+        if not selection.is_absolute() or not selection.is_file():
+            raise RuntimeContractError("train_episode_allowlist must be an existing absolute file")
     derived_global = (
         expected_world_size
         * int(train["micro_batch_size"])
@@ -471,6 +476,9 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             "optimizer learning rates must satisfy 0 <= start <= peak and 0 < min <= peak"
         )
     conditioning_scale = float(optimizer.get("robot_conditioning_lr_scale", 1.0))
+    video_scale = float(optimizer.get("video_backbone_lr_scale", 1.0))
+    if not 0.0 < video_scale <= 1.0:
+        raise RuntimeContractError("video_backbone_lr_scale must be in (0, 1]")
     if not 0.0 < conditioning_scale <= 1.0:
         raise RuntimeContractError("robot_conditioning_lr_scale must be in (0, 1]")
     if schedule.get("name") != "warmup_stable_cosine":
@@ -1015,7 +1023,10 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
             validate_foundation_objective,
         )
 
-        validate_foundation_objective(objective["objective"])
+        initialization = model["model"].get("initialization", "wsa_checkpoint")
+        validate_foundation_objective(objective["objective"], initialization=initialization)
+        if initialization == "wan_video" and runtime["train"].get("model_warmstart_checkpoint"):
+            raise RuntimeContractError("native Wan pretraining forbids external model warmstarts; exact resume remains separate")
     else:
         objective_config_from_mapping(objective["objective"])
     closure = value["data_closure"]

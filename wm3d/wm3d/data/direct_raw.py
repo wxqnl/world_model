@@ -768,6 +768,7 @@ class DirectRawDataset(UnifiedCacheDataset):
         split: str,
         grouped_normalizer: GroupedRobotNormalizer,
         rank: int,
+        train_episode_allowlist: Path | str | None = None,
     ) -> None:
         if closure.get("schema") != DIRECT_RAW_DATA_CLOSURE_SCHEMA:
             raise CacheDataError("direct raw closure schema mismatch")
@@ -797,6 +798,12 @@ class DirectRawDataset(UnifiedCacheDataset):
             item.feature_shard: (item.source, item.episode_id)
             for item in episode_index
         }
+        if split == "train" and train_episode_allowlist is not None:
+            from .episode_selection import select_training_entries
+            self.entries, self.source_sampling_weights = select_training_entries(
+                self.entries, by_thin_feature, train_episode_allowlist,
+                closure["metadata_root"],
+            )
         self._source = _DirectWindowSource(closure=closure, profile=data_profile)
         self._task_id_by_feature: dict[str, str] = {}
         for relative, identity in by_thin_feature.items():

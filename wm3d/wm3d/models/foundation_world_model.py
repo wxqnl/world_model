@@ -25,14 +25,16 @@ class FoundationModelError(ValueError):
     pass
 
 
-def validate_foundation_objective(mapping: Mapping[str, object]) -> None:
+def validate_foundation_objective(
+    mapping: Mapping[str, object], *, initialization: str = "wsa_checkpoint"
+) -> None:
     expected = {
         "schema": FOUNDATION_OBJECTIVE_SCHEMA,
-        "owner": "wsa_joint_training_loss",
+        "owner": "wm3d_native_joint_training_loss" if initialization == "wan_video" else "wsa_joint_training_loss",
     }
     if dict(mapping) != expected:
         raise FoundationModelError(
-            "foundation objective must be owned exclusively by WSA joint training"
+            "foundation objective owner disagrees with the initialization/training route"
         )
 
 
@@ -94,6 +96,12 @@ class FoundationWorldModelConfig:
     # Explicit stage contract; loading an old profile preserves its behavior.
     # adapters freezes the released experts, not the gradient path through them.
     finetune_mode: str = "full"
+    # Explicit pretraining boundary; old checkpoint profiles remain readable.
+    initialization: str = "wsa_checkpoint"
+    native_3d_mode: str = "legacy_readout"
+    # Generated from local generic Wan weights by the upstream pretraining tool.
+    wan_action_backbone_path: str = ""
+    wan_3d_backbone_path: str = ""
     # Explicit fresh-start policy; old sealed profiles remain reproducible.
     pretrained_interface_init: str = "legacy_skip"
     # Preserve old runtimes; fp32 only promotes the small trainable interfaces.
@@ -178,18 +186,32 @@ class FoundationWorldModelConfig:
             )
         if tuple(self.rgb_decode_indices) != tuple(range(self.K)):
             raise FoundationModelError("foundation video loss must supervise all K frames")
-        for name in (
-            "video_loss_weight",
-            "action_loss_weight",
-            "native_3d_loss_weight",
-            "native_3d_rollout_loss_weight",
-        ):
+        if self.initialization not in {"wsa_checkpoint", "wan_video"}:
+            raise FoundationModelError("unsupported foundation initialization")
+        if self.native_3d_mode not in {"legacy_readout", "trajectory"}:
+            raise FoundationModelError("unsupported native-3D mode")
+        if self.initialization == "wan_video":
+            if self.wsa_pretrained_path or self.pretrained_interface_init != "legacy_skip":
+                raise FoundationModelError("Wan-only initialization forbids WSA checkpoint/prior transfer")
+            if not self.wan_action_backbone_path or not self.wan_3d_backbone_path:
+                raise FoundationModelError("native pretraining requires explicit Wan-derived expert backbones")
+            if self.finetune_mode not in {"full", "native_bootstrap"}:
+                raise FoundationModelError("native experts must be trained, not frozen adapters")
+            if self.native_3d_mode != "trajectory" or self.native_3d_context_tokens != self.P:
+                raise FoundationModelError("native pretraining requires K8 per-view P64 trajectory states")
+            if self.native_3d_rollout_loss_weight != 0:
+                raise FoundationModelError("trajectory states replace the old post-hoc rollout loss")
+        elif self.native_3d_mode != "legacy_readout" or self.finetune_mode == "native_bootstrap":
+            raise FoundationModelError("trajectory/bootstrap mode requires Wan-only initialization")
+        if self.native_3d_mode == "legacy_readout" and self.native_3d_rollout_loss_weight <= 0:
+            raise FoundationModelError("legacy rollout weight must be positive")
+        for name in ("video_loss_weight", "action_loss_weight", "native_3d_loss_weight"):
             if float(getattr(self, name)) <= 0:
                 raise FoundationModelError(f"{name} must be positive")
         if self.dtype != "bf16":
             raise FoundationModelError("the WSA foundation profile requires bf16")
-        if self.finetune_mode not in {"full", "adapters"}:
-            raise FoundationModelError("finetune_mode must be full or adapters")
+        if self.finetune_mode not in {"full", "adapters", "native_bootstrap"}:
+            raise FoundationModelError("unsupported foundation training stage")
         if self.trainable_interface_dtype not in {"model", "fp32"}:
             raise FoundationModelError("unsupported trainable interface precision")
         if self.trainable_interface_dtype == "fp32" and self.finetune_mode != "adapters":
@@ -201,11 +223,13 @@ class FoundationWorldModelConfig:
         if require_paths:
             for name in (
                 "upstream_source_root",
-                "wsa_pretrained_path",
                 "wan_model_path",
                 "wan_tokenizer_model_path",
                 "wan_context_store_path",
-            ):
+            ) + (("wsa_pretrained_path",) if self.initialization == "wsa_checkpoint"
+                 else ("wan_action_backbone_path", "wan_3d_backbone_path")):
+                if not str(getattr(self, name)).strip():
+                    raise FoundationModelError(f"{name} must be explicit")
                 value = Path(str(getattr(self, name))).expanduser()
                 if not value.exists():
                     raise FoundationModelError(f"{name} does not exist: {value}")
@@ -1194,6 +1218,8 @@ class FoundationWorldModel(nn.Module):
             config.wsa_text_dim,
             config.context_fusion_heads,
         )
+        if config.finetune_mode == "native_bootstrap":
+            self.backend.wsa_model.video_expert.requires_grad_(False)
         if config.finetune_mode == "adapters":
             # No no_grad/detach: new input adapters still learn through the
             # frozen experts. Keep all pretrained values exactly as loaded.
@@ -1234,6 +1260,15 @@ class FoundationWorldModel(nn.Module):
                 proprio.train()
         return self
 
+    def iter_fsdp_units(self):
+        # Expert block.forward is not the MoT execution boundary. Root-only
+        # sharding keeps parameters live through pre_dit/attention/post_dit.
+        return ()
+
+    @property
+    def fsdp_root_only(self):
+        return self.cfg.initialization == "wan_video"
+
     def forward(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         context, context_mask = self._fused_context(batch)
         sample = {
@@ -1250,6 +1285,9 @@ class FoundationWorldModel(nn.Module):
             "future_3d_images": batch["future_3d_images"],
             "future_3d_img_masks": batch["future_3d_img_masks"],
         }
+        if self.cfg.native_3d_mode == "trajectory":
+            for name in ("native_3d_trajectory_target", "native_3d_trajectory_mask"):
+                sample[name] = batch[name]
         result = self.backend(
             sample,
             batch["vggt_future_tokens"],
@@ -1411,6 +1449,7 @@ class FoundationWorldModel(nn.Module):
             **self._action_outputs(result["action_normalized"], batch),
             "video": result["video"],
             "conditioning": result["conditioning"],
+            **{key: result[key] for key in ("native_3d_future_tokens", "native_3d_view_mask") if key in result},
         }
 
     @torch.inference_mode()
@@ -1467,6 +1506,7 @@ class FoundationWorldModel(nn.Module):
         return {
             "video": result["video"],
             "conditioning": result.get("conditioning"),
+            **{key: result[key] for key in ("native_3d_future_tokens", "native_3d_view_mask") if key in result},
             "factual_action_normalized": factual_action,
             "action_element_mask": element_mask,
         }
@@ -1501,6 +1541,8 @@ class FoundationWorldModel(nn.Module):
             "foundation_native_3d_state": (self.backend.native_3d_state,),
             "foundation_native_3d_rollout": (self.backend.native_3d_rollout,),
         }
+        if self.cfg.native_3d_mode == "trajectory":
+            owners.pop("foundation_native_3d_rollout")
         if self.cfg.finetune_mode == "adapters":
             owners.update(self._pretrained_interface_modules())
             return owners
@@ -1632,6 +1674,9 @@ def build_foundation_world_model(
     WSALargeConfig, WSALargePolicy = _load_upstream_symbols(
         config.upstream_source_root
     )
+    if config.initialization == "wan_video":
+        from .foundation_native import build_native_pretraining_model
+        return build_native_pretraining_model(config, device=device)
     # The released config carries a registered ``type`` discriminator, so it
     # must be decoded through the upstream base registry rather than through
     # the concrete dataclass (which correctly rejects an unknown ``type``

@@ -11,7 +11,11 @@
   recoverable at serving. Future commands retain their original K world intervals: trim only a
   common unused suffix of per-interval capacity, never globally compact active rows. Irregular
   command counts remain masked slots; do not shift commands between intervals or synthesize values.
-- The foundation native-3D teacher encodes exactly three timestamps in one frozen VGGT call: last
-  observation, one deterministic sampled K8 target, and the final target. The sampled horizon comes
-  from the sealed sample index; targets never enter the model input. Spatial resizing is per view and
-  must not mix cameras.
+- Legacy foundation mode encodes three timestamps (current, sampled horizon, final).
+  Native trajectory mode encodes the current observation plus all K future timestamps,
+  in small independent-time VGGT batches. Future targets never enter model inputs.
+  Spatial resizing is per view and must not mix cameras or temporal rows.
+- Reuse an approved whole-episode selection verbatim. Filter training only; keep validation
+  unchanged and preserve the saved source-window proportions. Never count overlapping windows
+  as hours or replace the source mixture with a motion-selected/equal-source subset.
+  Missing raw mounts are an infrastructure error, not permission to silently drop sources.

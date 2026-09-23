@@ -1,0 +1,55 @@
+schema: wm3d_v8_model_profile_v1
+name: native_3d_wan_pretraining
+architecture: foundation_world_model
+sampling:
+  mode: observed_monotonic_subsequence
+  history_action_leading_boundary: observed_previous_state
+  context_horizon_seconds: 3.2
+  future_horizon_seconds: 1.6
+  minimum_horizon_coverage: 0.9
+  minimum_anchor_separation_seconds: 0.2
+  policy_target_horizon_seconds: 1.6
+  policy_training_times: observed_action_timestamps
+  interpolation: forbidden
+model:
+  schema: wm3d_foundation_world_model_v1
+  initialization: wan_video
+  native_3d_mode: trajectory
+  finetune_mode: full
+  pretrained_interface_init: legacy_skip
+  T: 16
+  P: 64
+  K: 8
+  token_dim: 2048
+  task_dim: 2048
+  num_views: 3
+  max_action_groups: 3
+  max_action_dim: 14
+  max_state_dim: 10
+  max_action_substeps: 128
+  max_policy_queries: 256
+  rgb_size: 256
+  rgb_decode_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+  native_3d_context_tokens: 64
+  native_3d_rollout_tokens: 64
+  native_3d_target_tokens: 64
+  video_height: 384
+  video_width: 320
+  wsa_text_dim: 4096
+  context_fusion_heads: 16
+  robot_conditioning_hidden: 256
+  wan_action_backbone_path: /data/Minko/models/WM3D-Wan-Backbones/action.pt
+  wan_3d_backbone_path: /data/Minko/models/WM3D-Wan-Backbones/native_3d.pt
+  action_time_fourier_dim: 64
+  wsa_action_horizon: 32
+  upstream_source_root: /data/Minko/third_party/WSA_native_20260923
+  wsa_pretrained_path: ''
+  wan_model_path: /data/Minko/models/Wan2.2-TI2V-5B
+  wan_tokenizer_model_path: /data/Minko/models/Wan2.2-TI2V-5B
+  wan_context_store_path: /data/Minko/wm3d_foundation_context_full_20260908
+  video_loss_weight: 1.0
+  action_loss_weight: 1.0
+  native_3d_loss_weight: 0.1
+  native_3d_rollout_loss_weight: 0.0
+  activation_checkpointing: true
+  dtype: bf16
