@@ -137,19 +137,45 @@ Tensor，尚未完成优化器更新。现仅把日志统一转成 Tensor，tota
 修复后 fresh 重测使用 44 的
 `/data/Minko/wm3d_native_available_q20_8gpu_20260923_attempt2`，不复用失败运行。
 
+attempt2 已完成真实 20 次优化器更新并正常退出。step20 的 COMMITTED、
+8 个 distcp 分片和 8 个 rank state 已齐全，checkpoint 约 76 GiB。
+MoT、native 3D、action time、proprio 和 robot conditioning 均有有限非零梯度。
+step20 total 1.711914、video 0.676270、action 0.803711、3D 2.324219、grad norm 8.433914。
+各步使用不同样本及扩散噪声，不能据此推断质量趋势。
+排除冷启动与验证后的 step12–20 平均 5.39 秒/步，范围 4.71–6.20 秒；
+单机 global batch 8、短程小集吞吐约 1.48 samples/s，不能外推为全量双机吞吐。
+
 Demo 导出也已补齐 native FSDP 路径：按保存时的 8/16 卡拓扑严格读回 checkpoint，
 各 rank 显式 unshard 后独立采样并分目录输出，不伪装单卡同拓扑；生成输入去除未来
-3D 标签，逐 horizon 3D 指标仅在预测完成后计算。实际 checkpoint 读回仍待资格结束。
-通过单机测试后，
-补真实双机分片/同步验证；完整数据恢复和必要验收通过后再进入正式训练。
+3D 标签，逐 horizon 3D 指标仅在预测完成后计算。独立读回/生成服务为
+`wm3d-native-available-q20-eval-20260923`，日志在 attempt2 根的 `logs/eval.log`；
+读回和生成已正常退出，8 份 receipt 均生成，future action 标签对独立 policy 的差异严格为 0。
+`foundation-demo` 接受 `--` 分隔的 torchrun 拓扑与应用参数。
+
+生成质量尚不达标：8 个样本未来帧间变化保持率为 13.1%–37.3%，方向余弦约 -0.004–0.048；
+RGB L1 均差于 copy-last，action MAE 均高于归一化零值基线。不能把画面有变化当作正确运动。
+对 Hydra 和 RoboCasa 各一组完整 9 帧做时序检查，保留场景结构，但生成机械臂运动仍弱，
+后期细节模糊；GIF 时间 0–2.8 秒仅为播放时间，非机器人控制时钟。没有单色或逐帧完全相同。
+这轮仅训练 20 步，说明工程链可运行，不能确认质量，也不能单凭它归因为模型结构错误。
+
+接续双机资格根为 `/data/Minko/wm3d_native_available_q100_2node16_20260923`。
+43/44 均已空闲，使用上述相同资格数据与模型，fresh Wan 初始化；16 卡 micro1/acc1/global16，
+100 步，不 resume 8 卡 checkpoint。配置从 `h100_16_native_pilot.yaml` 仅改资格身份、
+移除全量 allowlist 字段（资格 profile 已只含原清单选中的 episode），未改正式清单或 source 比例。
+运行配置 `/data/Minko/wm3d_native_pretrain_checks_20260923/h100_16_available_qualification.yaml`。
+服务 `wm3d-native-available-q100-n43-20260923` 与 `wm3d-native-available-q100-n44-20260923`；
+日志在运行根 `logs/preflight_n43.log`、`preflight_n44.log`、`train_n43.log`、`train_n44.log`。
+只有 NFS、16 rank preflight 均通过才启动训练；100 步后检查 checkpoint 与同 seed 无目标生成。
+完整数据恢复和必要验收通过后再正式训练。首轮正式更新预算已向用户确认，尚待回复；
+不能把 32 卡规划配置的 100000 步自动当成已批准预算。
 
 ## 验收与当前证据
 
 截至 2026-09-23，全仓检查为 652 passed、1 skipped。真实 Wan 权重的 CPU 建模已完成，
 未加载 WSA checkpoint；总参数约 7.247B、可训练参数约 6.542B，包含约 5.000B 视频骨干、
 1.021B action、0.433B 3D。参数注册已去重，避免重复保存同一 MoT 权重。
-这些证据只说明配置、代码路径和 CPU 建模可用。GPU 前后向、FSDP2 checkpoint、真实吞吐
-和质量尚未完成，不能写成已经跑通或优于 WSA。
+真实 8 卡训练、checkpoint 保存、同拓扑独立读回及无标签生成均已运行；双机同步与生成质量仍待验收。
+不能表述为 WM3D 已收敛或优于 WSA。
 
 试训先确认真实数据能读、各训练 owner 梯度有限非零、优化器确实更新参数、训练/推理边界
 一致和 checkpoint 可恢复，再记录稳态秒/步、samples/s、峰值显存、解码与 VGGT 耗时。
@@ -169,17 +195,19 @@ v3.0；恢复约 412 GiB 的原文件，不更换索引、adapter 或采样比�
 `/data/Minko/raw_recovery_20260923`，43 通过 NFS 访问同一路径。
 进度、日志与完成记录在 `/data/Minko/wm3d_native_pretrain_checks_20260923`，分别为
 `raw_recovery_progress.json`、`raw_recovery.log`、`RAW_RECOVERY_COMPLETE.json`。
-只有完成记录生成并确认完整文件可读后，才把恢复目录只读挂到双方原来的
-`/shared/Minko/datasets`，保持既有数据路径。开训前还需核对 NFS 和磁盘空间。
+双方 `/shared/Minko/datasets` 已只读映射恢复目录，以支持已恢复 source 的独立资格小集。
+目前 14 个 OXE source 已恢复，DROID 仍在下载；目录存在不代表全量就绪。
+只有全部完成且文件可读后，才能使用完整 1000h 清单。开训前核对 NFS 和磁盘空间。
 
-43/44 现有任务按用户要求等待，不停止或共享其 GPU。两机空闲且数据恢复完成后，
+43 的其他任务和 44 单机资格读回均已结束。每次启动前仍需查占用，
+不得停止或共享其他项目 GPU。两机空闲且数据恢复完成后，
 继续执行真实 16 卡 preflight 和 100 步试训；不得绕过缺失 source 开训。
 
 ## 来源与实验材料说明
 
 本计划使用 academic-research-suite 的 experiment-agent / code experiment plan 工作流，
 形成于 2026-09-23。材料来源：本机实际代码/资产、既定 1000h receipt、官方仓库；
-验证状态为代码/CPU 已验，GPU/吞吐/生成质量待验。本文不是研究结果或训练成功证明。
+验证状态为代码、8 卡训练/保存/独立读回/推理工程检查已验；双机试训与质量验收继续。本文不证明生成质量。
 
 - [WSA 官方实现](https://github.com/zaleni/WSA)：MoT、WSALarge mask、flow training 和 sampler。
 - [WSA 预训练入口](https://github.com/zaleni/WSA/blob/main/launch/wsa_large_pretrain.sh)：
