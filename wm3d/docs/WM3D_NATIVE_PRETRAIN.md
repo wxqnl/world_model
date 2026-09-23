@@ -220,12 +220,39 @@ loss、学习率及原数据采样语义不变。每次新建资格根，不复�
 第一次 micro2 在此容量检查退出，未训练、未 OOM；未通过复制窗口或删除 source 绕过检查。
 micro4 验证峰值 allocated 42.56 GiB，吞吐约为 micro1 的 3.76 倍。
 reserved 包含可回收缓存，不能等同活跃张量；不同 batch 的缓存布局也不同。
-目前 micro4 是五源小集已测的候选，不是完整 1000h 的最大安全 batch：
-小集最小 train 容量 70，不支持更大的 global batch；全量恢复后须检查真实最大样本形状，
-再测可容纳的更大 micro。实际配置、逐 rank 显存和日志分别保留在
+上述结果只覆盖五源小集。小集最小 train 容量 70，不支持更大的 global batch，
+因此更大档位使用恢复后的完整原索引，未复制窗口或删除 source。
+小集的配置、逐 rank 显存和日志分别保留在
 `/data/Minko/wm3d_native_capacity_micro1_2node16_20260924`、
 `/data/Minko/wm3d_native_capacity_micro2_2node16_20260924_attempt2`、
 `/data/Minko/wm3d_native_capacity_micro4_2node16_20260924`。
+
+### 全量容量验收与选档
+
+2026-09-24 的全量 micro4 attempt2 与 micro6 均正常完成：生产模型 fresh Wan 初始化，
+原 1000h 索引及比例，累积1；各20次实际更新、step10/20各4批验证。
+16rank的optimizer均到step20，COMMITTED、16 distcp、16 rank_state及梯度所有权通过，
+双机保存记录和分片可读性一致。没有OOM或非有限值，ECC均为0。
+本轮没有重复完整模型生成读回，不能把容量验收当作RGB/VLA质量验收。
+
+| 全量 train micro / global | 秒/步 | samples/s | 峰值 allocated / reserved GiB | 阶段末最少空闲 GiB |
+| --- | ---: | ---: | ---: | ---: |
+| 4 / 64 | 16.7786 | 3.81439 | 62.3296 / 70.4473 | 8.8032 |
+| 6 / 96 | 20.3846 | 4.70945 | 72.7140 / 76.5293 | 4.9067 |
+
+速度均取step12–20，排除加载、验证及保存窗口；保留真实的数据等待。
+micro6的DROID慢步为40.62秒，rank0新增prefetch等待21.01秒，已计入平均值。
+micro6吞吐提高23.47%，但余量已接近4–6GiB安全边界，故选micro6，不再试更大档。
+最大实际action为[6,32,42]、history为[6,128,42]，video/native3D形状保持原合同。
+20步实际抽到6源，不冒充18源GPU全覆盖；此前CPU真实读取已覆盖18源104个样本。
+记录在 `/data/Minko/wm3d_native_pretrain_checks_20260923/full_capacity_micro6_report_20260924.md`。
+
+正式首段配置已准备在上述checks目录的 `h100_16_native_formal2000_micro6_20260924.yaml`，
+仅用于用户确认43/44两台16卡后启动。2000更新步，micro6/acc1/global96，验证micro1；
+optimizer峰值学习率不变，视频骨干保持0.1倍。warmup100步，log每10步，
+每100步验证20批，checkpoint为100/500/1000/2000。不得resume任何资格checkpoint。
+2000步并不代表完整遍历1000h；按短程实测纯更新约11.3小时，另加加载、验证、保存和I/O波动。
+截至本次记录，正式拓扑尚待确认，未启动正式训练，未使用32卡。
 
 ## 验收与当前证据
 
@@ -276,7 +303,7 @@ v3.0；恢复约 412 GiB 的原文件，不更换索引、adapter 或采样比�
 寻址共约 0.10 秒；跨轮、乱序访问与恢复地址测试通过。这是 CPU 调度开销，不是 GPU 吞吐。
 原失败根 `/data/Minko/wm3d_native_full_capacity_micro4_2node16_20260924` 保留。
 后续使用独立 attempt2 根 fresh Wan 运行同一 micro4/acc1/global64、验证 micro1/global16
-的全量 20 步容量资格，不复用旧资格 checkpoint。全量 GPU 结果尚待验证。
+的全量20步容量资格，不复用旧资格checkpoint；随后micro6也已完成，结果见上方全量容量节。
 
 ## 来源与实验材料说明
 
