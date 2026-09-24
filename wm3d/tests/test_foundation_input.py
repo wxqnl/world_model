@@ -118,16 +118,17 @@ def test_input_adapter_binds_current_sampled_k8_and_final_vggt() -> None:
 
 
 class _IndependentVGGT(nn.Module):
-    def __init__(self):
+    def __init__(self, patches=144):
         super().__init__()
         self.rows = 0
+        self.patches = patches
 
     def forward(self, images, view_mask, **kwargs):
         self.rows += images.shape[0] * images.shape[1]
         value = images.mean(dim=(-1, -2, -3)).masked_fill(~view_mask, 0.0)
         # Cross-view dependence must be kept in each cache entry.
         value = value + value.mean(dim=-1, keepdim=True)
-        return {"view_tokens": value[..., None, None].expand(*value.shape, 144, 2048).clone()}
+        return {"view_tokens": value[..., None, None].expand(*value.shape, self.patches, 2048).clone()}
 
 
 def test_frozen_native_cache_preserves_values_masks_and_bounded_storage() -> None:
@@ -169,3 +170,46 @@ def test_frozen_native_cache_preserves_values_masks_and_bounded_storage() -> Non
     assert adapter.vggt_cache_bytes == 0
     assert not adapter._vggt_cache
     assert torch.equal(uncached["vggt_future_tokens"], changed_reference["vggt_future_tokens"])
+
+
+def test_trajectory_cache_keeps_k_order_and_current_future_isolation() -> None:
+    bridge = FoundationBridgeConfig(
+        context_frames=2, future_frames=4, video_height=48, video_width=32,
+        max_action_groups=2, max_action_dim=3, max_state_dim=2,
+    )
+    store = FoundationContextStore(["pick", "place"], torch.randn(2, 5, 32),
+                                   torch.ones(2, 5, dtype=torch.bool))
+    encoder = _IndependentVGGT(patches=64)
+    adapter = FoundationInputAdapter(
+        bridge, context_store=store, vggt_encoder=encoder, device="cpu",
+        native_3d_mode="trajectory", native_3d_context_tokens=64,
+        native_3d_target_tokens=64, vggt_cache_bytes=0,
+    )
+    batch = _batch()
+    batch["direct_frame_keys"] = torch.arange(12).reshape(2, 6)
+    # Overlapping windows share a complete simultaneous-camera row.
+    batch["direct_rgb_uint8"][1, 2] = batch["direct_rgb_uint8"][0, 3]
+    batch["direct_view_mask"][1, 2] = batch["direct_view_mask"][0, 3]
+    batch["direct_frame_keys"][1, 2] = batch["direct_frame_keys"][0, 3]
+    reference = adapter.materialize(batch)
+    state = torch.get_rng_state()
+    adapter.vggt_cache_limit = 64 * 1024**2
+    reused = adapter.materialize(batch)
+    assert torch.equal(state, torch.get_rng_state())
+    assert adapter.vggt_coalesced_rows > 0
+    for key, value in reference.items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(reused[key], value), key
+    assert reused["native_3d_trajectory_target"].shape == (2, 3, 4, 64, 2048)
+    assert not torch.is_inference(reused["vggt_current_tokens"])
+    current = reused["vggt_current_tokens"].clone()
+    batch["direct_rgb_uint8"][:, 2:] = 0
+    batch["direct_frame_keys"][:, 2:] += 1000
+    changed = adapter.materialize(batch)
+    assert torch.equal(current, changed["vggt_current_tokens"])
+    assert not torch.equal(
+        reused["native_3d_trajectory_target"], changed["native_3d_trajectory_target"])
+    weight = torch.nn.Parameter(torch.ones(2048))
+    (changed["vggt_current_tokens"] * weight).sum().backward()
+    assert weight.grad is not None and torch.isfinite(weight.grad).all()
+    assert weight.grad.abs().sum() > 0
