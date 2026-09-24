@@ -60,3 +60,18 @@ def test_invalid_scale_fails_in_runtime_and_optimizer(scale):
     model=OwnedParameters()
     with pytest.raises(PretrainError,match="robot_conditioning_lr_scale"):
         _optimizer_parameter_groups(model,list(model.parameters()),runtime["optimizer"])
+
+@pytest.mark.parametrize("implementation", ["single", "fused"])
+def test_explicit_adamw_implementation(implementation):
+    root = Path(__file__).resolve().parents[1]
+    runtime = yaml.safe_load((root / "configs/runtime/h100_8_fsdp2.yaml").read_text())
+    runtime["optimizer"]["implementation"] = implementation
+    validate_runtime_profile(runtime)
+
+
+def test_unknown_adamw_implementation_rejected():
+    root = Path(__file__).resolve().parents[1]
+    runtime = yaml.safe_load((root / "configs/runtime/h100_8_fsdp2.yaml").read_text())
+    runtime["optimizer"]["implementation"] = "silently_fall_back"
+    with pytest.raises(RuntimeContractError, match="optimizer.implementation"):
+        validate_runtime_profile(runtime)

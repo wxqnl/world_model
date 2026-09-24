@@ -380,9 +380,9 @@ def initialize_adamw_state(optimizer: torch.optim.AdamW) -> None:
     for group in optimizer.param_groups:
         if group.get("amsgrad", False):
             raise DistributedRuntimeError("WM3D AdamW does not support AMSGrad")
-        if group.get("capturable", False) or group.get("fused", False):
+        if group.get("capturable", False):
             raise DistributedRuntimeError(
-                "eager AdamW state requires capturable=fused=False"
+                "eager AdamW state requires capturable=False"
             )
         for parameter in group["params"]:
             state = optimizer.state[parameter]
@@ -390,7 +390,12 @@ def initialize_adamw_state(optimizer: torch.optim.AdamW) -> None:
                 if set(state) != {"step", "exp_avg", "exp_avg_sq"}:
                     raise DistributedRuntimeError("partially initialized AdamW state")
                 continue
-            state["step"] = torch.tensor(0.0, dtype=torch.float32)
+            # Match torch.optim.Adam's lazy placement. Fused kernels require
+            # device-local scalar counters; the unfused checkpoint ABI stays CPU.
+            state["step"] = torch.zeros(
+                (), dtype=torch.float32,
+                device=parameter.device if group.get("fused", False) else "cpu",
+            )
             state["exp_avg"] = torch.zeros_like(parameter)
             state["exp_avg_sq"] = torch.zeros_like(parameter)
 

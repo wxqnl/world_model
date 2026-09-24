@@ -1813,6 +1813,7 @@ def main() -> None:
             eps=float(optimizer_cfg["eps"]),
             weight_decay=float(optimizer_cfg["weight_decay"]),
             foreach=False,
+            fused=optimizer_cfg.get("implementation", "single") == "fused",
         )
         initialize_adamw_state(optimizer)
         objective = None

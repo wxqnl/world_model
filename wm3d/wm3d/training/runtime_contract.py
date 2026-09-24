@@ -468,6 +468,8 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
             )
     if optimizer.get("name") != "adamw":
         raise RuntimeContractError("optimizer.name must be adamw")
+    if optimizer.get("implementation", "single") not in ("single", "fused"):
+        raise RuntimeContractError("optimizer.implementation must be single or fused")
     start_lr = float(optimizer.get("start_lr", 0.0))
     peak_lr = float(optimizer["peak_lr"])
     min_lr = float(optimizer["min_lr"])
