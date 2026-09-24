@@ -1,7 +1,7 @@
 """Reuse validated window-index objects without changing data or sampling.
 
 The disk cache is a private, disposable accelerator. Source integrity is still
-checked once in every process. Cached pickle accepts only CacheIndexEntry,
+checked on every call, including memory hits. Pickle accepts only CacheIndexEntry,
 checks its CRC before deserialization, and is published atomically under flock.
 """
 from __future__ import annotations
@@ -143,11 +143,13 @@ def load_parsed_window_index(path, expected_digest, *, verify_source, build):
     directory = os.environ.get("WM3D_INDEX_CACHE_DIR", "")
     key = (str(path), expected_digest, signature, directory)
     with _MUTEX:
-        if key in _MEMORY:
-            return _MEMORY[key]
+        # Filesystems can retain the same timestamp within one clock tick;
+        # stat identity alone must never bypass the original content check.
         verify_source()
         if _signature(path) != signature:
             raise ValueError("window index changed during source verification")
+        if key in _MEMORY:
+            return _MEMORY[key]
         mode = "parsed"
         entries = None
         if directory:
