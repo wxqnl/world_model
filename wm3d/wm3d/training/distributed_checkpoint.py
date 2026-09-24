@@ -60,6 +60,7 @@ class ResumeExpectations:
     topology_contract_sha256: str
     allow_topology_reshard: bool = False
     extra_immutable_metadata: Mapping[str, Any] | None = None
+    raw_asset_repairs: Mapping[str, Any] | None = None
 
 
 def checkpoint_name(step: int) -> str:
@@ -564,6 +565,7 @@ def _validate_metadata(
         "model_contract_sha256": expected.model_contract_sha256,
         "distributed_strategy": expected.distributed_strategy,
         "global_batch_size": int(expected.global_batch_size),
+        "raw_asset_repairs": expected.raw_asset_repairs,
     }
     errors = [
         f"{name}: {metadata.get(name)!r} != {value!r}"
@@ -1182,6 +1184,7 @@ class DistributedCheckpointManager:
             global_batch_size=int(metadata["global_batch_size"]),
             topology_contract_sha256=str(metadata["topology_contract_sha256"]),
             allow_topology_reshard=False,
+            raw_asset_repairs=metadata.get("raw_asset_repairs"),
         )
         container, snapshot, _metadata, _mode = self._snapshot_for_load(
             checkpoint_path=checkpoint_path,

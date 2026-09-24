@@ -24,6 +24,10 @@ from torch.utils.data import DataLoader, default_collate
 
 from wm3d.data.manifest_contract import load_data_profile
 from wm3d.data.parsed_index_cache import clear_parsed_index_memory_cache
+from wm3d.data.raw_asset_repairs import (
+    active_raw_asset_repairs,
+    repair_resume_expectation,
+)
 from wm3d.data.step_sampler import StepAddressedBatchSampler
 from wm3d.data.unified_cache_dataset import UnifiedCacheDataset
 from wm3d.data.streaming_raw import (
@@ -1425,6 +1429,9 @@ def _resume_expectations(
         global_batch_size=int(runtime["train"]["global_batch_size"]),
         topology_contract_sha256=_topology_contract_sha256(config),
         allow_topology_reshard=bool(runtime["checkpoint"]["allow_topology_reshard"]),
+        raw_asset_repairs=repair_resume_expectation(
+            str(config["run"]["output_root"]), int(step)
+        ),
     )
 
 
@@ -1588,6 +1595,20 @@ def main() -> None:
     context = initialize_distributed(strategy)
     async_pipeline: AsyncCudaInputPipeline | None = None
     try:
+        raw_asset_repairs = active_raw_asset_repairs()
+        repair_contracts: list[Any] = [None] * context.world_size
+        dist.all_gather_object(repair_contracts, raw_asset_repairs)
+        if any(item != raw_asset_repairs for item in repair_contracts):
+            raise PretrainError("raw RGB repair contracts differ across ranks")
+        if raw_asset_repairs is not None:
+            if not args.preflight_only and args.resume is None:
+                raise PretrainError("approved RGB repair requires checkpoint continuation")
+            repair_resume_expectation(
+                str(config["run"]["output_root"]),
+                int(raw_asset_repairs["adoption_checkpoint_step"]),
+            )
+            if context.is_rank0:
+                print(json.dumps({"raw_asset_repairs": raw_asset_repairs}), flush=True)
         if int(runtime["expected_world_size"]) != context.world_size:
             raise PretrainError(
                 f"WORLD_SIZE={context.world_size} != {runtime['expected_world_size']}"
@@ -2217,6 +2238,7 @@ def main() -> None:
                         "sampler_progress": {"next_optimizer_step": completed},
                         "initial_seed": seed,
                         "gradient_ownership": gradient_ownership,
+                        "raw_asset_repairs": raw_asset_repairs,
                     },
                     rank_state={"next_optimizer_step": completed},
                 )

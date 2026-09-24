@@ -361,6 +361,7 @@ def decode_episode_window_views(
             )
         relative, digest = assets[role]
         path = asset_verifier.verify(source_root, relative, digest)
+        digest = asset_verifier.content_digest(path, digest)
         jobs.append(
             (name, role, segment_kind, start_s, stop_s, path, digest)
         )

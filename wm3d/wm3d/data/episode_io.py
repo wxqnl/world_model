@@ -12,6 +12,7 @@ import numpy as np
 
 from .cache_tasks import CacheTask
 from .manifest_contract import canonical_timestamp_sha256, sha256_file
+from .raw_asset_repairs import active_raw_asset_repairs
 from .source_adapters import AdapterContract, EpisodeAccessor
 
 
@@ -44,6 +45,12 @@ class VerifiedAssetStore:
     def __init__(self) -> None:
         self._verified: dict[Path, _VerifiedAsset] = {}
         self._lock = threading.RLock()
+        self._repair = active_raw_asset_repairs()
+        self._repair_by_asset = {
+            (Path(item["source_root"]).resolve(strict=True), item["relative_path"]): item
+            for item in (self._repair or {}).get("assets", [])
+        }
+        self._actual_digests: dict[Path, str] = {}
 
     @staticmethod
     def _fingerprint(path: Path, expected_sha256: str) -> _VerifiedAsset:
@@ -62,6 +69,24 @@ class VerifiedAssetStore:
             return self._verify_locked(root, relative, expected_sha256)
 
     def _verify_locked(self, root: Path, relative: str, expected_sha256: str) -> Path:
+        original = self._verify_exact(root, relative, expected_sha256)
+        item = self._repair_by_asset.get((Path(root).resolve(strict=True), relative))
+        if item is None:
+            return original
+        if item["sealed_digest"] != expected_sha256:
+            raise EpisodeIOError("raw RGB repair does not match the original sealed asset")
+        replacement = self._verify_exact(
+            root, item["replacement_relative_path"], item["replacement_digest"]
+        )
+        self._actual_digests[replacement] = str(item["replacement_digest"])
+        return replacement
+
+    def content_digest(self, path: Path, original_digest: str) -> str:
+        """Report the actual replacement identity in window decode evidence."""
+        with self._lock:
+            return self._actual_digests.get(path, original_digest)
+
+    def _verify_exact(self, root: Path, relative: str, expected_sha256: str) -> Path:
         root = Path(root).resolve(strict=True)
         candidate = root / relative
         if candidate.is_symlink() or not candidate.is_file():

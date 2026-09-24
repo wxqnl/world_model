@@ -1,5 +1,11 @@
 # Data module guide
 
+- An approved raw RGB repair is an explicit data revision, never a seal bypass.
+  Keep the original asset and verify both versions; only listed source-local videos
+  may redirect to the repair namespace. Require full-frame timestamp alignment.
+  Bind the entire repair list to the adoption checkpoint and every later checkpoint.
+  Do not silently change action labels, indexes, source ratios, or resume state.
+
 - Preserve source-native cadence and physical values in episode caches.
 - Adapters are the only place that map raw fields into grouped action/current-state semantics.
 - Fine command, coarse effect, and current-state normalization lanes are separate.
