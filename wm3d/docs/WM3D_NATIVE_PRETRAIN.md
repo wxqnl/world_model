@@ -1,5 +1,37 @@
 # WM3D Native 预训练
 
+## 2026-09-24 正式训练恢复与优化
+
+用户已确认43/44两台共16卡，正式首段为2000更新步。此前根
+`/data/Minko/wm3d_native_1000h_formal_2node16_micro6_step2000_20260924`
+于08:30启动，完成日志step30后中断。两机BMC在09:28记录电源冗余丢失，
+09:29:54–56记录多路AC lost，约09:32恢复供电并自动开机；没有正常关机记录，
+训练末尾未见OOM或Traceback。故障属于供电中断；具体上游原因仍需运维核实。
+首个step100未保存，不能恢复step30，旧根仅保留证据。
+
+新正式根为
+`/data/Minko/wm3d_native_1000h_formal_2node16_micro6_step2000_20260924_attempt2`，
+代码为双方同路径`/data/Minko/wm3d_native_pretrain_perf_20260924`。
+恢复原数据/文本/输出NFS挂载后，重新由通用Wan与Wan派生权重初始化。
+不使用资格checkpoint作为训练初始化。micro6、累积1、global96、原1000h索引、
+LR、loss、3D/action、分辨率和K8均不变。下方“待拓扑确认”的内容是历史准备记录。
+
+本次只增加封存的`optimizer.implementation: fused`选项，默认仍为`single`。
+沿用PyTorch AdamW的相同公式，主参数和两个moment仍为FP32；fused的step标量
+按PyTorch要求放到参数所在设备。不是低精度优化器，也没有改FSDP划分或注意力mask。
+重启后的完整训练吞吐尚待实测，不能把算子速度作为整步加速倍数。
+
+`scripts/benchmark_native_adamw.py`使用既有真实生产checkpoint的全部2144个
+可训练tensor（6,542,457,322参数），按原2×8 DTensor拓扑比较single与fused。
+只作优化器回放：相同保存moment作为回放梯度，包含不更新参数；不代表模型前后向或质量。
+16份receipt均通过，8次更新后参数/moment/step符合rtol2e-5、atol2e-7；
+全局最大绝对差3.8147e-6（大幅值元素使用相对容差），不声称逐位等价。
+三个真实专家tensor的fused GPU-step DCP保存读回逐元素一致。
+排除2次预热、对每轮取最慢rank后，single均值0.76487秒，fused0.05150秒，
+该环节快14.85倍，节约0.71338秒/更新。重启前整步约18.57秒，
+不能据此声称整个训练快14.85倍。记录在
+`/data/Minko/wm3d_native_adamw_replay_2node16_20260924`。
+
 ## 目标与初始化边界
 
 训练自己的 native 3D world model，改善 RGB 预测并支持 action 下游任务。
