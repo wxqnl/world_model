@@ -904,11 +904,25 @@ def validate_source_manifest(
 
 
 def load_cache_index(path: Path, *, expected_sha256: str) -> tuple[CacheIndexEntry, ...]:
+    from .parsed_index_cache import load_parsed_window_index
+
     path = resolve_regular_file(path)
     expected_sha256 = _require_sha(expected_sha256, field="cache index SHA")
+    return load_parsed_window_index(
+        path,
+        expected_sha256,
+        verify_source=lambda: _verify_cache_index_source(path, expected_sha256),
+        build=lambda: _parse_cache_index(path),
+    )
+
+
+def _verify_cache_index_source(path: Path, expected_sha256: str) -> None:
     observed = sha256_file(path)
     if observed != expected_sha256:
         raise ManifestContractError(f"cache index SHA mismatch: {observed} != {expected_sha256}")
+
+
+def _parse_cache_index(path: Path) -> tuple[CacheIndexEntry, ...]:
     entries: list[CacheIndexEntry] = []
     identities: set[str] = set()
     for line_number, row in iter_jsonl(path):

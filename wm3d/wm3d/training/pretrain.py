@@ -23,6 +23,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, default_collate
 
 from wm3d.data.manifest_contract import load_data_profile
+from wm3d.data.parsed_index_cache import clear_parsed_index_memory_cache
 from wm3d.data.step_sampler import StepAddressedBatchSampler
 from wm3d.data.unified_cache_dataset import UnifiedCacheDataset
 from wm3d.data.streaming_raw import (
@@ -1608,6 +1609,12 @@ def main() -> None:
             )
         except LaunchQualificationError as exc:
             raise PretrainError("runtime code provenance failed") from exc
+        # Node-local, outside the shared run directory. Preflight and train
+        # reuse the same validated parse; independent jobs keep file locking.
+        os.environ.setdefault(
+            "WM3D_INDEX_CACHE_DIR",
+            str(Path(config["run"]["output_root"]).parent / ".wm3d_parsed_index_cache"),
+        )
         train_dataset, profile = _build_mixed_dataset(
             config, split="train", device=context.device, rank=context.rank
         )
@@ -1639,6 +1646,9 @@ def main() -> None:
                 seed=int(runtime["train"]["validation_seed"]),
                 micro_batch_size=_validation_micro_batch_size(runtime),
             )
+        # The two datasets retain their selected immutable rows. Do not keep
+        # the complete corpus alive throughout model training.
+        clear_parsed_index_memory_cache()
         model_cfg = config["model_profile"]["model"]
         cache_representation = profile.cache_representation
         if int(cache_representation["spatial_tokens"]) < int(model_cfg["P"]):
