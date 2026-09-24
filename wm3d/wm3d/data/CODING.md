@@ -22,3 +22,12 @@
 - Episode selection supplies integer window counts to the exact source sampler, not fractional
   probabilities. Keep the selected-window ratios exact. Cached schedules must reproduce the
   original per-cycle shuffle and per-source occurrence for arbitrary optimizer-step access.
+- `parsed_index_cache.py` accelerates only canonical window-index parsing. Keep the original
+  source-content check on every call, including memory hits; filesystem timestamps are not enough.
+  Cached immutable rows must preserve every field and exact order. Do not cache a modified mixture.
+- The trainer shares parsed rows between train/validation and uses a private node-local disk cache
+  across preflight/training processes. Serialize cache construction, not warm readers. Publish
+  atomically; reject stale/corrupt payloads and rebuild with the original validated parser.
+  Release the full-corpus memory reference after both datasets are assembled.
+- Bump the parsed-cache format when canonical row validation or `CacheIndexEntry` semantics change.
+  `WM3D_INDEX_CACHE_DIR` selects the private cache root; an explicit empty value disables disk reuse.
