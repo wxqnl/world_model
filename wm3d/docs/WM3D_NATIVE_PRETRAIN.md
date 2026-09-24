@@ -1,5 +1,44 @@
 # WM3D Native 预训练
 
+## 当前正式任务：50K、fused AdamW、100Gbps IB（2026-09-24）
+
+用户已授权43/44两台16卡训练50,000步。本节取代下文历史的2000步预算和TCP启动方式。
+旧2000步attempt2通过预检后，在训练索引加载期间按用户要求干净停止；
+未发生优化器更新、没有checkpoint，也不是运行故障。新任务保持fresh Wan初始化。
+
+正式根：`/data/Minko/wm3d_native_1000h_formal_2node16_micro6_step50000_20260924`。
+两机代码仍是`/data/Minko/wm3d_native_pretrain_perf_20260924`。
+micro6、累积1、global96、验证micro1；模型、原1000h索引/比例、loss和FP32主参数不变。
+总步数50,000、warmup1000、stable_fraction0.55，原峰值1e-4、最小1e-5和video LR比例0.1不变；
+因此从第27,950步起才进入余弦下降，而不是沿用2000步的短调度。
+每10步记录，每500步验证20批；保存100/500/1000/2000以及每5000步。
+配置原件在checks目录的`h100_16_native_formal50000_micro6_fused_ib_20260924.yaml`。
+约480万窗口次、0.975个窗口等效epoch，不保证每个episode或每个窗口都访问一次，也不证明收敛。
+
+本次另外启用已连通的100Gbps InfiniBand：43固定`mlx5_4:1`、44固定`mlx5_6:1`，
+两端均Active、SM LID25。44的400Gbps端口仍Initializing，不改网络设备或共享fabric。
+`NCCL_IB_DISABLE=0`、`NCCL_NET=IB`和精确`NCCL_IB_HCA`选择防止静默回退；
+TCP网卡`bond0.1411`仅用于bootstrap。NCCL NVLS仍关闭，FSDP2仍为节点内shard8/节点间复制。
+
+实际链路测试98.4Gbps。NCCL 2.26.2通信A/B使用正式checkpoint的2144个可训练tensor形状，
+每rank的FP32 padded gradient为3,278,446,328字节，在真实2×8 mesh上同时执行8组跨节点all-reduce。
+TCP与IB各16份receipt通过，全buffer归约值正确。排除2次预热，4次测量均取最慢rank：
+TCP平均8.96636秒，IB平均2.13845秒，通信环节减少6.82791秒、快4.19倍。
+这是生产梯度规模的通信测量，不是完整训练step；不能直接声称整步快4.19倍。
+证据保存在checks的`replica_tcp/`、`replica_ib/`和对应日志，脚本为
+`benchmark_native_replica_collective.py`。容量checkpoint只用于读取形状，绝非正式初始化。
+整步速度仍须排除加载/验证/保存、保留实际I/O慢步，从正式日志测量。
+
+单checkpoint约76GiB，50K全保存在43本地会超出可用空间。
+每小时监控要在保存后验证COMMITTED、16distcp/16rank_state/owner和双机可读，
+始终保留最新两个完整正式checkpoint在43；更早的已被取代checkpoint可低优先级完整迁往44
+独立归档目录，核对全文件数量/字节/内容后保留原路径符号链接，不直接删证据。
+43至少留出两份checkpoint加50GiB空间，不在checkpoint写入期间迁移，不让归档抢占训练I/O。
+50K完成后先验收，不自动延长或启动32卡。
+
+以下为资格、数据恢复与旧预算的历史记录。
+
+
 ## 2026-09-24 正式训练恢复与优化
 
 用户已确认43/44两台共16卡，正式首段为2000更新步。此前根
