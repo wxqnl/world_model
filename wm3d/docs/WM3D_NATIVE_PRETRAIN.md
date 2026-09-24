@@ -1,5 +1,41 @@
 # WM3D Native 预训练
 
+## 2026-09-24：冻结特征复用与性能维护
+
+用户要求立即停止优化，不再等第500步保存。13:27两机停止，日志虽到500，
+但validation/save尚未完成；完整恢复点为本50K正式根的step100。
+不得把日志步数当作已保存checkpoint。旧日志保留，101之后的未保存更新需要重算。
+
+恢复代码为两机的 /data/Minko/wm3d_native_vggt_reuse_20260924，
+入口为正式根的 resume_cache_step100.sh，服务名称为
+wm3d-native-formal50k-cache-r100-n43/n44-20260924。
+恢复仍用原runtime和step100完整optimizer、sampler、RNG；
+50K、micro6/global96、FP32主参数、BF16计算、IB、模型、loss和原数据比例均不变。
+代码执行版本变化记录在正式根 cache_optimization_transition.json；
+launcher核对实际干净代码及验收记录后才允许执行兼容恢复，不伪称执行版本没变。
+
+新增启用两个执行选项：冻结VGGT的8GiB/rank CPU特征缓存，以及官方foreach梯度裁剪。
+VGGT只复用同一物理帧和同一有效相机组合的冻结输出，完整保留current/K8时间顺序；
+未来特征仍只进入loss。无teacher forcing、量化、分辨率变化或新loss。
+CPU索引解析缓存也随此代码部署；原完整索引的字段、顺序、比例和源文件校验不变。
+
+真实VGGT验收使用原正式采样器rank0/8、step481–496的32个batch，
+共192窗口、7个source。所有缓存开关输出逐元素相同，最大差0，CPU/CUDA RNG不变；
+输出是可被可导模块使用的普通张量。1728个时间行只需编码709行。
+两节点平均VGGT耗时2.71215→1.14356秒，减少57.84%；这是冻结编码环节，
+不能写成整步加速58%。记录在正式根cache_optimization/receipt_rank00/08.json。
+
+真实16卡DTensor裁剪对照覆盖全部2144个可训练tensor形状，用step100保存的
+first moment作为回放梯度，包括有/无裁剪和无梯度参数。六轮对照的范数及裁剪后
+数值逐元素一致。排除两轮预热、每轮取最慢rank，默认/foreach平均为0.12897/0.08769秒；
+单轮波动较大，约0.04秒收益只是辅助，不能当主要瓶颈。全局非有限检查保持开启。
+记录在grad_clip_optimization/，脚本为scripts/benchmark_native_grad_clip.py。
+首次裁剪测试仅启动路径错误，未启动GPU worker；修正为python -m torch.distributed.run后通过。
+
+GPU/功率验收看恢复后真实训练samples/s和完整时间窗口。400W恒定不是通过条件。
+本轮未改MoT、FSDP边界或attention mask；MoT直接调用block子函数，不能机械逐层wrap。
+CPU检查669 passed、4 skipped，不代替以上真实GPU对照或RGB/action质量验收。
+
 ## 当前正式任务：50K、fused AdamW、100Gbps IB（2026-09-24）
 
 用户已授权43/44两台16卡训练50,000步。本节取代下文历史的2000步预算和TCP启动方式。

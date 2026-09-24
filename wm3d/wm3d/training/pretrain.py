@@ -2111,7 +2111,14 @@ def main() -> None:
             if hasattr(model, "clip_grad_norm_"):
                 grad_norm = model.clip_grad_norm_(clip_value)
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+                # Explicit opt-in: PyTorch's automatic foreach selection skips
+                # DTensor. The official kernel preserves the global norm and
+                # clipping formula; retain the non-finite guard below.
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), clip_value,
+                    foreach=True if foundation_mode and _environment_flag(
+                        "WM3D_FOUNDATION_CLIP_FOREACH") else None,
+                )
             grad_norm_value = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
             if not bool(torch.isfinite(grad_norm_value).all()):
                 raise FloatingPointError(f"non-finite gradient norm at step {step}")

@@ -15,6 +15,11 @@
   Native trajectory mode encodes the current observation plus all K future timestamps,
   in small independent-time VGGT batches. Future targets never enter model inputs.
   Spatial resizing is per view and must not mix cameras or temporal rows.
+- Frozen feature reuse is instance-local to the encoder/preprocessing/task manifest.
+  Key it by packed episode/frame identity plus the complete camera-availability mask;
+  never use sample_index alone. Keep ordinary output tensors and preserve CPU/CUDA RNG.
+  A cache speed claim requires actual encoder A/B on unmodified sampler batches,
+  including current/K8 ordering and future-label isolation, not only a fake encoder test.
 - Reuse an approved whole-episode selection verbatim. Filter training only; keep validation
   unchanged and preserve the saved source-window proportions. Never count overlapping windows
   as hours or replace the source mixture with a motion-selected/equal-source subset.
