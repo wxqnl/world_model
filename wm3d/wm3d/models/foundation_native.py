@@ -14,6 +14,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .foundation_flow_precision import FP32TrainingFlowScheduler
 from .foundation_world_model import (
     ActionTimeConditioner, FoundationModelError, FoundationWorldModel,
     FoundationWorldModelConfig, Native3DStateConditioner, WSABackendAdapter,
@@ -182,13 +183,82 @@ class NativeTrajectoryBackend(WSABackendAdapter):
     @torch.inference_mode()
     def infer_world(self, **kwargs):
         self._last_native_state = None
-        device_type = self.wsa_model.device.type
+        core = self.wsa_model
+        device_type = core.device.type
+        joint = kwargs["factual_action"] is None
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16, enabled=device_type == "cuda"):
             result = dict(super().infer_world(**kwargs))
+            if joint:
+                # The sampler's last MoT call precedes its final Euler update.
+                # Its cached 3D state therefore describes noisy, pre-update
+                # actions, not the clean action chunk returned to the caller.
+                # Read the trajectory once at that final action and t=0.
+                # Only observed video is needed: action/3D cannot attend to
+                # future video in the production MoT mask. No labels are read.
+                candidate = result["action_normalized"].to(
+                    device=core.device, dtype=core.torch_dtype
+                )
+                candidate = candidate.masked_fill(
+                    ~kwargs["action_element_mask"].to(
+                        device=core.device, dtype=torch.bool
+                    ), 0.0
+                )
+                context = kwargs["context"].to(
+                    device=core.device, dtype=core.torch_dtype
+                )
+                context_mask = kwargs["context_mask"].to(
+                    device=core.device, dtype=torch.bool
+                )
+                proprio = kwargs["proprio"]
+                if proprio.ndim == 3 and proprio.shape[1] == 1:
+                    proprio = proprio[:, 0]
+                context, context_mask = core._append_proprio_to_context(
+                    context=context, context_mask=context_mask,
+                    proprio=proprio.to(
+                        device=core.device, dtype=core.torch_dtype
+                    ),
+                )
+                first_frame = core._encode_input_image_latents_tensor(
+                    kwargs["input_image"].to(
+                        device=core.device, dtype=core.torch_dtype
+                    )
+                )
+                self._active_time_update = self.action_time(
+                    kwargs["action_time_s"], kwargs["action_element_mask"]
+                )
+                self._active_native_3d_update = self.native_3d_state(
+                    kwargs["current_native_3d"],
+                    kwargs["current_native_3d_view_mask"],
+                )
+                self._last_native_state = None
+                try:
+                    core._predict_action_noise(
+                        first_frame_latents=first_frame,
+                        latents_action=candidate,
+                        timestep_action=torch.zeros(
+                            candidate.shape[0], device=core.device,
+                            dtype=core.torch_dtype,
+                        ),
+                        context=context, context_mask=context_mask,
+                        fuse_vae_embedding_in_latents=bool(
+                            core.video_expert.fuse_vae_embedding_in_latents
+                        ),
+                    )
+                finally:
+                    self._active_time_update = None
+                    self._active_native_3d_update = None
         if self._last_native_state is None:
             raise FoundationModelError("joint sampler produced no native trajectory state")
         result["native_3d_future_tokens"] = self._last_native_state
         result["native_3d_view_mask"] = kwargs["current_native_3d_view_mask"]
+        result["conditioning"] = {
+            **result["conditioning"],
+            "native_3d_action_state": (
+                "final_generated_action_t0" if joint else "given_candidate_t0"
+            ),
+            "native_3d_action_timestep": 0.0,
+            "native_3d_readout_recomputed": joint,
+        }
         self._last_native_state = None
         return result
 
@@ -256,6 +326,12 @@ def build_native_pretraining_model(config: FoundationWorldModelConfig, *, device
         mask_action_dim_padding_loss=True, loss_lambda_3d=0.0,
         future_3d_view_attention_layout="robotwin",
     )
+    # Keep continuous training noise levels out of BF16 endpoint rounding.
+    # The upstream distributions/weights/targets and inference stay unchanged.
+    core.train_video_scheduler = FP32TrainingFlowScheduler(core.train_video_scheduler)
+    core.train_action_scheduler = FP32TrainingFlowScheduler(core.train_action_scheduler)
+    core.train_scheduler = core.train_video_scheduler
+
     # Keep the upstream API aliases but register each expert exactly once.
     # Otherwise a fresh FP32 state_dict stores the same MoT weights under
     # video_expert, mot.mixtures and dit.mixtures, multiplying checkpoint I/O.

@@ -28,7 +28,7 @@ from wm3d.data.raw_asset_repairs import (
     active_raw_asset_repairs,
     repair_resume_expectation,
 )
-from wm3d.data.step_sampler import StepAddressedBatchSampler
+from wm3d.data.step_sampler import StepAddressedBatchSampler, FullEpochBatchSampler
 from wm3d.data.unified_cache_dataset import UnifiedCacheDataset
 from wm3d.data.streaming_raw import (
     STREAMING_DATA_CLOSURE_SCHEMA,
@@ -1215,9 +1215,12 @@ def _make_loader(
     seed: int,
     gradient_accumulation: int,
     micro_batch_size: int | None = None,
+    is_training: bool = False,
 ) -> DataLoader:
     train = runtime_profile["train"]
-    sampler = StepAddressedBatchSampler(
+    full_epochs = is_training and train.get("sampling_mode") == "source_count_epochs_v1"
+    sampler_type = FullEpochBatchSampler if full_epochs else StepAddressedBatchSampler
+    sampler = sampler_type(
         dataset.source_spans,
         dataset.source_names,
         {
@@ -1236,7 +1239,12 @@ def _make_loader(
         num_optimizer_steps=num_steps,
         seed=seed,
         source_episode_spans=getattr(dataset, "source_episode_spans", None),
+        **({"epochs": train["sampling_epochs"]} if full_epochs else {}),
     )
+    if full_epochs and int(train["total_steps"]) != sampler.budget["optimizer_steps"]:
+        raise PretrainError("total_steps does not cover the sealed full-epoch selection exactly")
+    if full_epochs and rank == 0 and num_steps == 1 and start_step == 0:
+        print(json.dumps({"complete_epoch_sampling": sampler.budget}), flush=True)
     if callable(getattr(dataset, "prefetch_indices", None)):
         sampler = _StreamingLookaheadBatchSampler(
             sampler, dataset, lookahead_batches=2
@@ -1268,6 +1276,7 @@ def _require_sampling_capacity(
     gradient_accumulation: int,
     seed: int,
     micro_batch_size: int | None = None,
+    is_training: bool = False,
 ) -> None:
     """Reject undersized source splits before model construction or training."""
 
@@ -1282,6 +1291,7 @@ def _require_sampling_capacity(
         seed=seed,
         gradient_accumulation=gradient_accumulation,
         micro_batch_size=micro_batch_size,
+        is_training=is_training,
     )
 
 
@@ -1430,7 +1440,8 @@ def _resume_expectations(
         topology_contract_sha256=_topology_contract_sha256(config),
         allow_topology_reshard=bool(runtime["checkpoint"]["allow_topology_reshard"]),
         raw_asset_repairs=repair_resume_expectation(
-            str(config["run"]["output_root"]), int(step)
+            str(config["run"]["output_root"]), int(step),
+            initial_raw_asset_repairs=runtime["train"].get("initial_raw_asset_repairs"),
         ),
     )
 
@@ -1554,6 +1565,12 @@ def _topology_contract_sha256(config: Mapping[str, Any]) -> str:
                 "total_steps": int(train["total_steps"]),
                 "seed": int(train["seed"]),
                 "gradient_clip": float(train["gradient_clip"]),
+                **({
+                    "sampling_mode": train["sampling_mode"],
+                    "sampling_epochs": train["sampling_epochs"],
+                    # Rank-contiguous epoch ownership cannot change mid-epoch.
+                    "sampling_world_size": int(runtime["expected_world_size"]),
+                } if train.get("sampling_mode") == "source_count_epochs_v1" else {}),
             },
             "distributed_numerics": {
                 "strategy": distributed["strategy"],
@@ -1600,13 +1617,23 @@ def main() -> None:
         dist.all_gather_object(repair_contracts, raw_asset_repairs)
         if any(item != raw_asset_repairs for item in repair_contracts):
             raise PretrainError("raw RGB repair contracts differ across ranks")
-        if raw_asset_repairs is not None:
-            if not args.preflight_only and args.resume is None:
-                raise PretrainError("approved RGB repair requires checkpoint continuation")
+        initial_repairs = runtime["train"].get("initial_raw_asset_repairs")
+        if initial_repairs is not None:
+            # Explicit new-run data inheritance never loads a source checkpoint.
+            # Missing/changed environment must fail even when every rank agrees.
             repair_resume_expectation(
-                str(config["run"]["output_root"]),
-                int(raw_asset_repairs["adoption_checkpoint_step"]),
+                str(config["run"]["output_root"]), 0,
+                initial_raw_asset_repairs=initial_repairs,
             )
+        if raw_asset_repairs is not None:
+            if (not args.preflight_only and args.resume is None
+                    and initial_repairs is None):
+                raise PretrainError("approved RGB repair requires explicit initial inheritance or checkpoint continuation")
+            if initial_repairs is None:
+                repair_resume_expectation(
+                    str(config["run"]["output_root"]),
+                    int(raw_asset_repairs["adoption_checkpoint_step"]),
+                )
             if context.is_rank0:
                 print(json.dumps({"raw_asset_repairs": raw_asset_repairs}), flush=True)
         if int(runtime["expected_world_size"]) != context.world_size:
@@ -1647,6 +1674,7 @@ def main() -> None:
             world_size=context.world_size,
             gradient_accumulation=int(runtime["train"]["gradient_accumulation"]),
             seed=int(runtime["train"]["seed"]),
+            is_training=True,
         )
         validation_dataset: UnifiedCacheDataset | None = None
         if int(runtime["train"]["validate_every"]) > 0:
@@ -1986,6 +2014,7 @@ def main() -> None:
             num_steps=stop_after_step - start_step,
             seed=seed,
             gradient_accumulation=int(runtime["train"]["gradient_accumulation"]),
+            is_training=True,
         )
         iterator = iter(loader)
         if input_adapter is not None and _environment_flag(

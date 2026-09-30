@@ -520,3 +520,125 @@ class StepAddressedBatchSampler(Sampler[list[int]]):
                     source_start + permutation.at(rank_base + local_index)
                     for local_index in range(self.micro_batch_size)
                 ]
+
+
+def complete_epoch_budget(
+    window_counts: Mapping[str, int], *, global_batch: int, epochs: int,
+) -> dict:
+    """Count complete source passes with explicit fixed-batch tail padding."""
+    if (type(global_batch) is not int or global_batch <= 0
+            or type(epochs) is not int or epochs <= 0 or not window_counts):
+        raise SamplingContractError("epoch count and global batch must be positive integers")
+    if any(type(n) is not int or n < global_batch for n in window_counts.values()):
+        raise SamplingContractError("each selected source must contain at least one global batch")
+    source_steps = {name: (n + global_batch - 1) // global_batch
+                    for name, n in window_counts.items()}
+    padding = {name: source_steps[name] * global_batch - n
+               for name, n in window_counts.items()}
+    steps_per_epoch = sum(source_steps.values())
+    selected = sum(window_counts.values())
+    return {
+        "sampling_mode": "source_count_epochs_v1",
+        "selected_windows": selected, "global_batch_size": global_batch,
+        "requested_epochs": epochs, "steps_per_epoch": steps_per_epoch,
+        "source_steps_per_epoch": source_steps,
+        "source_padding_draws_per_epoch": padding,
+        "padding_draws_per_epoch": sum(padding.values()),
+        "optimizer_steps": steps_per_epoch * epochs,
+        "unique_window_visits": selected * epochs,
+        "window_draws": steps_per_epoch * epochs * global_batch,
+        "window_equivalent_epochs": steps_per_epoch * epochs * global_batch / selected,
+        "tail_policy": "repeat_only_within_current_rank_partition_and_epoch",
+    }
+
+
+class FullEpochBatchSampler(Sampler[list[int]]):
+    """Visit every selected window each epoch, without changing legacy sampling.
+
+    Sources retain homogeneous global batches. Each epoch shuffles the complete
+    episode-local stream, then partitions its positions into equal contiguous
+    rank ranges (lengths differ by at most one). This avoids making every rank
+    decode the same episode simultaneously. Only the last batch of each source
+    repeats its rank's prefix; all padding is counted separately from coverage.
+    Exact resume requires the same world size; epoch-crossing repartition is not
+    silently treated as a topology-reshard-compatible sample stream.
+    """
+
+    def __init__(
+        self, source_spans, source_order, source_weights, *,
+        world_size, rank, micro_batch_size, gradient_accumulation,
+        start_optimizer_step, num_optimizer_steps, seed,
+        source_episode_spans=None, epochs,
+    ):
+        self.source_spans = dict(source_spans)
+        self.world_size, self.rank = int(world_size), int(rank)
+        self.micro_batch_size = int(micro_batch_size)
+        self.gradient_accumulation = int(gradient_accumulation)
+        self.start_optimizer_step = int(start_optimizer_step)
+        self.num_optimizer_steps = int(num_optimizer_steps)
+        if self.world_size <= 0 or not 0 <= self.rank < self.world_size:
+            raise SamplingContractError("invalid rank/world size")
+        if self.micro_batch_size <= 0 or self.gradient_accumulation <= 0:
+            raise SamplingContractError("batch size and accumulation must be positive")
+        if any(start < 0 or stop <= start for start, stop in self.source_spans.values()):
+            raise SamplingContractError("invalid source span")
+        counts = {name: stop - start for name, (start, stop) in self.source_spans.items()}
+        if dict(source_weights) != counts:
+            raise SamplingContractError("full epochs require actual selected-window source weights")
+        self.local_batch = self.micro_batch_size * self.gradient_accumulation
+        self.global_batch = self.world_size * self.local_batch
+        self.budget = complete_epoch_budget(counts, global_batch=self.global_batch, epochs=epochs)
+        if (self.start_optimizer_step < 0 or self.num_optimizer_steps <= 0
+                or self.start_optimizer_step + self.num_optimizer_steps > self.budget["optimizer_steps"]):
+            raise SamplingContractError("optimizer-step interval exceeds complete epoch budget")
+        self.schedule = ExactSourceSchedule(
+            source_order, self.budget["source_steps_per_epoch"], seed=seed
+        )
+        if source_episode_spans is not None and set(source_episode_spans) != set(counts):
+            raise SamplingContractError("episode-local spans must exactly match scheduled sources")
+        self._permutations = {}
+        self._rank_ranges = {}
+        for name, (start, stop) in self.source_spans.items():
+            n = counts[name]
+            quotient, remainder = divmod(n, self.world_size)
+            rank_start = quotient * self.rank + min(self.rank, remainder)
+            rank_length = quotient + int(self.rank < remainder)
+            self._rank_ranges[name] = (rank_start, rank_length)
+            self._permutations[name] = (
+                AffinePermutation(n, seed=seed, source_name=name)
+                if source_episode_spans is None else EpisodeLocalPermutation(
+                    source_start=start, source_stop=stop,
+                    episode_spans=source_episode_spans[name], seed=seed, source_name=name,
+                )
+            )
+
+    def __len__(self):
+        return self.num_optimizer_steps * self.gradient_accumulation
+
+    def describe_step(self, optimizer_step):
+        address = self.schedule.address(optimizer_step)
+        return {
+            "optimizer_step": address.optimizer_step, "source_name": address.source_name,
+            "epoch": address.cycle, "step_in_epoch": address.cycle_position,
+            "source_batch_in_epoch": address.source_occurrence % self.schedule.weights[address.source_name],
+            "source_padding_draws_per_epoch": self.budget["source_padding_draws_per_epoch"][address.source_name],
+        }
+
+    def __iter__(self):
+        for step in range(self.start_optimizer_step,
+                          self.start_optimizer_step + self.num_optimizer_steps):
+            address = self.schedule.address(step)
+            name = address.source_name
+            source_start, source_stop = self.source_spans[name]
+            rank_start, rank_length = self._rank_ranges[name]
+            batch_in_epoch = address.source_occurrence % self.schedule.weights[name]
+            epoch_start = address.cycle * (source_stop - source_start)
+            permutation = self._permutations[name]
+            for micro in range(self.gradient_accumulation):
+                local_start = batch_in_epoch * self.local_batch + micro * self.micro_batch_size
+                yield [
+                    source_start + permutation.at(
+                        epoch_start + rank_start + (local_start + i) % rank_length
+                    )
+                    for i in range(self.micro_batch_size)
+                ]

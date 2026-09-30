@@ -22,7 +22,11 @@ def _read_contract(filename: str) -> dict[str, Any]:
     path = Path(filename)
     if not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise ValueError("raw RGB repair contract must be an absolute regular file")
-    value = json.loads(path.read_text())
+    return validate_raw_asset_repair_contract(json.loads(path.read_text()))
+
+
+def validate_raw_asset_repair_contract(value: Any) -> dict[str, Any]:
+    """Validate the complete approved data revision without changing its lineage."""
     required = {"schema", "repair_id", "upstream", "user_approved",
                 "adoption_run_root", "adoption_checkpoint_step", "assets"}
     if not isinstance(value, dict) or set(value) != required:
@@ -76,8 +80,24 @@ def active_raw_asset_repairs() -> dict[str, Any] | None:
     return _read_contract(filename) if filename else None
 
 
-def repair_resume_expectation(run_root: str, step: int) -> Mapping[str, Any] | None:
+def repair_resume_expectation(
+    run_root: str, step: int, *,
+    initial_raw_asset_repairs: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any] | None:
     repair = active_raw_asset_repairs()
+    if initial_raw_asset_repairs is not None:
+        initial = validate_raw_asset_repair_contract(initial_raw_asset_repairs)
+        if repair != initial:
+            raise ValueError("initial raw RGB repair differs from active approved contract")
+        if (not Path(run_root).is_absolute()
+                or Path(run_root) == Path(initial["adoption_run_root"])):
+            raise ValueError("initial raw RGB repair requires a distinct absolute new run")
+        if type(step) is not int or step < 0:
+            raise ValueError("initial raw RGB repair requires a non-negative step")
+        # This is a fresh run over an explicitly inherited data revision, not
+        # model/optimizer continuation. Every new checkpoint, including step0,
+        # must carry the entire original approval and adoption lineage.
+        return repair
     if repair is None:
         return None
     if Path(run_root) != Path(repair["adoption_run_root"]):

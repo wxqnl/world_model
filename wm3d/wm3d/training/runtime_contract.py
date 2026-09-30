@@ -16,6 +16,7 @@ from wm3d.data.cache_tasks import (
 )
 from wm3d.data.manifest_contract import SHA256_RE, load_data_profile, sha256_file
 from wm3d.data.direct_raw import DIRECT_RAW_DATA_CLOSURE_SCHEMA
+from wm3d.data.raw_asset_repairs import validate_raw_asset_repair_contract
 from wm3d.data.streaming_raw import (
     STREAMING_DATA_CLOSURE_SCHEMA,
     load_streaming_metadata_seal,
@@ -240,12 +241,23 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "appearance_validation_three_way",
         "model_warmstart_checkpoint",
         "model_warmstart_new_parameter_prefixes",
+        "initial_raw_asset_repairs",
+        "sampling_mode",
+        "sampling_epochs",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
             f"train fields mismatch: missing={sorted(required_train-set(train))} "
             f"unknown={sorted(set(train)-required_train-optional_train)}"
         )
+    if "sampling_mode" in train or "sampling_epochs" in train:
+        if (train.get("sampling_mode") != "source_count_epochs_v1"
+                or type(train.get("sampling_epochs")) is not int
+                or train["sampling_epochs"] <= 0
+                or train.get("train_episode_allowlist") is None):
+            raise RuntimeContractError("complete epochs require explicit mode, positive epochs and selection")
+        if train.get("model_warmstart_checkpoint"):
+            raise RuntimeContractError("complete-epoch initial run must not load old WM3D weights")
     if train.get("train_episode_allowlist") is not None:
         selection = Path(str(train["train_episode_allowlist"]))
         if not selection.is_absolute() or not selection.is_file():
@@ -437,6 +449,16 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         )
     warmstart_path = train.get("model_warmstart_checkpoint")
     warmstart_prefixes = train.get("model_warmstart_new_parameter_prefixes")
+    initial_repairs = train.get("initial_raw_asset_repairs")
+    if initial_repairs is not None:
+        try:
+            validate_raw_asset_repair_contract(initial_repairs)
+        except ValueError as exc:
+            raise RuntimeContractError("invalid initial raw RGB repair contract") from exc
+        if warmstart_path is not None:
+            raise RuntimeContractError(
+                "initial raw RGB repair is for fresh initialization, not model warmstart"
+            )
     if (warmstart_path is None) != (warmstart_prefixes is None):
         raise RuntimeContractError(
             "model warmstart checkpoint and new parameter prefixes are required together"
