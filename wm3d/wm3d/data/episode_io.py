@@ -13,6 +13,7 @@ import numpy as np
 from .cache_tasks import CacheTask
 from .manifest_contract import canonical_timestamp_sha256, sha256_file
 from .raw_asset_repairs import active_raw_asset_repairs
+from .file_binding import FileBindingError, require_stat_binding, verify_stat_asset
 from .source_adapters import AdapterContract, EpisodeAccessor
 
 
@@ -80,6 +81,26 @@ class VerifiedAssetStore:
         )
         self._actual_digests[replacement] = str(item["replacement_digest"])
         return replacement
+
+    def verify_admitted(
+        self, root: Path, relative: str, binding: Mapping[str, object]
+    ) -> Path:
+        """Verify an explicit new-admission stat contract without hashing.
+
+        This is separate from verify(): legacy SHA and approved raw-repair
+        checks are not disabled by an environment switch or a missing digest.
+        """
+        with self._lock:
+            try:
+                expected = require_stat_binding(binding)
+                key = (Path(root).resolve(strict=True), relative)
+                if key in self._repair_by_asset:
+                    raise EpisodeIOError(
+                        "legacy repaired assets require their original SHA contract"
+                    )
+                return verify_stat_asset(root, relative, expected)
+            except (FileBindingError, OSError) as exc:
+                raise EpisodeIOError(f"admitted asset verification failed: {relative}: {exc}") from exc
 
     def content_digest(self, path: Path, original_digest: str) -> str:
         """Report the actual replacement identity in window decode evidence."""
@@ -263,6 +284,54 @@ def open_episode_accessor(
     if adapter.raw_format == "npz":
         return NpzEpisodeAccessor(path, **kwargs)
     raise EpisodeIOError(f"unsupported episode format {adapter.raw_format!r}")
+
+
+def open_admitted_episode_accessor(
+    *,
+    source_root: Path,
+    payload: str,
+    payload_binding: Mapping[str, object],
+    row_start: int,
+    row_stop: int,
+    adapter: AdapterContract,
+    asset_verifier: VerifiedAssetStore,
+) -> EpisodeAccessor:
+    """Use the same production row reader with an explicit new-data binding.
+
+    Admission membership, physical mapping and episode split remain the
+    caller's contract. This function never falls back from a legacy SHA.
+    """
+    if type(row_start) is not int or type(row_stop) is not int or not 0 <= row_start < row_stop:
+        raise EpisodeIOError("invalid admitted episode row bounds")
+    path = asset_verifier.verify_admitted(source_root, payload, payload_binding)
+    kwargs = {"row_start": row_start, "row_stop": row_stop}
+    if adapter.raw_format in {"lerobot_parquet_video", "agibot_parquet_video"}:
+        accessor = ParquetEpisodeAccessor(path, **kwargs)
+    elif adapter.raw_format == "npz":
+        accessor = NpzEpisodeAccessor(path, **kwargs)
+    else:
+        raise EpisodeIOError(f"unsupported episode format {adapter.raw_format!r}")
+    asset_verifier.verify_admitted(source_root, payload, payload_binding)
+    return _AdmittedEpisodeAccessor(
+        accessor, verifier=asset_verifier, root=source_root,
+        relative=payload, binding=payload_binding,
+    )
+
+
+class _AdmittedEpisodeAccessor(EpisodeAccessor):
+    def __init__(self, accessor: EpisodeAccessor, *, verifier: VerifiedAssetStore,
+                 root: Path, relative: str, binding: Mapping[str, object]):
+        self._accessor = accessor
+        self._verifier = verifier
+        self._root = Path(root)
+        self._relative = relative
+        self._binding = require_stat_binding(binding)
+
+    def array(self, key: str) -> np.ndarray:
+        self._verifier.verify_admitted(self._root, self._relative, self._binding)
+        result = self._accessor.array(key)
+        self._verifier.verify_admitted(self._root, self._relative, self._binding)
+        return result
 
 
 @dataclass(frozen=True)

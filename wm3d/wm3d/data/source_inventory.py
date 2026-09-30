@@ -28,7 +28,13 @@ from .manifest_contract import (
     timestamp_evidence,
     validate_source_manifest,
 )
-from .source_adapters import AdapterContract, AdapterContractError, MappingTerm
+from .source_adapters import (
+    AdapterContract,
+    AdapterContractError,
+    MappingTerm,
+    _mapped,
+    align_coarse_action_rows,
+)
 
 
 INVENTORY_RECEIPT_SCHEMA = "wm3d_v8_source_inventory_receipt_v1"
@@ -36,6 +42,14 @@ INVENTORY_RECEIPT_SCHEMA = "wm3d_v8_source_inventory_receipt_v1"
 
 class SourceInventoryError(RuntimeError):
     pass
+
+
+class _ArrayAccessor:
+    def __init__(self, arrays: Mapping[str, np.ndarray]) -> None:
+        self.arrays = arrays
+
+    def array(self, key: str) -> np.ndarray:
+        return self.arrays[key]
 
 
 def _normalize_task_text(value: Any) -> str:
@@ -596,9 +610,24 @@ def _episode_rows(
                     f"episode {episode_index}/{mapping.group}/action",
                 )
             else:
-                interval = np.asarray(
-                    arrays[str(interval_key)], dtype=np.int64
-                ).reshape(-1)
+                if mapping.action_alignment == "as_recorded":
+                    interval = np.asarray(
+                        arrays[str(interval_key)], dtype=np.int64
+                    ).reshape(-1)
+                else:
+                    accessor = _ArrayAccessor(arrays)
+                    try:
+                        aligned, interval = align_coarse_action_rows(
+                            accessor=accessor,
+                            mapping=mapping,
+                            observation_time_key=adapter.observation_time_key,
+                            action=_mapped(accessor, mapping.action),
+                        )
+                    except AdapterContractError as exc:
+                        raise SourceInventoryError(
+                            f"episode {episode_index}/{mapping.group}: {exc}"
+                        ) from exc
+                    action_count = len(aligned)
                 if interval.shape != (action_count,) or bool((interval < 0).any()):
                     raise SourceInventoryError(
                         f"episode {episode_index}/{mapping.group}: invalid world intervals"

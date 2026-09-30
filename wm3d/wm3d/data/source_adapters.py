@@ -21,11 +21,13 @@ from .grouped_robot import (
     RawStateSnapshot,
 )
 from .manifest_contract import sha256_file
+from .file_binding import require_stat_binding, verify_stat_asset
 
 
 ADAPTER_SCHEMA = "wm3d_v8_source_adapter_v3"
 ADAPTER_COLOR_SCHEMA = "wm3d_source_adapter_v4"
 ADAPTER_CANONICAL_SCHEMA = "wm3d_source_adapter_v5"
+ADAPTER_ALIGNMENT_SCHEMA = "wm3d_source_adapter_v6"
 
 CANONICAL_ACTION_TRANSFORMS = frozenset(
     {
@@ -109,6 +111,7 @@ class GroupMapping:
     state_transform: str = "identity"
     action_value_mask: Optional[tuple[bool, ...]] = None
     state_value_mask: Optional[tuple[bool, ...]] = None
+    action_alignment: str = "as_recorded"
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,7 @@ class AdapterContract:
     observation_time_key: str
     views: tuple[ViewMapping, ...]
     groups: tuple[GroupMapping, ...]
+    file_binding: Mapping[str, Any] | None = None
 
     @property
     def required_array_keys(self) -> tuple[str, ...]:
@@ -156,15 +160,27 @@ def _term(value: Mapping[str, Any]) -> MappingTerm:
     return MappingTerm(str(value["key"]), columns, scale, offset)
 
 
-def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContract:
-    path = Path(path).resolve(strict=True)
-    if path.is_symlink() or not path.is_file():
-        raise AdapterContractError(f"adapter contract is not a regular file: {path}")
-    observed = sha256_file(path)
-    if observed != expected_sha256:
-        raise AdapterContractError(
-            f"adapter contract SHA mismatch: {observed} != {expected_sha256}"
-        )
+def load_adapter_contract(
+    path: Path, *, expected_sha256: str | None = None,
+    expected_binding: Mapping[str, Any] | None = None,
+) -> AdapterContract:
+    if (expected_sha256 is None) == (expected_binding is None):
+        raise AdapterContractError("exactly one explicit adapter file binding is required")
+    binding = None
+    if expected_binding is not None:
+        path = Path(path).absolute()
+        binding = require_stat_binding(expected_binding)
+        path = verify_stat_asset(Path(path.anchor), path.relative_to(path.anchor).as_posix(), binding)
+        observed = ""
+    else:
+        path = Path(path).resolve(strict=True)
+        if path.is_symlink() or not path.is_file():
+            raise AdapterContractError(f"adapter contract is not a regular file: {path}")
+        observed = sha256_file(path)
+        if observed != expected_sha256:
+            raise AdapterContractError(
+                f"adapter contract SHA mismatch: {observed} != {expected_sha256}"
+            )
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
     required = {
         "schema",
@@ -181,6 +197,7 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
         ADAPTER_SCHEMA,
         ADAPTER_COLOR_SCHEMA,
         ADAPTER_CANONICAL_SCHEMA,
+        ADAPTER_ALIGNMENT_SCHEMA,
     }:
         raise AdapterContractError(f"unsupported adapter schema {schema!r}")
     raw_format = str(value["raw_format"])
@@ -231,7 +248,7 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
             "state_time_key",
             "world_interval_index_key",
         }
-        if schema == ADAPTER_CANONICAL_SCHEMA:
+        if schema in {ADAPTER_CANONICAL_SCHEMA, ADAPTER_ALIGNMENT_SCHEMA}:
             fields.update(
                 {
                     "action_transform",
@@ -240,6 +257,8 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
                     "state_value_mask",
                 }
             )
+        if schema == ADAPTER_ALIGNMENT_SCHEMA:
+            fields.add("action_alignment")
         if not isinstance(raw, dict) or set(raw) != fields:
             raise AdapterContractError("adapter group fields mismatch")
         name = str(raw["group"])
@@ -313,6 +332,22 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
             raise AdapterContractError(
                 "canonical state_value_mask must declare exactly ten dimensions"
             )
+        alignment = str(raw.get("action_alignment", "as_recorded"))
+        if alignment not in {"as_recorded", "next_observation_drop_terminal"}:
+            raise AdapterContractError(f"unsupported action alignment {alignment!r}")
+        if alignment == "next_observation_drop_terminal" and (
+            supervision != "coarse_effect"
+            or action_time is not None
+            or not state_terms
+            or not raw["state_time_key"]
+            or action_transform != "identity"
+            or state_transform != "identity"
+            or action_value_mask != state_value_mask
+        ):
+            raise AdapterContractError(
+                "next-observation effects require identity action/state mappings, "
+                "matching masks, a measured state clock, and no command clock"
+            )
         groups.append(
             GroupMapping(
                 group=name,
@@ -332,8 +367,11 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
                 state_transform=state_transform,
                 action_value_mask=action_value_mask,
                 state_value_mask=state_value_mask,
+                action_alignment=alignment,
             )
         )
+    if binding is not None:
+        verify_stat_asset(path.parent, path.name, binding)
     return AdapterContract(
         path,
         observed,
@@ -342,6 +380,7 @@ def load_adapter_contract(path: Path, *, expected_sha256: str) -> AdapterContrac
         observation_time_key,
         tuple(views),
         tuple(groups),
+        file_binding=binding,
     )
 
 
@@ -373,6 +412,62 @@ def _mapped(accessor: EpisodeAccessor, terms: Sequence[MappingTerm]) -> np.ndarr
     if not np.isfinite(result).all():
         raise AdapterContractError("mapped values contain NaN/Inf")
     return result
+
+
+
+def align_coarse_action_rows(
+    *,
+    accessor: EpisodeAccessor,
+    mapping: GroupMapping,
+    observation_time_key: str,
+    action: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bind recorded effects to real observation intervals, never a nominal FPS.
+
+    Some releases store action[t] = state[t+1] on the same N-row observation
+    table, including a terminal label with no in-episode successor. Only the
+    explicit v6 alignment may drop that terminal action; all N observed states
+    remain. It is not an observed fine control command.
+    """
+
+    if mapping.supervision != "coarse_effect":
+        raise AdapterContractError("coarse action alignment requires coarse_effect")
+    raw_indices = np.asarray(accessor.array(mapping.world_interval_index_key)).reshape(-1)
+    indices = raw_indices.astype(np.int64)
+    if indices.shape != (len(action),):
+        raise AdapterContractError("coarse interval cardinality mismatch")
+    if mapping.action_alignment == "as_recorded":
+        return action, indices
+    if mapping.action_alignment != "next_observation_drop_terminal":
+        raise AdapterContractError("unsupported action alignment")
+    if (
+        mapping.action_time_key is not None
+        or not mapping.state
+        or not mapping.state_time_key
+        or mapping.action_transform != "identity"
+        or mapping.state_transform != "identity"
+        or mapping.action_value_mask != mapping.state_value_mask
+    ):
+        raise AdapterContractError("next-observation mapping contract is inconsistent")
+    state = _mapped(accessor, mapping.state)
+    clock = np.asarray(accessor.array(observation_time_key), dtype=np.float64).reshape(-1)
+    state_clock = np.asarray(accessor.array(mapping.state_time_key), dtype=np.float64).reshape(-1)
+    if (
+        len(action) < 2
+        or state.shape != action.shape
+        or clock.shape != (len(action),)
+        or not np.isfinite(clock).all()
+        or np.any(np.diff(clock) <= 0)
+        or not np.array_equal(state_clock, clock)
+        or not np.array_equal(raw_indices, np.arange(len(action), dtype=np.int64))
+    ):
+        raise AdapterContractError(
+            "next-observation effects require matching full observation/state rows "
+            "and the exact recorded zero-based frame indices"
+        )
+    if not np.array_equal(action[:-1], state[1:]):
+        raise AdapterContractError("action[t] is not exactly the next observed state")
+    return action[:-1], indices[:-1]
 
 
 def _pad7(value: np.ndarray) -> np.ndarray:
@@ -733,17 +828,20 @@ def adapt_action_series(
         timestamps: Optional[np.ndarray] = None
         interval_indices: Optional[np.ndarray] = None
         if mapping.supervision == "fine_command":
+            if mapping.action_alignment != "as_recorded":
+                raise AdapterContractError("next-observation labels are not fine commands")
             timestamps = np.asarray(
                 accessor.array(mapping.action_time_key), dtype=np.float64
             ).reshape(-1)
             if timestamps.shape != (len(action),):
                 raise AdapterContractError("action timestamp cardinality mismatch")
         else:
-            interval_indices = np.asarray(
-                accessor.array(mapping.world_interval_index_key), dtype=np.int64
-            ).reshape(-1)
-            if interval_indices.shape != (len(action),):
-                raise AdapterContractError("coarse interval cardinality mismatch")
+            action, interval_indices = align_coarse_action_rows(
+                accessor=accessor,
+                mapping=mapping,
+                observation_time_key=contract.observation_time_key,
+                action=action,
+            )
         actions.append(
             RawActionSeries(
                 mapping.group,
