@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import yaml
 
-from .file_binding import require_stat_binding
+from .file_binding import bind_stat_asset, require_stat_binding, verify_stat_asset
 from .grouped_robot import (
     ActionGroupSpec,
     EmbodimentSpec,
@@ -19,6 +19,8 @@ from .grouped_robot import (
 
 
 DATA_PROFILE_SCHEMA = "wm3d_v8_data_profile_v4"
+ADMITTED_DATA_PROFILE_SCHEMA = "wm3d_admitted_data_profile_v1"
+ADMITTED_CACHE_INDEX_SCHEMA = "wm3d_admitted_window_index_v1"
 SOURCE_MANIFEST_SCHEMA = "wm3d_v8_source_manifest_v4"
 ADMITTED_SOURCE_MANIFEST_SCHEMA = "wm3d_admitted_source_manifest_v1"
 RECORDED_CLOCK_STAT_BINDING = "recorded_in_admitted_payload"
@@ -137,6 +139,10 @@ class SourceSpec:
     weight: int
     nominal_hours: Optional[float]
     license_id: str
+    manifest_binding: Mapping[str, Any] | None = None
+    adapter_contract_binding: Mapping[str, Any] | None = None
+    admission_id: str | None = None
+    origin: str = "legacy_sha"
 
 
 @dataclass(frozen=True)
@@ -148,6 +154,9 @@ class DataProfile:
     embodiments: Mapping[str, EmbodimentSpec]
     cache_representation: Mapping[str, Any]
     cache: Mapping[str, Any]
+    file_binding: Mapping[str, Any] | None = None
+    admission_id: str | None = None
+    inherited: Mapping[str, Any] | None = None
 
     @property
     def source_order(self) -> tuple[str, ...]:
@@ -325,7 +334,15 @@ def _embodiments(values: object) -> Mapping[str, EmbodimentSpec]:
     return result
 
 
-def load_data_profile(path: Path, *, verify_source_manifests: bool = True) -> DataProfile:
+def load_data_profile(
+    path: Path, *, verify_source_manifests: bool = True,
+    expected_binding: Mapping[str, Any] | None = None,
+) -> DataProfile:
+    if expected_binding is not None:
+        return _load_admitted_data_profile(
+            path, expected_binding=expected_binding,
+            verify_source_manifests=verify_source_manifests,
+        )
     path = resolve_regular_file(path)
     value = _load_structured(path)
     if not isinstance(value, dict) or value.get("schema") != DATA_PROFILE_SCHEMA:
@@ -440,6 +457,19 @@ def load_data_profile(path: Path, *, verify_source_manifests: bool = True) -> Da
                 license_id=str(raw["license_id"]),
             )
         )
+    representation, cache = _profile_representation(value)
+    return DataProfile(
+        path=path,
+        profile_sha256=sha256_file(path),
+        name=str(value.get("name", "")),
+        sources=tuple(sources),
+        embodiments=embodiments,
+        cache_representation=representation,
+        cache=cache,
+    )
+
+
+def _profile_representation(value: Mapping[str, Any], *, admitted: bool = False):
     representation = value.get("cache_representation")
     cache = value.get("cache")
     if not isinstance(representation, dict) or not isinstance(cache, dict):
@@ -549,22 +579,186 @@ def load_data_profile(path: Path, *, verify_source_manifests: bool = True) -> Da
         raise ManifestContractError("cache state timestamps must be preserved")
     if state_selection["interpolation"] != "forbidden":
         raise ManifestContractError("cache state interpolation is forbidden")
-    if cache.get("schema") != CACHE_INDEX_SCHEMA:
-        raise ManifestContractError(f"cache.schema must be {CACHE_INDEX_SCHEMA}")
+    index_schema = ADMITTED_CACHE_INDEX_SCHEMA if admitted else CACHE_INDEX_SCHEMA
+    if cache.get("schema") != index_schema:
+        raise ManifestContractError(f"cache.schema must be {index_schema}")
     if cache.get("task_partition") != "episode":
         raise ManifestContractError("cache.task_partition must be episode")
     if cache.get("task_claim") != "atomic_no_clobber":
         raise ManifestContractError("cache.task_claim must be atomic_no_clobber")
-    if cache.get("resume") != "receipt_and_sha":
-        raise ManifestContractError("cache.resume must be receipt_and_sha")
+    resume = "receipt_and_stat" if admitted else "receipt_and_sha"
+    if cache.get("resume") != resume:
+        raise ManifestContractError(f"cache.resume must be {resume}")
+    return representation, cache
+
+
+
+def _bound_metadata_path(path: Path, binding: Mapping[str, Any], admission_id: str) -> Path:
+    expected = require_stat_binding(binding)
+    if expected["admission_id"] != admission_id:
+        raise ManifestContractError("metadata binding admission identity mismatch")
+    path = Path(path).absolute()
+    return verify_stat_asset(Path("/"), path.as_posix().lstrip("/"), expected)
+
+
+def _read_bound_metadata(path: Path, binding: Mapping[str, Any], admission_id: str):
+    safe = _bound_metadata_path(path, binding, admission_id)
+    value = _load_structured(safe)
+    _bound_metadata_path(path, binding, admission_id)
+    return value
+
+
+def _inherited_profile(value: Mapping[str, Any], admission_id: str):
+    """Reuse declared legacy metadata without scanning its payloads or digests.
+
+    The original digests are lineage, never newly verified hashes. The explicit
+    stat bindings protect the existing files for this new admission.
+    """
+    inherited = value.get("inherited")
+    if inherited is None:
+        return None, {}
+    required = {"profile_path", "profile_binding", "metadata_seal_path",
+                "metadata_seal_binding", "selection_path", "selection_binding"}
+    if not isinstance(inherited, dict) or set(inherited) != required:
+        raise ManifestContractError("inherited profile reference fields mismatch")
+    old_path = Path(inherited["profile_path"])
+    if not old_path.is_absolute():
+        raise ManifestContractError("inherited profile path must be absolute")
+    old = _read_bound_metadata(old_path, inherited["profile_binding"], admission_id)
+    seal = _read_bound_metadata(
+        Path(inherited["metadata_seal_path"]), inherited["metadata_seal_binding"], admission_id
+    )
+    _bound_metadata_path(
+        Path(inherited["selection_path"]), inherited["selection_binding"], admission_id
+    )
+    if (not isinstance(old, dict) or old.get("schema") != DATA_PROFILE_SCHEMA
+            or not isinstance(seal, dict) or seal.get("schema") != "wm3d_streaming_metadata_v1"
+            or Path(str(seal.get("data_profile_path", ""))).absolute() != old_path):
+        raise ManifestContractError("inherited profile/seal identity mismatch")
+    _require_sha(seal.get("data_profile_sha256", ""), field="inherited profile lineage")
+    old_sources = old.get("sources")
+    if not isinstance(old_sources, list) or not old_sources:
+        raise ManifestContractError("inherited profile has no sources")
+    by_name = {row["name"]: row for row in old_sources}
+    if len(by_name) != len(old_sources):
+        raise ManifestContractError("inherited sources are duplicated")
+    for field, digest_field in (
+        ("source_manifest_sha256_by_name", "manifest_sha256"),
+        ("adapter_contract_sha256_by_name", "adapter_contract_sha256"),
+    ):
+        expected = {name: _require_sha(row[digest_field], field=digest_field)
+                    for name, row in by_name.items()}
+        if seal.get(field) != expected:
+            raise ManifestContractError(f"inherited seal {field} does not match profile")
+    if value.get("cache_representation") != old.get("cache_representation"):
+        raise ManifestContractError("inherited representation must remain unchanged")
+    old_embodiments = _embodiments(old.get("embodiments"))
+    new_embodiments = _embodiments(value.get("embodiments"))
+    if any(new_embodiments.get(name) != spec for name, spec in old_embodiments.items()):
+        raise ManifestContractError("inherited embodiments must remain unchanged")
+    return old_path, by_name
+
+
+def _load_admitted_data_profile(
+    path: Path, *, expected_binding: Mapping[str, Any], verify_source_manifests: bool,
+) -> DataProfile:
+    binding = require_stat_binding(expected_binding)
+    admission_id = binding["admission_id"]
+    path = _bound_metadata_path(path, binding, admission_id)
+    value = _read_bound_metadata(path, binding, admission_id)
+    allowed = {"schema", "admission_id", "name", "sources", "embodiments",
+               "cache_representation", "cache", "notes", "inherited"}
+    if (not isinstance(value, dict) or value.get("schema") != ADMITTED_DATA_PROFILE_SCHEMA
+            or value.get("admission_id") != admission_id or set(value) - allowed):
+        raise ManifestContractError("admitted profile schema/identity/fields mismatch")
+    embodiments = _embodiments(value.get("embodiments"))
+    representation, cache = _profile_representation(value, admitted=True)
+    old_path, old_sources = _inherited_profile(value, admission_id)
+    raw_sources = value.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ManifestContractError("admitted profile has no sources")
+    sources, names, inherited_names = [], set(), set()
+    required = {"name", "adapter", "raw_root", "adapter_config", "manifest",
+                "adapter_contract_binding", "manifest_binding", "embodiment",
+                "weight", "license_id", "origin"}
+    legacy_fields = {"adapter_contract_sha256", "manifest_sha256"}
+    for raw in raw_sources:
+        if not isinstance(raw, dict):
+            raise ManifestContractError("admitted source must be a mapping")
+        origin = raw.get("origin")
+        fields = required | (legacy_fields if origin == "inherited_legacy" else set())
+        if (origin not in {"admitted", "inherited_legacy"} or fields - set(raw)
+                or set(raw) - fields - {"nominal_hours"}):
+            raise ManifestContractError("admitted source fields/origin mismatch")
+        name = raw["name"]
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise ManifestContractError("admitted source name is empty/duplicated")
+        names.add(name)
+        embodiment = str(raw["embodiment"])
+        if embodiment not in embodiments:
+            raise ManifestContractError(f"{name}: unknown embodiment")
+        root = Path(raw["raw_root"])
+        if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+            raise ManifestContractError(f"{name}: raw_root must be an absolute real directory")
+        paths = {}
+        for field, binding_field in (("manifest", "manifest_binding"),
+                                     ("adapter_config", "adapter_contract_binding")):
+            candidate = Path(raw[field])
+            if not candidate.is_absolute():
+                candidate = path.parent / candidate
+            paths[field] = _bound_metadata_path(candidate, raw[binding_field], admission_id)
+        if origin == "inherited_legacy":
+            original = old_sources.get(name)
+            if original is None:
+                raise ManifestContractError(f"{name}: inherited source not in original profile")
+            compared = {k: v for k, v in raw.items()
+                        if k not in {"origin", "manifest_binding", "adapter_contract_binding"}}
+            original = dict(original)
+            for field in ("manifest", "adapter_config"):
+                candidate = Path(original[field])
+                original[field] = str(candidate if candidate.is_absolute() else old_path.parent/candidate)
+                compared[field] = str(paths[field])
+            if compared != original:
+                raise ManifestContractError(f"{name}: inherited source configuration changed")
+            inherited_names.add(name)
+        elif name in old_sources:
+            raise ManifestContractError(f"{name}: legacy source cannot be relabelled as new")
+        if type(raw["weight"]) is not int or raw["weight"] <= 0:
+            raise ManifestContractError(f"{name}: source weight must be positive integer")
+        hours = raw.get("nominal_hours")
+        if hours is not None and not (0 < float(hours) < float("inf")):
+            raise ManifestContractError(f"{name}: nominal hours must be finite and positive")
+        if not str(raw["license_id"]).strip() or not str(raw["adapter"]).strip():
+            raise ManifestContractError(f"{name}: adapter/license must be explicit")
+        if verify_source_manifests and origin == "admitted":
+            validate_source_manifest(
+                paths["manifest"], expected_source=name,
+                expected_embodiment=embodiments[embodiment], admission_id=admission_id,
+            )
+        # Legacy membership, split and normalization stay in the original seal
+        # and selection. Do not rewrite or rescan that source manifest.
+        for field, binding_field in (("manifest", "manifest_binding"),
+                                     ("adapter_config", "adapter_contract_binding")):
+            _bound_metadata_path(paths[field], raw[binding_field], admission_id)
+        sources.append(SourceSpec(
+            name=name, adapter=str(raw["adapter"]), raw_root=root.resolve(strict=True),
+            adapter_config_path=paths["adapter_config"],
+            adapter_contract_sha256=str(raw.get("adapter_contract_sha256", "")),
+            manifest_path=paths["manifest"], manifest_sha256=str(raw.get("manifest_sha256", "")),
+            embodiment=embodiment, weight=raw["weight"],
+            nominal_hours=None if hours is None else float(hours), license_id=str(raw["license_id"]),
+            manifest_binding=dict(raw["manifest_binding"]),
+            adapter_contract_binding=dict(raw["adapter_contract_binding"]),
+            admission_id=admission_id, origin=origin,
+        ))
+    if inherited_names != set(old_sources):
+        raise ManifestContractError("admitted profile must preserve every inherited source")
+    _bound_metadata_path(path, binding, admission_id)
     return DataProfile(
-        path=path,
-        profile_sha256=sha256_file(path),
-        name=str(value.get("name", "")),
-        sources=tuple(sources),
-        embodiments=embodiments,
-        cache_representation=representation,
-        cache=cache,
+        path=path, profile_sha256="", name=str(value.get("name", "")),
+        sources=tuple(sources), embodiments=embodiments, cache_representation=representation,
+        cache=cache, file_binding=binding, admission_id=admission_id,
+        inherited=value.get("inherited"),
     )
 
 
