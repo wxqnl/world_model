@@ -237,6 +237,27 @@ def _decode_selected_frames(
     return frames, "pyav_seek", decoded_count
 
 
+def _admitted_boundary_ordinal(timestamps: np.ndarray, boundary: float) -> int:
+    """Resolve only float64 serialization roundoff, not a missing video frame.
+
+    Shared-video metadata may sum episode durations before serializing a PTS
+    boundary.  That boundary can differ from the same integer packet PTS by a
+    few ulps.  One nanosecond (or 64 ulps at larger offsets) is a numerical
+    tolerance; a genuinely displaced boundary is never snapped to a frame.
+    Legacy sealed sources deliberately retain their original half-open rule.
+    """
+    position = int(np.searchsorted(timestamps, boundary, side="left"))
+    tolerance = max(1.0e-9, 64.0 * float(np.spacing(abs(boundary))))
+    matches = [
+        index for index in (position - 1, position)
+        if 0 <= index < len(timestamps)
+        and abs(float(timestamps[index]) - boundary) <= tolerance
+    ]
+    if len(matches) > 1:
+        raise EpisodeIOError("admitted video boundary is numerically ambiguous")
+    return matches[0] if matches else position
+
+
 def _segment_ordinals(
     *,
     timestamps: np.ndarray,
@@ -245,6 +266,7 @@ def _segment_ordinals(
     stop_s: float | None,
     observation_samples: int,
     view_name: str,
+    strict_admitted: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, int, int, int]:
     if segment_kind == "entire_file":
         if start_s is not None or stop_s is not None:
@@ -271,6 +293,9 @@ def _segment_ordinals(
         stop_ordinal = int(
             np.searchsorted(timestamps, float(stop_s) - 1.0e-12, side="left")
         )
+        if strict_admitted:
+            start_ordinal = _admitted_boundary_ordinal(timestamps, float(start_s))
+            stop_ordinal = _admitted_boundary_ordinal(timestamps, float(stop_s))
         if stop_ordinal <= start_ordinal:
             raise EpisodeIOError(
                 f"view {view_name!r} has an empty/reversed recorded PTS range"
@@ -288,6 +313,12 @@ def _segment_ordinals(
     trailing_dropped = 0
     trailing_repeated = 0
     delta = container_count - int(observation_samples)
+    if strict_admitted and delta:
+        raise EpisodeIOError(
+            f"admitted view {view_name!r} has {container_count} indexed frames "
+            f"but episode has {observation_samples} observation rows; "
+            "no dropped or synthetic trailing frame"
+        )
     if delta == 1:
         ordinals = ordinals[:-1]
         trailing_dropped = 1
@@ -389,6 +420,7 @@ def decode_episode_window_views(
             stop_s=stop_s,
             observation_samples=task.observation_samples,
             view_name=name,
+            strict_admitted=admitted and task.origin == "admitted",
         )
         if admitted and task.origin == "admitted" and (trailing_dropped or trailing_repeated):
             raise EpisodeIOError("admitted video cardinality differs; no synthetic trailing frame")
