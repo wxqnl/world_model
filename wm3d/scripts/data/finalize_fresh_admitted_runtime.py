@@ -16,11 +16,40 @@ def append_file(target,item,admission):
  with p.open("rb") as f:shutil.copyfileobj(f,target,8<<20)
  verify_stat_asset(p.parent,p.name,item["binding"])
 
+def publish_runtime(a,model,closure,runtime,counts,task_total):
+ n=a.new_root;admission=closure["admission_id"];env=Path(closure["metadata_root"])/"environment_receipt.json";train=runtime["train"]
+ obj=yaml.safe_load((n/"candidates_three_node_24/objective.candidate.yaml").read_text())
+ output=n/"training";output.mkdir(exist_ok=True)
+ cfg=dict(schema=RUNTIME_CONFIG_SCHEMA,
+  run=dict(name="native_fresh_base1000_plus_B1_B2_B3_2epochs",lineage="native_fresh_20261001",
+   output_root=str(output),code_commit=a.code_commit,environment_lock_path=str(env),environment_lock_binding=bind(env,admission)),
+  model_profile=model,data_closure=closure,runtime_profile=runtime,objective_profile=obj)
+ cfg["bindings"]={k+"_sha256":canonical_sha256(v) for k,v in
+  (("model_profile",model),("data_closure",closure),("runtime_profile",runtime),("objective_profile",obj),
+   ("model_contract",{"architecture":model["architecture"],"model":model["model"]}))}
+ validate_materialized_runtime(cfg);publish(a.output/"runtime.json",cfg)
+ publish(a.output/"COMPLETE.json",dict(passed=True,formal_training_started=False,source_checkpoint=None,
+  epochs=2,total_steps=train["total_steps"],global_batch_size=96,world_size=24,task_count=task_total,
+  window_count_by_split_source=counts,tail_repetitions_per_epoch={k:((v+95)//96)*96-v for k,v in counts["train"].items()},
+  raw_video_redecoded=False,SHA_file_scans=False,old_normalization_rows_exact=True,
+  runtime_path=str(a.output/"runtime.json"),new_window_receipt=str(a.windows_root/"COMPLETE.json")))
+ print(json.dumps(dict(stage="fresh_runtime_complete",steps=train["total_steps"],train_windows=sum(counts["train"].values()))),flush=True)
+
 def main():
  p=argparse.ArgumentParser();p.add_argument("--new-root",type=Path,required=True)
  p.add_argument("--windows-root",type=Path,required=True);p.add_argument("--output",type=Path,required=True)
- p.add_argument("--code-commit",required=True);a=p.parse_args()
+ p.add_argument("--code-commit",required=True);p.add_argument("--resume-materialized",action="store_true");a=p.parse_args()
  n=a.new_root;admission="wm3d_fresh_new_data_20260930";combined=n/"combined_profile_20261001"
+ if a.resume_materialized:
+  sealpath=a.output/"metadata_seal.json";s=json.loads(sealpath.read_text())
+  closure=dict(s["contract"],name="base1000_and_frozen_B1_B2_B3_stat_direct",
+   metadata_seal_path=str(sealpath),metadata_seal_binding=bind(sealpath,admission))
+  validate_admitted_closure(closure,s["model_profile"])
+  runtime=yaml.safe_load((n/"candidates_three_node_24/runtime.candidate.yaml").read_text())
+  runtime["train"].pop("train_episode_allowlist");runtime["train"]["admitted_selection"]=closure["cache_index_binding"]
+  runtime["train"]["total_steps"]=2*sum((v+95)//96 for v in s["window_count_by_split_source"]["train"].values())
+  publish_runtime(a,s["model_profile"],closure,runtime,s["window_count_by_split_source"],sum(s["task_count_by_source"].values()))
+  return
  profilepath=combined/"data_profile.yaml";pb=bind(profilepath,admission)
  profile=load_data_profile(profilepath,expected_binding=pb,verify_source_manifests=False)
  model=json.loads((combined/"model.json").read_text())
@@ -110,20 +139,6 @@ def main():
    inherited=profile.inherited,published_release_identity_not_global_recording_certification=True)))
  closure.update(metadata_seal_path=str(seal),metadata_seal_binding=bind(seal,admission))
  validate_admitted_closure(closure,model)
- obj=yaml.safe_load((n/"candidates_three_node_24/objective.candidate.yaml").read_text())
- output=n/"training";output.mkdir(exist_ok=True)
- cfg=dict(schema=RUNTIME_CONFIG_SCHEMA,
-  run=dict(name="native_fresh_base1000_plus_B1_B2_B3_2epochs",lineage="native_fresh_20261001",
-   output_root=str(output),code_commit=a.code_commit,environment_lock_path=str(env),environment_lock_binding=bind(env,admission)),
-  model_profile=model,data_closure=closure,runtime_profile=runtime,objective_profile=obj)
- cfg["bindings"]={k+"_sha256":canonical_sha256(v) for k,v in
-  (("model_profile",model),("data_closure",closure),("runtime_profile",runtime),("objective_profile",obj),
-   ("model_contract",{"architecture":model["architecture"],"model":model["model"]}))}
- validate_materialized_runtime(cfg);publish(a.output/"runtime.json",cfg)
- publish(a.output/"COMPLETE.json",dict(passed=True,formal_training_started=False,source_checkpoint=None,
-  epochs=2,total_steps=train["total_steps"],global_batch_size=96,world_size=24,task_count=task_total,
-  window_count_by_split_source=counts,tail_repetitions_per_epoch={k:((v+95)//96)*96-v for k,v in counts["train"].items()},
-  raw_video_redecoded=False,SHA_file_scans=False,old_normalization_rows_exact=True,
-  runtime_path=str(a.output/"runtime.json"),new_window_receipt=str(a.windows_root/"COMPLETE.json")))
- print(json.dumps(dict(stage="fresh_runtime_complete",steps=train["total_steps"],train_windows=sum(counts["train"].values()))),flush=True)
+ publish_runtime(a,model,closure,runtime,counts,task_total)
+
 if __name__=="__main__":main()

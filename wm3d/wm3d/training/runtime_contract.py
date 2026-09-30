@@ -41,7 +41,7 @@ RUNTIME_CONFIG_SCHEMA = "wm3d_v8_materialized_runtime_v2"
 MODEL_PROFILE_SCHEMA = "wm3d_v8_model_profile_v1"
 OBJECTIVE_PROFILE_SCHEMA = "wm3d_v8_objective_profile_v1"
 DATA_CLOSURE_SCHEMA = "wm3d_v8_dataset_closure_v2"
-_PLACEHOLDER = re.compile(r"PENDING|MATERIALIZE_REQUIRED|__")
+_PLACEHOLDER = re.compile(r"PENDING|MATERIALIZE_REQUIRED|__[A-Z][A-Z0-9_]*__")
 
 _LEGACY_STREAMING_NON_BINDING_FIELDS = {
     "appearance_action_residual_scale",
