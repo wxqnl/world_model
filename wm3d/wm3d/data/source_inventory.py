@@ -1,9 +1,10 @@
 """Audited raw-source inventory for the unified WM3D pipeline.
 
 The scanner understands container structure, not robot semantics.  Robot and
-camera field mappings come exclusively from a SHA-bound source adapter.  All
-clock evidence is read from payload columns and hashed; no nominal frame rate
-is converted into state or action timestamps.
+camera field mappings come exclusively from an explicitly bound source adapter.
+Legacy manifests use SHA; an approved admission may select stat identity
+without re-reading payload bytes for hashing. Clocks always come from recorded
+payload columns, never a nominal frame rate.
 """
 
 from __future__ import annotations
@@ -18,9 +19,11 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 import numpy as np
 import pyarrow.parquet as pq
 
+from .file_binding import bind_stat_asset, verify_stat_asset
 from .grouped_robot import EmbodimentSpec
 from .manifest_contract import (
     SOURCE_MANIFEST_SCHEMA,
+    ADMITTED_SOURCE_MANIFEST_SCHEMA,
     ManifestContractError,
     canonical_sha256,
     safe_relative_path,
@@ -38,6 +41,7 @@ from .source_adapters import (
 
 
 INVENTORY_RECEIPT_SCHEMA = "wm3d_v8_source_inventory_receipt_v1"
+ADMITTED_INVENTORY_RECEIPT_SCHEMA = "wm3d_admitted_source_inventory_receipt_v1"
 
 
 class SourceInventoryError(RuntimeError):
@@ -285,7 +289,8 @@ def _term_width(array: np.ndarray, term: MappingTerm, label: str) -> None:
 
 
 def _clock(
-    arrays: Mapping[str, np.ndarray], key: str, expected_count: int, label: str
+    arrays: Mapping[str, np.ndarray], key: str, expected_count: int, label: str,
+    *, admitted_payload: bool = False,
 ) -> dict[str, Any]:
     values = np.asarray(arrays[key], dtype=np.float64).reshape(-1)
     if values.shape != (expected_count,):
@@ -293,7 +298,7 @@ def _clock(
             f"{label}: timestamp cardinality {values.shape} != {(expected_count,)}"
         )
     try:
-        return timestamp_evidence(key=key, values=values)
+        return timestamp_evidence(key=key, values=values, admitted_payload=admitted_payload)
     except ManifestContractError as exc:
         raise SourceInventoryError(f"{label}: {exc}") from exc
 
@@ -465,6 +470,8 @@ def _episode_rows(
     default_task: str,
     episode_indices: Optional[frozenset[int]],
     episode_ranges: Optional[Mapping[int, tuple[tuple[int, int], ...]]],
+    admission_id: str | None = None,
+    episode_catalog: Mapping[int, Mapping[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     info_path = root / "meta" / "info.json"
     if info_path.is_symlink() or not info_path.is_file():
@@ -508,14 +515,22 @@ def _episode_rows(
             file_origin[key] = (
                 dataset_start if previous is None else min(previous, dataset_start)
             )
-    digest_cache: dict[str, str] = {}
+    binding_cache: dict[str, Any] = {}
 
-    def digest(relative: str) -> str:
-        observed = digest_cache.get(relative)
+    def binding(relative: str) -> Any:
+        observed = binding_cache.get(relative)
         if observed is None:
-            observed = sha256_file(root / relative)
-            digest_cache[relative] = observed
+            observed = (
+                sha256_file(root / relative) if admission_id is None
+                else bind_stat_asset(root, relative, admission_id=admission_id)
+            )
+            binding_cache[relative] = observed
         return observed
+
+    def asset(role: str, relative: str) -> dict[str, Any]:
+        field = "sha256" if admission_id is None else "binding"
+        return {"role": role, "path": relative, field: binding(relative)}
+
 
     payload_cache_path: str | None = None
     payload_cache_rows = 0
@@ -528,6 +543,12 @@ def _episode_rows(
         episode_ranges=episode_ranges,
         file_origin=file_origin,
     )
+    if episode_catalog is not None:
+        selected = {int(row["episode_index"]) for row in metadata_rows}
+        if selected != set(episode_catalog):
+            raise SourceInventoryError(
+                "admitted episode catalog must match selected episodes exactly"
+            )
     for metadata in metadata_rows:
         episode_index = int(metadata["episode_index"])
         length = int(metadata.get("length", metadata.get("episode_length", 0)))
@@ -569,6 +590,9 @@ def _episode_rows(
             raise SourceInventoryError(f"episode {episode_index} has invalid row slice")
         payload_path = root / payload
         if payload != payload_cache_path:
+            # Capture identity before reading; cached arrays remain tied to this file.
+            if admission_id is not None:
+                binding(payload)
             required_keys = tuple(dict.fromkeys(adapter.required_array_keys))
             try:
                 table = pq.read_table(payload_path, columns=list(required_keys))
@@ -585,12 +609,15 @@ def _episode_rows(
             raise SourceInventoryError(
                 f"episode {episode_index} row slice exceeds payload"
             )
+        if admission_id is not None:
+            verify_stat_asset(root, payload, binding(payload))
         arrays = {key: payload_cache[key][row_start:row_stop] for key in payload_cache}
         observation_clock = _clock(
             arrays,
             adapter.observation_time_key,
             length,
             f"episode {episode_index}/observation",
+            admitted_payload=admission_id is not None,
         )
         robot_groups: dict[str, Any] = {}
         for mapping in adapter.groups:
@@ -608,6 +635,7 @@ def _episode_rows(
                     str(mapping.action_time_key),
                     action_count,
                     f"episode {episode_index}/{mapping.group}/action",
+                    admitted_payload=admission_id is not None,
                 )
             else:
                 if mapping.action_alignment == "as_recorded":
@@ -639,6 +667,7 @@ def _episode_rows(
                     str(mapping.state_time_key),
                     state_count,
                     f"episode {episode_index}/{mapping.group}/state",
+                    admitted_payload=admission_id is not None,
                 )
             robot_groups[mapping.group] = {
                 "supervision": mapping.supervision,
@@ -649,11 +678,7 @@ def _episode_rows(
                 "world_interval_index_key": interval_key,
             }
 
-        assets: list[dict[str, str]] = []
-        payload_digest = digest(payload)
-        assets.append(
-            {"role": "primary_payload", "path": payload, "sha256": payload_digest}
-        )
+        assets: list[dict[str, Any]] = [asset("primary_payload", payload)]
         views: list[dict[str, Any]] = []
         for view in adapter.views:
             direct = metadata.get(f"videos/{view.key}/path")
@@ -679,8 +704,7 @@ def _episode_rows(
             )
             video = _existing_relative(root, video_candidates)
             role = f"rgb/{view.name}"
-            video_digest = digest(video)
-            assets.append({"role": role, "path": video, "sha256": video_digest})
+            assets.append(asset(role, video))
             start = metadata.get(f"videos/{view.key}/from_timestamp")
             stop = metadata.get(f"videos/{view.key}/to_timestamp")
             if start is None and stop is None:
@@ -718,7 +742,13 @@ def _episode_rows(
                     clock_ends.append(float(clock["end_s"]))
                     clock_max_dt.append(float(clock["max_dt_s"]))
         duration = max(clock_ends) - min(clock_starts) + max(clock_max_dt)
-        base_episode_id = f"{source}:{episode_index:09d}"
+        declared_episode = (
+            None if episode_catalog is None else episode_catalog[episode_index]
+        )
+        base_episode_id = (
+            f"{source}:{episode_index:09d}" if declared_episode is None
+            else declared_episode["episode_id"]
+        )
         segment_index = metadata.get("_wm3d_segment_index")
         episode_id = (
             base_episode_id
@@ -727,23 +757,29 @@ def _episode_rows(
         )
         rows.append(
             {
-                "schema": SOURCE_MANIFEST_SCHEMA,
+                "schema": (
+                    SOURCE_MANIFEST_SCHEMA if admission_id is None
+                    else ADMITTED_SOURCE_MANIFEST_SCHEMA
+                ),
+                **({} if admission_id is None else {"admission_id": admission_id}),
                 "episode_id": episode_id,
                 "source": source,
                 "payload": payload,
-                "payload_sha256": payload_digest,
+                ("payload_sha256" if admission_id is None else "payload_binding"): (
+                    binding(payload)
+                ),
                 "payload_row_start": row_start,
                 "payload_row_stop": row_stop,
                 "assets": assets,
                 "views": views,
                 "task_text": _task_text(metadata, tasks, default_task),
                 "embodiment": embodiment.name,
-                "split": deterministic_split(
-                    source,
-                    base_episode_id,
-                    seed=split_seed,
-                    train_fraction=train_fraction,
-                    validation_fraction=validation_fraction,
+                "split": (
+                    deterministic_split(
+                        source, base_episode_id, seed=split_seed,
+                        train_fraction=train_fraction,
+                        validation_fraction=validation_fraction,
+                    ) if declared_episode is None else declared_episode["split"]
                 ),
                 "duration_s": duration,
                 "observation_samples": length,
@@ -768,9 +804,39 @@ def scan_lerobot_source(
     default_task: str,
     episode_indices: Optional[Sequence[int]] = None,
     episode_ranges: Optional[Mapping[int | str, Sequence[Sequence[int]]]] = None,
+    admission_id: str | None = None,
+    episode_catalog: Mapping[int, Mapping[str, str]] | None = None,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
     """Scan one file-per-episode/shared-file LeRobot source into WM3D ABI."""
 
+    admitted = admission_id is not None
+    if admitted:
+        if not isinstance(admission_id, str) or not admission_id.strip():
+            raise SourceInventoryError("admission_id must be explicit")
+        if (adapter.file_binding is None
+                or adapter.file_binding["admission_id"] != admission_id):
+            raise SourceInventoryError("adapter admission identity mismatch")
+        verify_stat_asset(
+            Path("/"), adapter.path.as_posix().lstrip("/"), adapter.file_binding
+        )
+        if not isinstance(episode_catalog, dict) or not episode_catalog:
+            raise SourceInventoryError("admitted inventory requires an episode catalog")
+        if episode_ranges is not None:
+            raise SourceInventoryError("new admitted sources require whole episodes")
+        identities: set[str] = set()
+        for index, record in episode_catalog.items():
+            if type(index) is not int or index < 0:
+                raise SourceInventoryError("episode catalog keys must be non-negative integers")
+            if not isinstance(record, dict) or set(record) != {"episode_id", "split"}:
+                raise SourceInventoryError("episode catalog fields mismatch")
+            identity = record["episode_id"]
+            if not isinstance(identity, str) or not identity.strip() or identity in identities:
+                raise SourceInventoryError("episode catalog has duplicate/empty identity")
+            if record["split"] not in {"train", "val", "test"}:
+                raise SourceInventoryError("episode catalog split is invalid")
+            identities.add(identity)
+    elif episode_catalog is not None or adapter.file_binding is not None:
+        raise SourceInventoryError("stat-bound adapter/catalog requires explicit admission")
     root = Path(root)
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise SourceInventoryError("raw root must be an absolute real directory")
@@ -779,6 +845,19 @@ def scan_lerobot_source(
         raise AdapterContractError(
             f"adapter raw format {adapter.raw_format!r} is not a LeRobot source"
         )
+    metadata_bindings: dict[str, Any] = {}
+    if admitted:
+        metadata_paths = [
+            root / "meta" / name for name in
+            ("info.json", "episodes.jsonl", "tasks.jsonl", "tasks.parquet")
+        ]
+        metadata_paths.extend(sorted((root / "meta/episodes").glob("chunk-*/file-*.parquet")))
+        for path in metadata_paths:
+            if path.exists() or path.is_symlink():
+                relative = path.relative_to(root).as_posix()
+                metadata_bindings[relative] = bind_stat_asset(
+                    root, relative, admission_id=admission_id
+                )
     expected_groups = {group.name for group in embodiment.groups}
     if expected_groups != {group.group for group in adapter.groups}:
         raise SourceInventoryError("adapter and embodiment groups differ")
@@ -804,7 +883,37 @@ def scan_lerobot_source(
         default_task=default_task,
         episode_indices=selected_indices,
         episode_ranges=normalized_ranges,
+        admission_id=admission_id,
+        episode_catalog=episode_catalog,
     )
+    if admitted:
+        verify_stat_asset(
+            Path("/"), adapter.path.as_posix().lstrip("/"), adapter.file_binding
+        )
+        for relative, expected in metadata_bindings.items():
+            verify_stat_asset(root, relative, expected)
+        return tuple(rows), {
+            "schema": ADMITTED_INVENTORY_RECEIPT_SCHEMA,
+            "source": source, "raw_root": str(root), "admission_id": admission_id,
+            "adapter_contract_binding": dict(adapter.file_binding),
+            "input_metadata_bindings": metadata_bindings,
+            "episode_count": len(rows),
+            "split_count": {
+                split: sum(row["split"] == split for row in rows)
+                for split in ("train", "val", "test")
+            },
+            "duration_s": sum(float(row["duration_s"]) for row in rows),
+            "selection": {
+                "mode": "explicit_admitted_episode_catalog",
+                "episode_indices": sorted(episode_catalog),
+                "whole_episodes": True,
+            },
+            "binding_kind": "admitted_file_stat_v1",
+            "cryptographic_content_binding": False,
+            "source_identity_and_split_origin": "externally_admitted_episode_catalog",
+            "global_deduplication_performed_by_inventory": False,
+            "SHA_scans": False,
+        }
     manifest_digest = canonical_sha256(rows)
     receipt = {
         "schema": INVENTORY_RECEIPT_SCHEMA,
@@ -858,9 +967,11 @@ def validate_written_inventory(
     *,
     source: str,
     embodiment: EmbodimentSpec,
+    admission_id: str | None = None,
 ) -> dict[str, Any]:
     return validate_source_manifest(
         manifest_path,
         expected_source=source,
         expected_embodiment=embodiment,
+        admission_id=admission_id,
     )

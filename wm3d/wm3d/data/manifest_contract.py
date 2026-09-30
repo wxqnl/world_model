@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import yaml
 
+from .file_binding import require_stat_binding
 from .grouped_robot import (
     ActionGroupSpec,
     EmbodimentSpec,
@@ -19,6 +20,8 @@ from .grouped_robot import (
 
 DATA_PROFILE_SCHEMA = "wm3d_v8_data_profile_v4"
 SOURCE_MANIFEST_SCHEMA = "wm3d_v8_source_manifest_v4"
+ADMITTED_SOURCE_MANIFEST_SCHEMA = "wm3d_admitted_source_manifest_v1"
+RECORDED_CLOCK_STAT_BINDING = "recorded_in_admitted_payload"
 CACHE_EPISODE_INDEX_SCHEMA = "wm3d_v8_unified_episode_index_v1"
 CACHE_INDEX_SCHEMA = "wm3d_v8_unified_window_index_v3"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -71,14 +74,24 @@ def canonical_timestamp_sha256(values: Sequence[float]) -> str:
     return hashlib.sha256(array.tobytes(order="C")).hexdigest()
 
 
-def timestamp_evidence(*, key: str, values: Sequence[float]) -> dict[str, Any]:
+def timestamp_evidence(
+    *, key: str, values: Sequence[float], admitted_payload: bool = False
+) -> dict[str, Any]:
     """Create auditable evidence for an observed source-native clock."""
 
     import numpy as np
 
     array = np.asarray(values, dtype="<f8")
-    digest = canonical_timestamp_sha256(array)
+    if array.ndim != 1 or array.size < 2:
+        raise ManifestContractError("recorded clock requires at least two samples")
     delta = np.diff(array)
+    if not bool(np.isfinite(array).all()) or bool((delta <= 0).any()):
+        raise ManifestContractError("recorded clocks must be finite and strictly increasing")
+    binding = (
+        {"timestamp_binding": RECORDED_CLOCK_STAT_BINDING}
+        if admitted_payload
+        else {"timestamp_sha256": canonical_timestamp_sha256(array)}
+    )
     if not key:
         raise ManifestContractError("timestamp evidence key must be explicit")
     return {
@@ -90,7 +103,7 @@ def timestamp_evidence(*, key: str, values: Sequence[float]) -> dict[str, Any]:
         "end_s": float(array[-1]),
         "min_dt_s": float(delta.min()),
         "max_dt_s": float(delta.max()),
-        "timestamp_sha256": digest,
+        **binding,
     }
 
 
@@ -586,11 +599,16 @@ def _validate_clock_evidence(
     identity: str,
     label: str,
     expected_samples: int,
+    admitted_payload: bool = False,
 ) -> tuple[float, float, float]:
-    if not isinstance(value, dict) or set(value) != _CLOCK_EVIDENCE_FIELDS:
+    fields = (
+        (_CLOCK_EVIDENCE_FIELDS - {"timestamp_sha256"}) | {"timestamp_binding"}
+        if admitted_payload else _CLOCK_EVIDENCE_FIELDS
+    )
+    if not isinstance(value, dict) or set(value) != fields:
         raise ManifestContractError(
             f"{identity}.{label}: clock evidence fields must be exactly "
-            f"{sorted(_CLOCK_EVIDENCE_FIELDS)}"
+            f"{sorted(fields)}"
         )
     if not str(value["key"]):
         raise ManifestContractError(f"{identity}.{label}: clock key is empty")
@@ -619,9 +637,13 @@ def _validate_clock_evidence(
         raise ManifestContractError(
             f"{identity}.{label}: clock extent/delta is invalid"
         )
-    _require_sha(
-        value["timestamp_sha256"], field=f"{identity}.{label}.timestamp_sha256"
-    )
+    if admitted_payload:
+        if value["timestamp_binding"] != RECORDED_CLOCK_STAT_BINDING:
+            raise ManifestContractError(f"{identity}.{label}: clock binding is invalid")
+    else:
+        _require_sha(
+            value["timestamp_sha256"], field=f"{identity}.{label}.timestamp_sha256"
+        )
     return start_s, end_s, max_dt_s
 
 
@@ -630,6 +652,7 @@ def validate_source_manifest(
     *,
     expected_source: str,
     expected_embodiment: Optional[EmbodimentSpec] = None,
+    admission_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate per-group source-native clock and supervision evidence.
 
@@ -638,22 +661,31 @@ def validate_source_manifest(
     valid and are passed to continuous-time model inputs unchanged.
     """
 
+    if admission_id is not None and (
+        not isinstance(admission_id, str) or not admission_id.strip()
+    ):
+        raise ManifestContractError("admission_id must be explicit and non-empty")
+    admitted = admission_id is not None
+    expected_schema = (
+        ADMITTED_SOURCE_MANIFEST_SCHEMA if admitted else SOURCE_MANIFEST_SCHEMA
+    )
+    binding_field = "payload_binding" if admitted else "payload_sha256"
     identities: set[str] = set()
     episodes = 0
     duration_s = 0.0
     state_samples = 0
     action_samples = 0
     for line_number, row in iter_jsonl(path):
-        if row.get("schema") != SOURCE_MANIFEST_SCHEMA:
+        if row.get("schema") != expected_schema:
             raise ManifestContractError(
-                f"{path}:{line_number}: schema must be {SOURCE_MANIFEST_SCHEMA}"
+                f"{path}:{line_number}: schema must be {expected_schema}"
             )
         required = {
             "schema",
             "episode_id",
             "source",
             "payload",
-            "payload_sha256",
+            binding_field,
             "payload_row_start",
             "payload_row_stop",
             "assets",
@@ -666,6 +698,10 @@ def validate_source_manifest(
             "observation_clock",
             "robot_groups",
         }
+        if admitted:
+            required.add("admission_id")
+            if row.get("admission_id") != admission_id:
+                raise ManifestContractError(f"{path}:{line_number}: admission mismatch")
         missing = sorted(required - set(row))
         unknown = sorted(set(row) - required)
         if missing or unknown:
@@ -684,9 +720,14 @@ def validate_source_manifest(
                 f"{path}:{line_number}: source {row['source']!r} != {expected_source!r}"
             )
         payload = safe_relative_path(str(row["payload"]))
-        payload_sha = _require_sha(
-            row["payload_sha256"], field=f"{identity}.payload_sha256"
-        )
+        if admitted:
+            payload_binding = require_stat_binding(row["payload_binding"])
+            if payload_binding["admission_id"] != admission_id:
+                raise ManifestContractError(f"{identity}: payload admission mismatch")
+        else:
+            payload_binding = _require_sha(
+                row["payload_sha256"], field=f"{identity}.payload_sha256"
+            )
         row_start = int(row["payload_row_start"])
         row_stop = int(row["payload_row_stop"])
         if row_start < 0 or row_stop <= row_start:
@@ -700,7 +741,8 @@ def validate_source_manifest(
         asset_paths: set[str] = set()
         primary_matches = 0
         for asset_index, asset in enumerate(assets):
-            fields = {"role", "path", "sha256"}
+            asset_binding_field = "binding" if admitted else "sha256"
+            fields = {"role", "path", asset_binding_field}
             if not isinstance(asset, dict) or set(asset) != fields:
                 raise ManifestContractError(
                     f"{identity}.assets[{asset_index}]: fields must be exactly "
@@ -708,9 +750,14 @@ def validate_source_manifest(
                 )
             role = str(asset["role"])
             asset_path = safe_relative_path(str(asset["path"]))
-            asset_sha = _require_sha(
-                asset["sha256"], field=f"{identity}.assets[{asset_index}].sha256"
-            )
+            if admitted:
+                asset_binding = require_stat_binding(asset["binding"])
+                if asset_binding["admission_id"] != admission_id:
+                    raise ManifestContractError(f"{identity}: asset admission mismatch")
+            else:
+                asset_binding = _require_sha(
+                    asset["sha256"], field=f"{identity}.assets[{asset_index}].sha256"
+                )
             if not role or role in asset_roles:
                 raise ManifestContractError(
                     f"{identity}: duplicate/empty asset role {role!r}"
@@ -722,11 +769,11 @@ def validate_source_manifest(
             asset_roles.add(role)
             asset_paths.add(asset_path)
             if role == "primary_payload":
-                primary_matches += int(asset_path == payload and asset_sha == payload_sha)
+                primary_matches += int(asset_path == payload and asset_binding == payload_binding)
         if primary_matches != 1:
             raise ManifestContractError(
                 f"{identity}: assets must contain exactly one primary_payload "
-                "matching payload/path SHA"
+                "matching payload/path binding"
             )
         views = row["views"]
         if not isinstance(views, list) or not views:
@@ -783,6 +830,7 @@ def validate_source_manifest(
             identity=identity,
             label="observation_clock",
             expected_samples=observation_samples,
+            admitted_payload=admitted,
         )
         if observation_samples != row_stop - row_start:
             raise ManifestContractError(
@@ -850,6 +898,7 @@ def validate_source_manifest(
                         identity=identity,
                         label=f"{group_name}.action_clock",
                         expected_samples=action_count,
+                        admitted_payload=admitted,
                     )
                 )
             else:
@@ -871,6 +920,7 @@ def validate_source_manifest(
                         identity=identity,
                         label=f"{group_name}.state_clock",
                         expected_samples=state_count,
+                        admitted_payload=admitted,
                     )
                 )
             episode_action_count += action_count
