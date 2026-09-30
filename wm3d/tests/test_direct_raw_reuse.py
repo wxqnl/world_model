@@ -72,6 +72,7 @@ def test_ignored_action_dimension_is_removed_from_every_training_lane() -> None:
 
 def test_direct_window_source_coalesces_overlapping_episode_rows(monkeypatch) -> None:
     source = object.__new__(_DirectWindowSource)
+    source.admitted = False
     source.profile = SimpleNamespace(
         cache_representation={"view_slots": ("front",)}
     )
