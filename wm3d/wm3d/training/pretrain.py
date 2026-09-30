@@ -1234,7 +1234,11 @@ def _make_loader(
         dataset.source_spans,
         dataset.source_names,
         {
-            name: getattr(dataset, "source_sampling_weights", profile.source_weights)[name]
+            # Complete epochs are defined by the selected stream, not legacy
+            # profile mixture weights. Validation retains its original mixture.
+            name: (dataset.source_spans[name][1] - dataset.source_spans[name][0]
+                   if full_epochs else
+                   getattr(dataset, "source_sampling_weights", profile.source_weights)[name])
             for name in dataset.source_names
         },
         world_size=world_size,

@@ -82,14 +82,16 @@ def test_wrong_weights_or_out_of_budget_do_not_silently_skip_windows():
         complete_epoch_budget({"a": 3}, global_batch=8, epochs=2)
 
 
-def test_loader_uses_new_mode_only_for_training_and_rejects_wrong_stop():
+@pytest.mark.parametrize("has_selected_weights", [False, True])
+def test_loader_uses_new_mode_only_for_training_and_rejects_wrong_stop(has_selected_weights):
     args = arguments()
     dataset = SimpleNamespace(
         source_spans=args["source_spans"], source_names=args["source_order"],
-        source_sampling_weights=args["source_weights"],
         source_episode_spans=args["source_episode_spans"], requires_main_process=True,
     )
-    profile = SimpleNamespace(source_weights=args["source_weights"])
+    if has_selected_weights:
+        dataset.source_sampling_weights = {"a": 1, "b": 1}
+    profile = SimpleNamespace(source_weights={"a": 3, "b": 8})
     runtime = {"train": {"micro_batch_size": 2, "num_workers": 0,
                         "persistent_workers": False, "sampling_mode": "source_count_epochs_v1",
                         "sampling_epochs": 2, "total_steps": 18}}
