@@ -101,7 +101,9 @@ def canonical_sha256(value: object) -> str:
 
 def load_yaml(path: Path) -> dict[str, Any]:
     path = Path(path).resolve(strict=True)
-    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    # JSON scientific notation (e.g. 1e-05) is not a float in YAML 1.1.
+    value = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
     if not isinstance(value, dict):
         raise RuntimeContractError(f"YAML root must be a mapping: {path}")
     return value
