@@ -66,7 +66,9 @@ class PreparedEpisodeRobot:
     observation_times_s: np.ndarray
     action_series: tuple[RawActionSeries, ...]
     state_series: tuple[RawStateSeries, ...]
-    task_embedding: torch.Tensor
+    # Foundation models consume the real Wan context through task_text.
+    # They do not need or fabricate the separate legacy 2048-D task vector.
+    task_embedding: torch.Tensor | None
 
 
 def _mask(value: np.ndarray | None, shape: tuple[int, ...]) -> np.ndarray:

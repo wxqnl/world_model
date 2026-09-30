@@ -62,6 +62,9 @@ class _IndexUnpickler(pickle.Unpickler):
         if (module, name) == ("wm3d.data.manifest_contract", "CacheIndexEntry"):
             from .manifest_contract import CacheIndexEntry
             return CacheIndexEntry
+        if (module, name) == ("wm3d.data.admitted_window_index", "AdmittedWindowEntry"):
+            from .admitted_window_index import AdmittedWindowEntry
+            return AdmittedWindowEntry
         raise pickle.UnpicklingError("non-index object in parsed-index cache")
 
 
@@ -76,6 +79,7 @@ class _ChecksumWriter:
 
 def _read(path, metadata):
     from .manifest_contract import CacheIndexEntry
+    from .admitted_window_index import AdmittedWindowEntry
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as handle:
         s = os.fstat(handle.fileno())
@@ -101,7 +105,7 @@ def _read(path, metadata):
         entries = _IndexUnpickler(handle).load()
         if handle.tell() != end:
             raise ValueError("unexpected parsed-index cache trailing data")
-        if not isinstance(entries, tuple) or not entries or not all(isinstance(e, CacheIndexEntry) for e in entries):
+        if not isinstance(entries, tuple) or not entries or not all(isinstance(e, (CacheIndexEntry, AdmittedWindowEntry)) for e in entries):
             raise ValueError("invalid parsed-index cache entries")
         return entries
 
@@ -137,11 +141,14 @@ def _try_read(path, metadata):
         return None
 
 
-def load_parsed_window_index(path, expected_digest, *, verify_source, build):
+def load_parsed_window_index(path, expected_digest, *, verify_source, build, source_binding=None):
     started = time.monotonic()
     signature = _signature(path)
     directory = os.environ.get("WM3D_INDEX_CACHE_DIR", "")
-    key = (str(path), expected_digest, signature, directory)
+    if (expected_digest is None) == (source_binding is None):
+        raise ValueError("parsed index requires exactly one explicit source identity")
+    identity = expected_digest if source_binding is None else json.dumps(source_binding, sort_keys=True)
+    key = (str(path), identity, signature, directory)
     with _MUTEX:
         # Filesystems can retain the same timestamp within one clock tick;
         # stat identity alone must never bypass the original content check.
@@ -158,7 +165,9 @@ def load_parsed_window_index(path, expected_digest, *, verify_source, build):
             parent = root / _FORMAT / Path(*path.parts[1:])
             _private_directory(parent)
             cache, lock = parent / "entries.bin", parent / "build.lock"
-            metadata = dict(format=_FORMAT, source=str(path), source_digest=expected_digest)
+            metadata = dict(format=_FORMAT, source=str(path))
+            metadata.update({"source_digest": expected_digest} if source_binding is None
+                            else {"source_binding": source_binding})
             while entries is None:
                 with _lock(lock, fcntl.LOCK_SH):
                     entries = _try_read(cache, metadata)

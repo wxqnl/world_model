@@ -1,0 +1,209 @@
+{
+  "schema": "wm3d_source_adapter_v6",
+  "name": "robotwin_unified_recorded_state",
+  "raw_format": "lerobot_parquet_video",
+  "observation_time_key": "timestamp",
+  "views": [
+    {
+      "name": "head",
+      "key": "observation.images.cam_high",
+      "color_order": "rgb"
+    },
+    {
+      "name": "left_wrist",
+      "key": "observation.images.cam_left_wrist",
+      "color_order": "rgb"
+    },
+    {
+      "name": "right_wrist",
+      "key": "observation.images.cam_right_wrist",
+      "color_order": "rgb"
+    }
+  ],
+  "groups": [
+    {
+      "group": "left_arm",
+      "supervision": "coarse_effect",
+      "action": [
+        {
+          "key": "action",
+          "columns": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "scale": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "offset": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "state": [
+        {
+          "key": "observation.state",
+          "columns": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6
+          ],
+          "scale": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "offset": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "action_time_key": null,
+      "state_time_key": "timestamp",
+      "world_interval_index_key": "frame_index",
+      "action_transform": "identity",
+      "state_transform": "identity",
+      "action_value_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "state_value_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "action_alignment": "next_observation_drop_terminal"
+    },
+    {
+      "group": "right_arm",
+      "supervision": "coarse_effect",
+      "action": [
+        {
+          "key": "action",
+          "columns": [
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ],
+          "scale": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "offset": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "state": [
+        {
+          "key": "observation.state",
+          "columns": [
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13
+          ],
+          "scale": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "offset": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "action_time_key": null,
+      "state_time_key": "timestamp",
+      "world_interval_index_key": "frame_index",
+      "action_transform": "identity",
+      "state_transform": "identity",
+      "action_value_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "state_value_mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "action_alignment": "next_observation_drop_terminal"
+    }
+  ]
+}

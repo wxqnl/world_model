@@ -173,3 +173,74 @@ def test_foundation_bridge_rejects_nonfactorizable_element_mask() -> None:
     sample_mask[0, 0, 0, 0] = True
     with pytest.raises(FoundationBridgeError, match="time/dimension masks"):
         build_foundation_sample(batch, _config())
+
+
+def _effect_batch():
+    batch = _batch()
+    for prefix in ("history", "future_factual"):
+        values = batch[prefix + "_fine_action_values"][:, :, :, -1, :].clone()
+        mask = batch[prefix + "_fine_action_mask"][:, :, :, -1, :].clone()
+        batch[prefix + "_coarse_action_values"] = values
+        batch[prefix + "_coarse_action_mask"] = mask
+    for prefix in ("history", "future_factual"):
+        batch[prefix + "_fine_action_mask"].zero_()
+        batch[prefix + "_fine_sample_mask"].zero_()
+    for prefix in ("history", "future"):
+        key = prefix + "_world_boundaries_dt"
+        batch[key] = batch[key].clone()
+    batch["foundation_action_supervision"] = ["coarse_effect", "coarse_effect"]
+    return batch
+
+
+def test_admitted_next_states_use_interval_end_not_command_start():
+    batch = _effect_batch()
+    result = build_foundation_sample(batch, _config())
+    assert result["action_supervision_kind"] == "coarse_effect"
+    assert result["action"].shape == (2, 4, 6)
+    assert torch.equal(result["action"], batch["future_factual_coarse_action_values"]
+        .reshape(2, 4, 6).masked_fill(~result["action_element_mask"], 0))
+    assert torch.equal(result["action_time_s"][:, :, 0],
+                       batch["future_world_boundaries_dt"][:, 1:])
+    assert torch.equal(result["history_action_time_s"][:, :, 0],
+                       batch["history_world_boundaries_dt"][:, 1:])
+    assert result["history_action_time_s"].max() == 0
+
+
+def test_next_states_need_explicit_source_admission():
+    batch = _effect_batch()
+    del batch["foundation_action_supervision"]
+    with pytest.raises(FoundationBridgeError, match="explicit effect admission"):
+        build_foundation_sample(batch, _config())
+
+
+def test_effect_lane_cannot_silently_drop_commands():
+    batch = _effect_batch()
+    batch["future_factual_fine_action_mask"][:, :, 0, 0, 0] = True
+    with pytest.raises(FoundationBridgeError, match="replace any fine commands"):
+        build_foundation_sample(batch, _config())
+
+
+def test_changing_future_effects_does_not_change_observed_conditioning():
+    batch = _effect_batch()
+    before = build_foundation_sample(batch, _config())
+    batch["future_factual_coarse_action_values"].add_(100)
+    after = build_foundation_sample(batch, _config())
+    for key in ("proprio", "history_action", "history_action_time_s",
+                "history_action_element_mask", "proprio_dim_is_pad"):
+        assert torch.equal(before[key], after[key]), key
+    assert not torch.equal(before["action"], after["action"])
+
+
+@pytest.mark.parametrize("corruption", ["nan", "backwards", "anchor", "mixed"])
+def test_effect_lane_rejects_invalid_targets_and_clocks(corruption):
+    batch = _effect_batch()
+    if corruption == "nan":
+        batch["future_factual_coarse_action_values"][0, 0, 0, 0] = float("nan")
+    elif corruption == "backwards":
+        batch["future_world_boundaries_dt"][0, 2] = 0
+    elif corruption == "anchor":
+        batch["future_world_boundaries_dt"].add_(0.1)
+    else:
+        batch["foundation_action_supervision"] = ["coarse_effect", "fine_command"]
+    with pytest.raises(FoundationBridgeError):
+        build_foundation_sample(batch, _config())

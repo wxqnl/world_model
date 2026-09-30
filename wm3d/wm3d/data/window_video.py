@@ -334,6 +334,7 @@ def decode_episode_window_views(
 ) -> tuple[dict[str, DecodedEpisodeVideo], dict[str, Mapping[str, object]]]:
     """Decode only selected ordinal rows from every real camera stream."""
 
+    admitted = getattr(task, "timestamp_binding_mode", None) == "admitted_payload_stat"
     slots = tuple(str(item) for item in canonical_view_slots)
     if not slots or len(set(slots)) != len(slots):
         raise EpisodeIOError("canonical view slots must be unique/non-empty")
@@ -361,7 +362,8 @@ def decode_episode_window_views(
             )
         relative, digest = assets[role]
         path = asset_verifier.verify(source_root, relative, digest)
-        digest = asset_verifier.content_digest(path, digest)
+        if not admitted:
+            digest = asset_verifier.content_digest(path, digest)
         jobs.append(
             (name, role, segment_kind, start_s, stop_s, path, digest)
         )
@@ -388,13 +390,19 @@ def decode_episode_window_views(
             observation_samples=task.observation_samples,
             view_name=name,
         )
+        if admitted and task.origin == "admitted" and (trailing_dropped or trailing_repeated):
+            raise EpisodeIOError("admitted video cardinality differs; no synthetic trailing frame")
         selected_ordinals = ordinals[rows]
         frames, decode_backend, codec_decoded_count = _decode_selected_frames(
             path,
             frame_index,
             selected_ordinals,
         )
-        digest_pts = canonical_timestamp_sha256(segment_pts)
+        digest_pts = None if admitted else canonical_timestamp_sha256(segment_pts)
+        if admitted:
+            relative, binding = assets[role]
+            if asset_verifier.verify(source_root, relative, binding) != path:
+                raise EpisodeIOError("admitted video changed during decode")
         decoded = DecodedEpisodeVideo(
             frames=frames.copy(),
             recorded_pts_s=segment_pts,
@@ -418,6 +426,11 @@ def decode_episode_window_views(
             "recorded_pts_sha256": digest_pts,
             "binding": "episode_row_ordinal_random_access",
         }
+        if admitted:
+            evidence.pop("asset_sha256")
+            evidence.pop("recorded_pts_sha256")
+            evidence["asset_binding"] = digest
+            evidence["recorded_pts_binding"] = "observed_from_stat_bound_video"
         return name, decoded, evidence
 
     workers = min(int(decode_workers), len(jobs))

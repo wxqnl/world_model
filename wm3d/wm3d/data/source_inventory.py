@@ -619,6 +619,9 @@ def _episode_rows(
             f"episode {episode_index}/observation",
             admitted_payload=admission_id is not None,
         )
+        if adapter.raw_action_layout is not None:
+            from .lossless_action_layout import check_action_constants
+            check_action_constants(_ArrayAccessor(arrays), adapter.raw_action_layout)
         robot_groups: dict[str, Any] = {}
         for mapping in adapter.groups:
             for term in (*mapping.action, *mapping.state):

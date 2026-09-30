@@ -94,7 +94,7 @@ def test_direct_window_source_coalesces_overlapping_episode_rows(monkeypatch) ->
         selected_rows=np.arange(32, dtype=np.int64),
         prepared_robot=prepared_robot,
     )
-    task = SimpleNamespace(source="demo")
+    task = SimpleNamespace(source="demo", embodiment="robot", split="train")
     source._load_task = lambda _task_id: task
     source._load_episode = lambda _task: episode
     source.windows_decoded = 0
@@ -125,11 +125,13 @@ def test_direct_window_source_coalesces_overlapping_episode_rows(monkeypatch) ->
         fake_view_batch,
     )
     first = SimpleNamespace(
+        source="demo", embodiment="robot", split="train",
         leading_feature_row=0,
         context_feature_rows=(1, 2),
         future_feature_rows=(3,),
     )
     second = SimpleNamespace(
+        source="demo", embodiment="robot", split="train",
         leading_feature_row=1,
         context_feature_rows=(2, 3),
         future_feature_rows=(4,),
@@ -192,3 +194,22 @@ def test_direct_dataset_prefetch_submits_one_coalesced_batch() -> None:
     assert calls == [(0, 1)]
     assert dataset.prefetch_submitted == 2
     assert dataset.prefetch_consumed == 2
+
+def test_direct_sample_validation_preserves_explicit_effect_label() -> None:
+    import pytest
+    from wm3d.data.unified_cache_dataset import CacheDataError
+
+    fields = {
+        "task_text": "move the object",
+        "foundation_action_supervision": "coarse_effect",
+        "world_times_s": torch.tensor([0., 0.2, 0.4]),
+        "policy_query_mask": torch.ones(2, 2, dtype=torch.bool),
+        "policy_query_dt": torch.tensor([[0., 0.1], [0., 0.1]]),
+        "action_group_mask": torch.ones(2, dtype=torch.bool),
+        "current_state_mask": torch.ones(2, 7, dtype=torch.bool),
+    }
+    entry = SimpleNamespace(sample_id="robotwin:episode0:0")
+    DirectRawDataset._validate_sample(fields, entry)
+    fields["foundation_action_supervision"] = "inferred_command"
+    with pytest.raises(CacheDataError, match="invalid action supervision"):
+        DirectRawDataset._validate_sample(fields, entry)

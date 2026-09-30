@@ -40,6 +40,9 @@ ACTION_SEMANTIC_IDS: Mapping[str, int] = {
     "controller_mode": 13,
     "joint_velocity_rps": 14,
     "joint_torque_nm": 15,
+    # Recorded next-state coordinates in source-native units, not a command.
+    # Kept distinct in the existing semantic embedding; old IDs do not move.
+    "observed_state_native": 16,
 }
 
 STATE_SEMANTIC_IDS: Mapping[str, int] = {

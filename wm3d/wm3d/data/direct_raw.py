@@ -26,6 +26,7 @@ from .cache_tasks import CacheTask, cache_task_from_mapping
 from .episode_io import (
     VerifiedAssetStore,
     open_episode_accessor,
+    open_admitted_episode_accessor,
     select_episode_cache_rows,
 )
 from .episode_robot import (
@@ -44,6 +45,7 @@ from .manifest_contract import (
     CacheIndexEntry,
     DataProfile,
     canonical_timestamp_sha256,
+    timestamp_evidence,
     load_cache_episode_index,
 )
 from .source_adapters import (
@@ -52,6 +54,8 @@ from .source_adapters import (
     load_adapter_contract,
 )
 from .task_embedding_store import TaskEmbeddingStore
+from .admitted_direct_tasks import AdmittedAssetStore, admitted_task_from_mapping
+from .file_binding import verify_stat_asset
 from .unified_cache_dataset import CacheDataError, UnifiedCacheDataset
 from .window_video import (
     VideoTimestampIndexStore,
@@ -60,6 +64,7 @@ from .window_video import (
 
 
 DIRECT_RAW_DATA_CLOSURE_SCHEMA = "wm3d_direct_raw_data_closure_v1"
+ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA = "wm3d_admitted_direct_raw_data_closure_v1"
 
 
 def _apply_ignored_action_dimensions(
@@ -263,7 +268,7 @@ class _PreparedViewRowStore:
             }
 
 
-_TASK_ID_RE = re.compile(rb'"task_id"\s*:\s*"([0-9a-f]{64})"')
+_TASK_ID_RE = re.compile(rb'"task_id"\s*:\s*"([0-9a-f]{64}|task[0-9]{9})"')
 _TASK_SOURCE_RE = re.compile(rb'"source"\s*:\s*"([^"]+)"')
 _TASK_EPISODE_RE = re.compile(rb'"episode_id"\s*:\s*"([^"]+)"')
 
@@ -294,6 +299,12 @@ class _DirectWindowSource:
         profile: DataProfile,
     ) -> None:
         self.profile = profile
+        self.admitted = closure.get("schema") == ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
+        self.foundation_text_only = bool(closure.get("foundation_text_only", False))
+        if self.admitted and (not self.foundation_text_only or not profile.admission_id):
+            raise CacheDataError("admitted direct data requires explicit foundation text mode")
+        self._parse_task = admitted_task_from_mapping if self.admitted else cache_task_from_mapping
+        self._task_manifest_binding = closure.get("task_manifest_binding")
         self.task_manifest_path = Path(
             str(closure["task_manifest_path"])
         ).resolve(strict=True)
@@ -302,6 +313,7 @@ class _DirectWindowSource:
             or not self.task_manifest_path.is_file()
         ):
             raise CacheDataError("direct raw task manifest is not a regular file")
+        self._verify_task_manifest()
         self._task_record_by_episode: dict[
             tuple[str, str], _DirectTaskRecord
         ] = {}
@@ -336,9 +348,8 @@ class _DirectWindowSource:
                 self._task_ordinal_by_id[task_id] = line_number - 1
                 self._task_record_by_episode[episode_key] = record
                 if first_task is None:
-                    first_task = cache_task_from_mapping(
-                        json.loads(line)
-                    )
+                    first_task = self._parse_task(json.loads(line))
+        self._verify_task_manifest()
         if first_task is None:
             raise CacheDataError("direct raw task manifest is empty")
         self._task_cache: OrderedDict[str, CacheTask] = OrderedDict()
@@ -355,22 +366,29 @@ class _DirectWindowSource:
         self.adapters = {
             source.name: load_adapter_contract(
                 source.adapter_config_path,
-                expected_sha256=source.adapter_contract_sha256,
+                **({"expected_binding": source.adapter_contract_binding} if self.admitted
+                   else {"expected_sha256": source.adapter_contract_sha256}),
             )
             for source in profile.sources
         }
-        self.task_store = TaskEmbeddingStore(
-            root=Path(str(closure["task_bank_root"])),
-            index_sha256=str(closure["task_bank_index_sha256"]),
-            expected_data_profile_sha256=profile.profile_sha256,
-            expected_source_manifest_sha256_by_name={
-                source.name: source.manifest_sha256 for source in profile.sources
-            },
-            expected_encoder_contract_sha256=(
-                first_task.task_encoder_contract_sha256
-            ),
+        self.task_store = None
+        if not self.foundation_text_only:
+            self.task_store = TaskEmbeddingStore(
+                root=Path(str(closure["task_bank_root"])),
+                index_sha256=str(closure["task_bank_index_sha256"]),
+                expected_data_profile_sha256=profile.profile_sha256,
+                expected_source_manifest_sha256_by_name={
+                    source.name: source.manifest_sha256 for source in profile.sources
+                },
+                expected_encoder_contract_sha256=(
+                    first_task.task_encoder_contract_sha256
+                ),
+            )
+        self.asset_verifier = (
+            AdmittedAssetStore(admission_id=profile.admission_id,
+                initial_raw_asset_repairs=closure["initial_raw_asset_repairs"])
+            if self.admitted else VerifiedAssetStore()
         )
-        self.asset_verifier = VerifiedAssetStore()
         self.input_rgb_size = int(closure["direct_input_rgb_size"])
         self.decode_workers = int(
             os.environ.get(
@@ -412,6 +430,11 @@ class _DirectWindowSource:
         self.coalesced_unique_rows = 0
         self.decode_seconds = 0.0
 
+    def _verify_task_manifest(self) -> None:
+        if self.admitted:
+            verify_stat_asset(self.task_manifest_path.parent, self.task_manifest_path.name,
+                              self._task_manifest_binding)
+
     def task_id_for_episode(self, source: str, episode_id: str) -> str:
         try:
             return self._task_record_by_episode[
@@ -423,6 +446,7 @@ class _DirectWindowSource:
             ) from exc
 
     def _load_task(self, task_id: str) -> CacheTask:
+        self._verify_task_manifest()
         cached = self._task_cache.pop(task_id, None)
         if cached is not None:
             self._task_cache[task_id] = cached
@@ -437,7 +461,10 @@ class _DirectWindowSource:
         with self.task_manifest_path.open("rb") as handle:
             handle.seek(byte_offset)
             line = handle.readline()
-        task = cache_task_from_mapping(json.loads(line))
+        task = self._parse_task(json.loads(line))
+        self._verify_task_manifest()
+        if self.admitted and task.admission_id != self.profile.admission_id:
+            raise CacheDataError("direct task admission differs from profile")
         if task.task_id != task_id:
             raise CacheDataError(
                 "direct raw task offset resolved to another task"
@@ -458,6 +485,9 @@ class _DirectWindowSource:
         return value
 
     def _load_episode(self, task: CacheTask) -> _DirectEpisode:
+        if self.admitted:
+            source = self.sources[task.source]
+            self.asset_verifier.verify(source.raw_root, task.payload, task.payload_binding)
         cached = self._episodes.pop(task.task_id, None)
         if cached is not None:
             self._episodes[task.task_id] = cached
@@ -467,20 +497,31 @@ class _DirectWindowSource:
         if source is None or source.embodiment != task.embodiment:
             raise CacheDataError("direct raw source/embodiment mismatch")
         adapter = self.adapters[task.source]
-        accessor = open_episode_accessor(
-            task=task,
-            source_root=source.raw_root,
-            adapter=adapter,
-            asset_verifier=self.asset_verifier,
-        )
+        if self.admitted:
+            accessor = open_admitted_episode_accessor(
+                source_root=source.raw_root, payload=task.payload,
+                payload_binding=task.payload_binding, row_start=task.payload_row_start,
+                row_stop=task.payload_row_stop, adapter=adapter,
+                asset_verifier=self.asset_verifier,
+            )
+        else:
+            accessor = open_episode_accessor(
+                task=task, source_root=source.raw_root, adapter=adapter,
+                asset_verifier=self.asset_verifier,
+            )
         observation_clock = np.asarray(
             accessor.array(adapter.observation_time_key), dtype=np.float64
         ).reshape(-1)
-        if (
-            observation_clock.shape != (task.observation_samples,)
-            or canonical_timestamp_sha256(observation_clock)
-            != task.observation_clock["timestamp_sha256"]
-        ):
+        if observation_clock.shape != (task.observation_samples,):
+            raise CacheDataError("direct raw observation cardinality differs from task")
+        if self.admitted:
+            observed = timestamp_evidence(key=adapter.observation_time_key,
+                values=observation_clock, admitted_payload=True)
+            expected = {k: v for k, v in task.observation_clock.items()
+                        if k not in {"timestamp_sha256", "timestamp_binding"}}
+            if {k:v for k,v in observed.items() if k!="timestamp_binding"} != expected:
+                raise CacheDataError("direct raw admitted observation clock differs")
+        elif canonical_timestamp_sha256(observation_clock) != task.observation_clock["timestamp_sha256"]:
             raise CacheDataError("direct raw observation clock differs from task")
         selection = self.profile.cache_representation["state_frame_selection"]
         selected_rows = select_episode_cache_rows(
@@ -488,38 +529,39 @@ class _DirectWindowSource:
             minimum_separation_s=float(selection["minimum_separation_seconds"]),
         )
         embodiment = self.profile.embodiments[task.embodiment]
-        robot = build_episode_robot_cache(
-            embodiment=embodiment,
-            action_series=adapt_action_series(
-                accessor=accessor,
-                contract=adapter,
+        actions = tuple(adapt_action_series(accessor=accessor, contract=adapter,
+                                             embodiment=embodiment))
+        states = tuple(adapt_state_series(accessor=accessor, contract=adapter,
+                                          embodiment=embodiment))
+        if self.foundation_text_only:
+            prepared = PreparedEpisodeRobot(
+                observation_times_s=observation_clock,
+                action_series=actions, state_series=states, task_embedding=None,
+            )
+        else:
+            robot = build_episode_robot_cache(
                 embodiment=embodiment,
-            ),
-            state_series=adapt_state_series(
-                accessor=accessor,
-                contract=adapter,
-                embodiment=embodiment,
-            ),
-            task_embedding=self.task_store.get(task.task_text),
-            observation_times_s=observation_clock,
-            max_groups=max(
-                len(item.groups) for item in self.profile.embodiments.values()
-            ),
-            max_action_dim=max(
-                group.action_dim
-                for item in self.profile.embodiments.values()
-                for group in item.groups
-            ),
-            max_state_dim=max(
-                max((group.state_dim for group in item.groups), default=0)
-                for item in self.profile.embodiments.values()
-            ),
-        )
+                action_series=actions,
+                state_series=states,
+                task_embedding=self.task_store.get(task.task_text),
+                observation_times_s=observation_clock,
+                max_groups=max(
+                    len(item.groups) for item in self.profile.embodiments.values()
+                ),
+                max_action_dim=max(
+                    group.action_dim
+                    for item in self.profile.embodiments.values()
+                    for group in item.groups
+                ),
+                max_state_dim=max(
+                    max((group.state_dim for group in item.groups), default=0)
+                    for item in self.profile.embodiments.values()
+                ),
+            )
+            prepared = prepare_episode_robot_tensors(robot.as_tensors(), embodiment=embodiment)
         result = _DirectEpisode(
             selected_rows=np.asarray(selected_rows, dtype=np.int64),
-            prepared_robot=prepare_episode_robot_tensors(
-                robot.as_tensors(), embodiment=embodiment
-            ),
+            prepared_robot=prepared,
         )
         self._episodes[task.task_id] = result
         while len(self._episodes) > self.robot_cache_episodes:
@@ -614,6 +656,12 @@ class _DirectWindowSource:
         for task_id, items in grouped.items():
             with self._metadata_lock:
                 task = self._load_task(task_id)
+                if any(entry.source != task.source or entry.embodiment != task.embodiment
+                       or entry.split != task.split for _,entry in items):
+                    raise CacheDataError("direct window and task source/split/embodiment differ")
+                if self.admitted:
+                    for _,relative,binding in task.assets:
+                        self.asset_verifier.verify(self.sources[task.source].raw_root,relative,binding)
                 episode = self._load_episode(task)
             plans = {
                 index: self._plan_window(
@@ -770,12 +818,19 @@ class DirectRawDataset(UnifiedCacheDataset):
         rank: int,
         train_episode_allowlist: Path | str | None = None,
     ) -> None:
-        if closure.get("schema") != DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+        admitted = closure.get("schema") == ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
+        if closure.get("schema") not in {
+            DIRECT_RAW_DATA_CLOSURE_SCHEMA, ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
+        }:
             raise CacheDataError("direct raw closure schema mismatch")
+        if admitted and (model_profile.get("architecture") != "foundation_world_model"
+                         or train_episode_allowlist is not None):
+            raise CacheDataError("admitted windows are already selected and require foundation mode")
         super().__init__(
             cache_root=Path(str(closure["metadata_root"])),
             index_path=Path(str(closure["cache_index_path"])),
-            index_sha256=str(closure["cache_index_sha256"]),
+            index_sha256=None if admitted else str(closure["cache_index_sha256"]),
+            index_binding=closure.get("cache_index_binding") if admitted else None,
             data_profile=data_profile,
             model_profile=model_profile,
             split=split,
@@ -790,26 +845,44 @@ class DirectRawDataset(UnifiedCacheDataset):
             ),
             grouped_normalizer=grouped_normalizer,
         )
-        episode_index = load_cache_episode_index(
-            Path(str(closure["episode_index_path"])),
-            expected_sha256=str(closure["episode_index_sha256"]),
+        if not admitted:
+            episode_index = load_cache_episode_index(
+                Path(str(closure["episode_index_path"])),
+                expected_sha256=str(closure["episode_index_sha256"]),
+            )
+            by_thin_feature = {
+                item.feature_shard: (item.source, item.episode_id)
+                for item in episode_index
+            }
+            if split == "train" and train_episode_allowlist is not None:
+                from .episode_selection import select_training_entries
+                self.entries, self.source_sampling_weights = select_training_entries(
+                    self.entries, by_thin_feature, train_episode_allowlist,
+                    closure["metadata_root"],
+                )
+        self._foundation_action_supervision = dict(
+            closure.get("source_action_supervision", {})
         )
-        by_thin_feature = {
-            item.feature_shard: (item.source, item.episode_id)
-            for item in episode_index
-        }
-        if split == "train" and train_episode_allowlist is not None:
-            from .episode_selection import select_training_entries
-            self.entries, self.source_sampling_weights = select_training_entries(
-                self.entries, by_thin_feature, train_episode_allowlist,
-                closure["metadata_root"],
-            )
+        if (set(self._foundation_action_supervision) - set(data_profile.source_order)
+                or any(v not in {"fine_command", "coarse_effect"}
+                       for v in self._foundation_action_supervision.values())):
+            raise CacheDataError("invalid source action supervision admission")
         self._source = _DirectWindowSource(closure=closure, profile=data_profile)
+        for source_name, adapter in self._source.adapters.items():
+            expected_lane = self._foundation_action_supervision.get(source_name, "fine_command")
+            if any(g.supervision != expected_lane for g in adapter.groups):
+                raise CacheDataError("source target-kind label differs from physical adapter")
         self._task_id_by_feature: dict[str, str] = {}
-        for relative, identity in by_thin_feature.items():
-            self._task_id_by_feature[relative] = (
-                self._source.task_id_for_episode(*identity)
-            )
+        if admitted:
+            for entry in self.entries:
+                if entry.task_id not in self._source._task_offset_by_id:
+                    raise CacheDataError("admitted window references missing task")
+                self._task_id_by_feature[entry.task_id] = entry.task_id
+        else:
+            for relative, identity in by_thin_feature.items():
+                self._task_id_by_feature[relative] = (
+                    self._source.task_id_for_episode(*identity)
+                )
         order = {
             name: index for index, name in enumerate(data_profile.source_order)
         }
@@ -1100,7 +1173,7 @@ class DirectRawDataset(UnifiedCacheDataset):
             boundary_source=boundary_source,
             prepared_robot=prepared_robot,
         )
-        if task_embedding.numel() != int(self.model["task_dim"]):
+        if task_embedding is not None and task_embedding.numel() != int(self.model["task_dim"]):
             raise CacheDataError("direct raw task embedding dimension mismatch")
         frame_rows = boundary_source[1:]
         world_times = torch.from_numpy(
@@ -1118,8 +1191,10 @@ class DirectRawDataset(UnifiedCacheDataset):
             "direct_view_mask": view_mask.bool(),
             "direct_frame_keys": frame_keys,
             "world_times_s": world_times,
-            "task_embedding": task_embedding.to(torch.float32),
             "task_text": self._source.task_text(task_id),
+            "foundation_action_supervision": self._foundation_action_supervision.get(
+                entry.source, "fine_command"
+            ),
             "aux_values": aux_values,
             "aux_mask": torch.zeros(aux_values.shape[:-1], dtype=torch.bool),
             "aux_type_ids": torch.zeros(aux_values.shape[:-1], dtype=torch.int64),
@@ -1131,5 +1206,9 @@ class DirectRawDataset(UnifiedCacheDataset):
             ),
             "sample_index": torch.tensor(index, dtype=torch.long),
         }
+        if task_embedding is not None:
+            result["task_embedding"] = task_embedding.to(torch.float32)
+        elif not self._source.foundation_text_only:
+            raise CacheDataError("direct raw task embedding missing")
         self._validate_sample(result, entry)
         return result

@@ -106,10 +106,22 @@ def _materialize_admitted(args, template: Path, value, template_binding):
         rp = receipts[name]
         receipt, rb = _read_bound(rp, admission_id)
         if (receipt.get("schema") != "wm3d_admitted_source_inventory_receipt_v1"
-                or receipt.get("source") != name or receipt.get("admission_id") != admission_id
-                or receipt.get("data_template_binding") != template_binding):
+                or receipt.get("source") != name or receipt.get("admission_id") != admission_id):
             raise RuntimeError(f"{name}: inventory source/template/admission mismatch")
-        bound_paths = []
+        audited_template = Path(receipt["data_template_path"])
+        audited_binding = receipt["data_template_binding"]
+        _verify(audited_template, audited_binding, admission_id)
+        audited_value = yaml.safe_load(audited_template.read_text())
+        audited_sources = {s["name"]: s for s in audited_value["sources"]}
+        audited_embodiments = {e["name"]: e for e in audited_value["embodiments"]}
+        combined_embodiments = {e["name"]: e for e in value["embodiments"]}
+        expected_source = audited_sources.get(name)
+        if (expected_source is None or source["embodiment"] != expected_source["embodiment"]
+                or any(source.get(k) != v for k,v in expected_source.items())
+                or combined_embodiments[source["embodiment"]] !=
+                   audited_embodiments[source["embodiment"]]):
+            raise RuntimeError(f"{name}: combined profile changed audited source semantics")
+        bound_paths = [(audited_template, audited_binding)]
         for field, binding_field in (
             ("adapter_audit_receipt_path", "adapter_audit_receipt_binding"),
             ("episode_catalog_path", "episode_catalog_binding"),
@@ -125,7 +137,7 @@ def _materialize_admitted(args, template: Path, value, template_binding):
                 or audit.get("semantic_review") != "operator_confirmed_fail_closed"
                 or audit.get("structural_checks") != "pass"
                 or audit.get("adapter_contract_binding") != receipt["adapter_contract_binding"]
-                or audit.get("data_template_binding") != template_binding
+                or audit.get("data_template_binding") != audited_binding
                 or audit.get("episode_catalog_binding") != receipt["episode_catalog_binding"]):
             raise RuntimeError(f"{name}: physical adapter audit is missing/mismatched")
         validation = receipt.get("manifest_validation", {})

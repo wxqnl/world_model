@@ -338,7 +338,7 @@ class _AdmittedEpisodeAccessor(EpisodeAccessor):
 class DecodedEpisodeVideo:
     frames: np.ndarray
     recorded_pts_s: np.ndarray
-    pts_sha256: str
+    pts_sha256: str | None
     segment_kind: str
 
 

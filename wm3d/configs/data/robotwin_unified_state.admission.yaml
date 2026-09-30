@@ -1,0 +1,83 @@
+{
+  "schema": "wm3d_admitted_source_template_v1",
+  "sources": [
+    {
+      "name": "robotwin_unified_state",
+      "embodiment": "robotwin_aloha_recorded_state"
+    }
+  ],
+  "embodiments": [
+    {
+      "name": "robotwin_aloha_recorded_state",
+      "embodiment_id": 230,
+      "groups": [
+        {
+          "name": "left_arm",
+          "group_id": 20,
+          "action_semantics": [
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native"
+          ],
+          "state_semantics": [
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state"
+          ],
+          "action_frame": "robotwin_recorded_motor_coordinates_native_units_no_metric_or_gripper_polarity_claim",
+          "state_frame": "robotwin_recorded_motor_coordinates_native_units_no_metric_or_gripper_polarity_claim",
+          "composition_operators": [
+            "last",
+            "last",
+            "last",
+            "last",
+            "last",
+            "last",
+            "last"
+          ]
+        },
+        {
+          "name": "right_arm",
+          "group_id": 21,
+          "action_semantics": [
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native",
+            "observed_state_native"
+          ],
+          "state_semantics": [
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state",
+            "controller_state"
+          ],
+          "action_frame": "robotwin_recorded_motor_coordinates_native_units_no_metric_or_gripper_polarity_claim",
+          "state_frame": "robotwin_recorded_motor_coordinates_native_units_no_metric_or_gripper_polarity_claim",
+          "composition_operators": [
+            "last",
+            "last",
+            "last",
+            "last",
+            "last",
+            "last",
+            "last"
+          ]
+        }
+      ]
+    }
+  ]
+}

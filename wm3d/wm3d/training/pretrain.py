@@ -37,6 +37,7 @@ from wm3d.data.streaming_raw import (
 )
 from wm3d.data.direct_raw import (
     DIRECT_RAW_DATA_CLOSURE_SCHEMA,
+    ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA,
     DirectRawDataset,
 )
 from wm3d.data.grouped_normalization import GroupedRobotNormalizer
@@ -1057,9 +1058,11 @@ def _build_mixed_dataset(
     closure = runtime["data_closure"]
     if closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
         return build_formal_cache_dataset(runtime, split=split, profile=profile)
+    admitted = closure.get("schema") == ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
     if profile is None:
         profile = load_data_profile(
-            Path(closure["data_profile_path"]), verify_source_manifests=True
+            Path(closure["data_profile_path"]), verify_source_manifests=True,
+            expected_binding=closure["data_profile_binding"] if admitted else None,
         )
     normalization_model_sha = runtime["bindings"]["model_profile_sha256"]
     if closure.get("schema") in {
@@ -1071,15 +1074,22 @@ def _build_mixed_dataset(
             expected_sha256=str(closure["metadata_seal_sha256"]),
         )
         normalization_model_sha = str(metadata_seal["model_profile_sha256"])
-    normalizer = GroupedRobotNormalizer.load(
-        Path(closure["grouped_normalization_path"]),
-        expected_sha256=closure["grouped_normalization_sha256"],
-        expected_data_profile_sha256=closure["data_profile_sha256"],
-        expected_model_profile_sha256=normalization_model_sha,
-        expected_window_index_sha256=closure["cache_index_sha256"],
-        data_profile=profile,
-    )
-    if closure.get("schema") == DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+    if admitted:
+        normalizer=GroupedRobotNormalizer.load_admitted(
+            Path(closure["grouped_normalization_path"]),
+            expected_binding=closure["grouped_normalization_binding"],
+            expected_window_index_binding=closure["cache_index_binding"],
+            model_profile=runtime["model_profile"],data_profile=profile)
+    else:
+        normalizer = GroupedRobotNormalizer.load(
+            Path(closure["grouped_normalization_path"]),
+            expected_sha256=closure["grouped_normalization_sha256"],
+            expected_data_profile_sha256=closure["data_profile_sha256"],
+            expected_model_profile_sha256=normalization_model_sha,
+            expected_window_index_sha256=closure["cache_index_sha256"],
+            data_profile=profile,
+        )
+    if closure.get("schema") in {DIRECT_RAW_DATA_CLOSURE_SCHEMA, ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA}:
         dataset = DirectRawDataset(
             closure=closure,
             data_profile=profile,
@@ -1403,13 +1413,15 @@ def _run_contract(
     warmstart_model: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract = {
-        "schema": RUN_CONTRACT_SCHEMA,
+        "schema": ("wm3d_admitted_run_contract_v1" if "environment_lock_binding" in config["run"] else RUN_CONTRACT_SCHEMA),
         "name": config["run"]["name"],
         "lineage": config["run"]["lineage"],
         "data_closure_sha256": config["bindings"]["data_closure_sha256"],
         "model_contract_sha256": config["bindings"]["model_contract_sha256"],
         "code_commit": config["run"]["code_commit"],
-        "environment_lock_sha256": config["run"]["environment_lock_sha256"],
+        **({"environment_lock_binding": config["run"]["environment_lock_binding"]}
+            if "environment_lock_binding" in config["run"] else
+            {"environment_lock_sha256": config["run"]["environment_lock_sha256"]}),
         "topology_contract_sha256": _topology_contract_sha256(config),
         "resource_contract_sha256": resource_contract_sha256(
             config["runtime_profile"].get("resources")
@@ -1553,7 +1565,9 @@ def _topology_contract_sha256(config: Mapping[str, Any]) -> str:
         {
             "run_lineage": config["run"]["lineage"],
             "code_commit": config["run"]["code_commit"],
-            "environment_lock_sha256": config["run"]["environment_lock_sha256"],
+            **({"environment_lock_binding": config["run"]["environment_lock_binding"]}
+            if "environment_lock_binding" in config["run"] else
+            {"environment_lock_sha256": config["run"]["environment_lock_sha256"]}),
             "model_contract_sha256": config["bindings"]["model_contract_sha256"],
             "data_closure_sha256": config["bindings"]["data_closure_sha256"],
             "objective_profile_sha256": config["bindings"]["objective_profile_sha256"],
@@ -1744,7 +1758,7 @@ def main() -> None:
         input_adapter = None
         direct_raw = (
             config["data_closure"].get("schema")
-            == DIRECT_RAW_DATA_CLOSURE_SCHEMA
+            in {DIRECT_RAW_DATA_CLOSURE_SCHEMA, ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA}
         )
         if foundation_mode:
             if not direct_raw:

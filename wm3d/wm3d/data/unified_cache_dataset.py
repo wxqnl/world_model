@@ -360,7 +360,8 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
         *,
         cache_root: Path,
         index_path: Path,
-        index_sha256: str,
+        index_sha256: str | None,
+        index_binding: Mapping[str, Any] | None = None,
         data_profile: DataProfile,
         model_profile: Mapping[str, Any],
         split: str,
@@ -377,7 +378,14 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             appearance_cache_grid=appearance_cache_grid,
         )
         self.root = Path(cache_root).resolve(strict=True)
-        entries = load_cache_index(index_path, expected_sha256=index_sha256)
+        self._admitted_index = index_binding is not None
+        if self._admitted_index:
+            from .admitted_window_index import load_admitted_window_index
+            if index_sha256 is not None:
+                raise CacheDataError("admitted index cannot also claim a legacy SHA")
+            entries = load_admitted_window_index(index_path, expected_binding=index_binding)
+        else:
+            entries = load_cache_index(index_path, expected_sha256=index_sha256)
         if split not in {"train", "val", "test"}:
             raise CacheDataError(f"invalid split {split!r}")
         typed_model = model_config_from_profile(model_profile)
@@ -428,7 +436,9 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
             max_action_dim=int(model["max_action_dim"]),
             max_state_dim=int(model["max_state_dim"]),
         )
-        if grouped_normalizer.window_index_sha256 != index_sha256:
+        if (self._admitted_index and getattr(grouped_normalizer, "window_index_binding", None) != index_binding) or (
+            not self._admitted_index and grouped_normalizer.window_index_sha256 != index_sha256
+        ):
             raise CacheDataError(
                 "grouped normalization belongs to a different window index"
             )
@@ -482,11 +492,13 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
                 raise CacheDataError(
                     f"sample {entry.sample_id} embodiment differs from its source profile"
                 )
-        self.shards = _ShardStore(
-            self.root, _sha_map(self.entries), verify_on_open=verify_shard_sha_on_open
-        )
-        self.jpeg = _JpegStore(self.shards, jpeg_reader_cache_size)
-        self.robot = _RobotStore(self.shards, robot_reader_cache_size)
+        self.shards = self.jpeg = self.robot = None
+        if not self._admitted_index:
+            self.shards = _ShardStore(
+                self.root, _sha_map(self.entries), verify_on_open=verify_shard_sha_on_open
+            )
+            self.jpeg = _JpegStore(self.shards, jpeg_reader_cache_size)
+            self.robot = _RobotStore(self.shards, robot_reader_cache_size)
         self.grouped_normalizer = grouped_normalizer
 
     def __len__(self) -> int:
@@ -503,6 +515,12 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
     @staticmethod
     def _validate_sample(result: Mapping[str, Any], entry: CacheIndexEntry) -> None:
         for name, value in result.items():
+            if name == "foundation_action_supervision":
+                if value not in ("fine_command", "coarse_effect"):
+                    raise CacheDataError(
+                        f"sample {entry.sample_id} has invalid action supervision"
+                    )
+                continue
             if name == "task_text":
                 if not isinstance(value, str) or not value.strip():
                     raise CacheDataError(
@@ -531,6 +549,8 @@ class UnifiedCacheDataset(Dataset[dict[str, torch.Tensor]]):
     def _sample_from_entry(
         self, entry: CacheIndexEntry, *, sample_index: int
     ) -> dict[str, torch.Tensor]:
+        if self._admitted_index:
+            raise CacheDataError("admitted window metadata requires the direct-raw reader")
         context_rows = entry.context_feature_rows
         future_rows = entry.future_feature_rows
         all_rows = context_rows + future_rows

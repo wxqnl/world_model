@@ -39,6 +39,7 @@ from wm3d.models.native_world_model import native_config_from_mapping
 
 
 GROUPED_NORMALIZATION_SCHEMA = "wm3d_v8_grouped_normalization_v2"
+ADMITTED_NORMALIZATION_SCHEMA = "wm3d_admitted_grouped_normalization_v1"
 GROUPED_NORMALIZATION_ESTIMATOR = "masked_population_mean_std_float64_v1"
 GROUPED_NORMALIZATION_SPLIT = "train_only"
 ACTION_FINE_LANE = "fine_command"
@@ -173,6 +174,189 @@ def _source_by_name(profile: DataProfile) -> dict[str, Any]:
 def _scale_floor(statistic: _RunningMoments, minimum_scale: float) -> float:
     reference = max(1.0, abs(statistic.minimum), abs(statistic.maximum))
     return max(statistic.std, minimum_scale * reference)
+
+
+def accumulate_window_moments(*, assembled, prepared, embodiment, source_name, moments, lane_by_group):
+    """Shared physical-lane normalization, identical for cache and direct raw."""
+    for slot, group in enumerate(embodiment.groups):
+        if int(assembled["action_group_ids"][slot]) != group.group_id or not bool(
+            assembled["action_group_mask"][slot]
+        ):
+            raise GroupedNormalizationError("assembled robot group layout drifted")
+        action_ids = assembled["action_semantic_ids"][slot, : group.action_dim]
+        expected_action_ids = torch.tensor(
+            [ACTION_SEMANTIC_IDS[item] for item in group.action_semantics],
+            dtype=torch.int64,
+        )
+        if not torch.equal(action_ids, expected_action_ids):
+            raise GroupedNormalizationError("robot shard action semantics drifted")
+        prepared_series = prepared.action_series[slot]
+        lane = prepared_series.supervision
+        group_key = (source_name, group.group_id)
+        previous = lane_by_group.setdefault(group_key, lane)
+        if previous != lane:
+            raise GroupedNormalizationError(
+                "one source/group changes fine/coarse supervision across train episodes"
+            )
+        fine_mask_tensors = (
+            assembled["history_fine_action_mask"][:, slot, :, : group.action_dim],
+            assembled["future_factual_fine_action_mask"][:, slot, :, : group.action_dim],
+            assembled["target_fine_action_mask"][slot, :, : group.action_dim],
+        )
+        coarse_mask_tensors = (
+            assembled["history_coarse_action_mask"][:, slot, : group.action_dim],
+            assembled["future_factual_coarse_action_mask"][
+                :, slot, : group.action_dim
+            ],
+            assembled["target_coarse_action_mask"][:, slot, : group.action_dim],
+        )
+        if lane == ACTION_FINE_LANE:
+            if any(bool(mask.any()) for mask in coarse_mask_tensors):
+                raise GroupedNormalizationError(
+                    "fine-command group unexpectedly contains coarse-effect masks"
+                )
+            action = torch.cat(
+                (
+                    assembled["history_fine_action_values"][
+                        :, slot, :, : group.action_dim
+                    ].reshape(-1, group.action_dim),
+                    assembled["future_factual_fine_action_values"][
+                        :, slot, :, : group.action_dim
+                    ].reshape(-1, group.action_dim),
+                    assembled["target_fine_action"][
+                        slot, :, : group.action_dim
+                    ].reshape(-1, group.action_dim),
+                )
+            ).numpy()
+            action_mask = torch.cat(
+                tuple(
+                    mask.reshape(-1, group.action_dim)
+                    for mask in fine_mask_tensors
+                )
+            ).numpy()
+        elif lane == ACTION_COARSE_LANE:
+            if any(bool(mask.any()) for mask in fine_mask_tensors):
+                raise GroupedNormalizationError(
+                    "coarse-effect group unexpectedly contains fine-command masks"
+                )
+            action = torch.cat(
+                (
+                    assembled["history_coarse_action_values"][
+                        :, slot, : group.action_dim
+                    ],
+                    assembled["target_coarse_action"][:, slot, : group.action_dim],
+                )
+            ).numpy()
+            # future_factual_coarse and target_coarse are the same K
+            # physical effects exposed for different consumers.  Validate
+            # both masks above, but count each effect exactly once.
+            action_mask = torch.cat(
+                (coarse_mask_tensors[0], coarse_mask_tensors[2])
+            ).numpy()
+        else:
+            raise GroupedNormalizationError(f"unsupported action lane {lane!r}")
+        for dimension in range(group.action_dim):
+            key = ("action", lane, source_name, group.group_id, dimension)
+            moments.setdefault(key, _RunningMoments()).update(
+                action[action_mask[:, dimension], dimension]
+            )
+
+        if group.state_dim:
+            state_ids = assembled["state_semantic_ids"][slot, : group.state_dim]
+            expected_state_ids = torch.tensor(
+                [STATE_SEMANTIC_IDS[item] for item in group.state_semantics],
+                dtype=torch.int64,
+            )
+            if not torch.equal(state_ids, expected_state_ids):
+                raise GroupedNormalizationError("robot shard state semantics drifted")
+            state = assembled["current_state_values"][slot : slot + 1, : group.state_dim].numpy()
+            state_mask = assembled["current_state_mask"][slot : slot + 1, : group.state_dim].numpy()
+            for dimension in range(group.state_dim):
+                key = (
+                    "state",
+                    STATE_CURRENT_LANE,
+                    source_name,
+                    group.group_id,
+                    dimension,
+                )
+                moments.setdefault(key, _RunningMoments()).update(
+                    state[state_mask[:, dimension], dimension]
+                )
+
+
+
+def normalization_rows(*, data_profile, moments, lane_by_group, minimum_scale=1.0e-6, source_names=None):
+    source_specs=_source_by_name(data_profile)
+    source_ids={name:index for index,name in enumerate(data_profile.source_order)}
+    rows: list[dict[str, Any]] = []
+    for source_name in (data_profile.source_order if source_names is None else source_names):
+        source = source_specs[source_name]
+        embodiment = data_profile.embodiments[source.embodiment]
+        for group in embodiment.groups:
+            for kind, lane, semantics in (
+                (
+                    "action",
+                    lane_by_group[(source_name, group.group_id)],
+                    group.action_semantics,
+                ),
+                ("state", STATE_CURRENT_LANE, group.state_semantics),
+            ):
+                semantic_ids = (
+                    ACTION_SEMANTIC_IDS if kind == "action" else STATE_SEMANTIC_IDS
+                )
+                identities = (
+                    _ACTION_IDENTITY_SEMANTICS
+                    if kind == "action"
+                    else _STATE_IDENTITY_SEMANTICS
+                )
+                for dimension, semantic in enumerate(semantics):
+                    key = (kind, lane, source_name, group.group_id, dimension)
+                    statistic = moments.get(key)
+                    if statistic is None or statistic.count <= 0:
+                        count = 0
+                        observed_mean = 0.0
+                        observed_std = 0.0
+                        observed_minimum = 0.0
+                        observed_maximum = 0.0
+                        offset = 0.0
+                        scale = 1.0
+                    else:
+                        count = statistic.count
+                        observed_mean = statistic.mean
+                        observed_std = statistic.std
+                        observed_minimum = statistic.minimum
+                        observed_maximum = statistic.maximum
+                        offset = 0.0 if semantic in identities else statistic.mean
+                        scale = (
+                            1.0
+                            if semantic in identities
+                            else _scale_floor(statistic, minimum_scale)
+                        )
+                    identity = semantic in identities
+                    rows.append(
+                        {
+                            "kind": kind,
+                            "source": source_name,
+                            "source_id": source_ids[source_name],
+                            "embodiment": embodiment.name,
+                            "embodiment_id": embodiment.embodiment_id,
+                            "group": group.name,
+                            "group_id": group.group_id,
+                            "dimension": dimension,
+                            "semantic": semantic,
+                            "semantic_id": semantic_ids[semantic],
+                            "lane": lane,
+                            "transform": "identity" if identity else "zscore",
+                            "count": count,
+                            "observed_mean": observed_mean,
+                            "observed_std": observed_std,
+                            "observed_min": observed_minimum,
+                            "observed_max": observed_maximum,
+                            "offset": offset,
+                            "scale": scale,
+                        }
+                    )
+    return rows
 
 
 def build_grouped_normalization_artifact(
@@ -310,110 +494,8 @@ def build_grouped_normalization_artifact(
             policy_target_horizon_s=float(sampling["policy_target_horizon_seconds"]),
         )
         counts[entry.source] += 1
-        for slot, group in enumerate(embodiment.groups):
-            if int(assembled["action_group_ids"][slot]) != group.group_id or not bool(
-                assembled["action_group_mask"][slot]
-            ):
-                raise GroupedNormalizationError("assembled robot group layout drifted")
-            action_ids = assembled["action_semantic_ids"][slot, : group.action_dim]
-            expected_action_ids = torch.tensor(
-                [ACTION_SEMANTIC_IDS[item] for item in group.action_semantics],
-                dtype=torch.int64,
-            )
-            if not torch.equal(action_ids, expected_action_ids):
-                raise GroupedNormalizationError("robot shard action semantics drifted")
-            prepared_series = prepared.action_series[slot]
-            lane = prepared_series.supervision
-            group_key = (entry.source, group.group_id)
-            previous = lane_by_group.setdefault(group_key, lane)
-            if previous != lane:
-                raise GroupedNormalizationError(
-                    "one source/group changes fine/coarse supervision across train episodes"
-                )
-            fine_mask_tensors = (
-                assembled["history_fine_action_mask"][:, slot, :, : group.action_dim],
-                assembled["future_factual_fine_action_mask"][:, slot, :, : group.action_dim],
-                assembled["target_fine_action_mask"][slot, :, : group.action_dim],
-            )
-            coarse_mask_tensors = (
-                assembled["history_coarse_action_mask"][:, slot, : group.action_dim],
-                assembled["future_factual_coarse_action_mask"][
-                    :, slot, : group.action_dim
-                ],
-                assembled["target_coarse_action_mask"][:, slot, : group.action_dim],
-            )
-            if lane == ACTION_FINE_LANE:
-                if any(bool(mask.any()) for mask in coarse_mask_tensors):
-                    raise GroupedNormalizationError(
-                        "fine-command group unexpectedly contains coarse-effect masks"
-                    )
-                action = torch.cat(
-                    (
-                        assembled["history_fine_action_values"][
-                            :, slot, :, : group.action_dim
-                        ].reshape(-1, group.action_dim),
-                        assembled["future_factual_fine_action_values"][
-                            :, slot, :, : group.action_dim
-                        ].reshape(-1, group.action_dim),
-                        assembled["target_fine_action"][
-                            slot, :, : group.action_dim
-                        ].reshape(-1, group.action_dim),
-                    )
-                ).numpy()
-                action_mask = torch.cat(
-                    tuple(
-                        mask.reshape(-1, group.action_dim)
-                        for mask in fine_mask_tensors
-                    )
-                ).numpy()
-            elif lane == ACTION_COARSE_LANE:
-                if any(bool(mask.any()) for mask in fine_mask_tensors):
-                    raise GroupedNormalizationError(
-                        "coarse-effect group unexpectedly contains fine-command masks"
-                    )
-                action = torch.cat(
-                    (
-                        assembled["history_coarse_action_values"][
-                            :, slot, : group.action_dim
-                        ],
-                        assembled["target_coarse_action"][:, slot, : group.action_dim],
-                    )
-                ).numpy()
-                # future_factual_coarse and target_coarse are the same K
-                # physical effects exposed for different consumers.  Validate
-                # both masks above, but count each effect exactly once.
-                action_mask = torch.cat(
-                    (coarse_mask_tensors[0], coarse_mask_tensors[2])
-                ).numpy()
-            else:
-                raise GroupedNormalizationError(f"unsupported action lane {lane!r}")
-            for dimension in range(group.action_dim):
-                key = ("action", lane, entry.source, group.group_id, dimension)
-                moments.setdefault(key, _RunningMoments()).update(
-                    action[action_mask[:, dimension], dimension]
-                )
-
-            if group.state_dim:
-                state_ids = assembled["state_semantic_ids"][slot, : group.state_dim]
-                expected_state_ids = torch.tensor(
-                    [STATE_SEMANTIC_IDS[item] for item in group.state_semantics],
-                    dtype=torch.int64,
-                )
-                if not torch.equal(state_ids, expected_state_ids):
-                    raise GroupedNormalizationError("robot shard state semantics drifted")
-                state = assembled["current_state_values"][slot : slot + 1, : group.state_dim].numpy()
-                state_mask = assembled["current_state_mask"][slot : slot + 1, : group.state_dim].numpy()
-                for dimension in range(group.state_dim):
-                    key = (
-                        "state",
-                        STATE_CURRENT_LANE,
-                        entry.source,
-                        group.group_id,
-                        dimension,
-                    )
-                    moments.setdefault(key, _RunningMoments()).update(
-                        state[state_mask[:, dimension], dimension]
-                    )
+        accumulate_window_moments(assembled=assembled,prepared=prepared,
+            embodiment=embodiment,source_name=entry.source,moments=moments,lane_by_group=lane_by_group)
 
     missing_sources = sorted(name for name, count in counts.items() if count <= 0)
     if missing_sources:
@@ -421,74 +503,8 @@ def build_grouped_normalization_artifact(
             f"normalization has no train windows for sources: {missing_sources}"
         )
 
-    rows: list[dict[str, Any]] = []
-    for source_name in data_profile.source_order:
-        source = source_specs[source_name]
-        embodiment = data_profile.embodiments[source.embodiment]
-        for group in embodiment.groups:
-            for kind, lane, semantics in (
-                (
-                    "action",
-                    lane_by_group[(source_name, group.group_id)],
-                    group.action_semantics,
-                ),
-                ("state", STATE_CURRENT_LANE, group.state_semantics),
-            ):
-                semantic_ids = (
-                    ACTION_SEMANTIC_IDS if kind == "action" else STATE_SEMANTIC_IDS
-                )
-                identities = (
-                    _ACTION_IDENTITY_SEMANTICS
-                    if kind == "action"
-                    else _STATE_IDENTITY_SEMANTICS
-                )
-                for dimension, semantic in enumerate(semantics):
-                    key = (kind, lane, source_name, group.group_id, dimension)
-                    statistic = moments.get(key)
-                    if statistic is None or statistic.count <= 0:
-                        count = 0
-                        observed_mean = 0.0
-                        observed_std = 0.0
-                        observed_minimum = 0.0
-                        observed_maximum = 0.0
-                        offset = 0.0
-                        scale = 1.0
-                    else:
-                        count = statistic.count
-                        observed_mean = statistic.mean
-                        observed_std = statistic.std
-                        observed_minimum = statistic.minimum
-                        observed_maximum = statistic.maximum
-                        offset = 0.0 if semantic in identities else statistic.mean
-                        scale = (
-                            1.0
-                            if semantic in identities
-                            else _scale_floor(statistic, minimum_scale)
-                        )
-                    identity = semantic in identities
-                    rows.append(
-                        {
-                            "kind": kind,
-                            "source": source_name,
-                            "source_id": source_ids[source_name],
-                            "embodiment": embodiment.name,
-                            "embodiment_id": embodiment.embodiment_id,
-                            "group": group.name,
-                            "group_id": group.group_id,
-                            "dimension": dimension,
-                            "semantic": semantic,
-                            "semantic_id": semantic_ids[semantic],
-                            "lane": lane,
-                            "transform": "identity" if identity else "zscore",
-                            "count": count,
-                            "observed_mean": observed_mean,
-                            "observed_std": observed_std,
-                            "observed_min": observed_minimum,
-                            "observed_max": observed_maximum,
-                            "offset": offset,
-                            "scale": scale,
-                        }
-                    )
+    rows=normalization_rows(data_profile=data_profile,moments=moments,
+        lane_by_group=lane_by_group,minimum_scale=minimum_scale)
     return {
         "schema": GROUPED_NORMALIZATION_SCHEMA,
         "estimator": GROUPED_NORMALIZATION_ESTIMATOR,
@@ -509,32 +525,57 @@ class GroupedRobotNormalizer:
     """Strict runtime lookup for one immutable normalization artifact."""
 
     def __init__(self, artifact: Mapping[str, Any], *, data_profile: DataProfile):
-        if set(artifact) != _ARTIFACT_FIELDS:
-            raise GroupedNormalizationError("normalization artifact fields mismatch")
-        if artifact.get("schema") != GROUPED_NORMALIZATION_SCHEMA:
-            raise GroupedNormalizationError("normalization artifact schema mismatch")
+        admitted = artifact.get("schema") == ADMITTED_NORMALIZATION_SCHEMA
+        if admitted:
+            from .file_binding import require_stat_binding, verify_stat_asset
+            fields = (_ARTIFACT_FIELDS - {"data_profile_sha256", "model_profile_sha256",
+                      "window_index_sha256", "rows_sha256"}) | {
+                      "admission_id", "data_profile_binding", "model_profile",
+                      "window_index_binding", "inherited_normalization"}
+            if set(artifact) != fields or artifact["admission_id"] != data_profile.admission_id:
+                raise GroupedNormalizationError("admitted normalization fields/identity mismatch")
+            if artifact["data_profile_binding"] != data_profile.file_binding:
+                raise GroupedNormalizationError("admitted normalization profile mismatch")
+            binding = require_stat_binding(artifact["window_index_binding"])
+            if binding["admission_id"] != data_profile.admission_id:
+                raise GroupedNormalizationError("normalization window admission differs")
+            inherited = artifact["inherited_normalization"]
+            if not isinstance(inherited, dict) or set(inherited) != {"path", "binding", "sources"}:
+                raise GroupedNormalizationError("normalization inheritance is incomplete")
+            original = Path(inherited["path"])
+            verify_stat_asset(original.parent, original.name, inherited["binding"])
+            old = json.loads(original.read_text())
+            verify_stat_asset(original.parent, original.name, inherited["binding"])
+            legacy_names = [s.name for s in data_profile.sources if s.origin == "inherited_legacy"]
+            if inherited["sources"] != legacy_names:
+                raise GroupedNormalizationError("inherited normalization source membership changed")
+            old_rows = [r for r in old["rows"] if r["source"] in legacy_names]
+            new_old_rows = [r for r in artifact["rows"] if r["source"] in legacy_names]
+            if new_old_rows != old_rows or not old_rows:
+                raise GroupedNormalizationError("original normalization rows changed")
+        else:
+            if set(artifact) != _ARTIFACT_FIELDS:
+                raise GroupedNormalizationError("normalization artifact fields mismatch")
+            if artifact.get("schema") != GROUPED_NORMALIZATION_SCHEMA:
+                raise GroupedNormalizationError("normalization artifact schema mismatch")
+            if artifact.get("data_profile_sha256") != data_profile.profile_sha256:
+                raise GroupedNormalizationError("normalization/data profile SHA mismatch")
+            for field in ("data_profile_sha256", "model_profile_sha256",
+                          "window_index_sha256", "rows_sha256"):
+                if SHA256_RE.fullmatch(str(artifact.get(field, ""))) is None:
+                    raise GroupedNormalizationError(f"normalization {field} is invalid")
+            if canonical_sha256(artifact.get("rows")) != artifact.get("rows_sha256"):
+                raise GroupedNormalizationError("normalization row index SHA mismatch")
         if artifact.get("estimator") != GROUPED_NORMALIZATION_ESTIMATOR:
             raise GroupedNormalizationError("normalization estimator mismatch")
         if artifact.get("split") != GROUPED_NORMALIZATION_SPLIT:
             raise GroupedNormalizationError("normalization must be train-only")
-        if artifact.get("data_profile_sha256") != data_profile.profile_sha256:
-            raise GroupedNormalizationError("normalization/data profile SHA mismatch")
         minimum_scale = float(artifact.get("minimum_scale", 0.0))
         if not np.isfinite(minimum_scale) or minimum_scale <= 0:
             raise GroupedNormalizationError("normalization minimum scale is invalid")
-        for field in (
-            "data_profile_sha256",
-            "model_profile_sha256",
-            "window_index_sha256",
-            "rows_sha256",
-        ):
-            if SHA256_RE.fullmatch(str(artifact.get(field, ""))) is None:
-                raise GroupedNormalizationError(f"normalization {field} is invalid")
         rows = artifact.get("rows")
-        if not isinstance(rows, list) or canonical_sha256(rows) != artifact.get(
-            "rows_sha256"
-        ):
-            raise GroupedNormalizationError("normalization row index SHA mismatch")
+        if not isinstance(rows, list):
+            raise GroupedNormalizationError("normalization rows must be a list")
         expected_counts = {name: 0 for name in data_profile.source_order}
         counts = artifact.get("train_window_count_by_source")
         if not isinstance(counts, dict) or set(counts) != set(expected_counts):
@@ -543,8 +584,9 @@ class GroupedRobotNormalizer:
             raise GroupedNormalizationError("normalization source has no train episodes")
 
         self.profile = data_profile
-        self.window_index_sha256 = str(artifact["window_index_sha256"])
-        self.model_profile_sha256 = str(artifact["model_profile_sha256"])
+        self.window_index_sha256 = artifact.get("window_index_sha256")
+        self.model_profile_sha256 = artifact.get("model_profile_sha256")
+        self.window_index_binding = artifact.get("window_index_binding")
         self._rows: dict[tuple[str, str, str, int, int], Mapping[str, Any]] = {}
         self._lane_by_group: dict[tuple[str, int], str] = {}
         source_ids = {name: index for index, name in enumerate(data_profile.source_order)}
@@ -709,6 +751,25 @@ class GroupedRobotNormalizer:
             raise GroupedNormalizationError("normalization expected model profile SHA mismatch")
         if artifact.get("window_index_sha256") != expected_window_index_sha256:
             raise GroupedNormalizationError("normalization expected window index SHA mismatch")
+        return cls(artifact, data_profile=data_profile)
+
+    @classmethod
+    def load_admitted(
+        cls, path: Path, *, expected_binding, expected_window_index_binding,
+        model_profile: Mapping[str, Any], data_profile: DataProfile,
+    ) -> "GroupedRobotNormalizer":
+        from .file_binding import require_stat_binding, verify_stat_asset
+        binding = require_stat_binding(expected_binding)
+        if binding["admission_id"] != data_profile.admission_id:
+            raise GroupedNormalizationError("normalization file admission differs")
+        path = Path(path).absolute()
+        verify_stat_asset(path.parent, path.name, binding)
+        artifact = json.loads(path.read_text())
+        verify_stat_asset(path.parent, path.name, binding)
+        if (artifact.get("schema") != ADMITTED_NORMALIZATION_SCHEMA
+                or artifact.get("window_index_binding") != expected_window_index_binding
+                or artifact.get("model_profile") != model_profile):
+            raise GroupedNormalizationError("admitted normalization model/index mismatch")
         return cls(artifact, data_profile=data_profile)
 
     def tensors_for(

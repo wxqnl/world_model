@@ -15,7 +15,8 @@ from wm3d.data.cache_tasks import (
     CACHE_WINDOW_SEAL_SCHEMA,
 )
 from wm3d.data.manifest_contract import SHA256_RE, load_data_profile, sha256_file
-from wm3d.data.direct_raw import DIRECT_RAW_DATA_CLOSURE_SCHEMA
+from wm3d.data.direct_raw import DIRECT_RAW_DATA_CLOSURE_SCHEMA, ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
+from wm3d.data.admitted_closure import validate_admitted_closure, verify_file
 from wm3d.data.raw_asset_repairs import validate_raw_asset_repair_contract
 from wm3d.data.streaming_raw import (
     STREAMING_DATA_CLOSURE_SCHEMA,
@@ -244,6 +245,7 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "initial_raw_asset_repairs",
         "sampling_mode",
         "sampling_epochs",
+        "admitted_selection",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
@@ -254,10 +256,15 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         if (train.get("sampling_mode") != "source_count_epochs_v1"
                 or type(train.get("sampling_epochs")) is not int
                 or train["sampling_epochs"] <= 0
-                or train.get("train_episode_allowlist") is None):
+                or (train.get("train_episode_allowlist") is None and train.get("admitted_selection") is None)):
             raise RuntimeContractError("complete epochs require explicit mode, positive epochs and selection")
         if train.get("model_warmstart_checkpoint"):
             raise RuntimeContractError("complete-epoch initial run must not load old WM3D weights")
+    if train.get("admitted_selection") is not None:
+        from wm3d.data.file_binding import require_stat_binding
+        require_stat_binding(train["admitted_selection"])
+        if train.get("train_episode_allowlist") is not None:
+            raise RuntimeContractError("embedded selection must not reapply a legacy allowlist")
     if train.get("train_episode_allowlist") is not None:
         selection = Path(str(train["train_episode_allowlist"]))
         if not selection.is_absolute() or not selection.is_file():
@@ -1008,6 +1015,7 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     serialized = json.dumps(value, sort_keys=True)
     if _PLACEHOLDER.search(serialized):
         raise RuntimeContractError("materialized runtime contains a placeholder")
+    admitted = value["data_closure"].get("schema") == ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
     run = value["run"]
     required_run = {
         "name",
@@ -1015,7 +1023,7 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
         "output_root",
         "code_commit",
         "environment_lock_path",
-        "environment_lock_sha256",
+        "environment_lock_binding" if admitted else "environment_lock_sha256",
     }
     if not isinstance(run, dict) or set(run) != required_run:
         raise RuntimeContractError("runtime run fields mismatch")
@@ -1026,7 +1034,9 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     environment = Path(str(run["environment_lock_path"]))
     if not environment.is_absolute() or environment.is_symlink() or not environment.is_file():
         raise RuntimeContractError("environment lock must be an absolute regular file")
-    if sha256_file(environment) != _require_sha(
+    if admitted:
+        verify_file(environment,run["environment_lock_binding"],value["data_closure"]["admission_id"])
+    elif sha256_file(environment) != _require_sha(
         run["environment_lock_sha256"], "environment_lock_sha256"
     ):
         raise RuntimeContractError("environment lock SHA mismatch")
@@ -1054,7 +1064,24 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     else:
         objective_config_from_mapping(objective["objective"])
     closure = value["data_closure"]
-    if closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
+    if admitted:
+        data_profile,metadata_seal=validate_admitted_closure(closure,model)
+        validate_model_data_compatibility(model,data_profile,
+            appearance_cache_grid=int(closure["appearance_token_grid"]))
+        train=runtime["train"]
+        if (train.get("admitted_selection")!=closure["cache_index_binding"]
+                or train.get("sampling_mode")!="source_count_epochs_v1"
+                or train.get("initial_raw_asset_repairs")!=closure["initial_raw_asset_repairs"]
+                or train.get("model_warmstart_checkpoint") is not None):
+            raise RuntimeContractError("fresh admitted train selection/repair/initialization differs")
+        counts=metadata_seal["window_count_by_split_source"]["train"]
+        batch=train["global_batch_size"]
+        expected=train["sampling_epochs"]*sum((n+batch-1)//batch for n in counts.values())
+        if train["total_steps"]!=expected:
+            raise RuntimeContractError("two-epoch step budget differs from admitted real windows")
+    elif runtime["train"].get("admitted_selection") is not None:
+        raise RuntimeContractError("admitted selection requires admitted closure")
+    elif closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
         try:
             receipt = validate_formal_cache_closure(closure)
         except FormalCacheError as exc:
@@ -1158,4 +1185,7 @@ def load_materialized_runtime(path: Path) -> tuple[dict[str, Any], str]:
     path = Path(path).resolve(strict=True)
     value = load_yaml(path)
     validate_materialized_runtime(value)
+    # Config digest is over the small parsed runtime, never over admitted payload/index files.
+    if value["data_closure"].get("schema")==ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+        return value, canonical_sha256(value)
     return value, sha256_file(path)

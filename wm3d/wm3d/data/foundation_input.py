@@ -87,6 +87,9 @@ class FoundationContextStore:
         index_path = directory / "index.json"
         tensor_path = directory / "context.safetensors"
         payload = json.loads(index_path.read_text(encoding="utf-8"))
+        if payload.get("schema") == "wm3d_admitted_foundation_context_union_v1":
+            from .admitted_context import load_context_union
+            return load_context_union(directory, payload, cls)
         if payload.get("schema") != FOUNDATION_CONTEXT_STORE_SCHEMA:
             raise FoundationInputError("foundation context store schema mismatch")
         if set(payload) != {"schema", "tasks"}:

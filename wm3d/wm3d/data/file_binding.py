@@ -8,6 +8,8 @@ legacy SHA contracts are not converted or re-labelled.
 """
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -19,23 +21,41 @@ class FileBindingError(ValueError):
     pass
 
 
-def regular_asset(root: Path, relative: str) -> Path:
+def _regular_asset_stat(root: Path, relative: str):
     root = Path(root)
     rel = PurePosixPath(relative)
-    if (not root.is_absolute() or root.is_symlink() or not root.is_dir()
-            or not relative or rel.is_absolute() or ".." in rel.parts
-            or rel.as_posix() != relative):
+    if (not root.is_absolute() or not relative or not rel.parts or rel.is_absolute()
+            or ".." in rel.parts or rel.as_posix() != relative):
         raise FileBindingError("asset requires a real absolute root and canonical relative path")
-    root = root.resolve(strict=True)
-    candidate = root
-    for part in rel.parts:
-        candidate = candidate / part
-        if candidate.is_symlink():
-            raise FileBindingError(f"asset path contains a symlink: {candidate}")
-    if not candidate.is_file():
-        raise FileBindingError(f"asset is not a regular file: {candidate}")
-    candidate.resolve(strict=True).relative_to(root)
-    return candidate
+    # Walk relative components by descriptors: O_NOFOLLOW enforces the same
+    # no-symlink contract without repeatedly resolving every deep NFS ancestor.
+    descriptors=[]
+    try:
+        fd=os.open(root,os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptors.append(fd)
+        proc=Path("/proc/self/fd")/str(fd)
+        real_root=Path(os.readlink(proc)) if proc.exists() else root.resolve(strict=True)
+        for i,part in enumerate(rel.parts):
+            flags=getattr(os,"O_PATH",os.O_RDONLY) | os.O_NOFOLLOW
+            if i<len(rel.parts)-1:flags|=os.O_DIRECTORY
+            fd=os.open(part,flags,dir_fd=fd)
+            descriptors.append(fd)
+            st=os.fstat(fd)
+            if stat.S_ISLNK(st.st_mode):
+                raise FileBindingError("asset path contains a symlink")
+        if not stat.S_ISREG(st.st_mode):
+            raise FileBindingError("asset is not a regular file")
+        return real_root/relative,st
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise FileBindingError("asset path is unavailable or contains a symlink") from exc
+    finally:
+        for fd in reversed(descriptors):os.close(fd)
+
+
+def regular_asset(root: Path, relative: str) -> Path:
+    return _regular_asset_stat(root,relative)[0]
 
 
 def require_stat_binding(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -60,8 +80,7 @@ def bind_stat_asset(root: Path, relative: str, *, admission_id: str) -> dict[str
     Device is intentionally namespace-local and excluded from the portable
     contract; inode, file length and server mtime survive the NFS export.
     """
-    path = regular_asset(root, relative)
-    st = path.stat()
+    path, st = _regular_asset_stat(root, relative)
     return require_stat_binding(dict(kind=STAT_BINDING_KIND,
         admission_id=admission_id, size_bytes=st.st_size,
         mtime_ns=st.st_mtime_ns, inode=st.st_ino))
@@ -69,8 +88,9 @@ def bind_stat_asset(root: Path, relative: str, *, admission_id: str) -> dict[str
 
 def verify_stat_asset(root: Path, relative: str, binding: Mapping[str, Any]) -> Path:
     expected = require_stat_binding(binding)
-    path = regular_asset(root, relative)
-    observed = bind_stat_asset(root, relative, admission_id=expected["admission_id"])
+    path, st = _regular_asset_stat(root, relative)
+    observed = dict(kind=STAT_BINDING_KIND, admission_id=expected["admission_id"],
+                    size_bytes=st.st_size, mtime_ns=st.st_mtime_ns, inode=st.st_ino)
     if observed != expected:
         raise FileBindingError(f"admitted asset identity changed: {relative}")
     return path

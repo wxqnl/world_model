@@ -22,12 +22,14 @@ from .grouped_robot import (
 )
 from .manifest_contract import sha256_file
 from .file_binding import require_stat_binding, verify_stat_asset
+from .lossless_action_layout import validate_action_layout, check_action_constants, ActionLayoutError
 
 
 ADAPTER_SCHEMA = "wm3d_v8_source_adapter_v3"
 ADAPTER_COLOR_SCHEMA = "wm3d_source_adapter_v4"
 ADAPTER_CANONICAL_SCHEMA = "wm3d_source_adapter_v5"
 ADAPTER_ALIGNMENT_SCHEMA = "wm3d_source_adapter_v6"
+ADAPTER_LOSSLESS_SCHEMA = "wm3d_source_adapter_v7"
 
 CANONICAL_ACTION_TRANSFORMS = frozenset(
     {
@@ -124,6 +126,7 @@ class AdapterContract:
     views: tuple[ViewMapping, ...]
     groups: tuple[GroupMapping, ...]
     file_binding: Mapping[str, Any] | None = None
+    raw_action_layout: Mapping[str, Any] | None = None
 
     @property
     def required_array_keys(self) -> tuple[str, ...]:
@@ -190,6 +193,8 @@ def load_adapter_contract(
         "views",
         "groups",
     }
+    if isinstance(value, dict) and value.get("schema") == ADAPTER_LOSSLESS_SCHEMA:
+        required.add("raw_action_layout")
     if not isinstance(value, dict) or set(value) != required:
         raise AdapterContractError("adapter contract root fields mismatch")
     schema = str(value["schema"])
@@ -198,6 +203,7 @@ def load_adapter_contract(
         ADAPTER_COLOR_SCHEMA,
         ADAPTER_CANONICAL_SCHEMA,
         ADAPTER_ALIGNMENT_SCHEMA,
+        ADAPTER_LOSSLESS_SCHEMA,
     }:
         raise AdapterContractError(f"unsupported adapter schema {schema!r}")
     raw_format = str(value["raw_format"])
@@ -248,7 +254,7 @@ def load_adapter_contract(
             "state_time_key",
             "world_interval_index_key",
         }
-        if schema in {ADAPTER_CANONICAL_SCHEMA, ADAPTER_ALIGNMENT_SCHEMA}:
+        if schema in {ADAPTER_CANONICAL_SCHEMA, ADAPTER_ALIGNMENT_SCHEMA, ADAPTER_LOSSLESS_SCHEMA}:
             fields.update(
                 {
                     "action_transform",
@@ -257,7 +263,7 @@ def load_adapter_contract(
                     "state_value_mask",
                 }
             )
-        if schema == ADAPTER_ALIGNMENT_SCHEMA:
+        if schema in {ADAPTER_ALIGNMENT_SCHEMA, ADAPTER_LOSSLESS_SCHEMA}:
             fields.add("action_alignment")
         if not isinstance(raw, dict) or set(raw) != fields:
             raise AdapterContractError("adapter group fields mismatch")
@@ -370,6 +376,12 @@ def load_adapter_contract(
                 action_alignment=alignment,
             )
         )
+    layout = None
+    if schema == ADAPTER_LOSSLESS_SCHEMA:
+        try:
+            layout = validate_action_layout(value["raw_action_layout"], groups)
+        except ActionLayoutError as exc:
+            raise AdapterContractError(str(exc)) from exc
     if binding is not None:
         verify_stat_asset(path.parent, path.name, binding)
     return AdapterContract(
@@ -381,6 +393,7 @@ def load_adapter_contract(
         tuple(views),
         tuple(groups),
         file_binding=binding,
+        raw_action_layout=layout,
     )
 
 
@@ -799,6 +812,12 @@ def adapt_action_series(
     embodiment: EmbodimentSpec,
 ) -> list[RawActionSeries]:
     """Decode complete source-native action series without windowing them."""
+
+    if contract.raw_action_layout is not None:
+        try:
+            check_action_constants(accessor, contract.raw_action_layout)
+        except ActionLayoutError as exc:
+            raise AdapterContractError(str(exc)) from exc
 
     specs = {group.name: group for group in embodiment.groups}
     if set(specs) != {group.group for group in contract.groups}:

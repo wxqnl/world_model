@@ -284,6 +284,79 @@ def pack_grouped_history_action(
     }
 
 
+def _supervision_kind(batch: Mapping[str, Any], batch_size: int) -> str:
+    value = batch.get("foundation_action_supervision", "fine_command")
+    labels = [value] * batch_size if isinstance(value, str) else list(value)
+    if len(labels) != batch_size or len(set(labels)) != 1:
+        raise FoundationBridgeError("one source batch must use one action supervision kind")
+    kind = labels[0]
+    if kind not in {"fine_command", "coarse_effect"}:
+        raise FoundationBridgeError("unsupported foundation action supervision")
+    return kind
+
+
+def pack_grouped_effect_sequence(
+    batch: Mapping[str, Any], config: FoundationBridgeConfig, *, history: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Pack admitted world-interval outcomes, never high-rate commands.
+
+    The existing grouped composer has already combined native observation
+    intervals with each physical field's operator (absolute next states use
+    'last'). One target remains at each observed interval END. No interpolation
+    or repetition invents an unrecorded command between observations.
+    """
+    prefix = "history" if history else "future_factual"
+    values = _require_tensor(batch, prefix + "_coarse_action_values", ndim=4)
+    mask = _require_tensor(batch, prefix + "_coarse_action_mask", ndim=4)
+    fine_mask = _require_tensor(batch, prefix + "_fine_action_mask", ndim=5)
+    if bool(fine_mask.any()):
+        raise FoundationBridgeError("coarse effects must not replace any fine commands")
+    boundaries = _require_tensor(
+        batch, ("history" if history else "future") + "_world_boundaries_dt", ndim=2
+    )
+    b, length, groups, width = values.shape
+    expected_length = config.context_frames if history else config.future_frames
+    if (length, groups, width) != (
+        expected_length, config.max_action_groups, config.max_action_dim
+    ):
+        raise FoundationBridgeError("coarse effect shape differs from the foundation contract")
+    if mask.dtype != torch.bool or mask.shape != values.shape:
+        raise FoundationBridgeError("coarse effect masks must be boolean and match values")
+    if boundaries.shape != (b, length + 1) or not bool(torch.isfinite(boundaries).all()):
+        raise FoundationBridgeError("coarse effect boundary shape/values are invalid")
+    if not bool(torch.diff(boundaries, dim=1).gt(0).all()):
+        raise FoundationBridgeError("coarse effect boundaries must strictly increase")
+    anchor = boundaries[:, -1] if history else boundaries[:, 0]
+    if not bool(anchor.abs().le(1.0e-6).all()):
+        raise FoundationBridgeError("coarse effects must align with policy time zero")
+    values = values.reshape(b, length, groups * width)
+    element_mask = mask.reshape_as(values)
+    if not bool(torch.isfinite(values[element_mask]).all()):
+        raise FoundationBridgeError("coarse effect contains a non-finite target")
+    time_valid = element_mask.any(dim=-1)
+    dim_valid = element_mask.any(dim=1)
+    if not bool(time_valid.any(dim=1).all()) or not torch.equal(
+        element_mask, time_valid[:, :, None] & dim_valid[:, None, :]
+    ):
+        raise FoundationBridgeError("coarse effect cannot use WSA time/dimension masks")
+    times = boundaries[:, 1:, None].expand_as(values)
+    if not bool((times[element_mask] <= 0 if history else times[element_mask] > 0).all()):
+        raise FoundationBridgeError("coarse effect endpoint crosses the observation boundary")
+    if history:
+        return {
+            "history_action": values.masked_fill(~element_mask, 0),
+            "history_action_element_mask": element_mask,
+            "history_action_time_s": times.masked_fill(~element_mask, 0),
+        }
+    return {
+        "action": values.masked_fill(~element_mask, 0),
+        "action_element_mask": element_mask,
+        "action_is_pad": ~time_valid,
+        "action_dim_is_pad": ~dim_valid,
+        "action_time_s": times.masked_fill(~element_mask, 0),
+    }
+
+
 def pack_grouped_current_state(
     batch: Mapping[str, Any], config: FoundationBridgeConfig
 ) -> dict[str, torch.Tensor]:
@@ -329,7 +402,17 @@ def build_foundation_sample(
     if int(torch.unique(source_id).numel()) != 1:
         raise FoundationBridgeError("one foundation micro-batch must use one source")
     video, image_is_pad = compose_three_view_video(images, view_mask, config)
-    action = pack_grouped_future_action(batch, config)
+    supervision = _supervision_kind(batch, int(images.shape[0]))
+    if supervision == "coarse_effect":
+        action = pack_grouped_effect_sequence(batch, config)
+        history_action = pack_grouped_effect_sequence(batch, config, history=True)
+    else:
+        for prefix in ("history", "future_factual"):
+            coarse = batch.get(prefix + "_coarse_action_mask")
+            if isinstance(coarse, torch.Tensor) and bool(coarse.any()):
+                raise FoundationBridgeError("coarse supervision requires explicit effect admission")
+        action = pack_grouped_future_action(batch, config)
+        history_action = pack_grouped_history_action(batch, config)
     state = pack_grouped_current_state(batch, config)
     future_index = config.context_frames + config.future_frames - 1
     result: dict[str, Any] = {
@@ -341,7 +424,8 @@ def build_foundation_sample(
         "source_id": source_id,
     }
     result.update(action)
-    result.update(pack_grouped_history_action(batch, config))
+    result.update(history_action)
+    result["action_supervision_kind"] = supervision
     result.update(state)
     for name in (
         "action_group_ids",
