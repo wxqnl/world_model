@@ -418,6 +418,7 @@ def build_foundation_sample(
     result: dict[str, Any] = {
         "video": video,
         "image_is_pad": image_is_pad,
+        "video_view_mask": view_mask[:, config.context_frames - 1 :].clone(),
         "future_3d_images": images[:, future_index].float().div(255.0),
         "future_3d_img_masks": view_mask[:, future_index],
         "task_text": _task_texts(batch.get("task_text"), int(images.shape[0])),

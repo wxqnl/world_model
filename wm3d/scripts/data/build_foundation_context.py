@@ -15,7 +15,8 @@ from safetensors.torch import load_file, save_file
 import torch
 import torch.distributed as dist
 
-from wm3d.data.foundation_input import FOUNDATION_CONTEXT_STORE_SCHEMA
+from wm3d.data.foundation_input import FOUNDATION_CONTEXT_STORE_SCHEMA_V2
+from wm3d.data.foundation_prompt import RAW_TASK, PROMPT_FORMATS, format_wan_prompt
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--context-length", type=int, default=128)
+    parser.add_argument("--prompt-format", choices=PROMPT_FORMATS, default=RAW_TASK,
+                        help="Explicit T5 input semantics; legacy callers remain raw-task.")
     return parser.parse_args()
 
 
@@ -142,7 +145,8 @@ def main() -> None:
         for start in range(0, len(selected_tasks), args.batch_size):
             selected = selected_tasks[start : start + args.batch_size]
             ids, mask = tokenizer(
-                selected, return_mask=True, add_special_tokens=True
+                [format_wan_prompt(task, args.prompt_format) for task in selected],
+                return_mask=True, add_special_tokens=True
             )
             mask = mask.to(args.device, non_blocking=True).bool()
             hidden = encoder(
@@ -176,10 +180,13 @@ def main() -> None:
             str(temporary / "context.safetensors"),
         )
         (temporary / "index.json").write_text(
-            json.dumps({"schema": FOUNDATION_CONTEXT_STORE_SCHEMA, "tasks": tasks},
+            json.dumps({"schema": FOUNDATION_CONTEXT_STORE_SCHEMA_V2,
+                        "prompt_format": args.prompt_format, "tasks": tasks},
                        ensure_ascii=False, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
         )
+        # Release mmap-backed rank tensors before unlinking their NFS files.
+        del parts
         shutil.rmtree(temporary / "parts")
         os.rename(temporary, output)
         print(json.dumps({"output": str(output), "tasks": len(tasks),

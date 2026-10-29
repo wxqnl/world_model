@@ -817,6 +817,7 @@ class DirectRawDataset(UnifiedCacheDataset):
         grouped_normalizer: GroupedRobotNormalizer,
         rank: int,
         train_episode_allowlist: Path | str | None = None,
+        small_data_selection: Mapping[str, Any] | None = None,
     ) -> None:
         admitted = closure.get("schema") == ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
         if closure.get("schema") not in {
@@ -872,6 +873,11 @@ class DirectRawDataset(UnifiedCacheDataset):
             expected_lane = self._foundation_action_supervision.get(source_name, "fine_command")
             if any(g.supervision != expected_lane for g in adapter.groups):
                 raise CacheDataError("source target-kind label differs from physical adapter")
+        if small_data_selection is not None:
+            if not admitted:
+                raise CacheDataError("small-data selection requires admitted reads")
+            from .small_episode_selection import select_entries
+            select_entries(self, small_data_selection, split)
         self._task_id_by_feature: dict[str, str] = {}
         if admitted:
             for entry in self.entries:

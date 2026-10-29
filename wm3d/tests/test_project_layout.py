@@ -46,7 +46,7 @@ def test_user_facing_entrypoints_are_unversioned() -> None:
 def test_5b_operator_handoff_is_discoverable() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     entry = (ROOT / "run_wm3d.sh").read_text(encoding="utf-8")
-    assert "docs/WM3D_5B_SCALING.md" in readme
+    assert "docs/archive/WM3D_5B_SCALING.md" in readme
     assert '5b) exec bash scripts/cluster/wm3d_5b.sh' in entry
     assert (ROOT / "configs/cluster/h200_5b.env.example").is_file()
     assert (ROOT / "configs/runtime/h200_64_fsdp2_canary1k.yaml").is_file()
@@ -58,7 +58,7 @@ def test_5b_operator_handoff_is_discoverable() -> None:
 def test_1b_streaming_handoff_is_discoverable() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     entry = (ROOT / "run_wm3d.sh").read_text(encoding="utf-8")
-    assert "docs/WM3D_1B_STREAMING.md" in readme
+    assert "docs/archive/WM3D_1B_STREAMING.md" in readme
     assert '1b) exec bash scripts/cluster/wm3d_1b.sh' in entry
     assert (ROOT / "scripts/cluster/wm3d_1b.sh").is_file()
     assert (ROOT / "configs/cluster/h100_1b_streaming.env.example").is_file()

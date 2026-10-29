@@ -20,9 +20,11 @@ from wm3d.data.foundation_bridge import (
     build_foundation_sample,
 )
 from wm3d.encoders.native_vggt import NativeVGGTEncoder
+from wm3d.data.foundation_prompt import RAW_TASK, PROMPT_FORMATS
 
 
 FOUNDATION_CONTEXT_STORE_SCHEMA = "wm3d_foundation_context_store_v1"
+FOUNDATION_CONTEXT_STORE_SCHEMA_V2 = "wm3d_foundation_context_store_v2"
 
 
 class FoundationInputError(ValueError):
@@ -60,7 +62,12 @@ class FoundationContextStore:
         tasks: Sequence[str],
         context: torch.Tensor,
         mask: torch.Tensor,
+        *,
+        prompt_format: str = RAW_TASK,
     ) -> None:
+        if prompt_format not in PROMPT_FORMATS:
+            raise FoundationInputError("unsupported Wan prompt format")
+        self.prompt_format = prompt_format
         normalized = tuple(str(item).strip() for item in tasks)
         if not normalized or any(not item for item in normalized):
             raise FoundationInputError("foundation context tasks must be non-empty")
@@ -90,14 +97,22 @@ class FoundationContextStore:
         if payload.get("schema") == "wm3d_admitted_foundation_context_union_v1":
             from .admitted_context import load_context_union
             return load_context_union(directory, payload, cls)
-        if payload.get("schema") != FOUNDATION_CONTEXT_STORE_SCHEMA:
+        schema = payload.get("schema")
+        if schema not in {FOUNDATION_CONTEXT_STORE_SCHEMA, FOUNDATION_CONTEXT_STORE_SCHEMA_V2}:
             raise FoundationInputError("foundation context store schema mismatch")
-        if set(payload) != {"schema", "tasks"}:
+        expected = {"schema", "tasks"}
+        if schema == FOUNDATION_CONTEXT_STORE_SCHEMA_V2:
+            expected.add("prompt_format")
+        if set(payload) != expected:
             raise FoundationInputError("foundation context store index fields changed")
+        prompt_format = payload.get("prompt_format", RAW_TASK)
+        if prompt_format not in PROMPT_FORMATS:
+            raise FoundationInputError("unsupported Wan prompt format")
         tensors = load_file(str(tensor_path), device="cpu")
         if set(tensors) != {"context", "mask"}:
             raise FoundationInputError("foundation context tensor fields changed")
-        return cls(payload["tasks"], tensors["context"], tensors["mask"].bool())
+        return cls(payload["tasks"], tensors["context"], tensors["mask"].bool(),
+                   prompt_format=prompt_format)
 
     def lookup(self, tasks: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
         rows: list[int] = []
@@ -384,6 +399,9 @@ def build_foundation_input_adapter(
     from wm3d.models.foundation_world_model import foundation_config_from_mapping
 
     model = foundation_config_from_mapping(runtime["model_profile"]["model"])
+    context_store = FoundationContextStore.from_directory(model.wan_context_store_path)
+    if context_store.prompt_format != model.wan_prompt_format:
+        raise FoundationInputError("Wan context prompt format differs from model contract")
     closure = runtime["data_closure"]
     encoder_contract = _strict_encoder(Path(str(closure["encoder_contract_path"])))
     encoder_config = replace(
@@ -393,6 +411,17 @@ def build_foundation_input_adapter(
         appearance_feature_layer=-1,
         target_rgb_size=model.video_height,
     )
+    teacher = runtime["runtime_profile"]["train"].get("frozen_geometry_teacher")
+    if teacher is None:
+        native_encoder = NativeVGGTEncoder(
+            encoder_config, device=str(device), local_files_only=True)
+    else:
+        from wm3d.encoders.native_omega import NativeOmegaEncoder
+        if model.native_3d_mode != "trajectory":
+            raise FoundationInputError("Omega is qualified only for native trajectory mode")
+        native_encoder = NativeOmegaEncoder(
+            encoder_config, teacher, device=str(device))
+
     return FoundationInputAdapter(
         FoundationBridgeConfig(
             context_frames=model.T,
@@ -404,14 +433,8 @@ def build_foundation_input_adapter(
             max_action_dim=model.max_action_dim,
             max_state_dim=model.max_state_dim,
         ),
-        context_store=FoundationContextStore.from_directory(
-            model.wan_context_store_path
-        ),
-        vggt_encoder=NativeVGGTEncoder(
-            encoder_config,
-            device=str(device),
-            local_files_only=True,
-        ),
+        context_store=context_store,
+        vggt_encoder=native_encoder,
         device=device,
         native_3d_context_tokens=model.native_3d_context_tokens,
         native_3d_rollout_tokens=model.native_3d_rollout_tokens,

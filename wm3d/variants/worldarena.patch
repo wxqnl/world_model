@@ -1,0 +1,516 @@
+diff --git a/wm3d/scripts/data/materialize_worldarena.py b/wm3d/scripts/data/materialize_worldarena.py
+new file mode 100644
+--- /dev/null
++++ b/wm3d/scripts/data/materialize_worldarena.py
+@@ -0,0 +1,86 @@
++"""Bind actual node44 data, native CPU batches and the original unified runtime."""
++import copy,json,subprocess
++from pathlib import Path
++import torch
++from wm3d.data.benchmark_catalog import binding,publish,read_rows
++from wm3d.data.benchmark_worldarena import fit,WorldArenaNativeDataset,WorldArenaEpisodeBalancedBatchSampler
++from wm3d.data.foundation_bridge import FoundationBridgeConfig,build_foundation_sample
++from wm3d.training.pretrain import _collate_and_trim
++from wm3d.training.runtime_contract import canonical_sha256,validate_materialized_runtime
++
++R=Path('/data/Minko/wm3d_downstream_20261028')
++N=Path('/data/Minko/wm3d_native_fresh_pretraining_20260930')
++F=N/'formal_27source_2ep_20261005';H=N/'downstream_handoff_20261028'
++D=R/'worldarena/native_data_20261028'
++def main():
++    source=R/'native_metadata_20261028_2012/worldarena/train.jsonl'
++    catalog=D/'train_node44.jsonl';normalization=D/'normalization.json';proof=D/'CPU_COMPLETE.json'
++    if not catalog.exists():
++        rows=list(read_rows(source))
++        for row in rows:
++            actual=binding(row['file'])
++            if actual['size_bytes']!=row['file_binding']['size_bytes'] or actual['mtime_ns']!=row['file_binding']['mtime_ns']:
++                raise ValueError('node44 deployed HDF5 differs from admitted original')
++            row['original_node43_file_binding']=row['file_binding'];row['file_binding']=actual
++        with catalog.open('x') as out:
++            for row in rows:out.write(json.dumps(row,ensure_ascii=False,separators=(',',':'))+'\n')
++    if not normalization.exists():fit(catalog,normalization)
++    ds=WorldArenaNativeDataset(catalog,normalization)
++    if not proof.exists():
++        checked=[]
++        for i in (0,len(ds)//3,len(ds)//2,len(ds)-1):
++            batch=build_foundation_sample(_collate_and_trim([ds[i]]),FoundationBridgeConfig())
++            if batch['action'].shape!=(1,8,42) or batch['video'].shape!=(1,3,9,384,320):
++                raise ValueError('native real batch shape mismatch')
++            if batch['time_coordinate_unit']!='ordinal_step' or 'action_time_s' in batch:
++                raise ValueError('unlabelled time semantics')
++            if not torch.isfinite(batch['action']).all() or not torch.isfinite(batch['video']).all():
++                raise ValueError('nonfinite native batch')
++            if not (batch['history_action_time_coordinate'][batch['history_action_element_mask']]<0).all():
++                raise ValueError('future leakage in observed history')
++            checked.append(dict(index=i,action_shape=list(batch['action'].shape),active_dimensions=int((~batch['action_dim_is_pad']).sum())))
++        sampler=WorldArenaEpisodeBalancedBatchSampler(ds.source_spans,ds.source_names,ds.source_sampling_weights,
++            world_size=8,rank=0,micro_batch_size=4,gradient_accumulation=4,start_optimizer_step=0,num_optimizer_steps=20000,
++            seed=3407,source_episode_spans=ds.source_episode_spans)
++        permutation=sampler._permutations['worldarena']
++        import bisect
++        first=[bisect.bisect_right(ds.ends,permutation.at(i)) for i in range(2000)]
++        if len(set(first))!=2000:raise ValueError('video sampler did not visit every video once')
++        publish(proof,dict(passed=True,foundation_bridge_passed=True,actual_current_future_RGB_decoded=True,
++            train_only_normalization=True,train_videos=2000,valid_windows=len(ds),actual_windows_checked=checked,
++            every_video_once_per_2000_positions=True,start_per_video_without_replacement=True,
++            time_coordinate_unit='ordinal_step',physical_clock_available=False))
++    ds.close()
++    sourcecfg=json.loads((H/'SOURCE_MODEL_CONFIG.json').read_text());old=json.loads((F/'runtime.json').read_text())
++    recipe=json.loads((R/'worldarena/runtime_profile.json').read_text())
++    recipe['train']['frozen_geometry_teacher']=sourcecfg['frozen_geometry_teacher']
++    recipe['train']['checkpoint_steps']=[2]
++    recipe['train']['downstream_initialization']=dict(schema='wm3d_benchmark_final_model_initialization_v1',benchmark='WorldArena',
++        source_step=167446,authority_path=str(R/'USER_START_AFTER_PRETRAINING.json'),handoff_manifest_path=str(H/'MODEL_ONLY_READY.json'),
++        source_model_config_path=str(H/'SOURCE_MODEL_CONFIG.json'))
++    model=copy.deepcopy(sourcecfg['model_profile']);model['name']='worldarena_native_ordinal'
++    model['model'].update(action_loss_weight=1.,video_loss_weight=1.,native_3d_loss_weight=.1,wan_context_store_path=str(D/'foundation_context'))
++    model['sampling']=dict(mode='source_native_ordinal_sequence',time_coordinate_unit='ordinal_step',physical_clock_available=False,
++        context_frames=16,future_frames=8,interpolation='forbidden',policy_training_times='observed_drive_target_ordinal')
++    encoder=N/'production_20261001/vggt_encoder.yaml'
++    closure=dict(schema='wm3d_benchmark_native_data_closure_v1',admission_id='wm3d_worldarena_native_20261028',benchmark='WorldArena',suite='clean50',
++        catalog_path=str(catalog),catalog_binding=binding(catalog),normalization_path=str(normalization),normalization_binding=binding(normalization),
++        raw_file_bindings=json.loads(normalization.read_text())['files'],encoder_contract_path=str(encoder),encoder_contract_binding=binding(encoder),
++        CPU_materialization_proof_path=str(proof),CPU_materialization_proof_binding=binding(proof))
++    run=copy.deepcopy(old['run']);run['environment_lock_binding']['admission_id']=closure['admission_id']
++    code=R/'worldarena/code/wm3d'
++    run['code_commit']=subprocess.check_output(['git','-C',str(code),'rev-parse','HEAD'],text=True).strip()
++    for suffix in ('capacity_micro4','formal'):
++        name='worldarena_native_'+suffix+'_20261028'
++        run.update(name=name,lineage=name,output_root=str(N/'downstream_runs_20261028'/name))
++        runtime=dict(schema='wm3d_v8_materialized_runtime_v2',run=copy.deepcopy(run),model_profile=model,data_closure=closure,
++            runtime_profile=copy.deepcopy(recipe),objective_profile=old['objective_profile'])
++        runtime['bindings']={key:canonical_sha256(value) for key,value in (
++            ('model_profile_sha256',model),('data_closure_sha256',closure),('runtime_profile_sha256',runtime['runtime_profile']),
++            ('objective_profile_sha256',runtime['objective_profile']),('model_contract_sha256',dict(architecture=model['architecture'],model=model['model'])))}
++        validate_materialized_runtime(runtime)
++        destination=R/'worldarena'/('runtime_'+suffix+'.json')
++        if destination.exists():raise ValueError('refusing runtime replacement '+str(destination))
++        publish(destination,runtime)
++        print(json.dumps(dict(runtime=str(destination),validated=True,output=run['output_root'])),flush=True)
++if __name__=='__main__':main()
+diff --git a/wm3d/scripts/data/prepare_worldarena_native.py b/wm3d/scripts/data/prepare_worldarena_native.py
+new file mode 100644
+--- /dev/null
++++ b/wm3d/scripts/data/prepare_worldarena_native.py
+@@ -0,0 +1,21 @@
++"""Prepare complete train-only WorldArena source instruction inventory."""
++import json
++from pathlib import Path
++
++ROOT = Path('/data/Minko/wm3d_downstream_20261028')
++
++def main():
++    rows = [json.loads(line) for line in (ROOT/'native_metadata_20261028_2012/worldarena/train.jsonl').read_text().splitlines()]
++    if len(rows) != 2000 or any(row['split'] != 'train' for row in rows):
++        raise ValueError('WorldArena requires all 2000 train videos')
++    dest = ROOT/'worldarena/native_data_20261028'
++    dest.mkdir(exist_ok=True)
++    inventory = sorted({row['instruction_payload']['seen'][0].strip() for row in rows})
++    if any(not text for text in inventory):
++        raise ValueError('empty source instruction')
++    (dest/'task_bank.jsonl').write_text(''.join(json.dumps({'text':text},ensure_ascii=False)+'\n' for text in inventory))
++    print(json.dumps({'train_videos':len(rows),'source_instructions':len(inventory),'inventory':str(dest/'task_bank.jsonl')}))
++
++if __name__ == '__main__':
++    main()
++
+diff --git a/wm3d/wm3d/data/benchmark_native.py b/wm3d/wm3d/data/benchmark_native.py
+--- a/wm3d/wm3d/data/benchmark_native.py
++++ b/wm3d/wm3d/data/benchmark_native.py
+@@ -25,6 +25,9 @@
+                 "CPU_materialization_proof_binding"}
+     if set(closure) != required or closure["schema"] != SCHEMA:
+         raise ValueError("benchmark native closure fields/schema differ")
++    if closure["benchmark"] == "WorldArena":
++        from .benchmark_worldarena import validate_closure
++        return validate_closure(closure, model_profile, runtime_profile)
+     if closure["benchmark"] != "LIBERO":
+         raise ValueError("this native reader currently implements LIBERO only")
+     from .benchmark_libero import SUITES, SCHEMA as NORMALIZATION_SCHEMA
+@@ -83,6 +86,12 @@
+ 
+ 
+ def build_dataset(closure, *, split):
++    if closure["benchmark"] == "WorldArena":
++        if split != "train":
++            raise ValueError("held-out WorldArena video evaluation is separate")
++        from .benchmark_worldarena import WorldArenaNativeDataset
++        dataset = WorldArenaNativeDataset(closure["catalog_path"], closure["normalization_path"], file_bindings=closure["raw_file_bindings"])
++        return dataset, dataset.profile
+     if split != "train":
+         raise ValueError("LIBERO simulator evaluation is separate from its full demonstration training split")
+     from .benchmark_libero import LiberoNativeDataset
+diff --git a/wm3d/wm3d/data/benchmark_worldarena.py b/wm3d/wm3d/data/benchmark_worldarena.py
+new file mode 100644
+--- /dev/null
++++ b/wm3d/wm3d/data/benchmark_worldarena.py
+@@ -0,0 +1,217 @@
++"""All official WorldArena train videos, original sampled drive targets and RGB.
++
++The generator saves segment starts, periodic controller snapshots and segment
++ends. Their physical timestamps are not stored. Coordinates are therefore
++explicit ordinal_step, never seconds/Hz, without interpolation or repetition.
++"""
++from bisect import bisect_right
++from collections import OrderedDict
++import io
++import json
++from pathlib import Path
++from types import SimpleNamespace
++
++import h5py
++import numpy as np
++from PIL import Image
++import torch
++from torch.utils.data import Dataset
++
++from .benchmark_catalog import binding, publish, read_rows
++from .benchmark_libero import Moments
++
++SCHEMA = 'wm3d_worldarena_native_normalization_v1'
++
++def canonical_robot(h):
++    action = np.asarray(h['joint_action/vector'], dtype=np.float32).reshape(-1,2,7)
++    states = []
++    for side in ('left','right'):
++        pose = np.asarray(h[f'endpose/{side}_endpose'], dtype=np.float64)
++        q = pose[:,3:]
++        if not np.allclose(np.linalg.norm(q,axis=1),1,atol=.002):
++            raise ValueError('nonunit recorded wxyz quaternion')
++        w,x,y,z = q.T
++        rotation = np.stack((1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w),
++                             2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w),
++                             2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)),axis=1).reshape(-1,3,3)
++        r6 = rotation[:,:,:2].transpose(0,2,1).reshape(-1,6)
++        grip = np.asarray(h[f'endpose/{side}_gripper'])
++        states.append(np.column_stack((pose[:,:3],r6,grip)))
++    state = np.stack(states,axis=1).astype(np.float32)
++    if not (np.isfinite(action).all() and np.isfinite(state).all()):
++        raise ValueError('nonfinite source robot measurements')
++    if np.any(action[:,:,6] < -.001) or np.any(action[:,:,6] > 1.001):
++        raise ValueError('source gripper not open01')
++    return action,state
++
++def fit(catalog,destination):
++    rows=list(read_rows(catalog))
++    if len(rows)!=2000 or any(r['split']!='train' for r in rows):
++        raise ValueError('train-only complete 2000 video normalization required')
++    am,sm=Moments(14),Moments(20)
++    files={}
++    for row in rows:
++        if binding(row['file']) != row['file_binding']:
++            raise ValueError('source identity changed')
++        with h5py.File(row['file'],'r') as h:
++            action,state=canonical_robot(h)
++        am.add(action.reshape(-1,14)); sm.add(state.reshape(-1,20))
++        files[row['file']]=row['file_binding']
++    a,s=am.export(),sm.export()
++    for i in (6,13): a['offset'][i],a['scale'][i]=0.,1.
++    for i in (9,19): s['offset'][i],s['scale'][i]=0.,1.
++    value=dict(schema=SCHEMA,train_videos=2000,fitting_split='train',catalog=str(catalog),
++        catalog_binding=binding(catalog),files=files,action=a,state=s,
++        time_coordinate_unit='ordinal_step',physical_clock_available=False,
++        physical_clock_unavailable_reason='HDF5 has no timestamps; segment endpoint snapshots make save_freq nonuniform; trajectory plans do not record full control-call and gripper order',
++        generator_provenance=dict(observation='/data/Minko/external/FastWAM/third_party/RoboTwin/envs/_base_task.py:508-516',
++            drive_target='/data/Minko/external/FastWAM/third_party/RoboTwin/envs/robot/robot.py:494-506',
++            real_qpos_distinct='/data/Minko/external/FastWAM/third_party/RoboTwin/envs/robot/robot.py:508',
++            snapshot_sampling='/data/Minko/external/FastWAM/third_party/RoboTwin/envs/_base_task.py:1429-1497'),
++        action_semantics='two groups of six joint_position_rad drive targets and absolute_gripper_open01',
++        state_semantics='per-arm xyz metres, wxyz quaternion converted to rotation6d columns, gripper_open01',
++        no_physical_cadence_inferred=True,no_interpolation_or_repetition=True)
++    publish(destination,value)
++    return value
++
++class WorldArenaNativeDataset(Dataset):
++    requires_main_process=False
++    episode_balanced=True
++    def __init__(self,catalog,normalization,**kwargs):
++        self.rows=list(read_rows(catalog)); self.stats=json.loads(Path(normalization).read_text())
++        if self.stats['schema'] != SCHEMA or len(self.rows)!=2000:
++            raise ValueError('wrong WorldArena train closure')
++        self.files=kwargs.get('file_bindings') or self.stats['files']
++        self.ends=[]; spans=[]; cursor=0
++        for row in self.rows:
++            count=row['full_native_K8_windows_with_prior']
++            spans.append((cursor,cursor+count));cursor+=count;self.ends.append(cursor)
++        self.source_names=('worldarena',);self.source_spans={'worldarena':(0,cursor)}
++        self.source_episode_spans={'worldarena':tuple(spans)}
++        self.source_sampling_weights={'worldarena':1}
++        self.profile=SimpleNamespace(source_weights=self.source_sampling_weights,source_order=self.source_names,
++            cache_representation=dict(spatial_tokens=64,token_dim=2048,num_views=3,rgb_size=518))
++        self._open=OrderedDict();self._robot=OrderedDict()
++        self.ao=np.asarray(self.stats['action']['offset'],np.float32).reshape(2,7)
++        self.asc=np.asarray(self.stats['action']['scale'],np.float32).reshape(2,7)
++        self.so=np.asarray(self.stats['state']['offset'],np.float32).reshape(2,10)
++        self.ssc=np.asarray(self.stats['state']['scale'],np.float32).reshape(2,10)
++    def __len__(self):return self.ends[-1]
++    def __getitem__(self,index):
++        from scripts.data.run_cache_worker import _view_batch
++        index=int(index); episode=bisect_right(self.ends,index)
++        row=self.rows[episode];base=0 if episode==0 else self.ends[episode-1]
++        anchor=1+index-base;path=row['file']
++        if path not in self._open:
++            from .benchmark_native import verify
++            verify(path,self.files[path]);self._open[path]=h5py.File(path,'r')
++        self._open.move_to_end(path)
++        while len(self._open)>2:self._open.popitem(last=False)[1].close()
++        h=self._open[path]
++        if episode not in self._robot:
++            a,s=canonical_robot(h);self._robot[episode]=((a-self.ao)/self.asc,(s-self.so)/self.ssc)
++        self._robot.move_to_end(episode)
++        while len(self._robot)>8:self._robot.popitem(last=False)
++        action,state=self._robot[episode]
++        selected=anchor+np.arange(9,dtype=np.int64)
++        decoded={}
++        for camera in row['camera_names']:
++            frames=[]
++            for t in selected:
++                encoded=h[f'observation/{camera}/rgb'][t]
++                payload=bytes(encoded) if isinstance(encoded,(bytes,np.bytes_)) else np.asarray(encoded,np.uint8).tobytes()
++                with Image.open(io.BytesIO(payload)) as image:
++                    frames.append(np.asarray(image.convert('RGB')))
++            decoded[camera]=SimpleNamespace(frames=np.stack(frames))
++        images,masks=_view_batch(decoded=decoded,slots=tuple(row['camera_names']),input_size=518)
++        rgb=torch.zeros(24,3,3,518,518,dtype=torch.uint8); view=torch.zeros(24,3,dtype=torch.bool)
++        rgb[15:]=images.mul(255).round().clamp_(0,255).to(torch.uint8);view[15:]=masks
++        keys=torch.full((24,),-1,dtype=torch.long);keys[15:]=torch.from_numpy((episode<<32)+selected)
++        result=dict(direct_rgb_uint8=rgb,direct_view_mask=view,direct_frame_keys=keys,
++            source_id=torch.tensor(0),sample_index=torch.tensor(index),
++            task_text=row['instruction_payload']['seen'][0].strip(),embodiment_ids=torch.tensor(230),
++            action_group_ids=torch.tensor([20,21,0]),action_group_mask=torch.tensor([True,True,False]),
++            action_semantic_ids=torch.zeros(3,14,dtype=torch.long),state_semantic_ids=torch.zeros(3,10,dtype=torch.long),
++            action_normalization_offset=torch.zeros(3,14),action_normalization_scale=torch.ones(3,14),
++            state_normalization_offset=torch.zeros(3,10),state_normalization_scale=torch.ones(3,10),
++            current_state_values=torch.zeros(3,10),current_state_mask=torch.zeros(3,10,dtype=torch.bool),
++            history_world_boundaries_dt=torch.arange(-16,1,dtype=torch.float32),
++            future_world_boundaries_dt=torch.arange(9,dtype=torch.float32),
++            time_coordinate_unit='ordinal_step',physical_clock_available=False,
++            policy_query_dt=torch.zeros(3,32),policy_query_mask=torch.zeros(3,32,dtype=torch.bool),
++            target_fine_action=torch.zeros(3,32,14),target_fine_action_mask=torch.zeros(3,32,14,dtype=torch.bool))
++        result['action_semantic_ids'][:2,:7]=torch.tensor([6,6,6,6,6,6,4])
++        result['state_semantic_ids'][:2]=torch.tensor([1,1,1,2,2,2,2,2,2,3])
++        for name,value in (('action_normalization_offset',self.ao),('action_normalization_scale',self.asc),
++                           ('state_normalization_offset',self.so),('state_normalization_scale',self.ssc)):
++            result[name][:2,:value.shape[1]]=torch.from_numpy(value)
++        result['current_state_values'][:2]=torch.from_numpy(state[anchor]);result['current_state_mask'][:2]=True
++        # Exactly one recorded command per observed interval. No fake high-rate commands.
++        for prefix,length,first in (('history',16,anchor-16),('future_factual',8,anchor)):
++            ids=first+np.arange(length);active=ids>=0;safe=np.maximum(ids,0)
++            values=torch.zeros(length,3,1,14);mask=torch.zeros_like(values,dtype=torch.bool)
++            samples=torch.zeros(length,3,1,dtype=torch.bool);dt=torch.zeros(length,3,1)
++            values[:,:2,0,:7]=torch.from_numpy(action[safe])*torch.from_numpy(active[:,None,None])
++            mask[:,:2,0,:7]=torch.from_numpy(np.broadcast_to(active[:,None,None],(length,2,7)).copy())
++            samples[:,:2,0]=torch.from_numpy(np.broadcast_to(active[:,None],(length,2)).copy())
++            result[prefix+'_fine_action_values']=values;result[prefix+'_fine_action_mask']=mask
++            result[prefix+'_fine_action_dt']=dt;result[prefix+'_fine_sample_mask']=samples
++        result['policy_query_dt'][:2,:8]=torch.arange(8,dtype=torch.float32)
++        result['policy_query_mask'][:2,:8]=True
++        result['target_fine_action'][:2,:8,:7]=torch.from_numpy(action[anchor:anchor+8].transpose(1,0,2))
++        result['target_fine_action_mask'][:2,:8,:7]=True
++        return result
++
++    def close(self):
++        for h in self._open.values():h.close()
++        self._open.clear();self._robot.clear()
++
++def validate_closure(closure,model_profile,runtime_profile):
++    from .benchmark_native import verify
++    for p,b in (('catalog_path','catalog_binding'),('normalization_path','normalization_binding'),
++                ('encoder_contract_path','encoder_contract_binding'),('CPU_materialization_proof_path','CPU_materialization_proof_binding')):
++        verify(closure[p],closure[b])
++    rows=list(read_rows(closure['catalog_path']))
++    normal=json.loads(Path(closure['normalization_path']).read_text())
++    proof=json.loads(Path(closure['CPU_materialization_proof_path']).read_text())
++    if len(rows)!=2000 or any(r['split']!='train' for r in rows):raise ValueError('incomplete train split')
++    if normal['schema']!=SCHEMA or normal['fitting_split']!='train' or normal['train_videos']!=2000:
++        raise ValueError('WorldArena normalization must be complete and train-only')
++    if set(closure['raw_file_bindings'])!={r['file'] for r in rows} or set(normal['files'])!=set(closure['raw_file_bindings']):
++        raise ValueError('WorldArena raw-file closure incomplete')
++    for p,b in closure['raw_file_bindings'].items():verify(p,b)
++    if not (proof['passed'] and proof['foundation_bridge_passed'] and proof['actual_current_future_RGB_decoded']):
++        raise ValueError('real CPU materialization is missing')
++    if normal['time_coordinate_unit']!='ordinal_step' or normal['physical_clock_available']:
++        raise ValueError('unresolved source clock cannot claim seconds')
++    from .foundation_input import FoundationContextStore
++    model=model_profile['model'];bank=FoundationContextStore.from_directory(model['wan_context_store_path'])
++    bank.lookup(sorted({r['instruction_payload']['seen'][0].strip() for r in rows}))
++    if bank.prompt_format!=model['wan_prompt_format']:raise ValueError('instruction feature format changed')
++    train=runtime_profile['train']
++    if train['global_batch_size']!=128 or train['total_steps']!=20000 or train['validate_every']!=0:
++        raise ValueError('fixed WorldArena training budget changed')
++    if train['downstream_initialization']['benchmark']!='WorldArena':raise ValueError('wrong initialization')
++    return dict(native_windows=sum(r['full_native_K8_windows_with_prior'] for r in rows),train_videos=2000,
++                train_only_normalization=True,time_coordinate_unit='ordinal_step',physical_clock_available=False)
++
++from .step_sampler import StepAddressedBatchSampler, AffinePermutation
++
++class _EpisodeBalancedPermutation:
++    def __init__(self,spans,seed):
++        self.spans=tuple(spans);self.seed=seed
++        self.order=AffinePermutation(len(spans),seed=seed,source_name='worldarena-video-order')
++        self.starts=[AffinePermutation(stop-start,seed=seed,source_name=f'worldarena-video-{i}')
++                     for i,(start,stop) in enumerate(spans)]
++    def at(self,position):
++        # One video per global position, every video exactly once per cycle.
++        # Each video's own starts are exhausted without replacement before reuse.
++        cycle,slot=divmod(position,len(self.spans))
++        episode=self.order.at(cycle*len(self.spans)+slot)
++        return self.spans[episode][0]+self.starts[episode].at(cycle)
++
++class WorldArenaEpisodeBalancedBatchSampler(StepAddressedBatchSampler):
++    def __init__(self,*args,**kwargs):
++        super().__init__(*args,**kwargs)
++        self._rank_episode_partitioned_sources.clear()
++        self._permutations={'worldarena':_EpisodeBalancedPermutation(kwargs['source_episode_spans']['worldarena'],kwargs['seed'])}
+diff --git a/wm3d/wm3d/data/foundation_bridge.py b/wm3d/wm3d/data/foundation_bridge.py
+--- a/wm3d/wm3d/data/foundation_bridge.py
++++ b/wm3d/wm3d/data/foundation_bridge.py
+@@ -440,4 +440,16 @@
+         "state_normalization_scale",
+     ):
+         result[name] = _require_tensor(batch, name)
++    coordinate = batch.get("time_coordinate_unit")
++    if coordinate is not None:
++        labels = [coordinate] if isinstance(coordinate, str) else list(coordinate)
++        if set(labels) != {"ordinal_step"}:
++            raise FoundationBridgeError("unknown native time coordinate unit")
++        available = batch.get("physical_clock_available")
++        if available is None or bool(torch.as_tensor(available).any()):
++            raise FoundationBridgeError("ordinal coordinates cannot claim physical timestamps")
++        result["time_coordinate_unit"] = "ordinal_step"
++        result["physical_clock_available"] = False
++        result["action_time_coordinate"] = result.pop("action_time_s")
++        result["history_action_time_coordinate"] = result.pop("history_action_time_s")
+     return result
+diff --git a/wm3d/wm3d/models/foundation_world_model.py b/wm3d/wm3d/models/foundation_world_model.py
+--- a/wm3d/wm3d/models/foundation_world_model.py
++++ b/wm3d/wm3d/models/foundation_world_model.py
+@@ -1296,6 +1296,17 @@
+         return self.cfg.initialization == "wan_video"
+ 
+     def forward(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
++        # Explicit native-event coordinate ABI. The legacy internal backend
++        # argument names remain unchanged; its Fourier encoder is unit-agnostic.
++        # These aliases are local only, never serialized as physical seconds.
++        if "action_time_coordinate" in batch:
++            if batch.get("time_coordinate_unit") != "ordinal_step" or batch.get("physical_clock_available") is not False:
++                raise FoundationModelError("unlabelled or physically misrepresented event coordinates")
++            if "action_time_s" in batch or "history_action_time_s" in batch:
++                raise FoundationModelError("ambiguous physical/event coordinate inputs")
++            batch = dict(batch)
++            batch["action_time_s"] = batch["action_time_coordinate"]
++            batch["history_action_time_s"] = batch["history_action_time_coordinate"]
+         context, context_mask = self._fused_context(batch)
+         sample = {
+             "video": batch["video"],
+diff --git a/wm3d/wm3d/models/model_factory.py b/wm3d/wm3d/models/model_factory.py
+--- a/wm3d/wm3d/models/model_factory.py
++++ b/wm3d/wm3d/models/model_factory.py
+@@ -51,6 +51,16 @@
+     if not str(profile.get("name", "")):
+         raise ValueError("model profile name must be non-empty")
+     sampling = profile.get("sampling")
++    if isinstance(sampling, dict) and sampling.get("mode") == "source_native_ordinal_sequence":
++        expected = dict(mode="source_native_ordinal_sequence", time_coordinate_unit="ordinal_step",
++                        physical_clock_available=False, context_frames=16, future_frames=8,
++                        interpolation="forbidden", policy_training_times="observed_drive_target_ordinal")
++        if sampling != expected or profile.get("architecture") != "foundation_world_model":
++            raise ValueError("native ordinal sampling contract differs")
++        config = model_config_from_profile(profile)
++        if config.T != 16 or config.K != 8:
++            raise ValueError("native ordinal window differs from source model capacity")
++        return
+     required_sampling = {
+         "mode",
+         "history_action_leading_boundary",
+diff --git a/wm3d/wm3d/training/pretrain.py b/wm3d/wm3d/training/pretrain.py
+--- a/wm3d/wm3d/training/pretrain.py
++++ b/wm3d/wm3d/training/pretrain.py
+@@ -1266,6 +1266,9 @@
+     reweighted = is_training and train.get("sampling_mode") == sampling_transition.MODE
+     sampler_type = (ReweightedContinuationBatchSampler if reweighted else
+                     FullEpochBatchSampler if full_epochs else StepAddressedBatchSampler)
++    if getattr(dataset, "episode_balanced", False):
++        from wm3d.data.benchmark_worldarena import WorldArenaEpisodeBalancedBatchSampler
++        sampler_type = WorldArenaEpisodeBalancedBatchSampler
+     sampler = sampler_type(
+         dataset.source_spans,
+         dataset.source_names,
+@@ -2319,50 +2322,28 @@
+                 "--stop-after-step must be a sealed checkpoint step so the "
+                 "stopped run is exactly resumable"
+             )
+-        if benchmark_sft:
+-            # Full native loading precedes root sharding. Release only the
+-            # now-unused initialization allocator cache once at this boundary;
+-            # active model, Adam, gradients, precision and RNG are unchanged.
+-            torch.cuda.synchronize(context.device)
+-            before_free, before_total = torch.cuda.mem_get_info(context.device)
+-            cleanup = {"rank": context.rank,
+-                       "allocated_before": torch.cuda.memory_allocated(context.device),
+-                       "reserved_before": torch.cuda.memory_reserved(context.device),
+-                       "device_free_before": before_free}
+-            torch.cuda.empty_cache()
+-            torch.cuda.synchronize(context.device)
+-            after_free, after_total = torch.cuda.mem_get_info(context.device)
+-            cleanup.update(allocated_after=torch.cuda.memory_allocated(context.device),
+-                           reserved_after=torch.cuda.memory_reserved(context.device),
+-                           device_free_after=after_free, device_total=after_total)
+-            cleanup_rows = [None] * context.world_size
+-            dist.all_gather_object(cleanup_rows, cleanup)
+-            if context.is_rank0:
+-                print(json.dumps({"benchmark_initialization_cache_release_once": cleanup_rows,
+-                                  "allocator_configuration_changed": False,
+-                                  "active_tensors_or_RNG_changed": False}), flush=True)
+         log_path = output_root / "train_metrics.jsonl"
+         memory_log = (
+             output_root / f"gpu_memory_rank_{context.rank:05d}.jsonl"
+             if _environment_flag("WM3D_PROFILE_GPU_MEMORY") else None
+         )
++        if benchmark_sft:
++            # Loading complete unsharded source tensors leaves unused slabs.
++            # Release only that initialization cache once at the lifecycle
++            # boundary; live tensors, Adam, RNG and the allocator policy stay.
++            torch.cuda.synchronize(context.device)
++            startup_memory_before = dict(allocated_bytes=torch.cuda.memory_allocated(context.device),
++                                         reserved_bytes=torch.cuda.memory_reserved(context.device))
++            torch.cuda.empty_cache()
++            startup_memory_after = dict(allocated_bytes=torch.cuda.memory_allocated(context.device),
++                                        reserved_bytes=torch.cuda.memory_reserved(context.device))
++            print(json.dumps({"benchmark_initialization_cache_release": {
++                "rank": context.rank, "step": start_step, "once_before_first_batch": True,
++                "before": startup_memory_before, "after": startup_memory_after,
++                "allocator_configuration_changed": False}}), flush=True)
+         _record_gpu_memory(
+             memory_log, context.device, step=start_step, phase="initialized",
+         )
+-        libero_stage_cache = benchmark_sft and config["data_closure"].get("benchmark") == "LIBERO"
+-
+-        def release_unused_stage_cache():
+-            if not libero_stage_cache:
+-                return
+-            # Frozen teacher and trainable FSDP graph run sequentially. Their
+-            # dead workspaces must not fragment each other's large allocations.
+-            torch.cuda.synchronize(context.device)
+-            live = torch.cuda.memory_allocated(context.device)
+-            torch.cuda.empty_cache()
+-            torch.cuda.synchronize(context.device)
+-            if torch.cuda.memory_allocated(context.device) != live:
+-                raise PretrainError("LIBERO stage cache release changed live tensors")
+-
+         accumulation = int(runtime["train"]["gradient_accumulation"])
+         model.train()
+         optimizer.zero_grad(set_to_none=True)
+@@ -2395,11 +2376,9 @@
+             for micro_step in range(accumulation):
+                 final_micro = micro_step == accumulation - 1
+                 if async_pipeline is None:
+-                    release_unused_stage_cache()
+                     cpu_batch = next(iterator)
+                     if input_adapter is not None:
+                         cpu_batch = input_adapter.materialize(cpu_batch)
+-                    release_unused_stage_cache()
+                     batch = _batch_to_device(cpu_batch, context.device)
+                 else:
+                     batch = async_pipeline.consume()

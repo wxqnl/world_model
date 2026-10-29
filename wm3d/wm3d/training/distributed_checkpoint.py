@@ -645,8 +645,13 @@ def _validate_metadata(
 
 
 class DistributedCheckpointManager:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, snapshot_parent: Path | None = None):
         self.root = Path(root)
+        # Only the parent is routed. All original private/no-clobber source,
+        # payload, topology and collective cleanup checks remain unchanged.
+        self.snapshot_parent = (
+            None if snapshot_parent is None else Path(snapshot_parent)
+        )
 
     def save(
         self,
@@ -918,7 +923,10 @@ class DistributedCheckpointManager:
         if dist.get_rank() == 0:
             container: Path | None = None
             try:
-                snapshot_parent = self.root.parent / _LOAD_SNAPSHOT_DIRECTORY
+                snapshot_parent = (
+                    self.root.parent / _LOAD_SNAPSHOT_DIRECTORY
+                    if self.snapshot_parent is None else self.snapshot_parent
+                )
                 container, snapshot = _make_private_checkpoint_snapshot(
                     checkpoint_path,
                     snapshot_parent=snapshot_parent,

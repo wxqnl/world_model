@@ -21,6 +21,24 @@ from .foundation_world_model import (
 )
 
 
+def native_query_options(config: FoundationWorldModelConfig) -> dict[str, Any]:
+    """Select an upstream protocol without replacing its query implementation.
+
+    slot_noise uses the released WSA defaults: sinusoidal slot identities and
+    sigma-scaled noise (fresh during training, fixed upstream noise at eval).
+    query_token remains byte-for-byte the old native configuration.
+    """
+    if config.native_3d_query_mode == "slot_noise":
+        return dict(query_mode="slot_noise", query_noise_scale=0.5,
+                    query_noise_min_sigma=0.0, query_noise_max_sigma=0.5,
+                    query_sigma_source="constant", slot_pos_scale=0.5)
+    if config.native_3d_query_mode != "query_token":
+        raise FoundationModelError("unsupported native-3D query mode")
+    return dict(query_mode="query_token", query_noise_scale=0.0,
+                query_noise_min_sigma=0.0, query_noise_max_sigma=0.0,
+                query_sigma_source="constant", slot_pos_scale=0.5)
+
+
 def _tensor_loss_metrics(total, metrics):
     # Upstream detailed diagnostics can remain Python floats even when its
     # primary loss metrics request tensors. Preserve total's autograd graph.
@@ -114,6 +132,31 @@ def trajectory_loss(
     return loss, logs
 
 
+def project_trajectory_tokens(expert, tokens: torch.Tensor, config: FoundationWorldModelConfig) -> torch.Tensor:
+    """Read K*P ordered outputs per view without changing the teacher ABI.
+
+    The opt-in path uses the actual upstream Perceiver and output queries.
+    Messenger tokens remain the original MoT bridge; output-query index owns
+    the requested horizon/patch. This is the upstream per-view layout with
+    da3_tokens_per_view=K*P, not temporal interpolation or a new dynamics loss.
+    """
+    batch, length, hidden = tokens.shape
+    per_view = config.K * config.P
+    if length != config.num_views * per_view:
+        raise FoundationModelError("native trajectory messenger layout changed")
+    if config.native_3d_readout_mode == "linear":
+        decoded = expert.output_decoder(tokens)
+    else:
+        if tuple(expert.output_queries.shape) != (1, per_view, hidden):
+            raise FoundationModelError("upstream native output-query layout changed")
+        memory = tokens.reshape(batch * config.num_views, per_view, hidden)
+        queries = expert.output_queries.expand(batch, per_view, hidden)
+        queries = queries[:, None].expand(batch, config.num_views, per_view, hidden)
+        queries = queries.reshape(batch * config.num_views, per_view, hidden)
+        decoded = expert.output_decoder(queries, memory)
+    return decoded.reshape(batch, config.num_views, config.K, config.P, config.token_dim)
+
+
 class NativeTrajectoryBackend(WSABackendAdapter):
     """Reuse WSA training_loss and samplers; replace only its 3D contract."""
 
@@ -129,11 +172,35 @@ class NativeTrajectoryBackend(WSABackendAdapter):
             wsa_model.action_expert.hidden_dim, config.action_time_fourier_dim)
         self.native_3d_state = TrajectoryStateConditioner(config, expert.hidden_dim)
         self.native_3d_rollout = nn.Identity()  # No second dynamics owner/loss.
-        expert.output_decoder = TrajectoryReadout(expert.hidden_dim, config.token_dim)
-        del expert.output_queries
+        # Consume the same legacy projection initialization in both modes so
+        # downstream robot-conditioner initialization keeps the comparison seed.
+        legacy_readout = TrajectoryReadout(expert.hidden_dim, config.token_dim)
+        if config.native_3d_readout_mode == "linear":
+            expert.output_decoder = legacy_readout
+            del expert.output_queries
+        # Otherwise retain both original upstream modules, initialized by WSA.
+        del legacy_readout
         self._active_time_update = None
         self._active_native_3d_update = None
         self._targets = None
+        self._video_view_mask = None
+        self._video_loss_metrics = {}
+        if config.video_loss_reduction == "valid_view_mean_v1":
+            from .foundation_video_objective import valid_view_video_loss
+
+            def compute_video_loss(_model, pred_video, target_video, image_is_pad,
+                                   include_initial_video_step):
+                if self._video_view_mask is None:
+                    raise FoundationModelError("video view validity was not bound for loss")
+                loss, logs = valid_view_video_loss(
+                    pred_video, target_video, self._video_view_mask, image_is_pad,
+                    temporal_factor=int(_model.vae.temporal_downsample_factor),
+                    include_initial=include_initial_video_step,
+                )
+                self._video_loss_metrics = logs
+                return loss
+
+            wsa_model._compute_video_loss_per_sample = types.MethodType(compute_video_loss, wsa_model)
         # Upstream uses presence of a teacher to collect intermediate states.
         # The callback below owns VGGT supervision; no DA3 model is loaded.
         wsa_model.da3_teacher = TrajectoryObjective()
@@ -152,8 +219,7 @@ class NativeTrajectoryBackend(WSABackendAdapter):
             if len(layers) != len(_expert.layer_norms):
                 raise FoundationModelError("native query-layer count changed")
             return [
-                _expert.output_decoder(norm(tokens)).reshape(
-                    tokens.shape[0], config.num_views, config.K, config.P, config.token_dim)
+                project_trajectory_tokens(_expert, norm(tokens), config)
                 for norm, tokens in zip(_expert.layer_norms, layers, strict=True)
             ]
 
@@ -175,8 +241,8 @@ class NativeTrajectoryBackend(WSABackendAdapter):
                 return
             states = output[0] if isinstance(output, tuple) else output
             tokens = states["future_3d"]
-            self._last_native_state = expert.output_decoder(expert.layer_norms[-1](tokens)).reshape(
-                tokens.shape[0], config.num_views, config.K, config.P, config.token_dim)
+            self._last_native_state = project_trajectory_tokens(
+                expert, expert.layer_norms[-1](tokens), config)
 
         self._state_hook = wsa_model.mot.register_forward_hook(capture_state)
 
@@ -278,12 +344,16 @@ class NativeTrajectoryBackend(WSABackendAdapter):
                          sample["native_3d_trajectory_mask"].bool(), current.detach())
         self._active_time_update = self.action_time(sample["action_time_s"], sample["action_element_mask"])
         self._active_native_3d_update = self.native_3d_state(current, current_mask)
+        self._video_view_mask = sample.get("video_view_mask")
+        self._video_loss_metrics = {}
         try:
             total, metrics = self.wsa_model.training_loss(
                 sample, collect_loss_dict=True, collect_detailed_loss_dict=True,
                 loss_dict_as_tensors=True)
-            return _tensor_loss_metrics(total, metrics)
+            return _tensor_loss_metrics(total, {**metrics, **self._video_loss_metrics})
         finally:
+            self._video_view_mask = None
+            self._video_loss_metrics = {}
             self._targets = None
             self._active_time_update = None
             self._active_native_3d_update = None
@@ -307,9 +377,7 @@ def build_native_pretraining_model(config: FoundationWorldModelConfig, *, device
         da3_query_dim=config.token_dim, da3_num_views=config.num_views,
         da3_tokens_per_view=config.K * config.P,
         future_3d_tokens_per_view=config.K * config.P,
-        query_mode="query_token", query_noise_scale=0.0,
-        query_noise_min_sigma=0.0, query_noise_max_sigma=0.0,
-        query_sigma_source="constant", slot_pos_scale=0.5,
+        **native_query_options(config),
     )
     for mapping in (video, action, future):
         mapping["use_gradient_checkpointing"] = config.activation_checkpointing

@@ -59,6 +59,10 @@ from wm3d.training.distributed_checkpoint import (
     ResumeExpectations,
     canonical_sha256,
 )
+from wm3d.training.checkpoint_stores import CheckpointStores
+from wm3d.training import formal_sampling_transition as sampling_transition
+from wm3d.training import formal_omega_transition as quality_transition
+from wm3d.data.reweighted_continuation import ReweightedContinuationBatchSampler
 from wm3d.training.distributed_runtime import (
     autocast_context,
     destroy_distributed,
@@ -85,6 +89,11 @@ from wm3d.training.gradient_ownership import (
     validate_gradient_ownership_receipt,
 )
 from wm3d.training.runtime_contract import load_materialized_runtime
+from wm3d.training.native_bounded_continuation import (
+    resolve_native_bounded_continuation,
+    native_bounded_rank_restore_receipt,
+    require_native_continuation_storage,
+)
 from wm3d.training.resource_preflight import (
     ResourcePreflightError,
     current_rank_identity,
@@ -119,7 +128,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Explicit committed step_XXXXXXXX directory; 'latest' is forbidden.",
     )
+    parser.add_argument("--qualify-capacity", action="store_true", help="Two real complete benchmark updates and a real DCP save; disposable preformal qualification, never formal training.")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--restore-only", action="store_true",
+        help="Formal sampling continuation: complete original DCP restore, audit and exit with zero updates.")
+    parser.add_argument("--resume-latest-committed", action="store_true",
+        help="Resolve this formal run's original global committed index before init.")
     parser.add_argument(
         "--stop-after-step",
         type=int,
@@ -149,6 +163,9 @@ def _record_gpu_memory(
 ) -> None:
     """Opt-in rank-local capacity measurements; never change training tensors."""
     if path is None:
+        return
+    first_updates = int(os.environ.get("WM3D_MEMORY_FIRST_UPDATES", "0"))
+    if first_updates and step > first_updates and phase not in {"validation", "checkpoint_save", "generation"}:
         return
     torch.cuda.synchronize(device)
     free, total = torch.cuda.mem_get_info(device)
@@ -427,6 +444,19 @@ def _checkpoint_steps(train: Mapping[str, Any]) -> set[int]:
     if any(step <= 0 or step > total for step in result):
         raise PretrainError("checkpoint step lies outside training range")
     return result
+
+
+def _bounded_completion_reason(
+    *, deadline: float | None, completed: int, total_steps: int, deadline_reached: bool
+) -> str | None:
+    """Bounded runs finish on either limit; ordinary full runs keep their behavior."""
+    if deadline is None:
+        return None
+    if deadline_reached:
+        return "wall_clock_budget"
+    if completed == total_steps:
+        return "configured_steps_completed"
+    return None
 
 
 def _learning_rate(step: int, runtime: Mapping[str, Any]) -> float:
@@ -1056,6 +1086,9 @@ def _build_mixed_dataset(
     rank: int = 0,
 ) -> tuple[Any, Any]:
     closure = runtime["data_closure"]
+    if closure.get("schema") == "wm3d_benchmark_native_data_closure_v1":
+        from wm3d.data.benchmark_native import build_dataset
+        return build_dataset(closure, split=split)
     if closure.get("schema") == FORMAL_CACHE_CLOSURE_SCHEMA:
         return build_formal_cache_dataset(runtime, split=split, profile=profile)
     admitted = closure.get("schema") == ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
@@ -1098,6 +1131,7 @@ def _build_mixed_dataset(
             grouped_normalizer=normalizer,
             rank=rank,
             train_episode_allowlist=runtime["runtime_profile"]["train"].get("train_episode_allowlist"),
+            small_data_selection=runtime["runtime_profile"]["train"].get("small_data_selection"),
         )
         return dataset, profile
     if closure.get("schema") == STREAMING_DATA_CLOSURE_SCHEMA:
@@ -1229,7 +1263,9 @@ def _make_loader(
 ) -> DataLoader:
     train = runtime_profile["train"]
     full_epochs = is_training and train.get("sampling_mode") == "source_count_epochs_v1"
-    sampler_type = FullEpochBatchSampler if full_epochs else StepAddressedBatchSampler
+    reweighted = is_training and train.get("sampling_mode") == sampling_transition.MODE
+    sampler_type = (ReweightedContinuationBatchSampler if reweighted else
+                    FullEpochBatchSampler if full_epochs else StepAddressedBatchSampler)
     sampler = sampler_type(
         dataset.source_spans,
         dataset.source_names,
@@ -1237,7 +1273,7 @@ def _make_loader(
             # Complete epochs are defined by the selected stream, not legacy
             # profile mixture weights. Validation retains its original mixture.
             name: (dataset.source_spans[name][1] - dataset.source_spans[name][0]
-                   if full_epochs else
+                   if full_epochs or reweighted else
                    getattr(dataset, "source_sampling_weights", profile.source_weights)[name])
             for name in dataset.source_names
         },
@@ -1254,7 +1290,10 @@ def _make_loader(
         seed=seed,
         source_episode_spans=getattr(dataset, "source_episode_spans", None),
         **({"epochs": train["sampling_epochs"]} if full_epochs else {}),
+        **({"multipliers": sampling_transition.MULTIPLIERS} if reweighted else {}),
     )
+    if reweighted and sampler.migration != train["formal_sampling_transition"]["sampler_migration"]:
+        raise PretrainError("actual sampler differs from the sealed real CPU migration")
     if full_epochs and int(train["total_steps"]) != sampler.budget["optimizer_steps"]:
         raise PretrainError("total_steps does not cover the sealed full-epoch selection exactly")
     if full_epochs and rank == 0 and num_steps == 1 and start_step == 0:
@@ -1300,7 +1339,8 @@ def _require_sampling_capacity(
         runtime_profile,
         rank=rank,
         world_size=world_size,
-        start_step=0,
+        start_step=(30000 if is_training and runtime_profile["train"].get(
+            "formal_sampling_transition") is not None else 0),
         num_steps=1,
         seed=seed,
         gradient_accumulation=gradient_accumulation,
@@ -1415,6 +1455,7 @@ def _run_contract(
     parameter_counts: Mapping[str, int],
     raw_model: torch.nn.Module,
     warmstart_model: Mapping[str, Any] | None = None,
+    native_bounded_continuation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract = {
         "schema": ("wm3d_admitted_run_contract_v1" if "environment_lock_binding" in config["run"] else RUN_CONTRACT_SCHEMA),
@@ -1433,8 +1474,16 @@ def _run_contract(
         "parameter_counts": dict(parameter_counts),
         "required_gradient_owners": list(required_gradient_owner_names(raw_model)),
     }
+    declaration = config["runtime_profile"]["train"].get("formal_sampling_transition")
+    if declaration is not None:
+        contract["formal_sampling_transition"] = declaration
+    correction = quality_transition.declaration(config)
+    if correction is not None:
+        contract[quality_transition.FIELD] = correction
     if warmstart_model is not None:
         contract["warmstart_model"] = dict(warmstart_model)
+    if native_bounded_continuation is not None:
+        contract["native_bounded_continuation"] = dict(native_bounded_continuation)
     return contract
 
 
@@ -1589,6 +1638,13 @@ def _topology_contract_sha256(config: Mapping[str, Any]) -> str:
                     # Rank-contiguous epoch ownership cannot change mid-epoch.
                     "sampling_world_size": int(runtime["expected_world_size"]),
                 } if train.get("sampling_mode") == "source_count_epochs_v1" else {}),
+                **({
+                    "sampling_mode": train["sampling_mode"],
+                    "formal_sampling_transition": train["formal_sampling_transition"],
+                    "sampling_world_size": int(runtime["expected_world_size"]),
+                } if train.get("formal_sampling_transition") is not None else {}),
+                **({quality_transition.FIELD: train[quality_transition.FIELD]}
+                   if train.get(quality_transition.FIELD) is not None else {}),
             },
             "distributed_numerics": {
                 "strategy": distributed["strategy"],
@@ -1618,10 +1674,135 @@ def _restore_gradient_ownership(
     return saved
 
 
+def _publish_complete_state_restore(
+    *, output_root: Path, source_checkpoint: Mapping[str, Any],
+    audit: Mapping[str, Any], context: Any, model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer, metadata: Mapping[str, Any],
+    progress: Mapping[str, Any], launch_qualification_path: str,
+) -> tuple[str, dict[str, Any]]:
+    local: dict[str, Any]
+    try:
+        local = {"receipt": native_bounded_rank_restore_receipt(
+            source_checkpoint_path=Path(source_checkpoint["path"]),
+            rank=context.rank, model=model, optimizer=optimizer,
+            metadata=metadata, progress=progress,
+        ), "error": None}
+    except Exception as exc:
+        local = {"receipt": None, "error": f"{type(exc).__name__}: {exc}"}
+    gathered: list[Any] = [None] * context.world_size
+    dist.all_gather_object(gathered, local)
+    failures = [item["error"] for item in gathered if item["error"] is not None]
+    if failures:
+        raise PretrainError(f"complete-state continuation restore audit failed: {failures}")
+    ranks = [item["receipt"] for item in gathered]
+    if context.world_size != 24 or [item["rank"] for item in ranks] != list(range(24)):
+        raise PretrainError("complete-state continuation restore rank closure differs")
+    path = output_root / "COMPLETE_STATE_RESTORE.json"
+    verdict: list[Any] = [None]
+    if context.is_rank0:
+        try:
+            require_native_continuation_storage(
+                source_checkpoint_path=Path(source_checkpoint["path"]),
+                output_root=output_root, final_save=False,
+            )
+            receipt = {
+                "schema": "wm3d_native_complete_state_restore_v1",
+                "passed": True, "created_unix_ns": time.time_ns(),
+                "source_checkpoint": dict(source_checkpoint),
+                "native_bounded_continuation": dict(audit),
+                "launch_qualification_path": launch_qualification_path,
+                "source_step": 783, "restored_step": 783, "first_optimizer_update": 784,
+                "before_first_new_optimizer_update": True,
+                "same_schedule_exact_trajectory": False,
+                "gradient_ownership": dict(metadata["gradient_ownership"]),
+                "inherited_source_gradient_proof": True,
+                "newly_audited_gradient_ownership": False,
+                "source_snapshot_cleanup_before_first_update": True,
+                "ranks": ranks,
+            }
+            _atomic_json_no_clobber(path, receipt)
+            verdict[0] = {"ok": True, "path": str(path), "receipt": receipt}
+        except Exception as exc:
+            verdict[0] = {"ok": False, "error": str(exc)}
+    dist.broadcast_object_list(verdict, src=0)
+    if not verdict[0]["ok"]:
+        raise PretrainError(f"complete-state restore receipt publication failed: {verdict[0]}")
+    if context.is_rank0:
+        print(json.dumps({"complete_state_restore": str(path),
+                          "source_step": 783, "first_optimizer_update": 784,
+                          "inherited_source_gradient_proof": True}), flush=True)
+    return str(verdict[0]["path"]), dict(verdict[0]["receipt"])
+
+
+def _require_continuation_deadline(context: Any, deadline: float) -> None:
+    # No new optimizer update may begin after the hard wall-clock deadline.
+    # The existing early-save margin and external group watchdog still apply.
+    expired = torch.tensor(
+        [int(context.is_rank0 and time.time() >= deadline)],
+        device=context.device, dtype=torch.int32,
+    )
+    dist.broadcast(expired, src=0)
+    if bool(expired.item()):
+        raise PretrainError("bounded continuation deadline expired before optimizer update")
+
+
 def main() -> None:
     args = parse_args()
     config, config_sha = load_materialized_runtime(args.runtime)
     runtime = config["runtime_profile"]
+    benchmark_sft = runtime["train"].get("downstream_initialization") is not None
+    if args.qualify_capacity and (not benchmark_sft or args.resume is not None or args.preflight_only or args.stop_after_step is not None):
+        raise PretrainError("capacity qualification requires a fresh authorized benchmark and no competing mode")
+    sampling_migration = sampling_transition.resolve_transition(config)
+    quality_migration = quality_transition.resolve_transition(config)
+    if args.restore_only and (sampling_migration is None or args.preflight_only):
+        raise PretrainError("--restore-only requires the explicit formal sampling runtime and no preflight")
+    storage_plan = runtime["checkpoint"].get("storage_plan")
+    storage_router = None
+    if args.resume_latest_committed and args.resume is not None:
+        raise PretrainError("choose explicit resume or committed-index resume")
+    if storage_plan is not None:
+        if (runtime["train"].get("native_bounded_continuation") is not None
+                or runtime["train"].get("model_warmstart_checkpoint") is not None):
+            raise PretrainError("formal storage forbids short-run continuation/warmstart")
+        if Path(args.runtime).absolute() != Path(storage_plan["formal_runtime_path"]):
+            raise PretrainError("formal storage must use the original same-run runtime path")
+        storage_router = CheckpointStores(
+            storage_plan, config=config, config_sha=config_sha)
+        # Real namespaces, exact native3, zero residue and actual fourth-slot
+        # capacity are checked before distributed/GPU/model initialization.
+        storage_router.preflight()
+        if args.resume_latest_committed:
+            args.resume = storage_router.latest_formal_committed()
+        if args.resume is not None and args.resume.parent not in {
+            Path(item["root"]) for item in storage_router.stores
+        }:
+            raise PretrainError("formal resume cannot load a legacy short-run checkpoint")
+    elif args.resume_latest_committed:
+        raise PretrainError("committed-index resume requires the formal storage plan")
+    if sampling_migration is not None:
+        if storage_router is None:
+            raise PretrainError("formal sampling migration requires original 3+1 storage")
+        if args.resume is None and not args.preflight_only:
+            raise PretrainError("formal sampling migration cannot launch fresh")
+        if args.resume is not None:
+            if re.fullmatch(r"step_[0-9]{8}", args.resume.name) is None:
+                raise PretrainError("formal sampling resume needs an exact committed step")
+            sampling_transition.require_resume_step(int(args.resume.name[5:]))
+            if args.resume != storage_router.latest_formal_committed():
+                raise PretrainError("formal sampling resume cannot roll back the latest own commit")
+            if quality_migration is not None:
+                quality_transition.require_resume_step(int(args.resume.name[5:]))
+                if int(args.resume.name[5:]) == quality_transition.STEP:
+                    quality_transition.require_initial_boundary(storage_router, args.resume)
+            elif int(args.resume.name[5:]) == 30000:
+                sampling_transition.require_initial_boundary(storage_router, args.resume)
+    # Resolve/inspect the frozen original source before distributed init and
+    # before official preflight; destination changes never weaken its checks.
+    continuation = resolve_native_bounded_continuation(config)
+    continuation_audit = None if continuation is None else continuation[2]
+    if continuation is not None and args.resume is not None:
+        raise PretrainError("bounded continuation declares its source; --resume is forbidden")
     architecture = str(config["model_profile"]["architecture"])
     foundation_mode = architecture == "foundation_world_model"
     if architecture not in {"native_world_model", "foundation_world_model"}:
@@ -1629,6 +1810,10 @@ def main() -> None:
     strategy = strategy_from_mapping(runtime["distributed"])
     context = initialize_distributed(strategy)
     async_pipeline: AsyncCudaInputPipeline | None = None
+    capacity_measurement = None
+    if args.qualify_capacity:
+        from wm3d.training.benchmark_capacity import CapacityMeasurement
+        capacity_measurement = CapacityMeasurement(context.device)
     try:
         raw_asset_repairs = active_raw_asset_repairs()
         repair_contracts: list[Any] = [None] * context.world_size
@@ -1762,7 +1947,7 @@ def main() -> None:
         input_adapter = None
         direct_raw = (
             config["data_closure"].get("schema")
-            in {DIRECT_RAW_DATA_CLOSURE_SCHEMA, ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA}
+            in {DIRECT_RAW_DATA_CLOSURE_SCHEMA, ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA, "wm3d_benchmark_native_data_closure_v1"}
         )
         if foundation_mode:
             if not direct_raw:
@@ -1840,6 +2025,13 @@ def main() -> None:
                 model = build_world_model(effective_model_profile)
             if not isinstance(model, NativeWorldModel):
                 raise PretrainError("native model factory returned the wrong type")
+        downstream_model_initialization = None
+        if args.resume is None and runtime["train"].get("downstream_initialization") is not None:
+            from wm3d.training.benchmark_initialization import initialize_final_model
+            downstream_model_initialization = initialize_final_model(
+                model, runtime["train"]["downstream_initialization"])
+            if context.is_rank0:
+                print(json.dumps({"downstream_model_only_initialization": downstream_model_initialization}), flush=True)
         raw_model = model
         parameter_counts = raw_model.parameter_counts()
         wrapped = wrap_model(
@@ -1851,7 +2043,7 @@ def main() -> None:
             ),
         )
         model = wrapped.model
-        warmstart_model: Mapping[str, Any] | None = None
+        warmstart_model: Mapping[str, Any] | None = downstream_model_initialization
         warmstart_path = (
             None
             if args.resume is not None
@@ -1911,7 +2103,7 @@ def main() -> None:
                 if output_root.is_symlink():
                     raise PretrainError("output root cannot be a symlink")
                 contract_warmstart = warmstart_model
-                existing_contract_path = output_root / "run_contract.json"
+                existing_contract_path = sampling_transition.contract_path(config)
                 if args.resume is not None and existing_contract_path.exists():
                     try:
                         existing_contract = json.loads(
@@ -1933,8 +2125,9 @@ def main() -> None:
                     parameter_counts,
                     raw_model,
                     warmstart_model=contract_warmstart,
+                    native_bounded_continuation=continuation_audit,
                 )
-                _atomic_json_no_clobber(output_root / "run_contract.json", contract)
+                _atomic_json_no_clobber(existing_contract_path, contract)
                 status[0] = {"ok": True, "contract": contract}
             except Exception as exc:
                 status[0] = {"ok": False, "type": type(exc).__name__, "error": str(exc)}
@@ -1942,18 +2135,54 @@ def main() -> None:
         if not status[0]["ok"]:
             raise PretrainError(f"run contract failed: {status[0]}")
 
-        manager = DistributedCheckpointManager(output_root / "checkpoints")
+        if benchmark_sft:
+            from wm3d.training.benchmark_checkpoint import BenchmarkCheckpointManager
+            manager = BenchmarkCheckpointManager(output_root / "checkpoints", lineage=config["run"]["lineage"])
+        else:
+            manager = (
+                DistributedCheckpointManager(output_root / "checkpoints")
+                if storage_router is None else storage_router
+            )
         start_step = 0
         gradient_ownership: Mapping[str, Any] | None = None
         source_checkpoint: Mapping[str, Any] | None = None
         expectations: ResumeExpectations | None = None
-        if args.resume is not None:
+        complete_state_restore_path: str | None = None
+        complete_state_restore: Mapping[str, Any] | None = None
+        formal_sampling_restore = None
+        initial_formal_sampling_restore = None
+        initial_formal_omega_restore = None
+        restore_manager = manager
+        restore_path = args.resume
+        if continuation is not None:
+            source_config, source_config_sha, _ = continuation
+            source_checkpoint = continuation_audit["source"]["checkpoint_inspection"]
+            restore_path = Path(source_checkpoint["path"])
+            # Source root is intentional: preserve the original private
+            # snapshot location, integrity implementation and source lineage.
+            restore_manager = DistributedCheckpointManager(restore_path.parent)
+            expected_step = 783
+            expectations = _resume_expectations(
+                source_config, source_config_sha, step=expected_step,
+                world_size=context.world_size,
+            )
+            inspected = restore_manager.inspect_committed_collective(
+                path=restore_path, expected=expectations, require_exact=True,
+            )
+            if inspected != source_checkpoint:
+                raise PretrainError("bounded continuation source controls changed after validation")
+        elif args.resume is not None:
             if re.fullmatch(r"step_[0-9]{8}", args.resume.name) is None:
                 raise PretrainError("resume must be an explicit step_XXXXXXXX directory")
             expected_step = int(args.resume.name.split("_")[1])
+            restore_config, restore_binding = config, config_sha
+            if quality_migration is not None and expected_step == quality_transition.STEP:
+                restore_config, restore_binding = quality_migration[:2]
+            elif sampling_migration is not None and expected_step == 30000:
+                restore_config, restore_binding = sampling_migration[:2]
             expectations = _resume_expectations(
-                config,
-                config_sha,
+                restore_config,
+                restore_binding,
                 step=expected_step,
                 world_size=context.world_size,
             )
@@ -1979,12 +2208,20 @@ def main() -> None:
                 )
             source_checkpoint = inspection[0]["source"]
         launch_kind = (
-            "fresh"
-            if source_checkpoint is None
+            "formal_omega_transition"
+            if quality_migration is not None and expected_step == quality_transition.STEP else
+            "formal_sampling_transition"
+            if sampling_migration is not None and expected_step == 30000 else
+            "bounded_continuation"
+            if continuation is not None
             else (
-                "exact_resume"
-                if source_checkpoint["resume_mode"] == "exact"
-                else "topology_reshard"
+                "fresh"
+                if source_checkpoint is None
+                else (
+                    "exact_resume"
+                    if source_checkpoint["resume_mode"] == "exact"
+                    else "topology_reshard"
+                )
             )
         )
         launch_qualification_path, launch_qualification_sha256 = (
@@ -1999,10 +2236,10 @@ def main() -> None:
                 launch_kind=launch_kind,
             )
         )
-        if args.resume is not None:
+        if restore_path is not None:
             assert expectations is not None
-            metadata, progress = manager.load(
-                path=args.resume,
+            metadata, progress = restore_manager.load(
+                path=restore_path,
                 model=raw_model,
                 optimizer=optimizer,
                 expected=expectations,
@@ -2011,12 +2248,42 @@ def main() -> None:
                 raise PretrainError("checkpoint sampler progress is not exact")
             start_step = int(metadata["step"])
             gradient_ownership = _restore_gradient_ownership(metadata, raw_model)
+            if sampling_migration is not None:
+                _, formal_sampling_restore = sampling_transition.publish_restore(
+                    config=config, context=context, model=raw_model, optimizer=optimizer,
+                    metadata=metadata, progress=progress, source_checkpoint=source_checkpoint,
+                    router=storage_router, launch_qualification_path=launch_qualification_path)
+                initial_formal_sampling_restore = (formal_sampling_restore if expected_step == 30000
+                    else metadata["initial_formal_sampling_restore"])
+                if quality_migration is not None:
+                    initial_formal_omega_restore = (formal_sampling_restore
+                        if expected_step == quality_transition.STEP
+                        else metadata["initial_formal_omega_restore"])
+                    if expected_step == quality_transition.STEP:
+                        # Re-audit actual parameter gradients for the changed objective.
+                        # This resets only the proof, never AdamW/model/RNG/step.
+                        gradient_ownership = None
+                if args.restore_only:
+                    if context.is_rank0:
+                        print(json.dumps({"formal_sampling_restore_only": formal_sampling_restore,
+                                          "new_optimizer_updates": 0}), flush=True)
+                    return
+            if continuation is not None:
+                complete_state_restore_path, complete_state_restore = _publish_complete_state_restore(
+                    output_root=output_root, source_checkpoint=source_checkpoint,
+                    audit=continuation_audit, context=context, model=raw_model,
+                    optimizer=optimizer, metadata=metadata, progress=progress,
+                    launch_qualification_path=launch_qualification_path,
+                )
+                _require_continuation_deadline(
+                    context, float(runtime["train"]["small_data_deadline_unix"]),
+                )
         total_steps = int(runtime["train"]["total_steps"])
         if start_step >= total_steps:
             raise PretrainError("checkpoint already reached total_steps")
-        stop_after_step = (
+        stop_after_step = (2 if args.qualify_capacity else (
             total_steps if args.stop_after_step is None else int(args.stop_after_step)
-        )
+        ))
         if not start_step < stop_after_step <= total_steps:
             raise PretrainError(
                 "--stop-after-step must be greater than the resume step and no "
@@ -2046,12 +2313,34 @@ def main() -> None:
             )
             async_pipeline.submit()
         validate_every = int(runtime["train"]["validate_every"])
-        checkpoint_steps = _checkpoint_steps(runtime["train"])
+        checkpoint_steps = ({2} if args.qualify_capacity else _checkpoint_steps(runtime["train"]))
         if stop_after_step not in checkpoint_steps:
             raise PretrainError(
                 "--stop-after-step must be a sealed checkpoint step so the "
                 "stopped run is exactly resumable"
             )
+        if benchmark_sft:
+            # Full native loading precedes root sharding. Release only the
+            # now-unused initialization allocator cache once at this boundary;
+            # active model, Adam, gradients, precision and RNG are unchanged.
+            torch.cuda.synchronize(context.device)
+            before_free, before_total = torch.cuda.mem_get_info(context.device)
+            cleanup = {"rank": context.rank,
+                       "allocated_before": torch.cuda.memory_allocated(context.device),
+                       "reserved_before": torch.cuda.memory_reserved(context.device),
+                       "device_free_before": before_free}
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(context.device)
+            after_free, after_total = torch.cuda.mem_get_info(context.device)
+            cleanup.update(allocated_after=torch.cuda.memory_allocated(context.device),
+                           reserved_after=torch.cuda.memory_reserved(context.device),
+                           device_free_after=after_free, device_total=after_total)
+            cleanup_rows = [None] * context.world_size
+            dist.all_gather_object(cleanup_rows, cleanup)
+            if context.is_rank0:
+                print(json.dumps({"benchmark_initialization_cache_release_once": cleanup_rows,
+                                  "allocator_configuration_changed": False,
+                                  "active_tensors_or_RNG_changed": False}), flush=True)
         log_path = output_root / "train_metrics.jsonl"
         memory_log = (
             output_root / f"gpu_memory_rank_{context.rank:05d}.jsonl"
@@ -2060,10 +2349,25 @@ def main() -> None:
         _record_gpu_memory(
             memory_log, context.device, step=start_step, phase="initialized",
         )
+        libero_stage_cache = benchmark_sft and config["data_closure"].get("benchmark") == "LIBERO"
+
+        def release_unused_stage_cache():
+            if not libero_stage_cache:
+                return
+            # Frozen teacher and trainable FSDP graph run sequentially. Their
+            # dead workspaces must not fragment each other's large allocations.
+            torch.cuda.synchronize(context.device)
+            live = torch.cuda.memory_allocated(context.device)
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(context.device)
+            if torch.cuda.memory_allocated(context.device) != live:
+                raise PretrainError("LIBERO stage cache release changed live tensors")
+
         accumulation = int(runtime["train"]["gradient_accumulation"])
         model.train()
         optimizer.zero_grad(set_to_none=True)
         last_log = time.monotonic()
+        deadline = runtime["train"].get("small_data_deadline_unix")
         for step in range(start_step, stop_after_step):
             lr = _learning_rate(step, runtime)
             training_objective = (
@@ -2091,9 +2395,11 @@ def main() -> None:
             for micro_step in range(accumulation):
                 final_micro = micro_step == accumulation - 1
                 if async_pipeline is None:
+                    release_unused_stage_cache()
                     cpu_batch = next(iterator)
                     if input_adapter is not None:
                         cpu_batch = input_adapter.materialize(cpu_batch)
+                    release_unused_stage_cache()
                     batch = _batch_to_device(cpu_batch, context.device)
                 else:
                     batch = async_pipeline.consume()
@@ -2113,7 +2419,7 @@ def main() -> None:
                     final_micro and serialize_after_step
                 ):
                     async_pipeline.submit()
-                with no_sync_context(model, enabled=not final_micro):
+                with no_sync_context(model, enabled=not final_micro and not benchmark_sft):
                     with autocast_context(strategy):
                         if foundation_mode:
                             losses = model(batch)
@@ -2164,8 +2470,14 @@ def main() -> None:
                 gradient_ownership = audit_gradient_ownership(raw_model)
                 ownership_audited_this_step = True
                 if context.is_rank0:
+                    ownership_path = output_root / "gradient_ownership.json"
+                    if quality_migration is not None:
+                        ownership_path = (
+                            quality_transition.CONTRACT_PATH.parent / "gradient_ownership"
+                            / (Path(launch_qualification_path).stem + ".json")
+                        )
                     _atomic_json_no_clobber(
-                        output_root / "gradient_ownership.json",
+                        ownership_path,
                         gradient_ownership,
                     )
                     print(
@@ -2194,12 +2506,26 @@ def main() -> None:
                 memory_log, context.device, step=completed,
                 phase="forward_backward", batch=batch,
             )
+            if continuation is not None:
+                _require_continuation_deadline(context, float(deadline))
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             _record_gpu_memory(
                 memory_log, context.device, step=completed, phase="optimizer",
             )
-            if completed % int(runtime["train"]["log_every"]) == 0 or completed == stop_after_step:
+            budget_stop = False
+            if deadline is not None:
+                # Rank 0 alone decides; all ranks save the same completed step.
+                stop_flag = torch.tensor([int(context.is_rank0 and time.time() >= deadline - 180)],
+                                         device=context.device, dtype=torch.int32)
+                dist.broadcast(stop_flag, src=0)
+                budget_stop = bool(stop_flag.item())
+                if budget_stop:
+                    checkpoint_steps.add(completed)
+            if (completed % int(runtime["train"]["log_every"]) == 0
+                    or completed == stop_after_step or budget_stop
+                    or (benchmark_sft and completed <= 2)
+                    or (sampling_migration is not None and completed == start_step + 1)):
                 metrics = reduce_metrics(accumulated)
                 grad_tensor = grad_norm_value.detach().float().reshape(-1).mean()
                 dist.all_reduce(grad_tensor, op=dist.ReduceOp.SUM)
@@ -2207,6 +2533,7 @@ def main() -> None:
                 if context.is_rank0:
                     record = {
                         "step": completed,
+                        **({"actual_optimizer_completed": True, "capacity_qualification_only": bool(args.qualify_capacity), "batch_loss_sample_not_all_updates_average": True} if benchmark_sft else {}),
                         "lr": lr,
                         "source_id": source_id,
                         "grad_norm": float(grad_tensor.cpu()),
@@ -2240,7 +2567,7 @@ def main() -> None:
                     last_log = time.monotonic()
                     print(json.dumps(record, sort_keys=True), flush=True)
                     _append_jsonl(log_path, record)
-            if validate_every > 0 and completed % validate_every == 0:
+            if not budget_stop and validate_every > 0 and completed % validate_every == 0:
                 assert validation_dataset is not None
                 validation = _validate(
                     model,
@@ -2266,6 +2593,20 @@ def main() -> None:
                         "checkpoint cannot precede the first full-objective "
                         "gradient ownership audit"
                     )
+                if continuation is not None:
+                    storage: list[Any] = [None]
+                    if context.is_rank0:
+                        try:
+                            require_native_continuation_storage(
+                                source_checkpoint_path=Path(source_checkpoint["path"]),
+                                output_root=output_root, final_save=True,
+                            )
+                            storage[0] = {"ok": True}
+                        except Exception as exc:
+                            storage[0] = {"ok": False, "error": str(exc)}
+                    dist.broadcast_object_list(storage, src=0)
+                    if not storage[0]["ok"]:
+                        raise PretrainError(f"continuation final-save storage gate failed: {storage[0]}")
                 manager.save(
                     step=completed,
                     model=model,
@@ -2282,19 +2623,54 @@ def main() -> None:
                         "topology_contract_sha256": _topology_contract_sha256(config),
                         "launch_qualification_path": launch_qualification_path,
                         "launch_qualification_sha256": launch_qualification_sha256,
-                        "sampler_progress": {"next_optimizer_step": completed},
+                        "sampler_progress": sampling_transition.progress_for(config, completed),
+                        **({
+                            "formal_sampling_transition": sampling_migration[2],
+                            "formal_sampling_restore": formal_sampling_restore,
+                            "initial_formal_sampling_restore": initial_formal_sampling_restore,
+                        } if sampling_migration is not None else {}),
+                        **({quality_transition.FIELD: quality_migration[2],
+                            "formal_omega_restore": formal_sampling_restore,
+                            "initial_formal_omega_restore": initial_formal_omega_restore,
+                        } if quality_migration is not None else {}),
                         "initial_seed": seed,
+                        **({"downstream_initialization": runtime["train"]["downstream_initialization"], "capacity_qualification_only": bool(args.qualify_capacity)} if benchmark_sft else {}),
                         "gradient_ownership": gradient_ownership,
                         "raw_asset_repairs": raw_asset_repairs,
+                        **({
+                            "native_bounded_continuation": continuation_audit,
+                            "complete_state_restore": complete_state_restore,
+                            "complete_state_restore_path": complete_state_restore_path,
+                        } if continuation is not None else {}),
                     },
-                    rank_state={"next_optimizer_step": completed},
+                    rank_state=sampling_transition.progress_for(config, completed),
                 )
+                _record_gpu_memory(memory_log, context.device, step=completed, phase="checkpoint_save")
+            completion_reason = _bounded_completion_reason(
+                deadline=deadline, completed=completed, total_steps=stop_after_step,
+                deadline_reached=budget_stop,
+            )
+            if completion_reason is not None:
+                if context.is_rank0:
+                    result = {"status": "bounded_training_completed", "step": completed,
+                              "completion_reason": completion_reason,
+                              "deadline_unix": deadline, "saved_at_unix": time.time(),
+                              "source_checkpoint": source_checkpoint, "quality_acceptance": False,
+                              **({"complete_state_restore_path": complete_state_restore_path,
+                                  "native_bounded_continuation": continuation_audit}
+                                 if continuation is not None else {})}
+                    (output_root / "BUDGET_STOP.json").write_text(json.dumps(result, indent=2) + "\n")
+                    print(json.dumps(result), flush=True)
+                break
             if (
                 async_pipeline is not None
                 and completed < stop_after_step
                 and not async_pipeline.pending
             ):
                 async_pipeline.submit()
+        if args.qualify_capacity:
+            from wm3d.training.benchmark_capacity import complete_capacity
+            complete_capacity(output_root, model, optimizer, config, context, capacity_measurement, completed=stop_after_step)
         dist.barrier()
     except BaseException:
         # NCCL teardown can wait for peers still in backward. Preserve the
@@ -2302,6 +2678,8 @@ def main() -> None:
         traceback.print_exc()
         raise
     finally:
+        if capacity_measurement is not None:
+            capacity_measurement.stop()
         if async_pipeline is not None:
             async_pipeline.close()
         destroy_distributed()

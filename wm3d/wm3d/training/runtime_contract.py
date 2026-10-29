@@ -210,6 +210,14 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         raise RuntimeContractError(
             "train/optimizer/schedule/checkpoint must all be mappings"
         )
+    if checkpoint.get("storage_plan") is not None:
+        from wm3d.training.checkpoint_stores import validate_storage_plan
+        try:
+            validate_storage_plan(checkpoint["storage_plan"])
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise RuntimeContractError("invalid formal native storage plan") from exc
+        if checkpoint.get("allow_topology_reshard"):
+            raise RuntimeContractError("formal two-store recovery requires the same exact24 topology")
     required_train = {
         "micro_batch_size",
         "gradient_accumulation",
@@ -229,6 +237,8 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
     }
     optional_train = {
         "train_episode_allowlist",
+        "small_data_selection",
+        "small_data_deadline_unix",
         "validation_micro_batch_size",
         "activation_checkpointing",
         "cudnn_benchmark",
@@ -247,14 +257,47 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         "initial_raw_asset_repairs",
         "sampling_mode",
         "sampling_epochs",
+        "formal_sampling_transition",
+        "formal_omega_transition",
+        "frozen_geometry_teacher",
+        "downstream_initialization",
         "admitted_selection",
+        "native_bounded_continuation",
     }
     if not required_train.issubset(train) or set(train) - required_train - optional_train:
         raise RuntimeContractError(
             f"train fields mismatch: missing={sorted(required_train-set(train))} "
             f"unknown={sorted(set(train)-required_train-optional_train)}"
         )
-    if "sampling_mode" in train or "sampling_epochs" in train:
+    if train.get("native_bounded_continuation") is not None:
+        from wm3d.training.native_bounded_continuation import validate_native_bounded_declaration
+        validate_native_bounded_declaration(train["native_bounded_continuation"])
+        if (train.get("model_warmstart_checkpoint") is not None
+                or train.get("model_warmstart_new_parameter_prefixes") is not None
+                or checkpoint.get("allow_topology_reshard")):
+            raise RuntimeContractError("native bounded continuation forbids warmstart/topology reshard")
+    if "frozen_geometry_teacher" in train:
+        from wm3d.encoders.native_omega import validate_teacher
+        validate_teacher(train["frozen_geometry_teacher"])
+        if train.get("formal_omega_transition") is None and train.get("downstream_initialization") is None:
+            raise RuntimeContractError("Omega requires its explicit complete-state migration or final-model SFT inheritance")
+    if train.get("downstream_initialization") is not None:
+        from wm3d.training.benchmark_initialization import validate_declaration
+        validate_declaration(train["downstream_initialization"])
+    if train.get("formal_omega_transition") is not None:
+        from wm3d.training.formal_omega_transition import validate_declaration as validate_quality
+        validate_quality(train["formal_omega_transition"])
+        if train.get("formal_sampling_transition") is None:
+            raise RuntimeContractError("quality correction must preserve the current sampling transition")
+    if train.get("formal_sampling_transition") is not None:
+        from wm3d.training.formal_sampling_transition import validate_declaration, MODE
+        validate_declaration(train["formal_sampling_transition"])
+        if (train.get("sampling_mode") != MODE or "sampling_epochs" in train
+                or train.get("native_bounded_continuation") is not None
+                or train.get("model_warmstart_checkpoint") is not None
+                or checkpoint.get("allow_topology_reshard")):
+            raise RuntimeContractError("formal sampling migration forbids epoch claims/warmstart/reshard")
+    elif "sampling_mode" in train or "sampling_epochs" in train:
         if (train.get("sampling_mode") != "source_count_epochs_v1"
                 or type(train.get("sampling_epochs")) is not int
                 or train["sampling_epochs"] <= 0
@@ -267,6 +310,14 @@ def validate_runtime_profile(value: Mapping[str, Any]) -> None:
         require_stat_binding(train["admitted_selection"])
         if train.get("train_episode_allowlist") is not None:
             raise RuntimeContractError("embedded selection must not reapply a legacy allowlist")
+    if train.get("small_data_selection") is not None:
+        from wm3d.data.small_episode_selection import validate_selection
+        validate_selection(train["small_data_selection"])
+        deadline = train.get("small_data_deadline_unix")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or deadline <= 0:
+            raise RuntimeContractError("small-data deadline must be explicit")
+    elif train.get("small_data_deadline_unix") is not None:
+        raise RuntimeContractError("deadline is restricted to an explicit small-data run")
     if train.get("train_episode_allowlist") is not None:
         selection = Path(str(train["train_episode_allowlist"]))
         if not selection.is_absolute() or not selection.is_file():
@@ -1017,6 +1068,7 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     serialized = json.dumps(value, sort_keys=True)
     if _PLACEHOLDER.search(serialized):
         raise RuntimeContractError("materialized runtime contains a placeholder")
+    benchmark = value["data_closure"].get("schema") == "wm3d_benchmark_native_data_closure_v1"
     admitted = value["data_closure"].get("schema") == ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA
     run = value["run"]
     required_run = {
@@ -1025,7 +1077,7 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
         "output_root",
         "code_commit",
         "environment_lock_path",
-        "environment_lock_binding" if admitted else "environment_lock_sha256",
+        "environment_lock_binding" if admitted or benchmark else "environment_lock_sha256",
     }
     if not isinstance(run, dict) or set(run) != required_run:
         raise RuntimeContractError("runtime run fields mismatch")
@@ -1036,7 +1088,7 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     environment = Path(str(run["environment_lock_path"]))
     if not environment.is_absolute() or environment.is_symlink() or not environment.is_file():
         raise RuntimeContractError("environment lock must be an absolute regular file")
-    if admitted:
+    if admitted or benchmark:
         verify_file(environment,run["environment_lock_binding"],value["data_closure"]["admission_id"])
     elif sha256_file(environment) != _require_sha(
         run["environment_lock_sha256"], "environment_lock_sha256"
@@ -1066,19 +1118,33 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
     else:
         objective_config_from_mapping(objective["objective"])
     closure = value["data_closure"]
-    if admitted:
+    if runtime["train"].get("downstream_initialization") is not None and not benchmark:
+        raise RuntimeContractError("new benchmark SFT initialization requires its bound native benchmark closure")
+    if benchmark:
+        from wm3d.data.benchmark_native import validate_closure
+        from wm3d.training.benchmark_initialization import validate_model_inheritance
+        validate_closure(closure, model, runtime)
+        validate_model_inheritance(runtime["train"]["downstream_initialization"], model, runtime["train"])
+    elif admitted:
         data_profile,metadata_seal=validate_admitted_closure(closure,model)
         validate_model_data_compatibility(model,data_profile,
             appearance_cache_grid=int(closure["appearance_token_grid"]))
         train=runtime["train"]
         if (train.get("admitted_selection")!=closure["cache_index_binding"]
-                or train.get("sampling_mode")!="source_count_epochs_v1"
+                or (train.get("sampling_mode") != "source_count_epochs_v1"
+                    and train.get("formal_sampling_transition") is None)
                 or train.get("initial_raw_asset_repairs")!=closure["initial_raw_asset_repairs"]
                 or train.get("model_warmstart_checkpoint") is not None):
             raise RuntimeContractError("fresh admitted train selection/repair/initialization differs")
         counts=metadata_seal["window_count_by_split_source"]["train"]
+        selection = train.get("small_data_selection")
+        if selection is not None:
+            if selection["source"] not in counts:
+                raise RuntimeContractError("selected source absent from production closure")
+            counts = {selection["source"]: selection["window_count_by_split"]["train"]}
         batch=train["global_batch_size"]
-        expected=train["sampling_epochs"]*sum((n+batch-1)//batch for n in counts.values())
+        epochs = 2 if train.get("formal_sampling_transition") is not None else train["sampling_epochs"]
+        expected = epochs * sum((n+batch-1)//batch for n in counts.values())
         if train["total_steps"]!=expected:
             raise RuntimeContractError("two-epoch step budget differs from admitted real windows")
     elif runtime["train"].get("admitted_selection") is not None:
@@ -1181,6 +1247,12 @@ def validate_materialized_runtime(value: Mapping[str, Any]) -> None:
         observed = _require_sha(bindings.get(name), name)
         if observed != expected:
             raise RuntimeContractError(f"runtime binding {name} mismatch")
+    if runtime["train"].get("native_bounded_continuation") is not None:
+        from wm3d.training.native_bounded_continuation import resolve_native_bounded_continuation
+        resolve_native_bounded_continuation(value)
+    if runtime["train"].get("formal_sampling_transition") is not None:
+        from wm3d.training.formal_sampling_transition import resolve_transition
+        resolve_transition(value)
 
 
 def load_materialized_runtime(path: Path) -> tuple[dict[str, Any], str]:
@@ -1188,6 +1260,6 @@ def load_materialized_runtime(path: Path) -> tuple[dict[str, Any], str]:
     value = load_yaml(path)
     validate_materialized_runtime(value)
     # Config digest is over the small parsed runtime, never over admitted payload/index files.
-    if value["data_closure"].get("schema")==ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA:
+    if value["data_closure"].get("schema") in {ADMITTED_DIRECT_RAW_DATA_CLOSURE_SCHEMA, "wm3d_benchmark_native_data_closure_v1"}:
         return value, canonical_sha256(value)
     return value, sha256_file(path)

@@ -28,7 +28,7 @@ from wm3d.training.resource_preflight import (
 
 
 LAUNCH_QUALIFICATION_SCHEMA = "wm3d_v8_launch_qualification_v1"
-_LAUNCH_KINDS = {"fresh", "exact_resume", "topology_reshard", "eval"}
+_LAUNCH_KINDS = {"fresh", "exact_resume", "bounded_continuation", "formal_sampling_transition", "formal_omega_transition", "topology_reshard", "eval"}
 _HEX_64 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -116,7 +116,7 @@ def build_launch_qualification(
     if source_checkpoint is not None:
         expected_mode = (
             "exact"
-            if launch_kind in {"exact_resume", "eval"}
+            if launch_kind in {"exact_resume", "bounded_continuation", "formal_sampling_transition", "formal_omega_transition", "eval"}
             else "topology_reshard"
         )
         if source_checkpoint.get("resume_mode") != expected_mode:

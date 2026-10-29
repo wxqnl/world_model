@@ -85,9 +85,13 @@ class FoundationWorldModelConfig:
     wan_model_path: str = ""
     wan_tokenizer_model_path: str = ""
     wan_context_store_path: str = ""
+    # Legacy profiles retain raw-task semantics; new profiles opt in explicitly.
+    wan_prompt_format: str = "raw_task_v1"
 
     # Joint objectives.
     video_loss_weight: float = 1.0
+    # Legacy checkpoints keep their original canvas-pixel objective.
+    video_loss_reduction: str = "legacy_canvas_mean"
     action_loss_weight: float = 1.0
     native_3d_loss_weight: float = 0.1
     native_3d_rollout_loss_weight: float = 0.05
@@ -99,6 +103,10 @@ class FoundationWorldModelConfig:
     # Explicit pretraining boundary; old checkpoint profiles remain readable.
     initialization: str = "wsa_checkpoint"
     native_3d_mode: str = "legacy_readout"
+    # Preserve existing native runs; opt in to the released WSA query protocol.
+    native_3d_query_mode: str = "query_token"
+    # Legacy native checkpoints keep their linear, one-to-one readout.
+    native_3d_readout_mode: str = "linear"
     # Generated from local generic Wan weights by the upstream pretraining tool.
     wan_action_backbone_path: str = ""
     wan_3d_backbone_path: str = ""
@@ -116,6 +124,10 @@ class FoundationWorldModelConfig:
         return self.max_action_groups * self.max_state_dim
 
     def validate(self, *, require_paths: bool = False) -> None:
+        from wm3d.data.foundation_prompt import PROMPT_FORMATS
+
+        if self.wan_prompt_format not in PROMPT_FORMATS:
+            raise FoundationModelError("unsupported Wan prompt format")
         if self.schema != FOUNDATION_WORLD_MODEL_SCHEMA:
             raise FoundationModelError(
                 f"foundation model schema must be {FOUNDATION_WORLD_MODEL_SCHEMA}"
@@ -190,6 +202,20 @@ class FoundationWorldModelConfig:
             raise FoundationModelError("unsupported foundation initialization")
         if self.native_3d_mode not in {"legacy_readout", "trajectory"}:
             raise FoundationModelError("unsupported native-3D mode")
+        if self.video_loss_reduction not in {"legacy_canvas_mean", "valid_view_mean_v1"}:
+            raise FoundationModelError("unsupported video loss reduction")
+        if self.video_loss_reduction != "legacy_canvas_mean" and (
+            self.initialization != "wan_video" or self.native_3d_mode != "trajectory"
+        ):
+            raise FoundationModelError("valid-view video loss requires the native trajectory backend")
+        if self.native_3d_query_mode not in {"query_token", "slot_noise"}:
+            raise FoundationModelError("unsupported native-3D query mode")
+        if self.native_3d_readout_mode not in {"linear", "wsa_perceiver"}:
+            raise FoundationModelError("unsupported native-3D readout mode")
+        if self.native_3d_readout_mode != "linear" and self.initialization != "wan_video":
+            raise FoundationModelError("native readout protocol requires Wan-only initialization")
+        if self.native_3d_query_mode != "query_token" and self.initialization != "wan_video":
+            raise FoundationModelError("native query protocol requires Wan-only initialization")
         if self.initialization == "wan_video":
             if self.wsa_pretrained_path or self.pretrained_interface_init != "legacy_skip":
                 raise FoundationModelError("Wan-only initialization forbids WSA checkpoint/prior transfer")
@@ -1285,6 +1311,8 @@ class FoundationWorldModel(nn.Module):
             "future_3d_images": batch["future_3d_images"],
             "future_3d_img_masks": batch["future_3d_img_masks"],
         }
+        if self.cfg.video_loss_reduction != "legacy_canvas_mean":
+            sample["video_view_mask"] = batch["video_view_mask"]
         if self.cfg.native_3d_mode == "trajectory":
             for name in ("native_3d_trajectory_target", "native_3d_trajectory_mask"):
                 sample[name] = batch[name]

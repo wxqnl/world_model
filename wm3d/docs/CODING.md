@@ -1,18 +1,8 @@
 # Documentation guide
 
-- `README.md` is the short operational overview.
-- `WM3D_FROM_ZERO.md` is the authoritative data-to-checkpoint procedure.
-- `WM3D_SCALING.md` owns model sizing and distributed topology.
-- `WM3D_NATIVE_RGB.md` owns the native token-to-RGB architecture, objective and quality gates.
-- `WM3D_5B_SCALING.md` is the complete data, cache, 1K/100K/600K training, and evaluation procedure.
-- `WM3D_STAGE1_UNIFIED.md` owns the Stage0-to-Stage1 workflow.
-- `WM3D_RELEASE_VALIDATION.md` records evidence and the boundary between pipeline correctness
-  and model quality.
-- `WM3D_WSA_FOUNDATION.md` owns the experimental V10 WSA-Large architecture, asset preparation,
-  environment, data bridge, training and evidence boundary.
-- Commands must match `run_wm3d.sh --help`; paths and filenames must exist in the repository.
-- Use `WM3D` for the current project. Mention an older release only when explaining an audited
-  migration or immutable legacy asset.
-- `WM3D_NATIVE_PRETRAIN.md` owns the current Wan-only initialization, WSA pipeline reuse,
-  native trajectory contract and 1000-hour pilot. The released-WSA adapter remains a historical
-  comparison, not the initialization or launch instructions for this route.
+- `README.md` indexes the current route.
+- `WM3D_NATIVE_PRETRAIN.md` owns the production Wan-only/native-trajectory model and completed pretraining.
+- `BENCHMARKS.md` owns the three authorized downstream protocols and numerical recipes.
+- `REPRODUCIBILITY.md` records source snapshots, variant patches, environment and checkpoint boundaries.
+- `archive/` holds compatibility manuals and historical pilots; it is not the current launch guide.
+- Keep commands aligned with `run_wm3d.sh`. Preserve necessary serialized schema names.

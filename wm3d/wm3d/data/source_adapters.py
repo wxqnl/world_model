@@ -48,6 +48,7 @@ CANONICAL_ACTION_TRANSFORMS = frozenset(
         "signed_to_close",
         "state_euler_residual",
         "taco_world",
+        "tcp_intrinsic_yxz_open",
         "xy_only",
         "xyz_only",
     }
@@ -59,6 +60,7 @@ CANONICAL_STATE_TRANSFORMS = frozenset(
         "droid_state",
         "language_table",
         "nyu_franka",
+        "pos_axis_angle_8d",
         "pos_euler_7d",
         "pos_euler_8d",
         "pos_quat",
@@ -305,6 +307,10 @@ def load_adapter_contract(
         if action_transform != "identity" and state_transform == "identity":
             raise AdapterContractError(
                 "canonical action transforms require an explicit canonical state transform"
+            )
+        if state_transform == "pos_axis_angle_8d" and action_transform != "axis_angle_residual":
+            raise AdapterContractError(
+                "axis-angle state requires the matching axis-angle residual action contract"
             )
         if state_transform == "zero" and (
             state_terms or raw["state_time_key"] is not None
@@ -598,7 +604,8 @@ def _matrix_to_rotvec(matrix: np.ndarray) -> np.ndarray:
 def _canonical_state7(raw: np.ndarray, transform: str) -> np.ndarray:
     state = np.asarray(raw, dtype=np.float32)
     zero = np.zeros((len(state), 1), dtype=np.float32)
-    if transform == "pos_euler_8d":
+    # Preserve the recorded rotation coordinates for the residual-action path.
+    if transform in {"pos_euler_8d", "pos_axis_angle_8d"}:
         result = np.concatenate((state[:, :6], state[:, 7:8]), axis=1)
     elif transform == "pos_euler_7d":
         result = _pad7(state)
@@ -650,8 +657,11 @@ def _canonical_state7(raw: np.ndarray, transform: str) -> np.ndarray:
     return result.astype(np.float32, copy=False)
 
 
-def _state7_to_v8(state: np.ndarray) -> np.ndarray:
-    rotation = _rpy_xyz_to_matrix(state[:, 3:6])
+def _state7_to_v8(state: np.ndarray, *, axis_angle: bool = False) -> np.ndarray:
+    rotation = (
+        _rotvec_to_matrix(state[:, 3:6])
+        if axis_angle else _rpy_xyz_to_matrix(state[:, 3:6])
+    )
     rotation6d = np.swapaxes(rotation[:, :, :2], 1, 2).reshape(len(state), 6)
     return np.concatenate((state[:, :3], rotation6d, state[:, 6:7]), axis=1).astype(
         np.float32, copy=False
@@ -714,6 +724,24 @@ def _canonical_action(
             (
                 action[:, :3],
                 _matrix_to_rotvec(current @ local @ np.swapaxes(current, -1, -2)),
+                1.0 - action[:, 6:7],
+            ),
+            axis=1,
+        )
+    elif transform == "tcp_intrinsic_yxz_open":
+        if state7 is None:
+            raise AdapterContractError("TCP-frame conversion requires current state")
+        current = _rpy_xyz_to_matrix(state7[:, 3:6])
+        # Berkeley UR5 collection right-multiplies a TCP increment using
+        # autolab_core euler_matrix(a3, a4, a5, axes="ryxz"). Intrinsic YXZ
+        # is the same matrix as extrinsic ZXY with the angle order reversed.
+        local = _euler_zxy_to_matrix(action[:, 3:6][:, ::-1])
+        result = np.concatenate(
+            (
+                np.einsum("nij,nj->ni", current, action[:, :3]),
+                _matrix_to_rotvec(
+                    current @ local @ np.swapaxes(current, -1, -2)
+                ),
                 1.0 - action[:, 6:7],
             ),
             axis=1,
@@ -967,7 +995,10 @@ def adapt_state_series(
             )
         values = _mapped(accessor, mapping.state)
         if mapping.state_transform != "identity":
-            values = _state7_to_v8(_canonical_state7(values, mapping.state_transform))
+            values = _state7_to_v8(
+                _canonical_state7(values, mapping.state_transform),
+                axis_angle=mapping.state_transform == "pos_axis_angle_8d",
+            )
         if values.shape[1] != spec.state_dim:
             raise AdapterContractError(
                 f"group {mapping.group!r} state dim {values.shape[1]} != {spec.state_dim}"

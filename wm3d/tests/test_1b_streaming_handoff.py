@@ -189,7 +189,7 @@ def test_1b_oxe_mix_is_60_sources_without_agibot_or_pca() -> None:
 
 
 def test_1b_docs_make_raw_storage_and_canary_explicit() -> None:
-    document = (ROOT / "docs/WM3D_1B_STREAMING.md").read_text()
+    document = (ROOT / "docs/archive/WM3D_1B_STREAMING.md").read_text()
     assert "60 个 source" in document
     assert "15–20TB" in document
     assert "2048→384 PCA" in document

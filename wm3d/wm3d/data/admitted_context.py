@@ -8,6 +8,10 @@ SCHEMA="wm3d_admitted_foundation_context_union_v1"
 
 class ContextUnion:
     def __init__(self,stores):
+        if not stores:raise ValueError("context union must contain stores")
+        formats={store.prompt_format for store in stores}
+        if len(formats)!=1:raise ValueError("context parts use different prompt formats")
+        self.prompt_format=next(iter(formats))
         self.stores=tuple(stores);self._owner={}
         for store in stores:
             for text in store.tasks:
@@ -35,7 +39,7 @@ def load_context_union(root,payload,store_type):
                 raise ValueError("context part admission differs")
             verify_stat_asset(directory,name,part[key])
         child=json.loads((directory/"index.json").read_text())
-        if child.get("schema")!="wm3d_foundation_context_store_v1":raise ValueError("nested context union forbidden")
+        if child.get("schema") not in {"wm3d_foundation_context_store_v1","wm3d_foundation_context_store_v2"}:raise ValueError("nested context union forbidden")
         store=store_type.from_directory(directory)
         for name,key in (("index.json","index_binding"),("context.safetensors","tensor_binding")):
             verify_stat_asset(directory,name,part[key])

@@ -175,7 +175,7 @@ def test_5b_configure_reports_control_pack_paths_from_another_machine(
 
 
 def test_5b_delivery_doc_uses_two_paths_without_internal_revision_directories() -> None:
-    document = (ROOT / "docs/WM3D_5B_SCALING.md").read_text()
+    document = (ROOT / "docs/archive/WM3D_5B_SCALING.md").read_text()
     assert "训练操作员" not in document
     assert "操作员" not in document
     assert re.search(r"[0-9a-f]{40}", document) is None

@@ -1,197 +1,46 @@
 # WM3D
 
-## 当前路线：自己的 native 3D world model
+当前实现使用 Wan2.2-TI2V-5B 视频骨干、动作分支和 native 3D 轨迹分支。生产模型使用 T16 / K8 / P64、最多三个视角、slot-noise query 和 WSA perceiver readout；冻结 VGGT-Omega 提供逐时刻几何监督。
 
-本次重启保留通用 Wan2.2 视频先验，不加载 WSA 训练完成的 checkpoint。
-复用 WSA 的 MoT、video/action flow 训练和采样 pipeline；用 WM3D 的多视角
-K8×P64 native 3D 轨迹替换其 3D 状态接口，并保留 grouped robot、真实时间戳和归一化。
-先复用已有约 1000h episode 清单做 43/44 双机试训，再按实测决定 32 卡长训配置。
-实现边界、单一路径启动命令和待完成验收见 [Native 预训练](docs/WM3D_NATIVE_PRETRAIN.md)。
+正式预训练已完成 167,446 次 optimizer 更新。LIBERO、WorldArena、RoboNet 的下游训练各使用单机 8×H100。参数、数据协议和完成条件分别见[预训练说明](docs/WM3D_NATIVE_PRETRAIN.md)与[benchmark 说明](docs/BENCHMARKS.md)。
 
-## 保留的旧路线与对照
+## 使用
 
-`v10` 分支新增一条 WSA-Large foundation 路线：以 Wan2.2 视频专家、ActionDiT、Future3D
-和 Mixture-of-Transformers 为基座，接入 WM3D 的 grouped robot、真实时间戳、source-specific
-归一化和 frozen VGGT 监督。WSA-Large 本身不使用 Qwen3-VL，因此 V10 也不引入 Qwen。
-架构、环境、权重、数据桥、训练命令和当前证据见
-[WM3D V10 WSA-Large foundation](docs/WM3D_WSA_FOUNDATION.md)。
+`run_wm3d.sh` 是统一入口。先绑定本地模型、数据、环境与输出路径，再物化 runtime；runtime 包含数据身份、初始化、优化器、采样器和资源约束。
 
-原有 native 路线继续保留，作为已经验证的数据 ABI、训练器和对照基线：它使用真实时间戳，
-在显式 3D 状态上预测未来 native token、RGB、depth、point 和 camera pose，并输出 grouped
-robot action。V10 不会原地修改或恢复任何正在运行的 V8 checkpoint。
+```bash
+./run_wm3d.sh --help
+PYTHON_BIN=/path/to/venv/bin/python ./run_wm3d.sh check
 
-```mermaid
-flowchart LR
-  O["多视角观测 + 真实时间戳"] --> G["融合 geometry tokens"]
-  G --> C["Native 3D core"]
-  A["source-native 已执行动作"] --> F["独立 factual future pass"]
-  C --> F
-  S["current state + embodiment"] --> H["统一 action policy"]
-  F --> W["未来 depth / point / pose"]
-  F --> R["V7 motion decoder + bounded detail refiner"]
-  C --> H
-  W --> P["Stage1 action-blind planner"]
+FOUNDATION_PYTHON_BIN=/path/to/venv/bin/python ./run_wm3d.sh foundation-preflight \
+  --standalone --nproc_per_node=8 -- --runtime /path/to/runtime.json
+
+FOUNDATION_PYTHON_BIN=/path/to/venv/bin/python ./run_wm3d.sh foundation-train \
+  --standalone --nproc_per_node=8 -- --runtime /path/to/runtime.json
 ```
 
-## 核心设计
-
-- world、action 和 current-state 保留数据源真实时间戳，不使用全局固定 Hz。
-- dynamics 使用真实执行过的 source-native fine command；policy 与 factual dynamics
-  state 分离，避免未来动作泄漏。
-- grouped action/current-state ABI 表达单臂、双臂、底盘、腰部、头部和可变维度。
-- 3D 主干使用融合后的 geometry tokens；future physical action 在 state encoder 前进入独立
-  factual pass，并在 factual decoder 再次注入。RGB 由 factual future state 直接驱动原始 V7
-  motion decoder，受限高频 refiner 只补晚期细节，不使用 absolute future P256、copy-last 或
-  future target。RGB、depth、point、pose 都是显式监督和显式输出。
-- Stage0 是联合世界动力学与 action policy 预训练；Stage1 冻结 Stage0，用真实 simulator
-  candidates 和 native 3D future evidence 学习候选排序。
-- DDP/FSDP2 共用训练入口；DCP 支持完整编号 checkpoint、独立进程 exact resume 和受控
-  topology reshard。
+WorldArena 与 RoboNet 使用各自已部署的代码差异补丁。应用方法、来源和初始化约束见[复现说明](docs/REPRODUCIBILITY.md)。补丁只用于新的独立 checkout。
 
 ## 目录
 
-```text
-wm3d/
-├── configs/             # 数据、adapter、encoder、模型、runtime、objective、Stage1 profile
-├── docs/                # 从零操作、扩展设计、归一化、Stage1 与发布验收
-├── environments/        # Python 依赖锁和环境引导脚本
-├── scripts/             # 下载、audit、cache、seal、runtime、eval 与 Stage1 工具
-├── tests/               # 数据、模型、分布式与端到端合同回归
-├── wm3d/
-│   ├── data/            # manifest、adapter、grouped robot、cache 与 sampler
-│   ├── encoders/        # VGGT 与任务 encoder
-│   ├── models/          # 1B/5B 共用 native world model
-│   ├── stage1_planner/  # 冻结 Stage0 的规划阶段
-│   └── training/        # FSDP2/DDP、DCP、Stage0 与 offline eval
-├── README.md
-└── run_wm3d.sh          # 唯一用户入口
-```
+| 目录 | 内容 |
+| --- | --- |
+| `wm3d/data/` | 原生数据读取、动作语义、归一化、窗口和确定性采样 |
+| `wm3d/models/` | 模型工厂、视频／动作／3D 分支及损失 |
+| `wm3d/encoders/` | 冻结视觉与任务编码器 |
+| `wm3d/training/` | 统一训练循环、FSDP2、完整 DCP 保存／恢复、资源与初始化约束 |
+| `wm3d/serving/` | 机器人策略输入输出接口 |
+| `configs/` | 模型、数据、runtime、objective 配置；`benchmarks/` 保存六份数值配方 |
+| `variants/` | WorldArena 与 RoboNet 运行版本相对公共代码的差异 |
+| `environments/` | 依赖锁、环境引导和上游必要补丁 |
+| `tests/` | 数据、模型、checkpoint 与分布式接口回归 |
+| `docs/` | 当前使用说明；历史路线集中在 `archive/` |
 
-各主要目录中的 `CODING.md` 说明职责、边界和修改规则。旧 receipt/schema 中的
-`wm3d_v8_*` 字符串是已经发布的磁盘 ABI 版本，只为兼容已有资产保留；新项目命名、
-Python 包、脚本和文档统一使用 `WM3D` / `wm3d`。
+## 历史兼容
 
-## 环境
+旧 native RGB、1B／H200 扩展和 Stage1 代码仍服务已有资产与回归测试，文档集中在历史目录：
+[1B streaming](docs/archive/WM3D_1B_STREAMING.md)、
+[H200 5B 扩展](docs/archive/WM3D_5B_SCALING.md)、
+[Stage1](docs/archive/WM3D_STAGE1_UNIFIED.md)。
 
-推荐 Linux x86_64、Python 3.10、PyTorch 2.7.1 和 CUDA 12.8。正式多机运行要求各节点能够
-访问配置的数据和输出路径，并具备节点内 NVLink、节点间 InfiniBand 和足够的磁盘空间。
-
-```bash
-git clone --branch v8 --single-branch https://github.com/wxqnl/world_model.git
-cd world_model/wm3d
-./run_wm3d.sh env
-source .venv/bin/activate
-PYTHON_BIN=.venv/bin/python ./run_wm3d.sh check
-```
-
-依赖由 `environments/requirements.lock` 固定；环境引导会执行 `pip check` 并生成不可覆盖
-的环境 receipt。CUDA wheel 与集群驱动不匹配时应显式调整 index，不能伪装环境证据。
-
-## 数据 pipeline
-
-正式顺序为：
-
-```text
-source revision/file list lock
-→ 断点下载及必要的冻结 converter
-→ schema inspection + 人工确认 adapter 语义
-→ source inventory + sealed data profile
-→ task embedding bank
-→ episode cache plan / workers / seal
-→ window index + grouped normalization
-→ sealed runtime
-```
-
-完整命令见 [从零数据、训练与评测](docs/WM3D_FROM_ZERO.md)。adapter 的单位、坐标系、
-gripper 极性、group 边界和 fine/coarse supervision 必须人工确认；代码不会猜测。
-
-默认正式数据模板为
-`configs/data/public_robot_5649h_legacy_compatible.template.yaml`。它保留已交付数据家庭、
-小时预算和采样权重，但所有样本都重新进入当前 grouped action/current-state/native-time
-ABI。旧 residual 只能由 `legacy-residual-import` 审计并转换，不能直接读取旧 cache。
-
-5B 集群流程默认使用完整 OXE collection，并保留 DROID、Bridge、RoboCasa365 和
-AgiBotWorld2026。AgiBotWorld Beta 默认关闭，可在生成 5B 数据模板前显式启用。具体命令见
-[WM3D 5B 训练流程](docs/WM3D_5B_SCALING.md)。第一次启动当前 V8 5B 前还应核对
-[V8 5B 训练交接](docs/WM3D_V8_5B_HANDOFF.md)。
-
-单机 8×H100 的 1B 新训练可使用全 OXE 按需缓存路径：保留 DROID、Bridge 和三类
-RoboCasa，加入去重后的 55 个 OXE source，不使用旧 PCA token cache。数据容量、1K canary、
-100K 正式训练与结果检查见
-[WM3D 1B 全 OXE 按需缓存训练](docs/WM3D_1B_STREAMING.md)。
-默认站点配置已经选择 V8 Core：P64 factual future state 驱动原始 V7 RGB motion decoder，
-高频 refiner 只补受限细节；无需操作者再手工替换 RGB 配置。
-
-## 真实小样本验收
-
-在正式训练前，用两张空闲 GPU 从冻结的公开 ALOHA 小样本真实跑通环境、下载、adapter、
-cache、Stage0 训练、独立进程恢复和离线评测：
-
-```bash
-./run_wm3d.sh smoke-real \
-  --work-root /data/wm3d_smoke \
-  --gpus 0,1 \
-  --operator "$USER" \
-  --accept-dataset-license \
-  --confirm-adapter-semantics
-```
-
-该命令验证基础设施正确性，不代表模型质量。细节见
-[真实公开小样本验收](docs/WM3D_REAL_SMOKE.md)。
-
-## Stage0 训练与评测
-
-模型、数据和运行拓扑是相互独立的 profile。先物化 sealed runtime，再在每台节点运行
-preflight，之后使用相同 rendezvous 参数启动训练：
-
-```bash
-./run_wm3d.sh preflight \
-  --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
-  --master_addr="$MASTER_ADDR" --master_port="$PREFLIGHT_PORT" -- \
-  --runtime "$SEALED_RUNTIME"
-
-./run_wm3d.sh train \
-  --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
-  --master_addr="$MASTER_ADDR" --master_port="$TRAIN_PORT" -- \
-  --runtime "$SEALED_RUNTIME" --stop-after-step "$STOP_STEP"
-
-./run_wm3d.sh eval \
-  --nnodes="$NNODES" --nproc_per_node="$GPUS_PER_NODE" --node_rank="$NODE_RANK" \
-  --master_addr="$MASTER_ADDR" --master_port="$EVAL_PORT" -- \
-  --runtime "$SEALED_RUNTIME" \
-  --checkpoint "$RUN_ROOT/checkpoints/step_XXXXXXXX" \
-  --output "$RUN_ROOT/eval_step_XXXXXXXX.json"
-```
-
-恢复必须指向含 `COMMITTED.json` 的完整编号 DCP，不接受 `latest`。默认 64×H200 正式训练按
-canary → validation → formal 逐级提升。第一次接手集群运行时直接使用
-[5B 从数据到正式训练](docs/WM3D_5B_SCALING.md)；模型规模和分布式设计见
-[统一训练与扩展](docs/WM3D_SCALING.md)，原生图像输出结构与验收指标见
-[原生 RGB 解码器](docs/WM3D_NATIVE_RGB.md)。
-
-## Stage1 规划
-
-Stage1 只加载同一 sealed Stage0 runtime 和 committed DCP。完整入口为：
-
-```text
-stage1-seal-selection
-→ stage1-replay-authority
-→ stage1-audit-rollouts
-→ stage1-produce
-→ stage1-materialize
-→ stage1-train
-→ stage1-eval
-```
-
-planner 不读取 candidate action；动作只用于外部可审计 cost。真实 simulator replay、native
-evidence、DCP exact resume 和完整 split gate 见
-[Stage1 统一原生 3D 规划](docs/WM3D_STAGE1_UNIFIED.md)。
-
-## 发布门禁
-
-```bash
-PYTHON_BIN=.venv/bin/python ./run_wm3d.sh check
-```
-
-发布提交必须在 clean tree 上无筛选通过静态检查和全部测试。真实训练证据、能力结论边界
-以及 1B/5B 资源验收见 [发布验收](docs/WM3D_RELEASE_VALIDATION.md)。
+Stage1 原有入口 `stage1-seal-selection`、`stage1-replay-authority`、`stage1-audit-rollouts`、`stage1-produce` 保留；它们不属于当前三项 benchmark 接续。已有 schema 名称保持磁盘兼容。

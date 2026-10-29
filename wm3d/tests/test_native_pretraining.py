@@ -143,3 +143,96 @@ def test_two_node_and_four_node_runtime_contracts():
         validate_runtime_profile(profile)
         assert profile["train"]["global_batch_size"] == world
         assert profile["distributed"]["shard_degree"] == 8
+
+
+def test_native_query_protocol_default_is_legacy_and_slot_noise_is_explicit():
+    from wm3d.models.foundation_native import native_query_options
+    cfg = config()
+    assert cfg.native_3d_query_mode == "query_token"
+    assert native_query_options(cfg) == dict(
+        query_mode="query_token", query_noise_scale=0.0,
+        query_noise_min_sigma=0.0, query_noise_max_sigma=0.0,
+        query_sigma_source="constant", slot_pos_scale=0.5)
+    changed = replace(cfg, native_3d_query_mode="slot_noise")
+    changed.validate()
+    options = native_query_options(changed)
+    assert options == dict(
+        query_mode="slot_noise", query_noise_scale=0.5,
+        query_noise_min_sigma=0.0, query_noise_max_sigma=0.5,
+        query_sigma_source="constant", slot_pos_scale=0.5)
+    with pytest.raises(FoundationModelError, match="query mode"):
+        replace(cfg, native_3d_query_mode="unknown").validate()
+    with pytest.raises(FoundationModelError, match="Wan-only"):
+        replace(changed, initialization="wsa_checkpoint").validate()
+
+
+def test_native_slot_noise_options_match_actual_upstream_release_defaults():
+    from wm3d.models.foundation_native import native_query_options
+    from wm3d.models.foundation_world_model import _load_upstream_symbols
+    cfg = config()
+    source = Path(cfg.upstream_source_root)
+    if not source.is_dir():
+        pytest.skip("upstream WSA source is not installed")
+    _load_upstream_symbols(source)
+    from lerobot.policies.WSA_Large.configuration_wsa_large import WSALargeConfig
+    fields = WSALargeConfig.__dataclass_fields__
+    options = native_query_options(replace(cfg, native_3d_query_mode="slot_noise"))
+    for name, value in options.items():
+        assert fields["future_3d_" + name].default == value
+
+
+def test_native_readout_mode_is_explicit_and_default_remains_linear():
+    cfg = config()
+    assert cfg.native_3d_readout_mode == "linear"
+    replace(cfg, native_3d_readout_mode="wsa_perceiver").validate()
+    with pytest.raises(FoundationModelError, match="readout mode"):
+        replace(cfg, native_3d_readout_mode="unknown").validate()
+    with pytest.raises(FoundationModelError, match="Wan-only"):
+        replace(cfg, native_3d_readout_mode="wsa_perceiver",
+                initialization="wsa_checkpoint").validate()
+
+
+def test_native_perceiver_reuses_actual_upstream_head_and_preserves_layout():
+    from wm3d.models.foundation_native import project_trajectory_tokens
+    from wm3d.models.foundation_world_model import _load_upstream_symbols
+    cfg = replace(config(), native_3d_readout_mode="wsa_perceiver")
+    if not Path(cfg.upstream_source_root).is_dir():
+        pytest.skip("upstream WSA source is not installed")
+    _load_upstream_symbols(Path(cfg.upstream_source_root))
+    from lerobot.policies.WSA_Large.core.models.wan22.future_3d_expert import (
+        Future3DExpert, Future3DPerceiverResampler)
+    # Actual production head dimensions and all K8*P64 positions, not a GPU pilot.
+    torch.manual_seed(3407)
+    decoder = Future3DPerceiverResampler(dim=768, num_heads=24, output_dim=2048)
+    output_queries = torch.nn.Parameter(torch.randn(1, 512, 768) * .02)
+    norm = torch.nn.LayerNorm(768)
+    expert = SimpleNamespace(output_decoder=decoder, output_queries=output_queries,
+        query_layer_indices=(29,), layer_norms=(norm,), da3_num_views=3,
+        query_tokens_per_view=512, hidden_dim=768, da3_tokens_per_view=512,
+        da3_query_dim=2048)
+    tokens = torch.randn(1, 1536, 768, requires_grad=True)
+    actual = project_trajectory_tokens(expert, norm(tokens), cfg)
+    official = Future3DExpert.project_query_layers(expert, (tokens,))[0]
+    assert torch.equal(actual.reshape(1, 1536, 2048), official)
+    assert actual.shape == (1, 3, 8, 64, 2048)
+    altered = tokens.detach().clone()
+    altered[:, 512:1024] += torch.randn_like(altered[:, 512:1024])
+    changed = project_trajectory_tokens(expert, norm(altered), cfg)
+    assert torch.equal(actual[:, 0], changed[:, 0])
+    assert torch.equal(actual[:, 2], changed[:, 2])
+    assert not torch.equal(actual[:, 1], changed[:, 1])
+    target = torch.randn_like(actual, requires_grad=True)
+    current = torch.randn(1, 3, 64, 2048, requires_grad=True)
+    mask = torch.ones(1, 3, 8, dtype=torch.bool)
+    mask[:, 2] = False
+    loss, _metrics = trajectory_loss([actual], target, mask, current)
+    loss.backward()
+    assert target.grad is None and current.grad is None
+    assert tokens.grad[:, 1024:].count_nonzero() == 0
+    assert output_queries.grad.isfinite().all()
+    assert (output_queries.grad.reshape(1, 8, 64, 768).abs().sum((-1, -2)) > 0).all()
+    assert decoder.output_proj.weight.grad.isfinite().all()
+    legacy = TrajectoryReadout(768, 2048)
+    delta_params = sum(p.numel() for p in decoder.parameters()) + output_queries.numel() - sum(p.numel() for p in legacy.parameters())
+    delta_tensors = len(decoder.state_dict()) + 1 - len(legacy.state_dict())
+    assert delta_params == 3938304 and delta_tensors == 14

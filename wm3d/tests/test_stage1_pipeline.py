@@ -1096,6 +1096,7 @@ def test_stage1_release_manual_tracks_required_audit_cli_and_schemas() -> None:
     manual = (
         Path(__file__).resolve().parents[1]
         / "docs"
+        / "archive"
         / "WM3D_STAGE1_UNIFIED.md"
     ).read_text(encoding="utf-8")
     audit_block = manual.split(
@@ -1126,6 +1127,7 @@ def test_stage1_release_manual_tracks_required_audit_cli_and_schemas() -> None:
     validation = (
         Path(__file__).resolve().parents[1]
         / "docs"
+        / "archive"
         / "WM3D_RELEASE_VALIDATION.md"
     ).read_text(encoding="utf-8")
     assert "旧 SHA 因此仅是开发记录" in validation

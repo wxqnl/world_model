@@ -1,0 +1,860 @@
+diff --git a/wm3d/scripts/export_robonet_selection.py b/wm3d/scripts/export_robonet_selection.py
+new file mode 100644
+--- /dev/null
++++ b/wm3d/scripts/export_robonet_selection.py
+@@ -0,0 +1,92 @@
++"""CPU-only native DCP model subset export on44's local artifact volume."""
++import argparse
++import json
++import os
++import sys
++import time
++from pathlib import Path
++import torch
++import torch.distributed.checkpoint as dcp
++from safetensors import safe_open
++from safetensors.torch import save_file
++
++def sig(p):
++    s=p.stat();return [s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns]
++
++def native_identity(root):
++    result={}
++    for p in sorted(root.rglob('*')):
++        if p.is_symlink():raise ValueError('selected native checkpoint may not contain symlinks')
++        if p.is_file():result[str(p.relative_to(root))]=sig(p)
++    return result
++
++def main():
++    parser=argparse.ArgumentParser()
++    parser.add_argument('--checkpoint',required=True,type=Path)
++    parser.add_argument('--destination',required=True,type=Path)
++    parser.add_argument('--source-header',required=True,type=Path)
++    parser.add_argument('--step',required=True,type=int)
++    parser.add_argument('--self-identity-json',required=True)
++    args=parser.parse_args()
++    self_identity=json.loads(args.self_identity_json)
++    if sig(Path(__file__))!=self_identity:raise ValueError('bound CPU export helper identity changed')
++    if Path.cwd()!=Path('/data/Minko') or os.environ.get('CUDA_VISIBLE_DEVICES')!='':raise ValueError('CPU export only')
++    torch.set_num_threads(2)
++    available=lambda:next(int(s.split()[1])*1024 for s in Path('/proc/meminfo').read_text().splitlines() if s.startswith('MemAvailable:'))
++    mem_before=available()
++    if mem_before<320*(1<<30):raise ValueError('CPU export cannot preserve160GiB RAM reserve under160G task cap')
++    commit=args.checkpoint/'COMMITTED.json'
++    original=sig(commit)
++    original_native=native_identity(args.checkpoint)
++    meta=json.loads((args.checkpoint/'metadata.json').read_text())
++    if meta['step']!=args.step or json.loads(commit.read_text())['step']!=args.step:raise ValueError('source DCP step differs')
++    reader=dcp.FileSystemReader(args.checkpoint/'distcp')
++    bounded_root=args.source_header.parents[1]/'formal_27source_2ep_20261005/training/checkpoint_retention/rolling_max4_20261014'
++    sys.path.insert(0,str(bounded_root))
++    from bounded_read import Pacer,FileSystem
++    pacer=Pacer(rate=128*(1<<20))
++    reader.fs=FileSystem(reader.fs,pacer)
++    metadata=reader.read_metadata().state_dict_metadata
++    state={}
++    with safe_open(str(args.source_header),framework='pt',device='cpu') as header:
++        names=list(header.keys())
++        if len(names)!=2354:raise ValueError('source complete model header differs')
++        for name in names:
++            item=metadata['model.'+name]
++            if tuple(item.size)!=tuple(header.get_slice(name).get_shape()):raise ValueError('DCP model shape differs')
++            if header.get_slice(name).get_dtype()!='F32' or item.properties.dtype!=torch.float32:raise ValueError('DCP inherited model dtype differs')
++            state[name]=torch.empty(tuple(item.size),dtype=item.properties.dtype,device='cpu')
++    if sum(x.numel() for x in state.values())!=7251084294:raise ValueError('full inherited model cardinality differs')
++    dcp.load({'model':state},storage_reader=reader,no_dist=True)
++    if not all(not x.is_floating_point() or bool(torch.isfinite(x).all()) for x in state.values()):raise FloatingPointError('selected model not finite')
++    if sig(commit)!=original:raise ValueError('source commit changed during model-only read')
++    if native_identity(args.checkpoint)!=original_native:raise ValueError('native source checkpoint changed during selected model export')
++    if available()<160*(1<<30):raise ValueError('actual160GiB RAM reserve lost during CPU export')
++    args.destination.parent.mkdir(parents=True,exist_ok=True)
++    v=os.statvfs(args.destination.parent)
++    required=sum(x.numel()*x.element_size() for x in state.values())
++    if v.f_bavail*v.f_frsize<required+32*(1<<30):raise ValueError('local44 artifact free space insufficient')
++    tmp=args.destination.with_name('.'+args.destination.name+'.incomplete.'+str(os.getpid()))
++    save_file(state,str(tmp),metadata={'source_step':str(args.step),'kind':'validation_selected_complete_model_only'})
++    with tmp.open('rb') as handle:os.fsync(handle.fileno())
++    with safe_open(str(tmp),framework='pt',device='cpu') as exported:
++        if set(exported.keys())!=set(state):raise ValueError('export omitted model names')
++        for name,value in state.items():
++            if tuple(exported.get_slice(name).get_shape())!=tuple(value.shape):raise ValueError('export shape differs')
++    os.replace(tmp,args.destination)
++    directory_fd=os.open(args.destination.parent,os.O_RDONLY|os.O_DIRECTORY)
++    try:os.fsync(directory_fd)
++    finally:os.close(directory_fd)
++    if sig(Path(__file__))!=self_identity:raise ValueError('CPU export helper changed during task')
++    result=dict(passed=True,model_only=True,all_tensors_finite=True,tensors=len(state),elements=sum(x.numel() for x in state.values()),source_checkpoint=str(args.checkpoint),source_step=args.step,source_commit_identity=original,source_native_stat_identity=original_native,source_unchanged=True,artifact=str(args.destination),artifact_identity=sig(args.destination),GPU_initialized=torch.cuda.is_initialized(),optimizer_or_sampler_exported=False,actual_reader_bytes=pacer.bytes,actual_read_rate_limit_bytes_per_second=pacer.rate,actual_read_seconds=time.monotonic()-pacer.started,MemAvailable_before=mem_before,MemAvailable_after=available(),resource_contract=dict(MemoryMax='160G',CPUQuota='200%',Nice=15,IOSchedulingClass='idle'))
++    receipt=args.destination.with_suffix('.json')
++    receipt_tmp=receipt.with_name('.'+receipt.name+'.incomplete.'+str(os.getpid()))
++    receipt_tmp.write_text(json.dumps(result,indent=2)+'\n')
++    with receipt_tmp.open('rb') as handle:os.fsync(handle.fileno())
++    os.replace(receipt_tmp,receipt)
++    directory_fd=os.open(receipt.parent,os.O_RDONLY|os.O_DIRECTORY)
++    try:os.fsync(directory_fd)
++    finally:os.close(directory_fd)
++    print(json.dumps(result),flush=True)
++
++if __name__=='__main__':main()
+diff --git a/wm3d/wm3d/data/benchmark_native.py b/wm3d/wm3d/data/benchmark_native.py
+--- a/wm3d/wm3d/data/benchmark_native.py
++++ b/wm3d/wm3d/data/benchmark_native.py
+@@ -18,6 +18,8 @@
+ 
+ 
+ def validate_closure(closure, model_profile, runtime_profile):
++    if closure.get("benchmark") == "RoboNet":
++        return validate_robonet(closure,model_profile,runtime_profile)
+     required = {"schema", "admission_id", "benchmark", "suite",
+                 "catalog_path", "catalog_binding", "normalization_path",
+                 "normalization_binding", "raw_file_bindings", "encoder_contract_path",
+@@ -83,9 +85,49 @@
+ 
+ 
+ def build_dataset(closure, *, split):
++    if closure.get("benchmark") == "RoboNet":
++        from .benchmark_robonet import RoboNetNativeDataset
++        item=closure["catalogs"][split]
++        verify(item["path"],item["binding"])
++        dataset=RoboNetNativeDataset(item["path"],split=split,normalization=closure["normalization_path"])
++        return dataset,dataset.profile
+     if split != "train":
+         raise ValueError("LIBERO simulator evaluation is separate from its full demonstration training split")
+     from .benchmark_libero import LiberoNativeDataset
+     dataset = LiberoNativeDataset(closure["catalog_path"], closure["normalization_path"],
+         file_bindings=closure["raw_file_bindings"], catalog_binding=closure["catalog_binding"])
+     return dataset, dataset.profile
++
++
++def validate_robonet(closure,model_profile,runtime_profile):
++    if closure["schema"]!=SCHEMA or closure["clock"]!="ordinal_step":
++        raise ValueError("RoboNet must retain explicit recorded-frame ordinal coordinates")
++    for split,count in (("train",161649),("val",512),("test",256)):
++        item=closure["catalogs"][split]
++        verify(item["path"],item["binding"])
++        rows=list(read_rows(item["path"]))
++        if len(rows)!=count or any(r["split"]!=split or not r["eligible"] for r in rows):
++            raise ValueError("RoboNet immutable trajectory protocol differs")
++    for name in ("normalization","encoder_contract","CPU_materialization_proof"):
++        verify(closure[name+"_path"],closure[name+"_binding"])
++    normal=json.loads(Path(closure["normalization_path"]).read_text())
++    proof=json.loads(Path(closure["CPU_materialization_proof_path"]).read_text())
++    if normal["fitting_split"]!="train" or normal["trajectories"]!=161649 or not proof["passed"]:
++        raise ValueError("real train-only normalization and native CPU RGB proof required")
++    train=runtime_profile["train"]
++    if (train["global_batch_size"]!=128 or train["total_steps"]!=101031 or train["validate_every"]!=2000
++            or train["validation_steps"]!=64 or train["validation_micro_batch_size"]!=1):
++        raise ValueError("RoboNet fixed exposure/validation protocol changed")
++    if train["downstream_initialization"]["benchmark"]!="RoboNet":
++        raise ValueError("RoboNet requires strict complete final-model initialization")
++    model=model_profile["model"]
++    for k,v in dict(T=16,K=8,P=64,num_views=3,max_action_groups=3,max_action_dim=14,max_state_dim=10).items():
++        if model[k]!=v: raise ValueError("native architecture changed")
++    from .foundation_input import FoundationContextStore
++    from .benchmark_robonet import TASK
++    bank=FoundationContextStore.from_directory(model["wan_context_store_path"])
++    bank.lookup([TASK])
++    if bank.prompt_format!=model["wan_prompt_format"]: raise ValueError("Wan prompt ABI changed")
++    if closure["targets_per_visit"]!=8 or closure["crop_offsets"]!=[0,2] or closure["trajectory_passes"]!=80:
++        raise ValueError("native K8 twelve-frame crop contract changed")
++    return dict(trajectories=161649,train_only_normalization=True,targets_per_visit=8)
+diff --git a/wm3d/wm3d/data/benchmark_robonet.py b/wm3d/wm3d/data/benchmark_robonet.py
+new file mode 100644
+--- /dev/null
++++ b/wm3d/wm3d/data/benchmark_robonet.py
+@@ -0,0 +1,182 @@
++"""RoboNet measured command/frame adapter for the complete native model.
++
++Time is recorded-frame ordinal, NOT a claimed physical control frequency.
++Two real overlapping K8 crops cover the twelve-frame protocol window.
++"""
++from __future__ import annotations
++import io
++import json
++import math
++from pathlib import Path
++from types import SimpleNamespace
++import h5py
++import av
++import numpy as np
++import torch
++from torch.utils.data import Dataset
++from .benchmark_catalog import binding, read_rows
++from .step_sampler import AffinePermutation
++
++TASK = "Interact with objects using the robot."
++ROBOTS = ("sawyer", "widowx", "R3", "baxter", "kuka", "fetch", "franka")
++
++def normalization_key(row,adim,sdim):
++    return json.dumps([row["robot"],row["action_space"],row["gripper"],adim,sdim],separators=(",",":"))
++
++def decode(h, row):
++    camera = h["env/cam0_video"]
++    if row["video_encoding"] == "mp4":
++        with av.open(io.BytesIO(camera["frames"][:].tobytes()), mode="r") as container:
++            stream = container.streams.video[0]
++            stream.thread_count = 1
++            frames = np.stack([frame.to_ndarray(format="rgb24")
++                               for frame in container.decode(stream)])
++    elif row["video_encoding"] == "jpg":
++        import cv2
++        frames = np.stack([cv2.imdecode(camera["frame"+str(i)][:], cv2.IMREAD_COLOR)[..., ::-1]
++                           for i in range(row["declared_video_frames"])])
++    else:
++        raise ValueError("unresolved native encoding")
++    if len(frames) != row["declared_video_frames"]:
++        raise ValueError("actual decoded frame cardinality differs from recorded T")
++    if row["image_format"] == "BGR":
++        frames = frames[..., ::-1].copy()
++    elif row["image_format"] != "RGB":
++        raise ValueError("unresolved native color order")
++    return frames
++
++def robot(h, row):
++    action = np.asarray(h["policy/actions"], dtype=np.float32)
++    state = np.asarray(h["env/state"], dtype=np.float32)
++    if not np.isfinite(action).all() or not np.isfinite(state).all():
++        raise ValueError("nonfinite native robot array")
++    if action.shape[1] == 4 and row["primitives"] == "autograsp":
++        if row["low_bound"] is None or row["high_bound"] is None:
++            lo=np.asarray(h["env/low_bound"],dtype=np.float32)
++            hi=np.asarray(h["env/high_bound"],dtype=np.float32)
++            lo=lo[1:len(action)+1,-1] if lo.ndim==2 else lo[-1]
++            hi=hi[1:len(action)+1,-1] if hi.ndim==2 else hi[-1]
++        else:
++            lo, hi = row["low_bound"][-1], row["high_bound"][-1]
++        gripper = np.where(state[1:len(action)+1,-1] > (lo+hi)/2, hi, lo).astype(np.float32)
++        action = np.column_stack((action, gripper))
++    # Keep source x,y[,z,theta,gripper], with no synthetic xyz or rotations.
++    if action.shape[1] not in (2,4,5) or state.shape[1] not in (3,5):
++        raise ValueError("unresolved native robot width")
++    return action, state
++
++class RoboNetNativeDataset(Dataset):
++    requires_main_process = False
++    def __init__(self, catalog, *, split="train", normalization=None):
++        self.rows = list(read_rows(catalog))
++        self.split = split
++        self.stats = json.loads(Path(normalization).read_text())["groups"] if normalization else None
++        self.trajectories = len(self.rows)
++        self.source_names = ("robonet",)
++        self.source_spans = {"robonet": (0, self.trajectories * (80 if split=="train" else 1))}
++        self.source_sampling_weights = {"robonet":1}
++        self.profile = SimpleNamespace(source_weights=self.source_sampling_weights,
++            source_order=self.source_names, cache_representation=dict(spatial_tokens=64,token_dim=2048,num_views=3,rgb_size=518))
++    def __len__(self):
++        return self.source_spans["robonet"][1]
++    def __getitem__(self,index):
++        from scripts.data.run_cache_worker import _view_batch
++        visit, episode = divmod(int(index), self.trajectories)
++        row = self.rows[episode]
++        before = binding(row["file"])
++        for key in ("inode","size_bytes","mtime_ns","ctime_ns"):
++            if before[key] != row["file_binding"][key]:
++                raise ValueError("RoboNet native file changed")
++        with h5py.File(row["file"],"r") as h:
++            frames = decode(h,row)
++            action,state = robot(h,row)
++        if binding(row["file"]) != before:
++            raise ValueError("native file changed while reading")
++        windows = row["valid12_frame_starts"]
++        start = AffinePermutation(windows,seed=(3407 if self.split=="train" else 7340),source_name=row["id"]).at(visit)
++        crop = (visit%2)*2 if self.split=="train" else 0
++        anchor = start+1+crop
++        selected = anchor+np.arange(9)
++        decoded = {"front":SimpleNamespace(frames=frames[selected])}
++        images,masks = _view_batch(decoded=decoded,slots=("front","left","right"),input_size=518)
++        rgb = torch.zeros(24,3,3,518,518,dtype=torch.uint8)
++        view = torch.zeros(24,3,dtype=torch.bool)
++        rgb[14,0] = torch.nn.functional.interpolate(torch.from_numpy(frames[anchor-1].copy()).permute(2,0,1)[None].float(),size=(518,518),mode="bilinear",align_corners=False)[0].round().clamp(0,255).byte()
++        view[14,0] = True
++        rgb[15:] = images.mul(255).round().clamp(0,255).byte()
++        view[15:] = masks
++        keys=torch.full((24,),-1,dtype=torch.long)
++        keys[14:] = torch.from_numpy((episode<<32)+np.arange(anchor-1,anchor+9))
++        result=dict(direct_rgb_uint8=rgb,direct_view_mask=view,direct_frame_keys=keys,
++            source_id=torch.tensor(0),sample_index=torch.tensor(index),task_text=TASK,time_coordinate="ordinal_step",
++            embodiment_ids=torch.tensor(ROBOTS.index(row["robot"])+1),
++            action_group_ids=torch.tensor([13,0,0]),action_group_mask=torch.tensor([True,False,False]),
++            action_semantic_ids=torch.zeros(3,14,dtype=torch.long),state_semantic_ids=torch.zeros(3,10,dtype=torch.long),
++            action_normalization_offset=torch.zeros(3,14),action_normalization_scale=torch.ones(3,14),
++            state_normalization_offset=torch.zeros(3,10),state_normalization_scale=torch.ones(3,10),
++            current_state_values=torch.zeros(3,10),current_state_mask=torch.zeros(3,10,dtype=torch.bool),
++            history_world_boundaries_dt=torch.arange(-16,1,dtype=torch.float32),
++            future_world_boundaries_dt=torch.arange(9,dtype=torch.float32),
++            policy_query_dt=torch.zeros(3,8),policy_query_mask=torch.zeros(3,8,dtype=torch.bool),
++            target_fine_action=torch.zeros(3,8,14),target_fine_action_mask=torch.zeros(3,8,14,dtype=torch.bool))
++        adim,sdim=action.shape[1],state.shape[1]
++        if self.stats is not None:
++            stats=self.stats[normalization_key(row,adim,sdim)]
++            for name,values in (("action",action),("state",state)):
++                offset=np.asarray(stats[name]["offset"],np.float32)
++                scale=np.asarray(stats[name]["scale"],np.float32)
++                values-=offset
++                values/=scale
++                result[name+"_normalization_offset"][0,:len(offset)]=torch.from_numpy(offset)
++                result[name+"_normalization_scale"][0,:len(scale)]=torch.from_numpy(scale)
++        # Existing source recording units remain exact; physical units unresolved.
++        result["current_state_values"][0,:sdim]=torch.from_numpy(state[anchor])
++        result["current_state_mask"][0,:sdim]=True
++        # Recording metadata names x/y/z/theta but does not establish SI delta
++        # frames or close01 polarity for every robot. Preserve controller-native
++        # values rather than mislabel those heterogeneous units as SI poses.
++        result["action_semantic_ids"][0,:adim]=12
++        result["state_semantic_ids"][0,:sdim]=11
++        for prefix,length,first in (("history",16,anchor-16),("future_factual",8,anchor)):
++            values=torch.zeros(length,3,1,14)
++            mask=torch.zeros_like(values,dtype=torch.bool)
++            sample_mask=torch.zeros(length,3,1,dtype=torch.bool)
++            positions=first+np.arange(length)
++            active=positions>=0
++            values[:,0,0,:adim]=torch.from_numpy(action[np.maximum(positions,0)])*torch.from_numpy(active[:,None])
++            mask[:,0,0,:adim]=torch.from_numpy(np.broadcast_to(active[:,None],(length,adim)).copy())
++            sample_mask[:,0,0]=torch.from_numpy(active)
++            result[prefix+"_fine_action_values"]=values
++            result[prefix+"_fine_action_mask"]=mask
++            result[prefix+"_fine_sample_mask"]=sample_mask
++            result[prefix+"_fine_action_dt"]=torch.zeros(length,3,1)
++        result["policy_query_dt"][0]=torch.arange(8)
++        result["policy_query_mask"][0]=True
++        result["target_fine_action"][0,:,:adim]=torch.from_numpy(action[anchor:anchor+8])
++        result["target_fine_action_mask"][0,:,:adim]=True
++        return result
++
++class RoboNetTrajectorySampler:
++    """Step-addressed 80 complete trajectory traversals; final padding only."""
++    def __init__(self,dataset,*,world_size,rank,micro_batch_size,gradient_accumulation,start_step,num_steps):
++        self.dataset=dataset
++        self.world_size,self.rank=world_size,rank
++        self.micro,self.accum=micro_batch_size,gradient_accumulation
++        self.start,self.steps=start_step,num_steps
++        self.order=AffinePermutation(dataset.trajectories,seed=3407,source_name="robonet_trajectory")
++    def __len__(self): return self.steps*self.accum
++    def __iter__(self):
++        n=self.dataset.trajectories
++        global_batch=self.world_size*self.micro*self.accum
++        for step in range(self.start,self.start+self.steps):
++            for micro in range(self.accum):
++                result=[]
++                for j in range(self.micro):
++                    draw=step*global_batch+micro*self.world_size*self.micro+self.rank*self.micro+j
++                    if draw>=n*80:
++                        # Forty-eight rounding draws repeat the first distinct
++                        # trajectories of the final pass, not one clip48times.
++                        draw=79*n+(draw-n*80)
++                    visit,pos=divmod(draw,n)
++                    result.append(visit*n+self.order.at(visit*n+pos))
++                yield result
+diff --git a/wm3d/wm3d/data/foundation_bridge.py b/wm3d/wm3d/data/foundation_bridge.py
+--- a/wm3d/wm3d/data/foundation_bridge.py
++++ b/wm3d/wm3d/data/foundation_bridge.py
+@@ -426,6 +426,16 @@
+     }
+     result.update(action)
+     result.update(history_action)
++    coordinate=batch.get("time_coordinate")
++    if coordinate is not None:
++        coordinates=[coordinate] if isinstance(coordinate,str) else list(coordinate)
++        if set(coordinates)!={"ordinal_step"}:
++            raise FoundationBridgeError("unsupported explicit source time coordinate")
++        # No physical seconds exist in RoboNet. Keep source frame ordinal
++        # separate from physical-clock field names at the public model ABI.
++        result["time_coordinate"]="ordinal_step"
++        result["action_time_ordinal"]=result.pop("action_time_s")
++        result["history_action_time_ordinal"]=result.pop("history_action_time_s")
+     result["action_supervision_kind"] = supervision
+     result.update(state)
+     for name in (
+diff --git a/wm3d/wm3d/models/foundation_world_model.py b/wm3d/wm3d/models/foundation_world_model.py
+--- a/wm3d/wm3d/models/foundation_world_model.py
++++ b/wm3d/wm3d/models/foundation_world_model.py
+@@ -436,7 +436,13 @@
+         )
+         history = batch["history_action"].float()
+         history_mask = batch["history_action_element_mask"].bool()
+-        history_time = batch["history_action_time_s"].float()
++        coordinate=batch.get("time_coordinate","physical_seconds")
++        if coordinate=="ordinal_step":
++            history_time=batch["history_action_time_ordinal"].float()
++        elif coordinate=="physical_seconds":
++            history_time=batch["history_action_time_s"].float()
++        else:
++            raise FoundationModelError("unknown robot time coordinate")
+         command_time, history_valid = self._valid_command_time(
+             history_time, history_mask
+         )
+@@ -1297,6 +1303,12 @@
+ 
+     def forward(self, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+         context, context_mask = self._fused_context(batch)
++        coordinate=batch.get("time_coordinate","physical_seconds")
++        if coordinate not in {"physical_seconds","ordinal_step"}:
++            raise FoundationModelError("unknown source time coordinate")
++        # Existing Fourier/ActionDiT consumes a numerical coordinate; ordinal
++        # inputs use the identical parameterization, never a new learned clock.
++        action_time=(batch["action_time_ordinal"] if coordinate=="ordinal_step" else batch["action_time_s"])
+         sample = {
+             "video": batch["video"],
+             "image_is_pad": batch["image_is_pad"],
+@@ -1305,7 +1317,8 @@
+             "action": batch["action"],
+             "action_is_pad": batch["action_is_pad"],
+             "action_dim_is_pad": batch["action_dim_is_pad"],
+-            "action_time_s": batch["action_time_s"],
++            "action_time_s": action_time,
++            "time_coordinate": coordinate,
+             "action_element_mask": batch["action_element_mask"],
+             "proprio": batch["proprio"],
+             "future_3d_images": batch["future_3d_images"],
+@@ -1363,7 +1376,7 @@
+         """Predict one source-native action chunk and return normalized/physical ABI."""
+ 
+         video = batch["video"]
+-        action_time_s = batch["action_time_s"]
++        action_time_s = self._command_coordinates(batch)
+         element_mask = batch["action_element_mask"].bool()
+         if video.ndim != 5 or video.shape[0] != 1:
+             raise FoundationModelError(
+@@ -1399,7 +1412,7 @@
+         self, normalized: torch.Tensor, batch: Mapping[str, torch.Tensor]
+     ) -> Mapping[str, torch.Tensor]:
+         element_mask = batch["action_element_mask"].bool()
+-        action_time_s = batch["action_time_s"]
++        action_time_s = self._command_coordinates(batch)
+         offset = batch["action_normalization_offset"].reshape(
+             1, 1, self.cfg.action_width
+         )
+@@ -1425,13 +1438,22 @@
+                 self.cfg.max_action_groups,
+                 self.cfg.max_action_dim,
+             ),
+-            "action_time_s": action_time_s.to(device=normalized.device).reshape(
++            ("action_time_ordinal" if batch.get("time_coordinate")=="ordinal_step" else "action_time_s"): action_time_s.to(device=normalized.device).reshape(
+                 1,
+                 int(normalized.shape[1]),
+                 self.cfg.max_action_groups,
+                 self.cfg.max_action_dim,
+             ),
+         }
++
++    @staticmethod
++    def _command_coordinates(batch):
++        coordinate=batch.get("time_coordinate","physical_seconds")
++        if coordinate=="ordinal_step":
++            return batch["action_time_ordinal"]
++        if coordinate=="physical_seconds":
++            return batch["action_time_s"]
++        raise FoundationModelError("unsupported serving command coordinate")
+ 
+     @torch.inference_mode()
+     def predict_joint(
+@@ -1443,7 +1465,7 @@
+     ) -> Mapping[str, Any]:
+         """Generate video and action from observation; future labels are not inputs."""
+         video = batch["video"]
+-        time_s = batch["action_time_s"]
++        time_s = self._command_coordinates(batch)
+         mask = batch["action_element_mask"].bool()
+         if video.ndim != 5 or video.shape[0] != 1 or video.shape[2] < 1:
+             raise FoundationModelError("joint serving requires one observed video frame")
+@@ -1498,7 +1520,7 @@
+ 
+         video = batch["video"]
+         action = batch["action"]
+-        action_time_s = batch["action_time_s"]
++        action_time_s = self._command_coordinates(batch)
+         element_mask = batch["action_element_mask"].bool()
+         if video.ndim != 5 or video.shape[0] != 1:
+             raise FoundationModelError(
+diff --git a/wm3d/wm3d/training/benchmark_recovery.py b/wm3d/wm3d/training/benchmark_recovery.py
+new file mode 100644
+--- /dev/null
++++ b/wm3d/wm3d/training/benchmark_recovery.py
+@@ -0,0 +1,82 @@
++"""Strict full-state benchmark continuation across a decoder-only implementation fix."""
++from __future__ import annotations
++import copy,json,random,time,stat
++from pathlib import Path
++import numpy as np
++import torch
++import torch.distributed as dist
++from .runtime_contract import load_materialized_runtime
++from .distributed_checkpoint import _atomic_json
++RUNS=Path("/data/Minko/wm3d_native_fresh_pretraining_20260930/downstream_runs_20261028")
++
++def _files(root):
++ result={}
++ for p in root.rglob("*"):
++  s=p.lstat()
++  if stat.S_ISLNK(s.st_mode):raise ValueError("recovery source contains symlink")
++  if p.is_file():
++   if not stat.S_ISREG(s.st_mode):raise ValueError("recovery source not regular")
++   result[str(p.relative_to(root))]=[s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns]
++ return result
++
++def prepare(config,args):
++ if not(args.resume is not None and args.resume_source_runtime and args.resume_cpu_proof):
++  raise ValueError("decoder recovery requires explicit own CP, original runtime and own full CPU proof")
++ if args.qualify_capacity or args.stop_after_step is not None or args.restore_only:
++  raise ValueError("recovery cannot reset/qualify/bound optimizer updates")
++ source,binding=load_materialized_runtime(Path(args.resume_source_runtime))
++ a,b=copy.deepcopy(source),copy.deepcopy(config)
++ for v in (a,b):
++  for key in ("code_commit","output_root"):v["run"].pop(key)
++ if a!=b:raise ValueError("decoder recovery changed model/data/optimizer/LR/batch/updates/sampling/lineage/environment")
++ if source["data_closure"].get("benchmark")!="RoboNet":raise ValueError("only this declared RoboNet decoder recovery is admitted")
++ old=Path(source["run"]["output_root"]);new=Path(config["run"]["output_root"])
++ if old.parent!=RUNS or new.parent!=RUNS or new==old:raise ValueError("new isolated identity required")
++ cp=Path(args.resume).resolve(strict=True)
++ if cp.parent!=old/"checkpoints":raise ValueError("source must be this own original SFT checkpoint")
++ index=json.loads((old/"checkpoint_index.json").read_text())
++ if index["entries"][-1]["path"]!=str(cp):raise ValueError("source is not latest own complete CP")
++ proof=json.loads(Path(args.resume_cpu_proof).read_text())
++ if not(proof["passed"] and proof["source_unchanged"] and proof["CPU_full_DCP_read_returned"] and proof["all_tensors_finite"] and not proof["GPU_initialized"]):raise ValueError("full own CPU proof missing")
++ if proof["source_checkpoint"]!=str(cp) or proof["world_size"]!=8 or proof["model_tensors"]!=2354 or proof["adam_states"]!=2157 or len(proof["rank_states"])!=8:raise ValueError("full CPU proof identity mismatch")
++ if _files(cp)!=proof["source_files"]:raise ValueError("own CPU-validated source changed")
++ meta=json.loads((cp/"metadata.json").read_text())
++ if meta["capacity_qualification_only"] or meta["runtime_config_sha256"]!=binding:raise ValueError("source runtime not exact original formal source")
++ if meta["step"]!=proof["source_step"] or meta["step"]!=proof["all_Adam_parameter_steps"]:raise ValueError("saved model/Adam step mismatch")
++ contract=json.loads((old/"run_contract.json").read_text())
++ if contract["code_commit"]!=source["run"]["code_commit"]:raise ValueError("source code provenance mismatch")
++ return dict(source_config=source,source_binding=binding,cpu_proof=proof,cpu_proof_path=str(args.resume_cpu_proof),warmstart_model=contract.get("warmstart_model"),source_checkpoint=str(cp))
++
++def verify_loaded(recovery,*,model,optimizer,metadata,progress,context,output_root):
++ step=recovery["cpu_proof"]["source_step"]
++ if metadata["step"]!=step or progress["next_optimizer_step"]!=step:raise ValueError("actual loaded sampler/step mismatch")
++ def local(t):return t.to_local() if hasattr(t,"to_local") else t
++ tensors=[local(v.detach()) for v in model.state_dict().values() if isinstance(v,torch.Tensor)]
++ finite=True
++ for v in tensors:
++  if v.is_floating_point():
++   for part in v.reshape(-1).split(4<<20):finite=finite and bool(torch.isfinite(part).all())
++ count=0;moments=0
++ for group in optimizer.param_groups:
++  for p in group["params"]:
++   state=optimizer.state[p]
++   if set(state)!={"step","exp_avg","exp_avg_sq"}:raise ValueError("actual restored Adam state incomplete")
++   if float(local(state["step"]).item())!=step:raise ValueError("actual restored Adam step differs")
++   for k in ("exp_avg","exp_avg_sq"):
++    v=local(state[k])
++    if v.dtype!=torch.float32:raise ValueError("restored moment precision changed")
++    for part in v.reshape(-1).split(4<<20):finite=finite and bool(torch.isfinite(part).all())
++    moments+=1
++   count+=1
++ saved=torch.load(Path(recovery["source_checkpoint"])/"rank_state"/f"rank_{context.rank:05d}.pt",map_location="cpu",weights_only=False)
++ rng=saved["rng"];np_now=np.random.get_state()
++ rng_equal=(random.getstate()==rng["python"] and np_now[0]==rng["numpy"][0] and np.array_equal(np_now[1],rng["numpy"][1]) and np_now[2:]==rng["numpy"][2:] and torch.equal(torch.get_rng_state(),rng["torch_cpu"]) and torch.equal(torch.cuda.get_rng_state(context.device),rng["torch_cuda"]))
++ if not(finite and count==2157 and moments==4314 and rng_equal):raise ValueError("full actual model/Adam/same-rank RNG restore verification failed")
++ row=dict(rank=context.rank,model_tensors=len(tensors),all_model_and_moments_finite=finite,Adam_states=count,Adam_moments=moments,all_Adam_parameter_steps=step,same_rank_Python_NumPy_TorchCPU_CUDA_RNG_equal=rng_equal,sampler_next_optimizer_step=progress["next_optimizer_step"])
++ rows=[None]*context.world_size;dist.all_gather_object(rows,row)
++ if context.is_rank0:
++  value=dict(schema="wm3d_benchmark_actual_full_recovery_v1",at_unix=time.time(),passed=True,source_checkpoint=recovery["source_checkpoint"],source_step=step,next_optimizer_step=step+1,source_CPU_full_proof=recovery["cpu_proof_path"],ranks=rows,model_optimizer_sampler_RNG_restored=True,first_optimizer_not_yet_claimed=True,original_unsaved_updates_require_recomputation=True)
++  _atomic_json(Path(output_root)/"FULL_RESTORE_VERIFIED.json",value)
++  print(json.dumps({"benchmark_full_recovery":value}),flush=True)
++ return rows
++
+diff --git a/wm3d/wm3d/training/benchmark_selection.py b/wm3d/wm3d/training/benchmark_selection.py
+new file mode 100644
+--- /dev/null
++++ b/wm3d/wm3d/training/benchmark_selection.py
+@@ -0,0 +1,60 @@
++"""Synchronous trainer-owned fixed-validation selection, separate from retention."""
++import fcntl
++import json
++import math
++import os
++from pathlib import Path
++import shlex
++import subprocess
++import torch.distributed as dist
++from .benchmark_checkpoint import BASE,RUNS,MIN_FREE
++from .distributed_checkpoint import _atomic_json
++
++def preserve_selected_model(config,*,completed,validation,context):
++    total=config['runtime_profile']['train']['total_steps']
++    if completed<math.ceil(total*.75) or validation is None:return
++    result=[None]
++    if context.is_rank0:
++        fd=None
++        try:
++            score=float(validation['loss_video'])
++            if not math.isfinite(score):raise ValueError('fixed-val video loss nonfinite')
++            root=Path(config['run']['output_root'])
++            previous=root/'BEST_VALIDATION_MODEL.json'
++            old=json.loads(previous.read_text()) if previous.exists() else None
++            is_best=old is None or score<float(old['validation_video_loss'])
++            if not is_best:
++                if completed==total:
++                    _atomic_json(root/'FINAL_MODEL.json',dict(passed=True,step=completed,full_checkpoint=str(root/'checkpoints'/f'step_{completed:08d}'),always_retained_final=True,validation=validation),exclusive=False)
++                result[0]=dict(passed=True,selected=False)
++            else:
++                fd=os.open(RUNS/'.checkpoint_operation.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
++                fcntl.flock(fd,fcntl.LOCK_EX)
++                checkpoint=root/'checkpoints'/f'step_{completed:08d}'
++                metadata=json.loads((checkpoint/'metadata.json').read_text())
++                if metadata['step']!=completed or metadata['run_lineage']!=config['run']['lineage']:raise ValueError('selected checkpoint differs')
++                mount=Path('/data/Minko/wm3d_native_fresh_node44_20260930/mounts/run')
++                remote_cp=mount/checkpoint.relative_to(BASE)
++                artifact_root=Path('/data/Minko/wm3d_downstream_artifacts_20261028/robonet')/root.name
++                kind='best_model'
++                destination=artifact_root/(kind+'.safetensors')
++                helper='/data/Minko/wm3d_downstream_artifacts_20261028/robonet_export_selection.py'
++                helper_identity=config['data_closure']['selection_exporter_node44_identity']
++                command='cd /data/Minko && systemd-run --quiet --wait --pipe --collect -p WorkingDirectory=/data/Minko -p MemoryMax=160G -p CPUQuota=200% -p Nice=15 -p IOSchedulingClass=idle -E CUDA_VISIBLE_DEVICES= -E PYTHONDONTWRITEBYTECODE=1 /data/Minko/.venvs/wm3d-foundation-v10-final/bin/python '+shlex.quote(helper)+' --checkpoint '+shlex.quote(str(remote_cp))+' --destination '+shlex.quote(str(destination))+' --source-header '+shlex.quote(str(mount/'downstream_handoff_20261028/final_model.safetensors'))+' --step '+str(completed)+' --self-identity-json '+shlex.quote(json.dumps(helper_identity))
++                cp=subprocess.run(['ssh','-T','-o','BatchMode=yes','-S',str(BASE/'control_20261001/ssh44.sock'),'root@172.27.0.7',command],capture_output=True,text=True,timeout=3600)
++                if cp.returncode:raise RuntimeError('selected model CPU export failed: '+cp.stderr[-3000:])
++                exported=json.loads(cp.stdout.splitlines()[-1])
++                if not (exported['passed'] and exported['all_tensors_finite'] and exported['source_step']==completed and exported['tensors']==2354 and not exported['GPU_initialized']):raise ValueError('selected model-only export proof failed')
++                v=os.statvfs(RUNS)
++                if v.f_bavail*v.f_frsize<MIN_FREE:raise ValueError('shared reserve changed during selected model export')
++                receipt=dict(passed=True,step=completed,validation_video_loss=score,validation=validation,artifact_node=44,artifact=str(destination),export=exported,fixed_validation_seed=7340,test_used_for_selection=False)
++                if is_best:_atomic_json(previous,receipt,exclusive=False)
++                if completed==total:_atomic_json(root/'FINAL_MODEL.json',receipt,exclusive=False)
++                result[0]=dict(passed=True,selected=is_best,artifact=str(destination))
++        except Exception as exc:
++            result[0]=dict(passed=False,error=repr(exc))
++        finally:
++            if fd is not None:fcntl.flock(fd,fcntl.LOCK_UN);os.close(fd)
++    dist.broadcast_object_list(result,src=0)
++    if not result[0]['passed']:raise RuntimeError('validation-selected model preservation failed: '+str(result[0]))
++    if context.is_rank0:print(json.dumps(dict(validation_model_preservation=result[0])),flush=True)
+diff --git a/wm3d/wm3d/training/pretrain.py b/wm3d/wm3d/training/pretrain.py
+--- a/wm3d/wm3d/training/pretrain.py
++++ b/wm3d/wm3d/training/pretrain.py
+@@ -128,6 +128,8 @@
+         default=None,
+         help="Explicit committed step_XXXXXXXX directory; 'latest' is forbidden.",
+     )
++    parser.add_argument("--resume-source-runtime", type=Path)
++    parser.add_argument("--resume-cpu-proof", type=Path)
+     parser.add_argument("--qualify-capacity", action="store_true", help="Two real complete benchmark updates and a real DCP save; disposable preformal qualification, never formal training.")
+     parser.add_argument("--preflight-only", action="store_true")
+     parser.add_argument("--restore-only", action="store_true",
+@@ -1292,6 +1294,11 @@
+         **({"epochs": train["sampling_epochs"]} if full_epochs else {}),
+         **({"multipliers": sampling_transition.MULTIPLIERS} if reweighted else {}),
+     )
++    if is_training and getattr(dataset,"split",None)=="train" and dataset.__class__.__name__=="RoboNetNativeDataset":
++        from wm3d.data.benchmark_robonet import RoboNetTrajectorySampler
++        sampler=RoboNetTrajectorySampler(dataset,world_size=world_size,rank=rank,
++            micro_batch_size=int(train["micro_batch_size"]),gradient_accumulation=gradient_accumulation,
++            start_step=start_step,num_steps=num_steps)
+     if reweighted and sampler.migration != train["formal_sampling_transition"]["sampler_migration"]:
+         raise PretrainError("actual sampler differs from the sealed real CPU migration")
+     if full_epochs and int(train["total_steps"]) != sampler.budget["optimizer_steps"]:
+@@ -1370,6 +1377,12 @@
+     memory_log: Path | None = None,
+ ) -> dict[str, Any]:
+     count = int(runtime_profile["train"]["validation_steps"])
++    fixed_validation = runtime_profile["train"].get("downstream_initialization",{}).get("benchmark")=="RoboNet"
++    validation_rng = None
++    if fixed_validation:
++        validation_rng=(random.getstate(),np.random.get_state(),torch.get_rng_state(),torch.cuda.get_rng_state(context.device))
++        validation_seed=int(runtime_profile["train"]["validation_seed"])+context.rank
++        random.seed(validation_seed);np.random.seed(validation_seed);torch.manual_seed(validation_seed);torch.cuda.manual_seed(validation_seed)
+     loader = _make_loader(
+         dataset,
+         profile,
+@@ -1447,6 +1460,8 @@
+             label: {"teacher_ratio": ratio, "metrics": reduced[label]}
+             for label, ratio in settings
+         }
++    if validation_rng is not None:
++        random.setstate(validation_rng[0]);np.random.set_state(validation_rng[1]);torch.set_rng_state(validation_rng[2]);torch.cuda.set_rng_state(validation_rng[3],context.device)
+     return result
+ 
+ 
+@@ -1751,6 +1766,10 @@
+     config, config_sha = load_materialized_runtime(args.runtime)
+     runtime = config["runtime_profile"]
+     benchmark_sft = runtime["train"].get("downstream_initialization") is not None
++    benchmark_recovery = None
++    if args.resume_source_runtime is not None or args.resume_cpu_proof is not None:
++        from wm3d.training.benchmark_recovery import prepare
++        benchmark_recovery = prepare(config, args)
+     if args.qualify_capacity and (not benchmark_sft or args.resume is not None or args.preflight_only or args.stop_after_step is not None):
+         raise PretrainError("capacity qualification requires a fresh authorized benchmark and no competing mode")
+     sampling_migration = sampling_transition.resolve_transition(config)
+@@ -2103,6 +2122,8 @@
+                 if output_root.is_symlink():
+                     raise PretrainError("output root cannot be a symlink")
+                 contract_warmstart = warmstart_model
++                if benchmark_recovery is not None:
++                    contract_warmstart = benchmark_recovery["warmstart_model"]
+                 existing_contract_path = sampling_transition.contract_path(config)
+                 if args.resume is not None and existing_contract_path.exists():
+                     try:
+@@ -2176,6 +2197,10 @@
+                 raise PretrainError("resume must be an explicit step_XXXXXXXX directory")
+             expected_step = int(args.resume.name.split("_")[1])
+             restore_config, restore_binding = config, config_sha
++            if benchmark_recovery is not None:
++                restore_config = benchmark_recovery["source_config"]
++                restore_binding = benchmark_recovery["source_binding"]
++                restore_manager = BenchmarkCheckpointManager(args.resume.parent, lineage=restore_config["run"]["lineage"])
+             if quality_migration is not None and expected_step == quality_transition.STEP:
+                 restore_config, restore_binding = quality_migration[:2]
+             elif sampling_migration is not None and expected_step == 30000:
+@@ -2191,7 +2216,7 @@
+                 try:
+                     inspection[0] = {
+                         "ok": True,
+-                        "source": manager.inspect_committed(
++                        "source": restore_manager.inspect_committed(
+                             path=args.resume, expected=expectations
+                         ),
+                     }
+@@ -2248,6 +2273,10 @@
+                 raise PretrainError("checkpoint sampler progress is not exact")
+             start_step = int(metadata["step"])
+             gradient_ownership = _restore_gradient_ownership(metadata, raw_model)
++            if benchmark_recovery is not None:
++                from wm3d.training.benchmark_recovery import verify_loaded
++                verify_loaded(benchmark_recovery, model=raw_model, optimizer=optimizer,
++                    metadata=metadata, progress=progress, context=context, output_root=output_root)
+             if sampling_migration is not None:
+                 _, formal_sampling_restore = sampling_transition.publish_restore(
+                     config=config, context=context, model=raw_model, optimizer=optimizer,
+@@ -2319,28 +2348,6 @@
+                 "--stop-after-step must be a sealed checkpoint step so the "
+                 "stopped run is exactly resumable"
+             )
+-        if benchmark_sft:
+-            # Full native loading precedes root sharding. Release only the
+-            # now-unused initialization allocator cache once at this boundary;
+-            # active model, Adam, gradients, precision and RNG are unchanged.
+-            torch.cuda.synchronize(context.device)
+-            before_free, before_total = torch.cuda.mem_get_info(context.device)
+-            cleanup = {"rank": context.rank,
+-                       "allocated_before": torch.cuda.memory_allocated(context.device),
+-                       "reserved_before": torch.cuda.memory_reserved(context.device),
+-                       "device_free_before": before_free}
+-            torch.cuda.empty_cache()
+-            torch.cuda.synchronize(context.device)
+-            after_free, after_total = torch.cuda.mem_get_info(context.device)
+-            cleanup.update(allocated_after=torch.cuda.memory_allocated(context.device),
+-                           reserved_after=torch.cuda.memory_reserved(context.device),
+-                           device_free_after=after_free, device_total=after_total)
+-            cleanup_rows = [None] * context.world_size
+-            dist.all_gather_object(cleanup_rows, cleanup)
+-            if context.is_rank0:
+-                print(json.dumps({"benchmark_initialization_cache_release_once": cleanup_rows,
+-                                  "allocator_configuration_changed": False,
+-                                  "active_tensors_or_RNG_changed": False}), flush=True)
+         log_path = output_root / "train_metrics.jsonl"
+         memory_log = (
+             output_root / f"gpu_memory_rank_{context.rank:05d}.jsonl"
+@@ -2349,20 +2356,25 @@
+         _record_gpu_memory(
+             memory_log, context.device, step=start_step, phase="initialized",
+         )
+-        libero_stage_cache = benchmark_sft and config["data_closure"].get("benchmark") == "LIBERO"
+-
+-        def release_unused_stage_cache():
+-            if not libero_stage_cache:
+-                return
+-            # Frozen teacher and trainable FSDP graph run sequentially. Their
+-            # dead workspaces must not fragment each other's large allocations.
++        if benchmark_sft:
++            # Once per SFT launch, after source/teacher/FSDP/Adam/own restore:
++            # release only dead initialization cache before the first batch.
++            # No allocator policy, active tensor, RNG, or optimizer is changed.
+             torch.cuda.synchronize(context.device)
+-            live = torch.cuda.memory_allocated(context.device)
++            lifecycle_before=dict(allocated=torch.cuda.memory_allocated(context.device),reserved=torch.cuda.memory_reserved(context.device),free=torch.cuda.mem_get_info(context.device)[0])
+             torch.cuda.empty_cache()
+-            torch.cuda.synchronize(context.device)
+-            if torch.cuda.memory_allocated(context.device) != live:
+-                raise PretrainError("LIBERO stage cache release changed live tensors")
+-
++            lifecycle_after=dict(allocated=torch.cuda.memory_allocated(context.device),reserved=torch.cuda.memory_reserved(context.device),free=torch.cuda.mem_get_info(context.device)[0])
++            lifecycle=dict(rank=context.rank,before=lifecycle_before,after=lifecycle_after,once_before_first_batch=True)
++            lifecycle_ranks=[None]*context.world_size
++            dist.all_gather_object(lifecycle_ranks,lifecycle)
++            if context.is_rank0:
++                live_memory_unchanged=all(r["before"]["allocated"]==r["after"]["allocated"] for r in lifecycle_ranks)
++                lifecycle_receipt=dict(passed=live_memory_unchanged,allocator_configuration_unchanged=True,live_tensors_unchanged=live_memory_unchanged,only_unused_initialization_cache_released=True,ranks=lifecycle_ranks)
++                (output_root/"INITIALIZATION_CACHE_LIFECYCLE.json").write_text(json.dumps(lifecycle_receipt,indent=2)+"\n")
++                print(json.dumps(dict(initialization_cache_lifecycle=lifecycle_receipt)),flush=True)
++            if not all(r["before"]["allocated"]==r["after"]["allocated"] for r in lifecycle_ranks):
++                raise PretrainError("SFT initialization cleanup changed live tensor allocation")
++            _record_gpu_memory(memory_log,context.device,step=start_step,phase="initialization_cache_released")
+         accumulation = int(runtime["train"]["gradient_accumulation"])
+         model.train()
+         optimizer.zero_grad(set_to_none=True)
+@@ -2395,11 +2407,9 @@
+             for micro_step in range(accumulation):
+                 final_micro = micro_step == accumulation - 1
+                 if async_pipeline is None:
+-                    release_unused_stage_cache()
+                     cpu_batch = next(iterator)
+                     if input_adapter is not None:
+                         cpu_batch = input_adapter.materialize(cpu_batch)
+-                    release_unused_stage_cache()
+                     batch = _batch_to_device(cpu_batch, context.device)
+                 else:
+                     batch = async_pipeline.consume()
+@@ -2419,7 +2429,13 @@
+                     final_micro and serialize_after_step
+                 ):
+                     async_pipeline.submit()
+-                with no_sync_context(model, enabled=not final_micro and not benchmark_sft):
++                # Root-only FSDP no_sync retains full FP32 gradients across
++                # micros. Together with live Adam moments its24.42GiB reduce
++                # staging buffer exceeds H100 capacity on the second update.
++                # Reduce each micro and accumulate the identical1/accum-scaled
++                # gradients as FP32 shards; Adam still advances once/global128.
++                sharded_micro_accumulation=benchmark_sft
++                with no_sync_context(model, enabled=not final_micro and not sharded_micro_accumulation):
+                     with autocast_context(strategy):
+                         if foundation_mode:
+                             losses = model(batch)
+@@ -2525,6 +2541,7 @@
+             if (completed % int(runtime["train"]["log_every"]) == 0
+                     or completed == stop_after_step or budget_stop
+                     or (benchmark_sft and completed <= 2)
++                    or (benchmark_recovery is not None and completed <= start_step + 2)
+                     or (sampling_migration is not None and completed == start_step + 1)):
+                 metrics = reduce_metrics(accumulated)
+                 grad_tensor = grad_norm_value.detach().float().reshape(-1).mean()
+@@ -2567,7 +2584,9 @@
+                     last_log = time.monotonic()
+                     print(json.dumps(record, sort_keys=True), flush=True)
+                     _append_jsonl(log_path, record)
+-            if not budget_stop and validate_every > 0 and completed % validate_every == 0:
++            selection_validation = None
++            robonet_selection = benchmark_sft and config["data_closure"].get("benchmark")=="RoboNet"
++            if not budget_stop and validate_every > 0 and (completed % validate_every == 0 or (robonet_selection and completed == total_steps and not args.qualify_capacity)):
+                 assert validation_dataset is not None
+                 validation = _validate(
+                     model,
+@@ -2587,6 +2606,7 @@
+                     record = {"step": completed, "validation": validation}
+                     print(json.dumps(record, sort_keys=True), flush=True)
+                     _append_jsonl(log_path, record)
++                selection_validation = validation
+             if completed in checkpoint_steps:
+                 if gradient_ownership is None:
+                     raise PretrainError(
+@@ -2646,6 +2666,9 @@
+                     rank_state=sampling_transition.progress_for(config, completed),
+                 )
+                 _record_gpu_memory(memory_log, context.device, step=completed, phase="checkpoint_save")
++                if robonet_selection and not args.qualify_capacity:
++                    from wm3d.training.benchmark_selection import preserve_selected_model
++                    preserve_selected_model(config,completed=completed,validation=selection_validation,context=context)
+             completion_reason = _bounded_completion_reason(
+                 deadline=deadline, completed=completed, total_steps=stop_after_step,
+                 deadline_reached=budget_stop,
+@@ -2676,6 +2699,12 @@
+         # NCCL teardown can wait for peers still in backward. Preserve the
+         # original rank-local error before entering that cleanup.
+         traceback.print_exc()
++        if benchmark_recovery is not None and not args.preflight_only:
++            # Do not leave peers in backward while this failed rank waits in
++            # destroy_process_group. Torchrun owns and terminates only its job.
++            sys.stderr.flush()
++            sys.stdout.flush()
++            os._exit(1)
+         raise
+     finally:
+         if capacity_measurement is not None:

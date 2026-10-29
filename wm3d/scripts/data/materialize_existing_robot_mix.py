@@ -278,7 +278,7 @@ OXE = (
         "lerobot/berkeley_autolab_ur5",
         32,
         ("observation.images.image", "observation.images.hand_image"),
-        "base_rpy_open",
+        "tcp_intrinsic_yxz_open",
         "pos_quat",
         bgr_views=("observation.images.hand_image",),
     ),

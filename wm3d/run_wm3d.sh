@@ -162,6 +162,7 @@ foundation_torchrun_split() {
     echo "找不到 ${python_bin}；先运行 ./run_wm3d.sh foundation-env。" >&2
     exit 2
   }
+  cd /data/Minko
   if [[ "${preflight}" == 1 ]]; then
     "${python_bin}" -m torch.distributed.run "${torch_args[@]}" \
       -m wm3d.training.pretrain "${app_args[@]}" --preflight-only
@@ -203,13 +204,26 @@ case "${command}" in
     [[ $# -eq 0 ]] || { usage; exit 2; }
     exec bash environments/bootstrap_foundation_environment.sh
     ;;
+  downstream-checkpoint-readers)
+    cd /data/Minko
+    exec "${PYTHON_BIN}" -m wm3d.training.benchmark_checkpoint "$@"
+    ;;
+  downstream-catalog)
+    cd /data/Minko
+    exec "${PYTHON_BIN}" -m wm3d.data.benchmark_catalog "$@"
+    ;;
+  downstream-libero-data)
+    cd /data/Minko
+    exec "${PYTHON_BIN}" -m wm3d.data.benchmark_libero "$@"
+    ;;
   foundation-fetch)
     exec "${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}" \
       scripts/data/fetch_foundation_weights.py "$@"
     ;;
   foundation-context)
+    cd /data/Minko
     exec "${FOUNDATION_PYTHON_BIN:-${ROOT}/.venv-foundation/bin/python}" \
-      scripts/data/build_foundation_context.py "$@"
+      "${ROOT}/scripts/data/build_foundation_context.py" "$@"
     ;;
   foundation-preflight) foundation_torchrun_split 1 "$@" ;;
   foundation-train) foundation_torchrun_split 0 "$@" ;;
